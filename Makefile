@@ -13,8 +13,10 @@ build:
 app: build
 	rm -rf $(BUNDLE)
 	mkdir -p $(BUNDLE)/Contents/MacOS
+	mkdir -p $(BUNDLE)/Contents/Resources
 	cp $(BIN) $(BUNDLE)/Contents/MacOS/$(APP_NAME)
 	cp Info.plist $(BUNDLE)/Contents/Info.plist
+	cp Assets/AppIcon.icns $(BUNDLE)/Contents/Resources/AppIcon.icns
 	codesign --force --deep -s - $(BUNDLE)
 	@echo "Built $(BUNDLE). Launch with: open $(BUNDLE)"
 	@echo "NOTE: ad-hoc signing (-s -) gives this build a signature that differs from the"

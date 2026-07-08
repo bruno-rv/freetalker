@@ -1,3 +1,5 @@
+<p align="center"><img src="Assets/icon.png" width="160" alt="FreeTalker icon"></p>
+
 # FreeTalker
 
 System-wide push-to-talk dictation for macOS. Hold a hotkey (default **Right-⌥**), speak,
