@@ -154,9 +154,10 @@ enum SelfCheck {
             }
 
             failures.append(contentsOf: hotKeyChecks())
+            failures.append(contentsOf: vocabularyChecks())
 
             if failures.isEmpty {
-                print("SelfCheck PASSED (template seeding, FTS round-trip, pipeline contract, mic device enumeration, hotkey spec/matcher)")
+                print("SelfCheck PASSED (template seeding, FTS round-trip, pipeline contract, mic device enumeration, hotkey spec/matcher, vocabulary normalization/injection)")
                 exit(0)
             } else {
                 print("SelfCheck FAILED:")
@@ -261,6 +262,162 @@ enum SelfCheck {
         }
         if HotKeySpec(modifiers: 0, keyCode: 105).displayLabel != "F13" {
             failures.append("displayLabel: bare F13")
+        }
+
+        return failures
+    }
+
+    /// Checks for `AppSettings.normalizeVocabulary` (trim/drop-empty/case-insensitive dedupe
+    /// keeping first spelling) and `vocabularyInstruction` (empty vocab -> empty injection),
+    /// plus one check against `AppSettings.shared` for the raw-input clamp (`@MainActor`, hence
+    /// this function is too).
+    @MainActor
+    private static func vocabularyChecks() -> [String] {
+        var failures: [String] = []
+
+        let normalized = AppSettings.normalizeVocabulary("  Anthropic \n\nanthropic\nClaude\n  Claude  \n \n")
+        if normalized != ["Anthropic", "Claude"] {
+            failures.append("normalizeVocabulary: expected [\"Anthropic\", \"Claude\"], got \(normalized)")
+        }
+        if AppSettings.normalizeVocabulary("") != [] {
+            failures.append("normalizeVocabulary: expected [] for empty input, got \(AppSettings.normalizeVocabulary(""))")
+        }
+        if AppSettings.normalizeVocabulary("   \n  \n") != [] {
+            failures.append("normalizeVocabulary: expected [] for whitespace-only input")
+        }
+
+        // Bounds: >100 terms truncates to 100, in user order. Terms are short (numeric strings,
+        // 0-149) so the 100-term cap is what bites here, not the character budget.
+        let manyTerms = (0..<150).map { String($0) }
+        let boundedByCount = AppSettings.normalizeVocabulary(manyTerms.joined(separator: "\n"))
+        if boundedByCount.count != AppSettings.maxVocabularyTerms || boundedByCount.first != "0" || boundedByCount.last != "99" {
+            failures.append("normalizeVocabulary: expected first 100 of 150 terms (\"0\"...\"99\"), got \(boundedByCount.count) terms ending in \(boundedByCount.last ?? "<none>")")
+        }
+
+        // Bounds: total joined-character budget enforced even under the 100-term cap.
+        let longTerms = (1...100).map { "term-\(String(repeating: "x", count: 20))-\($0)" } // ~30 chars each, way over 600 total
+        let boundedByBudget = AppSettings.normalizeVocabulary(longTerms.joined(separator: "\n"))
+        let joinedLength = boundedByBudget.joined(separator: ", ").count
+        if boundedByBudget.count >= 100 || joinedLength > AppSettings.maxVocabularyCharacterBudget {
+            failures.append("normalizeVocabulary: expected character budget to cap terms before count limit, got \(boundedByBudget.count) terms / \(joinedLength) chars")
+        }
+        if boundedByBudget.isEmpty || boundedByBudget.first != longTerms.first {
+            failures.append("normalizeVocabulary: expected budget truncation to keep terms in user order starting with the first")
+        }
+
+        // Bounds: a single overlong term is dropped outright, in-bounds neighbors survive.
+        let overlongTerm = String(repeating: "y", count: AppSettings.maxVocabularyTermLength + 1)
+        let withOverlong = AppSettings.normalizeVocabulary("Anthropic\n\(overlongTerm)\nClaude")
+        if withOverlong != ["Anthropic", "Claude"] {
+            failures.append("normalizeVocabulary: expected overlong term dropped, got \(withOverlong)")
+        }
+
+        // In-bounds input is unchanged.
+        let inBounds = AppSettings.normalizeVocabulary("Anthropic\nClaude\nFreeTalker")
+        if inBounds != ["Anthropic", "Claude", "FreeTalker"] {
+            failures.append("normalizeVocabulary: expected in-bounds input unchanged, got \(inBounds)")
+        }
+
+        // Round 2 finding 2: a combining-mark-heavy term is ONE grapheme cluster (String.count
+        // == 1) but well over maxVocabularyTermLength in UTF-8 bytes — must be dropped by byte
+        // length, not grapheme count.
+        let combiningBomb = "e" + String(repeating: "\u{0301}", count: 30) // base "e" + 30x combining acute accent (U+0301)
+        if combiningBomb.count > 2 {
+            failures.append("normalizeVocabulary: test setup invalid, expected combiningBomb to be ~1 grapheme cluster, got \(combiningBomb.count)")
+        }
+        if combiningBomb.utf8.count <= AppSettings.maxVocabularyTermLength {
+            failures.append("normalizeVocabulary: test setup invalid, expected combiningBomb to exceed \(AppSettings.maxVocabularyTermLength) UTF-8 bytes, got \(combiningBomb.utf8.count)")
+        }
+        let withCombiningBomb = AppSettings.normalizeVocabulary("Anthropic\n\(combiningBomb)\nClaude")
+        if withCombiningBomb != ["Anthropic", "Claude"] {
+            failures.append("normalizeVocabulary: expected combining-mark-heavy term dropped despite low grapheme count, got \(withCombiningBomb)")
+        }
+
+        // Round 2 finding 2: a term containing a control character is rejected outright.
+        let withControlChar = AppSettings.normalizeVocabulary("Anthropic\nFoo\u{0001}Bar\nClaude")
+        if withControlChar != ["Anthropic", "Claude"] {
+            failures.append("normalizeVocabulary: expected control-character term rejected, got \(withControlChar)")
+        }
+
+        // Round 2 finding 1: a very large raw input (well over maxVocabularyRawTextLength) is
+        // clamped fast and never yields more than maxVocabularyTerms kept terms. Save/restore
+        // AppSettings.shared.vocabularyText since this exercises the real persisted singleton.
+        // hugeDistinctTerms is all-ASCII, so String.count == utf8.count here — this check stays
+        // valid unchanged now that maxVocabularyRawTextLength is a UTF-8 byte bound rather than a
+        // character bound (see Round 4 Codex finding below).
+        let savedVocabularyText = AppSettings.shared.vocabularyText
+        let hugeDistinctTerms = (0..<12_000).map { "term-\($0)" }.joined(separator: "\n") // ~90k chars, all distinct, all-ASCII
+        AppSettings.shared.vocabularyText = hugeDistinctTerms
+        if AppSettings.shared.vocabularyText.utf8.count > AppSettings.maxVocabularyRawTextLength {
+            failures.append("vocabularyText: expected huge raw input clamped to \(AppSettings.maxVocabularyRawTextLength) bytes, got \(AppSettings.shared.vocabularyText.utf8.count)")
+        }
+        if AppSettings.shared.vocabulary.count > AppSettings.maxVocabularyTerms {
+            failures.append("vocabularyText: expected clamped huge input to still respect maxVocabularyTerms, got \(AppSettings.shared.vocabulary.count) terms")
+        }
+        if AppSettings.shared.vocabularyTruncation == nil {
+            failures.append("vocabularyTruncation: expected truncation feedback for huge input that exceeds the term cap")
+        }
+        AppSettings.shared.vocabularyText = savedVocabularyText
+
+        // Round 3 finding: the clamped value must actually persist to UserDefaults, not just
+        // the in-memory published property — didSet doesn't re-invoke itself on the
+        // self-assignment in its oversized branch, so persistence has to be explicit.
+        AppSettings.shared.vocabularyText = hugeDistinctTerms
+        let expectedClamped = AppSettings.clampVocabularyRawText(hugeDistinctTerms)
+        if UserDefaults.standard.string(forKey: "vocabularyText") != expectedClamped {
+            failures.append("vocabularyText: expected clamped value persisted to UserDefaults, got \(UserDefaults.standard.string(forKey: "vocabularyText")?.count ?? -1) chars")
+        }
+        AppSettings.shared.vocabularyText = savedVocabularyText
+
+        // Round 4 finding: combining-scalar-heavy raw text can have String.count well under
+        // maxVocabularyRawTextLength while its UTF-8 byte size is far over — the clamp must gate
+        // on bytes, not grapheme clusters, or an oversized string slips through and gets
+        // persisted/rescanned repeatedly. Each "cluster" here is a base letter plus many
+        // combining acute accents (U+0301): one grapheme, several bytes.
+        let combiningCluster = "e" + String(repeating: "\u{0301}", count: 30) // 1 grapheme, 61 UTF-8 bytes
+        let combiningHeavyText = String(repeating: combiningCluster, count: 1_000) // 1,000 chars, 61,000 bytes
+        if combiningHeavyText.count >= AppSettings.maxVocabularyRawTextLength {
+            failures.append("vocabularyText: test setup invalid, expected combiningHeavyText.count < \(AppSettings.maxVocabularyRawTextLength), got \(combiningHeavyText.count)")
+        }
+        if combiningHeavyText.utf8.count <= AppSettings.maxVocabularyRawTextLength {
+            failures.append("vocabularyText: test setup invalid, expected combiningHeavyText.utf8.count > \(AppSettings.maxVocabularyRawTextLength), got \(combiningHeavyText.utf8.count)")
+        }
+        AppSettings.shared.vocabularyText = combiningHeavyText
+        if AppSettings.shared.vocabularyText.utf8.count > AppSettings.maxVocabularyRawTextLength {
+            failures.append("vocabularyText: expected combining-heavy raw input clamped to \(AppSettings.maxVocabularyRawTextLength) UTF-8 bytes despite low grapheme count, got \(AppSettings.shared.vocabularyText.utf8.count)")
+        }
+        let persistedCombiningHeavy = UserDefaults.standard.string(forKey: "vocabularyText") ?? ""
+        if persistedCombiningHeavy.utf8.count > AppSettings.maxVocabularyRawTextLength {
+            failures.append("vocabularyText: expected combining-heavy clamped value persisted within \(AppSettings.maxVocabularyRawTextLength) UTF-8 bytes, got \(persistedCombiningHeavy.utf8.count)")
+        }
+        // "Result is valid" is checked two ways, independent of exactly how the source segments
+        // into grapheme clusters: (1) the clamped text must be an exact `Character`-for-`Character`
+        // prefix of the source — that's only true if the cut landed on a real grapheme boundary,
+        // never mid-cluster; (2) it must contain no U+FFFD replacement character, which is what a
+        // byte-level (not Character-level) truncation of multi-byte UTF-8 would produce.
+        if !combiningHeavyText.hasPrefix(AppSettings.shared.vocabularyText) {
+            failures.append("vocabularyText: expected combining-heavy clamp result to be an exact grapheme-cluster prefix of the source, cut mid-cluster instead")
+        }
+        if AppSettings.shared.vocabularyText.unicodeScalars.contains("\u{FFFD}") {
+            failures.append("vocabularyText: expected combining-heavy clamp result to contain no replacement characters (would indicate a byte-level, not Character-level, cut)")
+        }
+        AppSettings.shared.vocabularyText = savedVocabularyText
+
+        if vocabularyInstruction([]) != "" {
+            failures.append("vocabularyInstruction: expected empty injection for empty vocabulary, got \"\(vocabularyInstruction([]))\"")
+        }
+        let hint = vocabularyInstruction(["Anthropic", "Claude"])
+        if hint.isEmpty || !hint.contains("Anthropic") || !hint.contains("Claude") {
+            failures.append("vocabularyInstruction: expected non-empty injection containing both terms, got \"\(hint)\"")
+        }
+
+        let withVocab = buildProcessorInstructions(template: Template.builtIns.first!, vocabulary: ["Anthropic"], trailing: "TRAILING")
+        if !withVocab.contains("Anthropic") || !withVocab.contains("TRAILING") {
+            failures.append("buildProcessorInstructions: expected assembled instructions to contain vocabulary hint and trailing directive")
+        }
+        let withoutVocab = buildProcessorInstructions(template: Template.builtIns.first!, vocabulary: [], trailing: "TRAILING")
+        if withoutVocab.contains("recognize and spell") {
+            failures.append("buildProcessorInstructions: expected no vocabulary hint line when vocabulary is empty")
         }
 
         return failures

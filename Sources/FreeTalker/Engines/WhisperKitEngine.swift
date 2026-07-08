@@ -52,6 +52,16 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
             options.usePrefillPrompt = true
             options.detectLanguage = false
 
+            // Bias decoding toward user-registered vocabulary (proper nouns/jargon) via
+            // WhisperKit's `promptTokens`, following the same encode pattern as WhisperKit's own
+            // CLI/server prompt handling (leading space, special tokens filtered out).
+            let vocabulary = await AppSettings.shared.vocabulary
+            if !vocabulary.isEmpty, let tokenizer = kit.tokenizer {
+                let promptText = " " + vocabulary.joined(separator: ", ")
+                options.promptTokens = tokenizer.encode(text: promptText)
+                    .filter { $0 < tokenizer.specialTokens.specialTokenBegin }
+            }
+
             let results = try await kit.transcribe(audioArray: samples, decodeOptions: options)
             await setStatus("Ready")
             let text = results.map(\.text).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)

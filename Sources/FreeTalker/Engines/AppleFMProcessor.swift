@@ -16,11 +16,12 @@ struct AppleFMProcessor: PostProcessor {
             throw FMError.unavailable
         }
 
-        let instructions = """
-        \(template.prompt)
-
-        Always respond in the same language as the transcript below.
-        """
+        let vocabulary = await AppSettings.shared.vocabulary
+        let instructions = buildProcessorInstructions(
+            template: template,
+            vocabulary: vocabulary,
+            trailing: "Always respond in the same language as the transcript below."
+        )
         let session = LanguageModelSession(instructions: instructions)
         let response = try await session.respond(to: transcript)
         return response.content

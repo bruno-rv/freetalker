@@ -152,6 +152,19 @@ private struct GeneralSettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+
+            Section("Vocabulary") {
+                Text("One term per line — proper nouns, names, or jargon that should be recognized and spelled correctly. Used to bias transcription and post-processing.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                TextEditor(text: $settings.vocabularyText)
+                    .frame(minHeight: 100)
+                if let truncation = settings.vocabularyTruncation {
+                    Text("Using first \(truncation.kept) of \(truncation.total) terms (limit: \(AppSettings.maxVocabularyTerms) terms / \(AppSettings.maxVocabularyCharacterBudget) characters).")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+            }
         }
         .formStyle(.grouped)
         .onAppear { inputDevices = AudioInputDevices.enumerate() }
