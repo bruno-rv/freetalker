@@ -33,12 +33,13 @@ final class CloudSTTEngine: ObservableObject, TranscriptionEngine, @unchecked Se
 
         let wavData = WAVEncoder.encode(samples: samples, sampleRate: 16_000)
         let boundary = "FreeTalker-\(UUID().uuidString)"
+        let vocabulary = await AppSettings.shared.vocabulary
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        request.httpBody = multipartBody(boundary: boundary, wavData: wavData)
+        request.httpBody = multipartBody(boundary: boundary, wavData: wavData, vocabulary: vocabulary)
 
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
@@ -59,13 +60,22 @@ final class CloudSTTEngine: ObservableObject, TranscriptionEngine, @unchecked Se
         statusText = text
     }
 
-    private func multipartBody(boundary: String, wavData: Data) -> Data {
+    private func multipartBody(boundary: String, wavData: Data, vocabulary: [String]) -> Data {
         var body = Data()
         func append(_ string: String) { body.append(Data(string.utf8)) }
 
         append("--\(boundary)\r\n")
         append("Content-Disposition: form-data; name=\"model\"\r\n\r\n")
         append("whisper-1\r\n")
+
+        // Bias the cloud STT the same way as WhisperKitEngine's promptTokens — the
+        // OpenAI-compatible `/audio/transcriptions` endpoint accepts a free-text `prompt` field
+        // used as decoding context. Omitted entirely when vocabulary is empty.
+        if !vocabulary.isEmpty {
+            append("--\(boundary)\r\n")
+            append("Content-Disposition: form-data; name=\"prompt\"\r\n\r\n")
+            append("\(vocabulary.joined(separator: ", "))\r\n")
+        }
 
         // The default response format is plain text/minimal JSON with no `language` field on
         // most OpenAI-compatible servers; verbose_json is what actually returns it. See Round 1

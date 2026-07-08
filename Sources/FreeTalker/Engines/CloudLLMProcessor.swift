@@ -22,7 +22,11 @@ struct CloudLLMProcessor: PostProcessor {
         }
 
         let settings = await AppSettings.shared
-        let instructions = "\(template.prompt)\n\nAlways respond in the same language as the transcript. Output only the result, no commentary."
+        let instructions = buildProcessorInstructions(
+            template: template,
+            vocabulary: await settings.vocabulary,
+            trailing: "Always respond in the same language as the transcript. Output only the result, no commentary."
+        )
 
         switch await settings.llmProvider {
         case .anthropic:
