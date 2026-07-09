@@ -24,6 +24,9 @@ final class Database {
             throw DatabaseError.openFailed(message)
         }
         try exec("PRAGMA journal_mode=WAL;")
+        // Deletion is a privacy feature, not just a row removal: secure_delete zeroes deleted
+        // page content instead of leaving it recoverable in free pages. See PLAN.md step 1.
+        try exec("PRAGMA secure_delete=ON;")
         try createSchema()
     }
 
@@ -41,6 +44,10 @@ final class Database {
             transcript TEXT NOT NULL,
             refined TEXT NOT NULL,
             engine TEXT NOT NULL,
+            -- SQLite foreign keys stay OFF permanently in this app (never
+            -- `PRAGMA foreign_keys=ON`) — a dangling source_id after the source row is deleted
+            -- is intended provenance behavior, not corruption. See PLAN.md step 1, CONTEXT.md
+            -- "Re-process".
             source_id INTEGER REFERENCES dictations(id)
         );
         """)
@@ -91,14 +98,87 @@ final class Database {
         return sqlite3_last_insert_rowid(handle)
     }
 
+    // MARK: - Deletes
+
+    /// Deletes one Dictation row. The `dictations_ad` AFTER DELETE trigger keeps
+    /// `dictations_fts` in sync — no FTS code needed here. Followed by a verified WAL truncate:
+    /// with `secure_delete` on, per-row deletion is only privacy-grade if the deleted page image
+    /// doesn't linger in the WAL. See PLAN.md step 1.
+    func deleteDictation(id: Int64) throws {
+        let stmt = try prepare("DELETE FROM dictations WHERE id = ?;")
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, id)
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.sqlFailed(lastError())
+        }
+        try walCheckpointTruncate()
+    }
+
+    /// Clears the entire Library. `VACUUM` reclaims (and overwrites) freed pages so cleared text
+    /// doesn't linger there, then a verified WAL truncate clears the write-ahead log. See
+    /// PLAN.md step 1.
+    func deleteAllDictations() throws {
+        try exec("DELETE FROM dictations;")
+        try exec("VACUUM;")
+        try walCheckpointTruncate()
+    }
+
+    /// Whether a Dictation row with this id still exists — used by `AppCoordinator.reprocess` to
+    /// detect a source row deleted mid-flight (e.g. by Delete All while an LLM call was in
+    /// flight). See PLAN.md step 5.
+    func dictationExists(id: Int64) throws -> Bool {
+        let stmt = try prepare("SELECT 1 FROM dictations WHERE id = ? LIMIT 1;")
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, id)
+        return sqlite3_step(stmt) == SQLITE_ROW
+    }
+
+    /// Runs `PRAGMA wal_checkpoint(TRUNCATE)` as a prepared statement and checks the result
+    /// row's busy column (first column) — SQLite reports checkpoint-busy via the result row, not
+    /// an exec error, so a plain `exec(...)` would silently ignore a failed truncate. See
+    /// PLAN.md step 1.
+    private func walCheckpointTruncate() throws {
+        let stmt = try prepare("PRAGMA wal_checkpoint(TRUNCATE);")
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            throw DatabaseError.sqlFailed(lastError())
+        }
+        let busy = sqlite3_column_int(stmt, 0)
+        guard busy == 0 else {
+            throw DatabaseError.sqlFailed("wal_checkpoint(TRUNCATE) busy — checkpoint incomplete")
+        }
+    }
+
+    /// Reads back `PRAGMA secure_delete` (0/1) — exercised by SelfCheck to confirm the on-open
+    /// pragma in `init` actually took effect.
+    func secureDeleteStatus() throws -> Int32 {
+        let stmt = try prepare("PRAGMA secure_delete;")
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            throw DatabaseError.sqlFailed(lastError())
+        }
+        return sqlite3_column_int(stmt, 0)
+    }
+
     // MARK: - Reads
 
-    /// All dictations, reverse-chronological.
+    /// All dictations, reverse-chronological. `id DESC` breaks ties when two rows share a `ts`
+    /// (e.g. inserted within the same clock tick) — id is the monotonic tiebreaker.
     func allDictations() throws -> [Dictation] {
-        let sql = "SELECT id, ts, language, template, transcript, refined, engine, source_id FROM dictations ORDER BY ts DESC;"
+        let sql = "SELECT id, ts, language, template, transcript, refined, engine, source_id FROM dictations ORDER BY ts DESC, id DESC;"
         let stmt = try prepare(sql)
         defer { sqlite3_finalize(stmt) }
         return try readAll(stmt)
+    }
+
+    /// The newest dictation by id (not `ts` — id is the monotonic tiebreaker on equal
+    /// timestamps). Used by the Redo Last hotkey (Feature B) to fetch straight from the DB,
+    /// immune to the Library window's search-text filter. See PLAN.md step 10.
+    func latestDictation() throws -> Dictation? {
+        let sql = "SELECT id, ts, language, template, transcript, refined, engine, source_id FROM dictations ORDER BY id DESC LIMIT 1;"
+        let stmt = try prepare(sql)
+        defer { sqlite3_finalize(stmt) }
+        return try readAll(stmt).first
     }
 
     /// Full-text search over transcript + refined output, falling back to a LIKE scan if the
@@ -112,7 +192,7 @@ final class Database {
         FROM dictations d
         JOIN dictations_fts f ON f.rowid = d.id
         WHERE dictations_fts MATCH ?
-        ORDER BY d.ts DESC;
+        ORDER BY d.ts DESC, d.id DESC;
         """
         if let stmt = try? prepare(ftsSQL) {
             bindText(stmt, 1, ftsMatchExpression(for: trimmed))
@@ -127,7 +207,7 @@ final class Database {
         let likeSQL = """
         SELECT id, ts, language, template, transcript, refined, engine, source_id FROM dictations
         WHERE transcript LIKE ? OR refined LIKE ?
-        ORDER BY ts DESC;
+        ORDER BY ts DESC, id DESC;
         """
         let stmt = try prepare(likeSQL)
         defer { sqlite3_finalize(stmt) }
