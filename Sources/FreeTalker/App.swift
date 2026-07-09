@@ -24,6 +24,12 @@ struct FreeTalkerApp: App {
                 : 4
             DebugRecordTest.runAndExit(seconds: seconds)
         }
+        // One-time migration of the legacy shared BYOK LLM Keychain item into the active
+        // provider's scoped account (PLAN.md step 3). Deliberately placed here rather than in
+        // `AppSettings.init` so it never runs under `--self-check`, which exits above before
+        // reaching this line — SelfCheck exercises the pure migration logic separately, against
+        // an in-memory fake `SecretStore` (see SelfCheck.swift), never the real Keychain.
+        CloudLLMKeyMigration.migrateIfNeeded(provider: AppSettings.shared.llmProvider, store: KeychainSecretStore())
         // Triggers the system Accessibility prompt on first launch if not already granted
         // (a no-op, no dialog, if already trusted or already declined once).
         Permissions.requestAccessibility()

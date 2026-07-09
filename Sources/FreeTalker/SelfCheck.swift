@@ -39,6 +39,25 @@ struct EmptyPostProcessor: PostProcessor {
     }
 }
 
+/// In-memory `SecretStore` fake for `CloudLLMKeyMigration` checks below — never touches the real
+/// Keychain. `failNextSet` simulates a write failure (e.g. a transient `SecItemAdd` error) to
+/// verify the legacy key survives it. See PLAN.md step 3, Round 2 Codex finding 3.
+final class FakeSecretStore: SecretStore {
+    private var storage: [String: String] = [:]
+    var failNextSet = false
+
+    func get(account: String) -> String? { storage[account] }
+
+    @discardableResult
+    func set(_ value: String, account: String) -> Bool {
+        guard !failNextSet else { return false }
+        storage[account] = value
+        return true
+    }
+
+    func delete(account: String) { storage.removeValue(forKey: account) }
+}
+
 /// One-shot async signal — any number of `wait()` callers resume once `fire()` is called; a
 /// `wait()` after `fire()` returns immediately. Used only by the `SerialGate` cancellation
 /// check below, to pin down the interleaving of its concurrent tasks deterministically —
@@ -152,6 +171,9 @@ enum SelfCheck {
                 if resultA.refined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     failures.append("pipeline contract: refined output was empty for a non-empty transcript")
                 }
+                if resultA.fallbackReason != nil {
+                    failures.append("pipeline contract: expected no fallback reason for a successful post-processor")
+                }
                 let rows = try db.allDictations()
                 if !rows.contains(where: { $0.transcript == resultA.transcript && $0.refined == resultA.refined }) {
                     failures.append("pipeline contract: Library row missing after processDictation")
@@ -170,6 +192,11 @@ enum SelfCheck {
                 if resultB.refined != resultB.transcript {
                     failures.append("pipeline contract: empty post-processor output did not fall back to the raw transcript")
                 }
+                if case .emptyOutput = resultB.fallbackReason {
+                    // expected
+                } else {
+                    failures.append("pipeline contract: expected an emptyOutput fallback reason for empty post-processor output")
+                }
             } catch {
                 failures.append("Pipeline contract check threw: \(error)")
             }
@@ -182,9 +209,14 @@ enum SelfCheck {
             failures.append(contentsOf: livePreviewChecks())
             failures.append(contentsOf: await serialGateCancellationChecks())
             failures.append(contentsOf: previewEarlyCancelChecks())
+            failures.append(contentsOf: templateUpgradeChecks())
+            failures.append(contentsOf: providerDefaultsChecks())
+            failures.append(contentsOf: keychainMigrationChecks())
+            failures.append(contentsOf: cloudLLMRoutingChecks())
+            failures.append(contentsOf: handsFreeChecks())
 
             if failures.isEmpty {
-                print("SelfCheck PASSED (template seeding, FTS round-trip, pipeline contract, mic device enumeration, hotkey spec/matcher, vocabulary normalization/injection, app rule resolution, paste-target drift, prompt app-name sanitization, live preview gating/availability, SerialGate cancellation, preview early-cancel decisions)")
+                print("SelfCheck PASSED (template seeding, FTS round-trip, pipeline contract, mic device enumeration, hotkey spec/matcher, vocabulary normalization/injection, app rule resolution, paste-target drift, prompt app-name sanitization, live preview gating/availability, SerialGate cancellation, preview early-cancel decisions, built-in template prompt upgrade, LLM provider defaults, BYOK Keychain key migration, global cloud-selection routing, hands-free recording state machine/esc/cap-clamp/cancel)")
                 exit(0)
             } else {
                 print("SelfCheck FAILED:")
@@ -933,6 +965,369 @@ enum SelfCheck {
         func disabledDiscardDecision(cancelled: Bool) -> Bool { false }
         if WhisperKitEngine.shouldDiscardPreviewResult(cancelled: true) == disabledDiscardDecision(cancelled: true) {
             failures.append("mutation test: shouldDiscardPreviewResult(cancelled: true) must disagree with a disabled (never-discard) stand-in — the check above isn't discriminating")
+        }
+
+        return failures
+    }
+
+    /// Checks for `Template.upgradingBuiltIns` — the pure upgrade-if-unedited migration. Covers
+    /// PLAN.md step 9 (a)-(d): an unedited legacy prompt upgrades, an edited prompt is left
+    /// alone, a second pass is a no-op (idempotent), and a built-in the user deleted is not
+    /// re-seeded. Also covers (e): a v2 legacy prompt (not just the oldest v1 one) upgrades to
+    /// the current default, exercising the multi-entry `legacyPrompts` array added for the
+    /// cross-sentence self-correction prompt revision (v2 -> v3).
+    private static func templateUpgradeChecks() -> [String] {
+        var failures: [String] = []
+
+        guard let legacyPromptsForCleanDictation = Template.legacyPrompts["clean-dictation"],
+              let legacyCleanDictation = legacyPromptsForCleanDictation.first else {
+            failures.append("templateUpgradeChecks: missing legacy prompt fixture for clean-dictation")
+            return failures
+        }
+        let currentCleanDictation = Template.builtIns.first(where: { $0.id == "clean-dictation" })!.prompt
+
+        // (a) An unedited legacy prompt is upgraded to the current built-in default.
+        let unedited = [Template(id: "clean-dictation", name: "Clean Dictation", prompt: legacyCleanDictation)]
+        let (uneditedUpgraded, uneditedChanged) = Template.upgradingBuiltIns(unedited)
+        if !uneditedChanged || uneditedUpgraded.first?.prompt != currentCleanDictation {
+            failures.append("upgradingBuiltIns: expected an unedited legacy prompt to upgrade to the current default")
+        }
+
+        // (e) A v2 legacy prompt (the most recent predecessor, not just the oldest v1 entry)
+        // also upgrades to the current default — guards against `legacyPrompts` ever regressing
+        // to a single-entry array that only recognizes the original v1 prompt.
+        guard let mostRecentLegacyCleanDictation = legacyPromptsForCleanDictation.last,
+              legacyPromptsForCleanDictation.count > 1 else {
+            failures.append("templateUpgradeChecks: expected multiple legacy prompt fixtures for clean-dictation (v1 and v2)")
+            return failures
+        }
+        let uneditedV2 = [Template(id: "clean-dictation", name: "Clean Dictation", prompt: mostRecentLegacyCleanDictation)]
+        let (uneditedV2Upgraded, uneditedV2Changed) = Template.upgradingBuiltIns(uneditedV2)
+        if !uneditedV2Changed || uneditedV2Upgraded.first?.prompt != currentCleanDictation {
+            failures.append("upgradingBuiltIns: expected an unedited v2 legacy prompt to upgrade to the current default")
+        }
+
+        // (b) A user-edited prompt (matches neither legacy nor current) is left untouched.
+        let edited = [Template(id: "clean-dictation", name: "Clean Dictation", prompt: "My totally custom cleanup instructions.")]
+        let (editedUpgraded, editedChanged) = Template.upgradingBuiltIns(edited)
+        if editedChanged || editedUpgraded.first?.prompt != "My totally custom cleanup instructions." {
+            failures.append("upgradingBuiltIns: expected an edited prompt to be left untouched")
+        }
+
+        // (c) Idempotent: a second pass over an already-upgraded array reports changed == false.
+        let (secondPass, secondPassChanged) = Template.upgradingBuiltIns(uneditedUpgraded)
+        if secondPassChanged || secondPass.first?.prompt != currentCleanDictation {
+            failures.append("upgradingBuiltIns: expected a second pass over already-upgraded templates to be a no-op")
+        }
+
+        // (d) A built-in the user deleted is NOT re-seeded — `upgradingBuiltIns` only transforms
+        // elements already present in `templates`, it never adds one back.
+        let missingOneBuiltIn = Template.builtIns.filter { $0.id != "email" }
+        let (upgradedMissing, _) = Template.upgradingBuiltIns(missingOneBuiltIn)
+        if upgradedMissing.count != missingOneBuiltIn.count || upgradedMissing.contains(where: { $0.id == "email" }) {
+            failures.append("upgradingBuiltIns: expected a deleted built-in to NOT be re-seeded")
+        }
+
+        return failures
+    }
+
+    /// Checks for `AppSettings.resolveProviderDefaults` — PLAN.md step 9 (e): empty resolves to
+    /// the provider default; another provider's known default is swapped for this provider's (or
+    /// cleared, for `openAICompatible`, which has none); a user-customized value is untouched;
+    /// whitespace-padded values are trimmed before matching; and the function is idempotent.
+    private static func providerDefaultsChecks() -> [String] {
+        var failures: [String] = []
+
+        let emptyResolved = AppSettings.resolveProviderDefaults(provider: .ollama, baseURL: "", model: "")
+        if emptyResolved.baseURL != "https://ollama.com/v1" || emptyResolved.model != "gpt-oss:120b" {
+            failures.append("resolveProviderDefaults: expected empty base URL/model to resolve to the Ollama default, got \(emptyResolved)")
+        }
+
+        let switchedFromAnthropic = AppSettings.resolveProviderDefaults(provider: .ollama, baseURL: "https://api.anthropic.com/v1", model: "claude-sonnet-4-5")
+        if switchedFromAnthropic.baseURL != "https://ollama.com/v1" || switchedFromAnthropic.model != "gpt-oss:120b" {
+            failures.append("resolveProviderDefaults: expected another provider's known default to be swapped for Ollama's, got \(switchedFromAnthropic)")
+        }
+
+        let clearedForOpenAICompatible = AppSettings.resolveProviderDefaults(provider: .openAICompatible, baseURL: "https://ollama.com/v1", model: "gpt-oss:120b")
+        if clearedForOpenAICompatible.baseURL != "" || clearedForOpenAICompatible.model != "" {
+            failures.append("resolveProviderDefaults: expected a known default to be cleared (not swapped) for openAICompatible, got \(clearedForOpenAICompatible)")
+        }
+
+        let custom = AppSettings.resolveProviderDefaults(provider: .anthropic, baseURL: "https://my-proxy.example.com/v1", model: "my-custom-model")
+        if custom.baseURL != "https://my-proxy.example.com/v1" || custom.model != "my-custom-model" {
+            failures.append("resolveProviderDefaults: expected a user-customized value to be left untouched, got \(custom)")
+        }
+
+        let whitespacePadded = AppSettings.resolveProviderDefaults(provider: .ollama, baseURL: "  ", model: "  claude-sonnet-4-5  ")
+        if whitespacePadded.baseURL != "https://ollama.com/v1" || whitespacePadded.model != "gpt-oss:120b" {
+            failures.append("resolveProviderDefaults: expected whitespace-only/whitespace-padded-known-default values to be trimmed and resolved, got \(whitespacePadded)")
+        }
+
+        let secondPass = AppSettings.resolveProviderDefaults(provider: .ollama, baseURL: emptyResolved.baseURL, model: emptyResolved.model)
+        if secondPass != emptyResolved {
+            failures.append("resolveProviderDefaults: expected re-applying to an already-resolved value to be idempotent, got \(secondPass) from \(emptyResolved)")
+        }
+
+        return failures
+    }
+
+    /// Checks for `CloudLLMKeyMigration.migrateIfNeeded` over an in-memory `FakeSecretStore` —
+    /// no real Keychain IO. Covers PLAN.md step 9 (f): migrates once, idempotent, an existing
+    /// target-account value is never overwritten, and a failed write leaves the legacy key
+    /// intact instead of losing it. See Round 2 Codex finding 3.
+    private static func keychainMigrationChecks() -> [String] {
+        var failures: [String] = []
+
+        // Migrates once: legacy key present, target absent -> copied, legacy removed. Re-running
+        // afterward (legacy already gone) must be a no-op, not a crash.
+        do {
+            let store = FakeSecretStore()
+            store.set("legacy-secret", account: Keychain.Account.legacyCloudLLMKey)
+            CloudLLMKeyMigration.migrateIfNeeded(provider: .ollama, store: store)
+            if store.get(account: Keychain.Account.cloudLLMKey(for: .ollama)) != "legacy-secret" {
+                failures.append("CloudLLMKeyMigration: expected legacy secret copied to the target provider account")
+            }
+            if store.get(account: Keychain.Account.legacyCloudLLMKey) != nil {
+                failures.append("CloudLLMKeyMigration: expected legacy account cleared after a verified copy")
+            }
+            CloudLLMKeyMigration.migrateIfNeeded(provider: .ollama, store: store)
+            if store.get(account: Keychain.Account.cloudLLMKey(for: .ollama)) != "legacy-secret" {
+                failures.append("CloudLLMKeyMigration: expected re-running migration to be a no-op (idempotent)")
+            }
+        }
+
+        // Target already has a value: migration must not overwrite it, even if legacy has a
+        // different value.
+        do {
+            let store = FakeSecretStore()
+            store.set("legacy-secret", account: Keychain.Account.legacyCloudLLMKey)
+            store.set("existing-target-secret", account: Keychain.Account.cloudLLMKey(for: .anthropic))
+            CloudLLMKeyMigration.migrateIfNeeded(provider: .anthropic, store: store)
+            if store.get(account: Keychain.Account.cloudLLMKey(for: .anthropic)) != "existing-target-secret" {
+                failures.append("CloudLLMKeyMigration: expected an existing target-account secret to be left untouched")
+            }
+            if store.get(account: Keychain.Account.legacyCloudLLMKey) != "legacy-secret" {
+                failures.append("CloudLLMKeyMigration: expected legacy key preserved when target already has a value")
+            }
+        }
+
+        // A failed write (target `set` fails) must leave the legacy key intact — never silently
+        // drop the secret.
+        do {
+            let store = FakeSecretStore()
+            store.set("legacy-secret", account: Keychain.Account.legacyCloudLLMKey)
+            store.failNextSet = true
+            CloudLLMKeyMigration.migrateIfNeeded(provider: .openAICompatible, store: store)
+            if store.get(account: Keychain.Account.legacyCloudLLMKey) != "legacy-secret" {
+                failures.append("CloudLLMKeyMigration: expected a failed write to leave the legacy key intact")
+            }
+            if store.get(account: Keychain.Account.cloudLLMKey(for: .openAICompatible)) != nil {
+                failures.append("CloudLLMKeyMigration: expected no partial write to the target account on failure")
+            }
+        }
+
+        // Target account EXISTS but holds an empty/whitespace-only value (e.g. left behind by a
+        // Settings field that was cleared then never re-saved) — must NOT be treated as "already
+        // migrated"; migration must still proceed and overwrite the blank with the legacy value,
+        // otherwise the legacy key would be stranded forever behind that blank read.
+        do {
+            let store = FakeSecretStore()
+            store.set("legacy-secret", account: Keychain.Account.legacyCloudLLMKey)
+            store.set("   ", account: Keychain.Account.cloudLLMKey(for: .anthropic))
+            CloudLLMKeyMigration.migrateIfNeeded(provider: .anthropic, store: store)
+            if store.get(account: Keychain.Account.cloudLLMKey(for: .anthropic)) != "legacy-secret" {
+                failures.append("CloudLLMKeyMigration: expected a blank existing target value to still be migrated into")
+            }
+            if store.get(account: Keychain.Account.legacyCloudLLMKey) != nil {
+                failures.append("CloudLLMKeyMigration: expected legacy account cleared after migrating over a blank target")
+            }
+        }
+
+        return failures
+    }
+
+    /// Checks for Amendment A: the global implicit cloud-selection rule that replaced the removed
+    /// per-Template `Template.useCloud` toggle. Covers PLAN.md Amendment A5: a truth table over
+    /// `AppCoordinator.isCloudLLMConfigured` (missing key / blank model / blank base URL /
+    /// complete), and that a legacy `templates.json` entry containing the old `"useCloud": false`
+    /// key still decodes (synthesized `Codable` ignores unknown keys once the property is gone),
+    /// with routing under a complete cloud config resolving to cloud regardless of that stale
+    /// value — the implicit, global semantics are intentional, not a bug (see CONTEXT.md
+    /// "Post-Processor": "Never selected per Template").
+    private static func cloudLLMRoutingChecks() -> [String] {
+        var failures: [String] = []
+
+        func snapshot(baseURL: String, model: String, key: String?) -> CloudLLMSettingsSnapshot {
+            CloudLLMSettingsSnapshot(provider: .anthropic, baseURL: baseURL, model: model, key: key, vocabulary: [])
+        }
+
+        let complete = snapshot(baseURL: "https://api.anthropic.com/v1", model: "claude-sonnet-4-5", key: "sk-test")
+        if !AppCoordinator.isCloudLLMConfigured(snapshot: complete) {
+            failures.append("isCloudLLMConfigured: expected a fully configured snapshot to be cloud-eligible")
+        }
+
+        let missingKey = snapshot(baseURL: "https://api.anthropic.com/v1", model: "claude-sonnet-4-5", key: nil)
+        if AppCoordinator.isCloudLLMConfigured(snapshot: missingKey) {
+            failures.append("isCloudLLMConfigured: expected a missing key to fall back to on-device")
+        }
+        let blankKey = snapshot(baseURL: "https://api.anthropic.com/v1", model: "claude-sonnet-4-5", key: "   ")
+        if AppCoordinator.isCloudLLMConfigured(snapshot: blankKey) {
+            failures.append("isCloudLLMConfigured: expected a blank (whitespace-only) key to fall back to on-device")
+        }
+
+        let blankModel = snapshot(baseURL: "https://api.anthropic.com/v1", model: "  ", key: "sk-test")
+        if AppCoordinator.isCloudLLMConfigured(snapshot: blankModel) {
+            failures.append("isCloudLLMConfigured: expected a blank model to fall back to on-device")
+        }
+
+        let blankBaseURL = snapshot(baseURL: "", model: "claude-sonnet-4-5", key: "sk-test")
+        if AppCoordinator.isCloudLLMConfigured(snapshot: blankBaseURL) {
+            failures.append("isCloudLLMConfigured: expected a blank base URL to fall back to on-device")
+        }
+
+        // Legacy templates.json with the removed `useCloud` key must still decode — synthesized
+        // Codable ignores unknown keys once the property is gone from the struct.
+        let legacyJSON = Data("""
+        [{"id":"clean-dictation","name":"Clean Dictation","prompt":"legacy prompt","useCloud":false}]
+        """.utf8)
+        guard let decoded = try? JSONDecoder().decode([Template].self, from: legacyJSON), let decodedTemplate = decoded.first else {
+            failures.append("Template decode: expected legacy templates.json with a stale \"useCloud\" key to still decode")
+            return failures
+        }
+        if decodedTemplate.id != "clean-dictation" || decodedTemplate.prompt != "legacy prompt" {
+            failures.append("Template decode: legacy JSON decoded with unexpected field values")
+        }
+        // Routing under a complete cloud config is cloud regardless of the (now-nonexistent,
+        // ignored) stale useCloud value — implicit global semantics, not per-Template. See
+        // Amendment A5's documented intended behavior.
+        if !AppCoordinator.isCloudLLMConfigured(snapshot: complete) {
+            failures.append("isCloudLLMConfigured: expected routing under a complete config to be cloud, independent of any legacy per-Template value")
+        }
+
+        return failures
+    }
+
+    /// Checks for Amendment B (hands-free recording): the full `RecordingStateMachine.transition`
+    /// table, the Esc swallow/pass decision, the `handsFreeMaxMinutes` cap clamp, a stale
+    /// `capReached` no-op, and the `cancelRecording` side-effect set via injected hooks. All
+    /// against pure functions — no CGEvents, timers, audio, or real HUD/Keychain IO. See
+    /// PLAN.md Amendment B7.
+    private static func handsFreeChecks() -> [String] {
+        var failures: [String] = []
+
+        func expect(
+            _ label: String,
+            state: RecordingState,
+            event: RecordingEvent,
+            currentGeneration: Int = 0,
+            wantState: RecordingState,
+            wantAction: RecordingAction
+        ) {
+            let (gotState, gotAction) = RecordingStateMachine.transition(state: state, event: event, currentGeneration: currentGeneration)
+            if gotState != wantState || gotAction != wantAction {
+                failures.append("RecordingStateMachine [\(label)]: got (\(gotState), \(gotAction)), want (\(wantState), \(wantAction))")
+            }
+        }
+
+        // idle
+        expect("idle+keyDown -> pttRecording, startCapture", state: .idle, event: .keyDown, wantState: .pttRecording, wantAction: .startCapture)
+        expect("idle+keyUp -> no-op", state: .idle, event: .keyUp(elapsed: 1), wantState: .idle, wantAction: .none)
+        expect("idle+pillClick -> no-op", state: .idle, event: .pillClick, wantState: .idle, wantAction: .none)
+        expect("idle+esc -> no-op", state: .idle, event: .esc, wantState: .idle, wantAction: .none)
+        expect("idle+capReached -> no-op", state: .idle, event: .capReached(generation: 0), wantState: .idle, wantAction: .none)
+
+        // pttRecording: tap vs. hold (TAP_THRESHOLD).
+        expect(
+            "pttRecording+keyUp(elapsed<threshold) -> locked, enterLocked",
+            state: .pttRecording, event: .keyUp(elapsed: RecordingStateMachine.tapThreshold - 0.01),
+            wantState: .locked(ignoreNextKeyUp: false), wantAction: .enterLocked
+        )
+        expect(
+            "pttRecording+keyUp(elapsed==threshold) -> idle, stopAndTranscribe (hold, not tap)",
+            state: .pttRecording, event: .keyUp(elapsed: RecordingStateMachine.tapThreshold),
+            wantState: .idle, wantAction: .stopAndTranscribe
+        )
+        expect(
+            "pttRecording+keyUp(elapsed>threshold) -> idle, stopAndTranscribe",
+            state: .pttRecording, event: .keyUp(elapsed: RecordingStateMachine.tapThreshold + 1),
+            wantState: .idle, wantAction: .stopAndTranscribe
+        )
+        expect("pttRecording+pillClick -> locked(ignoreNextKeyUp:true), enterLocked", state: .pttRecording, event: .pillClick, wantState: .locked(ignoreNextKeyUp: true), wantAction: .enterLocked)
+        expect("pttRecording+esc -> idle, cancel", state: .pttRecording, event: .esc, wantState: .idle, wantAction: .cancel)
+        expect("pttRecording+keyDown -> no-op (already engaged)", state: .pttRecording, event: .keyDown, wantState: .pttRecording, wantAction: .none)
+        expect("pttRecording+capReached -> no-op (cap only applies once locked)", state: .pttRecording, event: .capReached(generation: 0), wantState: .pttRecording, wantAction: .none)
+
+        // locked: re-pressing the hotkey stops; the following keyUp (from the pill-click path)
+        // is a no-op regardless of `ignoreNextKeyUp`, which is reset either way.
+        expect("locked+keyDown -> idle, stopAndTranscribe", state: .locked(ignoreNextKeyUp: false), event: .keyDown, wantState: .idle, wantAction: .stopAndTranscribe)
+        expect(
+            "pttRecording+pillClick then keyUp -> no-op, flag reset",
+            state: .locked(ignoreNextKeyUp: true), event: .keyUp(elapsed: 999),
+            wantState: .locked(ignoreNextKeyUp: false), wantAction: .none
+        )
+        expect(
+            "locked(ignoreNextKeyUp:false)+keyUp -> no-op",
+            state: .locked(ignoreNextKeyUp: false), event: .keyUp(elapsed: 999),
+            wantState: .locked(ignoreNextKeyUp: false), wantAction: .none
+        )
+        expect("locked+pillClick -> idle, stopAndTranscribe", state: .locked(ignoreNextKeyUp: false), event: .pillClick, wantState: .idle, wantAction: .stopAndTranscribe)
+        expect("locked+esc -> idle, cancel", state: .locked(ignoreNextKeyUp: false), event: .esc, wantState: .idle, wantAction: .cancel)
+
+        // capReached: terminal only in locked, and only for the live generation — a stale
+        // generation (superseded recording) is a no-op, in any state.
+        expect(
+            "locked+capReached(live generation) -> idle, stopAndTranscribe",
+            state: .locked(ignoreNextKeyUp: false), event: .capReached(generation: 3), currentGeneration: 3,
+            wantState: .idle, wantAction: .stopAndTranscribe
+        )
+        expect(
+            "locked+capReached(stale generation) -> no-op",
+            state: .locked(ignoreNextKeyUp: false), event: .capReached(generation: 2), currentGeneration: 3,
+            wantState: .locked(ignoreNextKeyUp: false), wantAction: .none
+        )
+        expect(
+            "idle+capReached(stale generation) -> no-op",
+            state: .idle, event: .capReached(generation: 1), currentGeneration: 3,
+            wantState: .idle, wantAction: .none
+        )
+
+        // Esc swallow/pass decision (B1): swallowed only while recording; idle passes through.
+        if !HotKeyManager.shouldSwallowEscape(keyCode: HotKeyManager.escapeKeyCode, isRecording: true) {
+            failures.append("shouldSwallowEscape: expected Esc to be swallowed while recording")
+        }
+        if HotKeyManager.shouldSwallowEscape(keyCode: HotKeyManager.escapeKeyCode, isRecording: false) {
+            failures.append("shouldSwallowEscape: expected Esc to pass through while idle")
+        }
+        if HotKeyManager.shouldSwallowEscape(keyCode: 51, isRecording: true) {
+            failures.append("shouldSwallowEscape: expected a non-Esc keycode to never be swallowed by this decision")
+        }
+
+        // handsFreeMaxMinutes cap clamp (B2): [1, 60] on both read and persist.
+        if AppSettings.clampHandsFreeMaxMinutes(0) != 1 {
+            failures.append("clampHandsFreeMaxMinutes: expected 0 to clamp to 1")
+        }
+        if AppSettings.clampHandsFreeMaxMinutes(61) != 60 {
+            failures.append("clampHandsFreeMaxMinutes: expected 61 to clamp to 60")
+        }
+        if AppSettings.clampHandsFreeMaxMinutes(5) != 5 {
+            failures.append("clampHandsFreeMaxMinutes: expected an in-range value (5) to pass through unchanged")
+        }
+        if AppSettings.clampHandsFreeMaxMinutes(-100) != 1 {
+            failures.append("clampHandsFreeMaxMinutes: expected a deeply negative value to clamp to 1")
+        }
+
+        // cancelRecording side-effect set (B1a): exactly stop capture, cancel live preview,
+        // invalidate the cap timer, clear/flash the HUD — in that order — via injected hooks;
+        // never transcription/insertion/Library recording (there is no hook for those at all).
+        var calls: [String] = []
+        AppCoordinator.performCancelRecording(
+            stopCapture: { calls.append("stopCapture") },
+            cancelLivePreview: { calls.append("cancelLivePreview") },
+            invalidateCapTimer: { calls.append("invalidateCapTimer") },
+            clearHUD: { calls.append("clearHUD") }
+        )
+        if calls != ["stopCapture", "cancelLivePreview", "invalidateCapTimer", "clearHUD"] {
+            failures.append("performCancelRecording: expected exactly [stopCapture, cancelLivePreview, invalidateCapTimer, clearHUD] in order, got \(calls)")
         }
 
         return failures

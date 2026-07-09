@@ -1,8 +1,9 @@
 import FoundationModels
 import Foundation
 
-/// On-device post-processing via Apple's Foundation Models framework. Default processor —
-/// see ADR context: cloud is opt-in per Template only.
+/// On-device post-processing via Apple's Foundation Models framework. Default processor — used
+/// for every Template whenever the cloud provider isn't fully configured (see
+/// `AppCoordinator.isCloudLLMConfigured`; cloud selection is global, never per-Template — Amendment A).
 struct AppleFMProcessor: PostProcessor {
     enum FMError: Error {
         /// The system language model isn't available on this machine (unsupported device,
