@@ -28,6 +28,8 @@ Glossary of canonical terms. No implementation details.
 
 **BYOK** — "bring your own key": cloud engines/models are only ever used with the user's own API credentials, never a bundled key.
 
-**Library** — the local, searchable archive of all past Dictations: Transcript, Refined Output, Template used, timestamp. Supports full-text search and Re-processing. Audio is not retained.
+**Library** — the local, searchable archive of all past Dictations: Transcript, Refined Output, Template used, timestamp. Supports full-text search, Re-processing, and deletion (single Dictation or the entire archive). The Library never stores audio; transient on-disk debug audio may exist outside it (a copy of the most recent recording, and recordings whose transcription failed) and is purged when the archive is cleared.
 
-**Re-process** — taking an existing Library entry's Transcript and running it through a different Template to produce a new Refined Output.
+**Re-process** — taking an existing Library entry's Transcript and running it through a different Template to produce a new Refined Output, saved as a new Library entry pointing back at its source.
+
+**Redo Last** — a dedicated optional hotkey that re-inserts the newest Library entry's Refined Output at the current cursor. It never re-processes and never records; it is unbound until the user assigns a key.
