@@ -219,10 +219,11 @@ enum SelfCheck {
             failures.append(contentsOf: databaseStepClassificationChecks())
             failures.append(contentsOf: checkpointBusyChecks())
             failures.append(contentsOf: libraryPurgeScopeChecks())
+            failures.append(contentsOf: libraryStorePrivacyStepChecks())
             failures.append(contentsOf: redoLastChecks())
 
             if failures.isEmpty {
-                print("SelfCheck PASSED (template seeding, FTS round-trip, pipeline contract, mic device enumeration, hotkey spec/matcher, vocabulary normalization/injection, app rule resolution, paste-target drift, prompt app-name sanitization, live preview gating/availability, SerialGate cancellation, preview early-cancel decisions, built-in template prompt upgrade, LLM provider defaults, BYOK Keychain key migration, global cloud-selection routing, hands-free recording state machine/esc/cap-clamp/cancel, Library deletion: per-row/Delete All/latestDictation tiebreak/dangling source_id/secure_delete/unfiltered total count, SQLite step classification (readAll/dictationExists error propagation), WAL checkpoint busy path, debug-audio purge scoping, Redo Last gating/spec-constraints/matcher/result message/spec validation)")
+                print("SelfCheck PASSED (template seeding, FTS round-trip, pipeline contract, mic device enumeration, hotkey spec/matcher, vocabulary normalization/injection, app rule resolution, paste-target drift, prompt app-name sanitization, live preview gating/availability, SerialGate cancellation, preview early-cancel decisions, built-in template prompt upgrade, LLM provider defaults, BYOK Keychain key migration, global cloud-selection routing, hands-free recording state machine/esc/cap-clamp/cancel, Library deletion: per-row/Delete All/latestDictation tiebreak/dangling source_id/secure_delete/unfiltered total count, SQLite step classification (readAll/dictationExists error propagation), WAL checkpoint busy path, debug-audio purge scoping (incl. directory-named-*.wav skip, unreadable-directory error), LibraryStore privacy-step-then-always sequencing, Redo Last gating/spec-constraints/matcher/result message/spec validation)")
                 exit(0)
             } else {
                 print("SelfCheck FAILED:")
@@ -1387,7 +1388,8 @@ enum SelfCheck {
                 failures.append("dictationExists: expected false for a nonexistent id")
             }
 
-            try db.deleteDictation(id: deleteID)
+            try db.deleteRow(id: deleteID)
+            try db.checkpointTruncate()
 
             if try db.totalCount() != 1 {
                 failures.append("totalCount: expected 1 row after deleting 1 of 2, got \(try db.totalCount())")
@@ -1398,21 +1400,21 @@ enum SelfCheck {
 
             let remaining = try db.allDictations()
             if remaining.count != 1 {
-                failures.append("deleteDictation: expected 1 row to remain after deleting 1 of 2, got \(remaining.count)")
+                failures.append("deleteRow: expected 1 row to remain after deleting 1 of 2, got \(remaining.count)")
             }
             if remaining.contains(where: { $0.id == deleteID }) {
-                failures.append("deleteDictation: deleted row still present in allDictations()")
+                failures.append("deleteRow: deleted row still present in allDictations()")
             }
             if !remaining.contains(where: { $0.id == keepID }) {
-                failures.append("deleteDictation: surviving row missing from allDictations()")
+                failures.append("deleteRow: surviving row missing from allDictations()")
             }
             let survivorHits = try db.searchDictations(query: "alpha")
             if !survivorHits.contains(where: { $0.id == keepID }) {
-                failures.append("deleteDictation: FTS search no longer finds the surviving row's text")
+                failures.append("deleteRow: FTS search no longer finds the surviving row's text")
             }
             let deletedHits = try db.searchDictations(query: "delta")
             if deletedHits.contains(where: { $0.id == deleteID }) {
-                failures.append("deleteDictation: FTS search still finds the deleted row's text")
+                failures.append("deleteRow: FTS search still finds the deleted row's text")
             }
         } catch {
             failures.append("Per-row delete check threw: \(error)")
@@ -1429,18 +1431,19 @@ enum SelfCheck {
             _ = try db.insertDictation(timestamp: Date(), language: "en", template: "Clean Dictation", transcript: "golf hotel india", refined: "Golf hotel india.", engine: "WhisperKit")
             _ = try db.insertDictation(timestamp: Date(), language: "en", template: "Clean Dictation", transcript: "juliet kilo lima", refined: "Juliet kilo lima.", engine: "WhisperKit")
 
-            try db.deleteAllDictations()
+            try db.deleteAllRows()
+            try db.vacuumAndCheckpoint()
 
             let remaining = try db.allDictations()
             if !remaining.isEmpty {
-                failures.append("deleteAllDictations: expected 0 rows after Delete All, got \(remaining.count)")
+                failures.append("deleteAllRows: expected 0 rows after Delete All, got \(remaining.count)")
             }
             let ftsHits = try db.searchDictations(query: "golf")
             if !ftsHits.isEmpty {
-                failures.append("deleteAllDictations: FTS search still finds text after Delete All")
+                failures.append("deleteAllRows: FTS search still finds text after Delete All")
             }
             if try db.latestDictation() != nil {
-                failures.append("deleteAllDictations: expected latestDictation() to return nil on an empty table")
+                failures.append("deleteAllRows: expected latestDictation() to return nil on an empty table")
             }
         } catch {
             failures.append("Delete All check threw: \(error)")
@@ -1457,7 +1460,8 @@ enum SelfCheck {
             let sourceID = try db.insertDictation(timestamp: Date(), language: "en", template: "Clean Dictation", transcript: "source text", refined: "Source text.", engine: "WhisperKit")
             let derivedID = try db.insertDictation(timestamp: Date(), language: "en", template: "Refined Message", transcript: "source text", refined: "Derived refined.", engine: "WhisperKit", sourceID: sourceID)
 
-            try db.deleteDictation(id: sourceID)
+            try db.deleteRow(id: sourceID)
+            try db.checkpointTruncate()
 
             let remaining = try db.allDictations()
             if let derived = remaining.first(where: { $0.id == derivedID }) {
@@ -1537,19 +1541,22 @@ enum SelfCheck {
 
     /// Checks for the WAL checkpoint busy path (Round 1 Codex finding 8) and, alongside it, that
     /// row deletion succeeds independently of the checkpoint (Round 1 Codex finding 4's premise,
-    /// which `LibraryStore.deleteAll()`'s ordering fix relies on). A second raw sqlite3
-    /// connection to the same file holds an open read transaction (`BEGIN; SELECT`, uncommitted)
-    /// — `PRAGMA wal_checkpoint(TRUNCATE)` cannot complete while a reader is active, so SQLite
-    /// reports the checkpoint busy via the result row (not a query error — see
+    /// and the underlying guarantee `Database.deleteRow`/`deleteAllRows`'s split from the
+    /// privacy steps, Round 2 Codex finding 1/2, is built on). A second raw sqlite3 connection
+    /// to the same file holds an open read transaction (`BEGIN; SELECT`, uncommitted) — `PRAGMA
+    /// wal_checkpoint(TRUNCATE)` cannot complete while a reader is active, so SQLite reports the
+    /// checkpoint busy via the result row (not a query error — see
     /// `Database.checkpointTruncate`'s doc comment), which must surface as a thrown error rather
     /// than being silently swallowed. Releasing the reader (`COMMIT`) lets a follow-up checkpoint
     /// succeed, confirming the busy result above genuinely came from the concurrent reader.
     private static func checkpointBusyChecks() -> [String] {
         var failures: [String] = []
 
-        // deleteDictation: DELETE succeeds and commits immediately (implicit autocommit), but the
-        // checkpoint that follows it inside the same call is blocked by the reader — the whole
-        // call must throw, not silently succeed with an untruncated WAL.
+        // deleteRow: commits immediately (implicit autocommit) regardless of the reader —
+        // deleteRow and checkpointTruncate are separate calls now, so this must hold trivially;
+        // asserted anyway to catch a regression that re-fuses them. checkpointTruncate(), called
+        // as its own explicit step, must throw while the reader is active and succeed once it
+        // releases.
         do {
             let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
@@ -1571,37 +1578,43 @@ enum SelfCheck {
                 return failures
             }
 
-            var threwWhileBusy = false
             do {
-                try db.deleteDictation(id: firstID)
+                try db.deleteRow(id: firstID)
             } catch {
-                threwWhileBusy = true
+                failures.append("deleteRow: expected row deletion to succeed even while a concurrent reader blocks the checkpoint, threw \(error)")
             }
-            if !threwWhileBusy {
-                failures.append("deleteDictation: expected a busy WAL checkpoint (blocked by a concurrent reader) to throw, but it succeeded")
-            }
-            // The row DELETE itself already committed (SQLite autocommits each statement absent
-            // an explicit transaction) before the checkpoint ran and threw — confirms the failure
-            // really is checkpoint-only, the same fact `deleteAllDictations`'s split relies on.
             if try db.dictationExists(id: firstID) != false {
-                failures.append("deleteDictation: expected the row itself to be gone even though the trailing checkpoint threw busy")
+                failures.append("deleteRow: expected the row itself to be gone")
+            }
+
+            var checkpointThrew = false
+            do {
+                try db.checkpointTruncate()
+            } catch {
+                checkpointThrew = true
+            }
+            if !checkpointThrew {
+                failures.append("checkpointTruncate: expected a busy WAL checkpoint (blocked by a concurrent reader) to throw, but it succeeded")
             }
 
             sqlite3_exec(readerHandle, "COMMIT;", nil, nil, nil)
 
             do {
-                try db.deleteDictation(id: secondID)
+                try db.deleteRow(id: secondID)
+                try db.checkpointTruncate()
             } catch {
-                failures.append("deleteDictation: expected checkpoint to succeed once the concurrent reader released its transaction, threw \(error)")
+                failures.append("deleteRow/checkpointTruncate: expected both to succeed once the concurrent reader released its transaction, threw \(error)")
             }
         } catch {
-            failures.append("checkpointBusyChecks (deleteDictation) setup threw: \(error)")
+            failures.append("checkpointBusyChecks (deleteRow) setup threw: \(error)")
         }
 
-        // deleteAllDictations: row deletion (DELETE + VACUUM) must succeed even while a
-        // concurrent reader blocks the checkpoint — this is the guarantee
-        // `LibraryStore.deleteAll()`'s defer-free explicit sequencing (Round 1 Codex finding 4)
-        // depends on to purge debug audio + refresh regardless of a checkpoint-only failure.
+        // deleteAllRows: row deletion must succeed even while a concurrent reader blocks the
+        // checkpoint — the guarantee `LibraryStore.deleteAll()`'s split (Round 1 Codex finding
+        // 4, Round 2 Codex finding 1) depends on to purge debug audio + refresh regardless of a
+        // privacy-step-only failure. vacuumAndCheckpoint (VACUUM, which the reader does not
+        // block, followed by the checkpoint, which it does) must throw while the reader is
+        // active and succeed once it releases.
         do {
             let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
@@ -1623,33 +1636,33 @@ enum SelfCheck {
             }
 
             do {
-                try db.deleteAllDictations()
+                try db.deleteAllRows()
             } catch {
-                failures.append("deleteAllDictations: expected row deletion to succeed even while a concurrent reader blocks the checkpoint, threw \(error)")
+                failures.append("deleteAllRows: expected row deletion to succeed even while a concurrent reader blocks the checkpoint, threw \(error)")
             }
             let remaining = try db.allDictations()
             if !remaining.isEmpty {
-                failures.append("deleteAllDictations: expected 0 rows after Delete All even while the checkpoint is blocked, got \(remaining.count)")
+                failures.append("deleteAllRows: expected 0 rows after Delete All even while the checkpoint is blocked, got \(remaining.count)")
             }
 
-            var checkpointThrew = false
+            var vacuumThrew = false
             do {
-                try db.checkpointTruncate()
+                try db.vacuumAndCheckpoint()
             } catch {
-                checkpointThrew = true
+                vacuumThrew = true
             }
-            if !checkpointThrew {
-                failures.append("checkpointTruncate: expected the blocked checkpoint to throw while the reader still holds its transaction")
+            if !vacuumThrew {
+                failures.append("vacuumAndCheckpoint: expected the blocked checkpoint to throw while the reader still holds its transaction")
             }
 
             sqlite3_exec(readerHandle, "COMMIT;", nil, nil, nil)
             do {
-                try db.checkpointTruncate()
+                try db.vacuumAndCheckpoint()
             } catch {
-                failures.append("checkpointTruncate: expected checkpoint to succeed once the reader released its transaction, threw \(error)")
+                failures.append("vacuumAndCheckpoint: expected checkpoint to succeed once the reader released its transaction, threw \(error)")
             }
         } catch {
-            failures.append("checkpointBusyChecks (deleteAllDictations) setup threw: \(error)")
+            failures.append("checkpointBusyChecks (deleteAllRows) setup threw: \(error)")
         }
 
         return failures
@@ -1658,7 +1671,9 @@ enum SelfCheck {
     /// Checks for `LibraryStore.shouldPurgeFailedDictationFile` (Round 1 Codex finding 5): only
     /// `.wav` files (case-insensitive) under `failed-dictations/` are purged — never every child
     /// of the directory indiscriminately. Pure `String -> Bool`, no filesystem/real Library
-    /// touched.
+    /// touched. Plus two real-filesystem checks against `LibraryStore.purgeDebugAudio(in:)`
+    /// (Round 2 Codex findings 3/4), run against an isolated temp directory — never the real
+    /// Application Support path.
     private static func libraryPurgeScopeChecks() -> [String] {
         var failures: [String] = []
 
@@ -1680,6 +1695,142 @@ enum SelfCheck {
         func preFixShouldPurge(pathExtension: String) -> Bool { true }
         if LibraryStore.shouldPurgeFailedDictationFile(pathExtension: "txt") == preFixShouldPurge(pathExtension: "txt") {
             failures.append("mutation test: shouldPurgeFailedDictationFile(\"txt\") must disagree with a purge-everything stand-in — the check above isn't discriminating")
+        }
+
+        // Round 2 Codex finding 4: a directory named "*.wav" under failed-dictations/ must be
+        // left alone (skipped, not an error), not recursively removed by extension-only scoping.
+        do {
+            let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: tempDir) }
+            let failedDir = tempDir.appendingPathComponent("failed-dictations", isDirectory: true)
+            let trapDir = failedDir.appendingPathComponent("sneaky.wav", isDirectory: true)
+            try FileManager.default.createDirectory(at: trapDir, withIntermediateDirectories: true)
+            // A real file alongside it must still be purged, proving the directory is skipped
+            // deliberately, not because purging failed wholesale.
+            let realFile = failedDir.appendingPathComponent("real.wav")
+            FileManager.default.createFile(atPath: realFile.path, contents: Data())
+
+            do {
+                try LibraryStore.purgeDebugAudio(in: tempDir)
+            } catch {
+                failures.append("purgeDebugAudio: expected a directory named *.wav to be left alone (no error), threw \(error)")
+            }
+            if !FileManager.default.fileExists(atPath: trapDir.path) {
+                failures.append("purgeDebugAudio: a directory named *.wav must not be recursively removed")
+            }
+            if FileManager.default.fileExists(atPath: realFile.path) {
+                failures.append("purgeDebugAudio: expected a real *.wav file to still be purged alongside the skipped directory")
+            }
+        } catch {
+            failures.append("purgeDebugAudio directory-scoping check threw: \(error)")
+        }
+
+        // Round 2 Codex finding 3: an unreadable failed-dictations/ directory must feed into
+        // audioPurgeFailed rather than a `try?` silently reporting a clean purge while audio is
+        // left behind. Skipped when running as root (chmod 000 doesn't block root reads), same
+        // as any permission-based fault-injection test.
+        if getuid() != 0 {
+            do {
+                let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                let failedDir = tempDir.appendingPathComponent("failed-dictations", isDirectory: true)
+                try FileManager.default.createDirectory(at: failedDir, withIntermediateDirectories: true)
+                FileManager.default.createFile(atPath: failedDir.appendingPathComponent("orphan.wav").path, contents: Data())
+                try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: failedDir.path)
+                defer {
+                    try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: failedDir.path)
+                    try? FileManager.default.removeItem(at: tempDir)
+                }
+
+                var threw = false
+                do {
+                    try LibraryStore.purgeDebugAudio(in: tempDir)
+                } catch {
+                    threw = true
+                }
+                if !threw {
+                    failures.append("purgeDebugAudio: expected an unreadable failed-dictations/ directory to surface audioPurgeFailed, not report a clean purge")
+                }
+            } catch {
+                failures.append("purgeDebugAudio unreadable-directory check threw: \(error)")
+            }
+        }
+
+        return failures
+    }
+
+    /// Checks for `LibraryStore.runThenAlways` (Round 2 Codex finding 2): the "row deletion
+    /// already committed; run the privacy step (VACUUM/checkpoint), but always run the side
+    /// effect (UI refresh, and for `deleteAll()` also the debug-audio purge) regardless, then
+    /// surface the privacy-step error" sequencing that `delete(id:)`/`deleteAll()` depend on.
+    /// `LibraryStore` itself is a hard singleton (`private init()`, no injectable `Database`),
+    /// so this drives the actual extracted function with fake throwing closures instead of a
+    /// live Database/Library window.
+    private static func libraryStorePrivacyStepChecks() -> [String] {
+        var failures: [String] = []
+        struct StepError: Error {}
+        struct AlwaysError: Error {}
+
+        // A failing privacy step must not suppress `always` — and its error must still surface.
+        do {
+            var alwaysRan = false
+            var threw = false
+            do {
+                try LibraryStore.runThenAlways({ throw StepError() }, always: { alwaysRan = true })
+            } catch is StepError {
+                threw = true
+            } catch {
+                // wrong error type — leave `threw` false so it's flagged below
+            }
+            if !alwaysRan {
+                failures.append("runThenAlways: expected `always` to run even though the privacy step threw")
+            }
+            if !threw {
+                failures.append("runThenAlways: expected the privacy-step error to surface")
+            }
+        }
+
+        // A failing `always` (e.g. the debug-audio purge) must surface too, not be swallowed,
+        // when the privacy step itself succeeded.
+        do {
+            var threwAlwaysError = false
+            do {
+                try LibraryStore.runThenAlways({}, always: { throw AlwaysError() })
+            } catch is AlwaysError {
+                threwAlwaysError = true
+            } catch {
+                // wrong error type
+            }
+            if !threwAlwaysError {
+                failures.append("runThenAlways: expected `always`'s own error to surface when the privacy step succeeded")
+            }
+        }
+
+        // Both succeeding must not throw, and `always` must still have run.
+        do {
+            var alwaysRan = false
+            do {
+                try LibraryStore.runThenAlways({}, always: { alwaysRan = true })
+            } catch {
+                failures.append("runThenAlways: expected no throw when both steps succeed, threw \(error)")
+            }
+            if !alwaysRan {
+                failures.append("runThenAlways: expected `always` to run when the privacy step succeeds")
+            }
+        }
+
+        // Mutation test: a pre-fix stand-in that skips `always` once the privacy step throws
+        // (the bug — a deleted row stays visible because refresh() never runs) must disagree
+        // with the real function.
+        func preFixRunThenAlways(_ step: () throws -> Void, always: () throws -> Void) throws {
+            try step()
+            try always()
+        }
+        var realAlwaysRan = false
+        try? LibraryStore.runThenAlways({ throw StepError() }, always: { realAlwaysRan = true })
+        var preFixAlwaysRan = false
+        try? preFixRunThenAlways({ throw StepError() }, always: { preFixAlwaysRan = true })
+        if realAlwaysRan == preFixAlwaysRan {
+            failures.append("mutation test: runThenAlways must disagree with a pre-fix stand-in that skips `always` on a thrown privacy-step error — the checks above aren't discriminating")
         }
 
         return failures

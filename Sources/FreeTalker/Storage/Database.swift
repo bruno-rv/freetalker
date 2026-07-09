@@ -100,29 +100,41 @@ final class Database {
 
     // MARK: - Deletes
 
-    /// Deletes one Dictation row. The `dictations_ad` AFTER DELETE trigger keeps
-    /// `dictations_fts` in sync — no FTS code needed here. Followed by a verified WAL truncate:
-    /// with `secure_delete` on, per-row deletion is only privacy-grade if the deleted page image
-    /// doesn't linger in the WAL. See PLAN.md step 1.
-    func deleteDictation(id: Int64) throws {
+    /// Deletes one Dictation row — the committed step, alone. The `dictations_ad` AFTER DELETE
+    /// trigger keeps `dictations_fts` in sync — no FTS code needed here. Deliberately does NOT
+    /// also checkpoint (see `checkpointTruncate`, called as a separate step by
+    /// `LibraryStore.delete(id:)`) — splitting them means a checkpoint failure can never be
+    /// confused with "the row wasn't deleted": once this returns, the row is already gone. See
+    /// PLAN.md step 1, Round 2 Codex finding 2.
+    func deleteRow(id: Int64) throws {
         let stmt = try prepare("DELETE FROM dictations WHERE id = ?;")
         defer { sqlite3_finalize(stmt) }
         sqlite3_bind_int64(stmt, 1, id)
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.sqlFailed(lastError())
         }
-        try checkpointTruncate()
     }
 
-    /// Clears the entire Library. `VACUUM` reclaims (and overwrites) freed pages so cleared text
-    /// doesn't linger there. Deliberately does NOT also checkpoint (see `checkpointTruncate`,
-    /// called as a separate step by `LibraryStore.deleteAll()`) — splitting them lets a caller
-    /// tell "rows are gone, only the checkpoint housekeeping failed" apart from "nothing was
-    /// deleted at all", so a checkpoint-only failure never masks that the row deletion itself
-    /// already succeeded. See PLAN.md step 1, Round 1 Codex finding 4.
-    func deleteAllDictations() throws {
+    /// Clears the entire Library — the committed step, alone. Deliberately does NOT also VACUUM
+    /// or checkpoint (see `vacuumAndCheckpoint`, called as a separate step by
+    /// `LibraryStore.deleteAll()`) — splitting them lets a caller tell "rows are gone, only the
+    /// privacy housekeeping failed" apart from "nothing was deleted at all", so a
+    /// VACUUM/checkpoint-only failure never masks that the row deletion itself already
+    /// succeeded (and committed — SQLite autocommits a bare DELETE). See PLAN.md step 1, Round 1
+    /// Codex finding 4, Round 2 Codex finding 1.
+    func deleteAllRows() throws {
         try exec("DELETE FROM dictations;")
+    }
+
+    /// Privacy-grade cleanup run after a row deletion has already committed: `VACUUM` reclaims
+    /// (and, with `secure_delete` on, overwrites) freed pages so cleared text doesn't linger
+    /// there, then `checkpointTruncate()` verifies the WAL doesn't still hold the deleted page
+    /// image either. Deliberately kept as a step separate from `deleteRow`/`deleteAllRows` (see
+    /// their doc comments) so a failure here is never mistaken for "the delete itself failed".
+    /// See PLAN.md step 1, Round 2 Codex finding 1.
+    func vacuumAndCheckpoint() throws {
         try exec("VACUUM;")
+        try checkpointTruncate()
     }
 
     /// Whether a Dictation row with this id still exists — used by `AppCoordinator.reprocess` to
@@ -165,10 +177,10 @@ final class Database {
     /// Runs `PRAGMA wal_checkpoint(TRUNCATE)` as a prepared statement and checks the result
     /// row's busy column (first column) — SQLite reports checkpoint-busy via the result row, not
     /// an exec error, so a plain `exec(...)` would silently ignore a failed truncate. Called
-    /// after `deleteDictation`/`deleteAllDictations` complete their row mutation — kept as a
-    /// separate throwing step (not folded back into `deleteAllDictations`) so
-    /// `LibraryStore.deleteAll()` can tell a checkpoint-only failure apart from a row-deletion
-    /// failure. See PLAN.md step 1, Round 1 Codex finding 4.
+    /// after `deleteRow`/`deleteAllRows` (the latter via `vacuumAndCheckpoint`) complete their
+    /// row mutation — kept as a separate throwing step so `LibraryStore.delete(id:)` /
+    /// `deleteAll()` can tell a checkpoint-only failure apart from a row-deletion failure. See
+    /// PLAN.md step 1, Round 1 Codex finding 4, Round 2 Codex findings 1/2.
     func checkpointTruncate() throws {
         let stmt = try prepare("PRAGMA wal_checkpoint(TRUNCATE);")
         defer { sqlite3_finalize(stmt) }
