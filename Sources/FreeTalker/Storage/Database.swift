@@ -137,6 +137,17 @@ final class Database {
         return try readAll(stmt)
     }
 
+    /// The most recently inserted Dictation, or nil if the Library is empty. `id` (not `ts`) is
+    /// the tiebreaker for identical timestamps — shared reasoning with `allDictations()`'s
+    /// ordering. Consumed by `AppCoordinator.redoLast()` via `LibraryStore` — see CONTEXT.md
+    /// "Redo Last".
+    func latestDictation() throws -> Dictation? {
+        let sql = "SELECT id, ts, language, template, transcript, refined, engine, source_id FROM dictations ORDER BY id DESC LIMIT 1;"
+        let stmt = try prepare(sql)
+        defer { sqlite3_finalize(stmt) }
+        return try readAll(stmt).first
+    }
+
     private func ftsMatchExpression(for query: String) -> String {
         // Quote each token so punctuation/prefixes in free text don't break FTS5 query syntax.
         let tokens = query.split(separator: " ").map { "\"\($0)\"*" }

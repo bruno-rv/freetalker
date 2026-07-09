@@ -39,6 +39,21 @@ final class AppSettings: ObservableObject {
         }
     }
 
+    /// The optional Redo Last hotkey (CONTEXT.md "Redo Last"): nil = unbound = dormant, the
+    /// default. Persisted as JSON in UserDefaults like `hotKeySpec` above, but — since nil is a
+    /// meaningful, common state here, unlike `hotKeySpec` which is never unbound — persisting nil
+    /// removes the key rather than writing null/absent JSON, so a stale spec never lingers once
+    /// the user clears it. See PLAN.md step 7.
+    @Published var redoHotKeySpec: HotKeySpec? {
+        didSet {
+            if let redoHotKeySpec, let data = try? JSONEncoder().encode(redoHotKeySpec) {
+                defaults.set(data, forKey: Keys.redoHotKeySpec)
+            } else {
+                defaults.removeObject(forKey: Keys.redoHotKeySpec)
+            }
+        }
+    }
+
     @Published var sttEngine: STTEngineKind {
         didSet { defaults.set(sttEngine.rawValue, forKey: Keys.sttEngine) }
     }
@@ -281,6 +296,7 @@ final class AppSettings: ObservableObject {
 
     private enum Keys {
         static let hotKeySpec = "hotKeySpec"
+        static let redoHotKeySpec = "redoHotKeySpec"
         /// Legacy (read-only, for migration): single-modifier NX device mask bit.
         static let legacyHotKeyDeviceMask = "hotKeyDeviceMask"
         static let sttEngine = "sttEngine"
@@ -305,6 +321,11 @@ final class AppSettings: ObservableObject {
             hotKeySpec = HotKeySpec(modifiers: UInt64(bitPattern: legacyMask), keyCode: nil)
         } else {
             hotKeySpec = .default
+        }
+        if let data = defaults.data(forKey: Keys.redoHotKeySpec) {
+            redoHotKeySpec = try? JSONDecoder().decode(HotKeySpec.self, from: data)
+        } else {
+            redoHotKeySpec = nil
         }
         sttEngine = STTEngineKind(rawValue: defaults.string(forKey: Keys.sttEngine) ?? "") ?? .whisperKit
         cloudSTTBaseURL = defaults.string(forKey: Keys.cloudSTTBaseURL) ?? "https://api.openai.com/v1"
