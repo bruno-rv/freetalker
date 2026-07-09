@@ -10,7 +10,8 @@ struct SettingsView: View {
                 .tabItem { Label("Templates", systemImage: "text.badge.checkmark") }
         }
         .padding(20)
-        .frame(width: 520, height: 480)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(minWidth: 520, minHeight: 480)
     }
 }
 
@@ -29,7 +30,7 @@ private struct GeneralSettingsView: View {
     @State private var newRuleTemplateID: String?
 
     @State private var cloudSTTKey = Keychain.get(account: Keychain.Account.cloudSTTKey) ?? ""
-    @State private var cloudLLMKey = Keychain.get(account: Keychain.Account.cloudLLMKey) ?? ""
+    @State private var cloudLLMKey = Keychain.get(account: Keychain.Account.cloudLLMKey(for: AppSettings.shared.llmProvider)) ?? ""
     // Set when Keychain.set(_:account:) returns false, so the UI never claims a key was saved
     // when it wasn't. The field itself is left as typed so the user can retry. See Round 2
     // Codex finding 7.
@@ -95,6 +96,15 @@ private struct GeneralSettingsView: View {
                 }
             }
 
+            Section("Hands-free recording") {
+                Stepper(value: $settings.handsFreeMaxMinutes, in: 1...60) {
+                    Text("Auto-stop after \(settings.handsFreeMaxMinutes) minute\(settings.handsFreeMaxMinutes == 1 ? "" : "s")")
+                }
+                Text("Tap the push-to-talk key to start a hands-free recording that keeps going until you tap it again, click the HUD pill, or press Esc to cancel. Holding the key down instead is classic push-to-talk (unbounded, released to stop).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Microphone") {
                 Picker("Input device", selection: $settings.microphoneDeviceUID) {
                     Text("System default").tag(nil as String?)
@@ -146,20 +156,29 @@ private struct GeneralSettingsView: View {
             Section("Cloud post-processing (BYOK)") {
                 Picker("Provider", selection: $settings.llmProvider) {
                     Text("Anthropic").tag(LLMProviderKind.anthropic)
+                    Text("Ollama").tag(LLMProviderKind.ollama)
                     Text("OpenAI-compatible").tag(LLMProviderKind.openAICompatible)
                 }
-                TextField("Base URL", text: $settings.cloudLLMBaseURL)
-                TextField("Model", text: $settings.cloudLLMModel)
+                .onChange(of: settings.llmProvider) { _, newProvider in
+                    // The API key field is Keychain-backed (not part of `AppSettings`), so it
+                    // has to be reloaded explicitly for the newly selected provider's scoped
+                    // account — otherwise it would keep showing the previous provider's key.
+                    // See PLAN.md step 5.
+                    cloudLLMKey = Keychain.get(account: Keychain.Account.cloudLLMKey(for: newProvider)) ?? ""
+                    cloudLLMKeyError = false
+                }
+                TextField("Base URL", text: $settings.cloudLLMBaseURL, prompt: providerDefaultBaseURL.map(Text.init))
+                TextField("Model", text: $settings.cloudLLMModel, prompt: providerDefaultModel.map(Text.init))
                 SecureField("API key", text: $cloudLLMKey)
                     .onChange(of: cloudLLMKey) { _, newValue in
-                        cloudLLMKeyError = !Keychain.set(newValue, account: Keychain.Account.cloudLLMKey)
+                        cloudLLMKeyError = !Keychain.set(newValue, account: Keychain.Account.cloudLLMKey(for: settings.llmProvider))
                     }
                 if cloudLLMKeyError {
                     Text("Failed to save key to Keychain")
                         .font(.caption)
                         .foregroundStyle(.red)
                 }
-                Text("Only used by Templates with \"Use cloud model\" enabled.")
+                Text("Used for all templates whenever provider, model, and API key are configured. Clear the key to go back to on-device processing.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -245,6 +264,11 @@ private struct GeneralSettingsView: View {
         runningApps.first(where: { $0.bundleIdentifier == bundleID })?.localizedName ?? bundleID
     }
 
+    /// Shown as the Base URL/Model fields' placeholder for the active provider, when it has a
+    /// known default — nil (no placeholder) for `openAICompatible`. See PLAN.md step 5.
+    private var providerDefaultBaseURL: String? { AppSettings.knownProviderDefaults[settings.llmProvider]?.baseURL }
+    private var providerDefaultModel: String? { AppSettings.knownProviderDefaults[settings.llmProvider]?.model }
+
     private func beginCapture() {
         capturingHotKey = true
         // FreeTalker is LSUIElement (no Dock icon), so opening the Settings window from the
@@ -289,7 +313,7 @@ private struct TemplatesSettingsView: View {
             .toolbar {
                 ToolbarItemGroup {
                     Button {
-                        let new = Template(id: UUID().uuidString, name: "New Template", prompt: "", useCloud: false)
+                        let new = Template(id: UUID().uuidString, name: "New Template", prompt: "")
                         store.upsert(new)
                         selectedID = new.id
                     } label: { Image(systemName: "plus") }
@@ -319,8 +343,6 @@ private struct TemplateEditor: View {
         Form {
             TextField("Name", text: $template.name)
                 .onChange(of: template.name) { _, _ in store.upsert(template) }
-            Toggle("Use cloud model", isOn: $template.useCloud)
-                .onChange(of: template.useCloud) { _, _ in store.upsert(template) }
             Button(template.id == settings.activeTemplateID ? "Active Template" : "Make Active") {
                 settings.activeTemplateID = template.id
             }

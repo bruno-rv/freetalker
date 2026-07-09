@@ -18,10 +18,41 @@ final class AppCoordinator: ObservableObject {
     /// permission) and we're waiting for the user to grant it. See Round 1 Codex finding 8.
     @Published private(set) var hotKeyStatusText: String?
 
+    /// Source of truth for the hands-free gesture (Amendment B): idle / pttRecording /
+    /// locked. `isRecording` and `hotKeyManager.isRecording` (consulted synchronously by the
+    /// event tap's Esc swallow decision) are kept in sync with it here, in one place, rather
+    /// than at every call site that changes it.
+    private var recordingState: RecordingState = .idle {
+        didSet {
+            let recording = recordingState != .idle
+            if isRecording != recording { isRecording = recording }
+            hotKeyManager.isRecording = recording
+        }
+    }
+    /// Ties a `locked` recording's duration-cap timer fire to the recording it belongs to
+    /// (Amendment B2) — bumped once per new recording (`beginCapture`). A `capReached` for a
+    /// stale generation is a no-op, both defensively in `RecordingStateMachine.transition` and
+    /// because `invalidateCapTimer()` already cancels the previous timer on every terminal
+    /// transition.
+    private var recordingGeneration = 0
+    /// The current recording's key-down `CGEvent` timestamp (seconds since boot, from
+    /// `HotKeyManager`'s tap callback — NOT `Date()` at handler time), used to compute
+    /// `keyUp(elapsed:)` for the tap-vs-hold decision (`RecordingStateMachine.tapThreshold`).
+    /// Deriving elapsed from the two event timestamps rather than wall-clock reads at handler
+    /// time keeps the tap-vs-hold classification immune to capture-start latency or a delayed
+    /// hop to the main actor. See `HotKeyManager.onKeyDown`/`onKeyUp` doc comments.
+    private var keyDownTimestamp: TimeInterval?
+    /// Fires `handleCapReached` when a `locked` recording hits its (clamped, snapshotted)
+    /// duration cap. Invalidated on every terminal transition (stop/cancel/cap) — see B2.
+    private var capTimer: Timer?
+    private var lockedStartTime: Date?
+    private var lockedCapSeconds: TimeInterval?
+    /// Ticks the HUD's elapsed/cap display roughly once a second while `locked`.
+    private var lockedHUDTimer: Timer?
+
     let whisperEngine = WhisperKitEngine()
     let cloudSTTEngine = CloudSTTEngine()
     private let appleFMProcessor = AppleFMProcessor()
-    private let cloudLLMProcessor = CloudLLMProcessor()
 
     private let hotKeyManager = HotKeyManager()
     private let audioCapture = AudioCapture()
@@ -55,6 +86,9 @@ final class AppCoordinator: ObservableObject {
         NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.ensureHotKeyListening() }
         }
+        // Amendment B3: clicking the HUD pill locks an in-progress PTT recording or stops a
+        // locked one — wired once, not per-`ensureHotKeyListening()` call.
+        hud.onPillClick = { [weak self] in self?.handlePillClick() }
     }
 
     /// Single entry point that (re)creates the global hotkey event tap whenever it is dead.
@@ -70,8 +104,9 @@ final class AppCoordinator: ObservableObject {
             stopHotKeyRetryPoll()
             return
         }
-        hotKeyManager.onKeyDown = { [weak self] in self?.handleKeyDown() }
-        hotKeyManager.onKeyUp = { [weak self] in self?.handleKeyUp() }
+        hotKeyManager.onKeyDown = { [weak self] eventSeconds in self?.handleKeyDown(eventSeconds: eventSeconds) }
+        hotKeyManager.onKeyUp = { [weak self] eventSeconds in self?.handleKeyUp(eventSeconds: eventSeconds) }
+        hotKeyManager.onEscape = { [weak self] in self?.handleEscape() }
         if hotKeyManager.start(spec: AppSettings.shared.hotKeySpec) {
             hotKeyStatusText = nil
             stopHotKeyRetryPoll()
@@ -130,8 +165,106 @@ final class AppCoordinator: ObservableObject {
         Permissions.requestMicrophoneAccess { _ in }
     }
 
-    private func handleKeyDown() {
-        guard !isRecording, !isProcessing else { return }
+    // MARK: - Hands-free gesture (Amendment B)
+    //
+    // `handleKeyDown`/`handleKeyUp`/`handlePillClick`/`handleEscape`/`handleCapReached` each
+    // drive one `RecordingEvent` through the pure `RecordingStateMachine.transition`, update
+    // `recordingState`, then execute the `RecordingAction` it returned. The state machine itself
+    // decides *whether* something happens (e.g. a keyDown while already `pttRecording` is a
+    // no-op); these methods only ever perform the side effect the returned action names.
+
+    private func handleKeyDown(eventSeconds: TimeInterval) {
+        // A held-down previous recording still finishing (`isProcessing`) must not start a new
+        // one — mirrors the pre-Amendment-B `!isProcessing` guard. `recordingState` is already
+        // back to `.idle` by the time processing starts (set before the async pipeline `Task`
+        // below), so the state machine alone can't tell these apart.
+        guard !isProcessing else { return }
+        let (newState, action) = RecordingStateMachine.transition(state: recordingState, event: .keyDown, currentGeneration: recordingGeneration)
+        switch action {
+        case .startCapture:
+            keyDownTimestamp = eventSeconds
+            if beginCapture() { recordingState = newState }
+        case .stopAndTranscribe:
+            recordingState = newState
+            stopAndTranscribe()
+        case .none, .enterLocked, .cancel:
+            break
+        }
+    }
+
+    private func handleKeyUp(eventSeconds: TimeInterval) {
+        guard recordingState != .idle else { return }
+        let elapsed = keyDownTimestamp.map { eventSeconds - $0 } ?? 0
+        let (newState, action) = RecordingStateMachine.transition(state: recordingState, event: .keyUp(elapsed: elapsed), currentGeneration: recordingGeneration)
+        recordingState = newState
+        switch action {
+        case .enterLocked:
+            enterLockedMode()
+        case .stopAndTranscribe:
+            stopAndTranscribe()
+        case .none, .startCapture, .cancel:
+            break
+        }
+    }
+
+    /// Clicking the HUD pill (Amendment B3): locks an in-progress PTT recording, or stops a
+    /// locked one. The FULL insertion target — frontmost app AND its (best-effort) focused AX
+    /// element/window — is snapshotted BEFORE the click is processed, per B3 — the click itself
+    /// (even though `HUDPanel` never becomes key/main) must never be able to redirect where the
+    /// eventual paste lands. Snapshotting only the frontmost app here and deriving the AX
+    /// element later, inside `stopAndTranscribe` (after the state-machine transition and its
+    /// side effects have run), would leave a gap in which the focused element could drift before
+    /// it's captured — defeating the same-app target-drift protection `InsertionTarget` exists
+    /// for. See Codex finding: paste-target drift / same-app target drift.
+    private func handlePillClick() {
+        let preSnapshottedFrontmostApp = NSWorkspace.shared.frontmostApplication
+        let preSnapshottedTarget = Insertion.snapshotTarget(app: preSnapshottedFrontmostApp)
+        let (newState, action) = RecordingStateMachine.transition(state: recordingState, event: .pillClick, currentGeneration: recordingGeneration)
+        recordingState = newState
+        switch action {
+        case .enterLocked:
+            enterLockedMode()
+        case .stopAndTranscribe:
+            stopAndTranscribe(preSnapshotted: (app: preSnapshottedFrontmostApp, target: preSnapshottedTarget))
+        case .none, .startCapture, .cancel:
+            break
+        }
+    }
+
+    /// Esc while recording (either mode) cancels — the event tap only forwards Esc here while
+    /// actually recording (see `HotKeyManager.shouldSwallowEscape`), so this fires only when
+    /// `recordingState != .idle` in practice; routed through the state machine regardless, for a
+    /// single source of truth. See PLAN.md Amendment B1.
+    private func handleEscape() {
+        let (newState, action) = RecordingStateMachine.transition(state: recordingState, event: .esc, currentGeneration: recordingGeneration)
+        recordingState = newState
+        switch action {
+        case .cancel:
+            cancelRecording()
+        case .none, .startCapture, .enterLocked, .stopAndTranscribe:
+            break
+        }
+    }
+
+    /// A `locked` recording's duration-cap timer fired (Amendment B2). Routed through the state
+    /// machine so a stale generation (superseded by a newer recording) is a no-op even if the
+    /// timer somehow fired after `invalidateCapTimer()` should have cancelled it.
+    private func handleCapReached(generation: Int) {
+        let (newState, action) = RecordingStateMachine.transition(state: recordingState, event: .capReached(generation: generation), currentGeneration: recordingGeneration)
+        recordingState = newState
+        switch action {
+        case .stopAndTranscribe:
+            stopAndTranscribe()
+        case .none, .startCapture, .enterLocked, .cancel:
+            break
+        }
+    }
+
+    /// idle -> pttRecording side effect (unchanged from pre-Amendment-B PTT): starts audio
+    /// capture. Returns false — leaving `recordingState` at `.idle` — on a mic-authorization or
+    /// capture-start failure, so the caller never commits the state transition for a recording
+    /// that never actually started.
+    private func beginCapture() -> Bool {
         let micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
         Self.logger.log("key down: micAuthorizationStatus=\(micStatus.rawValue, privacy: .public)")
         // Guard unconditionally rather than proceeding to record silence — a denied/stale TCC
@@ -140,30 +273,81 @@ final class AppCoordinator: ObservableObject {
         // speech). See live-mic silence investigation, root cause H1.
         guard micStatus == .authorized else {
             hud.flash("Microphone not authorized — check System Settings › Privacy & Security › Microphone")
-            return
+            return false
         }
         do {
             try audioCapture.start(deviceUID: AppSettings.shared.microphoneDeviceUID)
-            isRecording = true
+            recordingGeneration += 1
             if let note = audioCapture.deviceFallbackNote {
                 hud.show(text: note)
             } else {
                 hud.show(text: "Recording…")
             }
             startLivePreviewIfNeeded()
+            return true
         } catch {
             lastError = "Mic error: \(error.localizedDescription)"
+            return false
         }
     }
 
-    private func handleKeyUp() {
-        guard isRecording else { return }
+    /// pttRecording -> locked side effect (Amendment B2/B3): snapshots the clamped duration cap
+    /// for this recording's generation, (re)starts the cap timer and the HUD's elapsed-time
+    /// ticker. Recording itself continues uninterrupted — no capture/preview changes.
+    ///
+    /// Both timers are added to the run loop's `.common` mode explicitly (rather than via
+    /// `Timer.scheduledTimer`, which only schedules in `.default` mode) — `.default` mode is
+    /// suspended while the run loop is tracking a menu, so a locked recording's duration cap
+    /// (safety-critical: it's what stops an unattended recording) and its HUD ticker would both
+    /// stall for as long as the user has any menu open (the app's own menu bar menu, a right-
+    /// click context menu, anywhere).
+    private func enterLockedMode() {
+        invalidateCapTimer()
+        let clampedMinutes = AppSettings.clampHandsFreeMaxMinutes(AppSettings.shared.handsFreeMaxMinutes)
+        let capSeconds = TimeInterval(clampedMinutes * 60)
+        lockedCapSeconds = capSeconds
+        lockedStartTime = Date()
+        let generation = recordingGeneration
+        let newCapTimer = Timer(timeInterval: capSeconds, repeats: false) { [weak self] _ in
+            Task { @MainActor in self?.handleCapReached(generation: generation) }
+        }
+        RunLoop.main.add(newCapTimer, forMode: .common)
+        capTimer = newCapTimer
+        lockedHUDTimer?.invalidate()
+        let newHUDTimer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.updateLockedHUD() }
+        }
+        RunLoop.main.add(newHUDTimer, forMode: .common)
+        lockedHUDTimer = newHUDTimer
+        updateLockedHUD()
+    }
+
+    private func updateLockedHUD() {
+        guard case .locked = recordingState, let start = lockedStartTime, let cap = lockedCapSeconds else { return }
+        hud.showLocked(elapsed: Date().timeIntervalSince(start), cap: cap, previewText: lastLivePreviewText.map { HUDController.tailTruncate($0, maxCharacters: 60) })
+    }
+
+    private func invalidateCapTimer() {
+        capTimer?.invalidate()
+        capTimer = nil
+        lockedHUDTimer?.invalidate()
+        lockedHUDTimer = nil
+    }
+
+    /// Terminal "stop" action (B4/B5) — shared by all four stop triggers: classic PTT release,
+    /// re-pressing the hotkey while locked, clicking the pill while locked, and the duration cap
+    /// firing while locked. Reads the frontmost app/insertion-target snapshot at the moment this
+    /// runs (i.e. at STOP time) unless `preSnapshotted` is supplied — used only by the pill-click
+    /// path, whose FULL snapshot (app + AX element/window, not just the app) must be taken BEFORE
+    /// the click itself is processed (B3). For the PTT path this is the same moment as before
+    /// Amendment B: synchronous, at key-up, before any `await`.
+    private func stopAndTranscribe(preSnapshotted: (app: NSRunningApplication?, target: InsertionTarget?)? = nil) {
+        invalidateCapTimer()
         // Cancel the preview loop immediately, before anything else — the final pipeline below
         // owns the buffer from here on. See PLAN 3 "Partial loop": "Key release: cancel loop
         // immediately, ignore any in-flight partial result, run existing final pipeline
         // untouched."
         stopLivePreview()
-        isRecording = false
         let samples = audioCapture.stop()
 
         // Always cheap, always on: peak/RMS tells us in one line whether the mic tap delivered
@@ -180,13 +364,11 @@ final class AppCoordinator: ObservableObject {
         }
         isProcessing = true
 
-        // Snapshot the engine, frontmost app, and resolved Template synchronously, at
-        // key-release, before any `await` — settings/app-switching mid-transcription (e.g.
-        // during a long model download) must not retroactively change which engine/template
-        // this dictation is processed and recorded under. See Round 1 Codex finding 12.
+        // Snapshot the engine, frontmost app, and resolved Template synchronously, before any
+        // `await` — settings/app-switching mid-transcription (e.g. during a long model download)
+        // must not retroactively change which engine/template this dictation is processed and
+        // recorded under. See Round 1 Codex finding 12.
         //
-        // Frontmost app is read here rather than at keyDown: this is the only existing snapshot
-        // point in the pipeline (engine/template are already captured here, not at keyDown).
         // `insertionTarget` (bundle id, pid, and best-effort focused element/window — see
         // `InsertionTarget`) is carried through the pipeline and re-checked against the live
         // frontmost app/element immediately before paste (`Insertion.insert`'s `target`) — if
@@ -196,10 +378,10 @@ final class AppCoordinator: ObservableObject {
         // the wrong place. See Codex finding: paste-target drift / same-app target drift.
         let engine = activeSTTEngine
         let engineName = engine.name
-        let frontmostApp = NSWorkspace.shared.frontmostApplication
+        let frontmostApp = preSnapshotted?.app ?? NSWorkspace.shared.frontmostApplication
         let bundleID = frontmostApp?.bundleIdentifier
         let appName = frontmostApp?.localizedName
-        let insertionTarget = Insertion.snapshotTarget(app: frontmostApp)
+        let insertionTarget = preSnapshotted?.target ?? Insertion.snapshotTarget(app: frontmostApp)
         let (template, ruleFired) = Self.resolveTemplate(
             bundleID: bundleID,
             rules: AppSettings.shared.appRules,
@@ -210,6 +392,36 @@ final class AppCoordinator: ObservableObject {
         hud.show(text: ruleFired ? "Processing… (\(template.name))" : "Processing…")
 
         Task { await runPipeline(samples: samples, engine: engine, engineName: engineName, template: template, appName: appName, target: insertionTarget) }
+    }
+
+    /// Terminal `cancelRecording` action (B1a) — the production call site, wired to the real
+    /// audio/HUD/timer objects. See `performCancelRecording` for the pure, injectable version
+    /// SelfCheck exercises.
+    private func cancelRecording() {
+        Self.performCancelRecording(
+            stopCapture: { _ = self.audioCapture.stop() },
+            cancelLivePreview: { self.stopLivePreview() },
+            invalidateCapTimer: { self.invalidateCapTimer() },
+            clearHUD: { self.hud.flash("Cancelled") }
+        )
+    }
+
+    /// Pure execution of the `cancelRecording` side-effect set (B1a): stop audio capture, cancel
+    /// the live preview loop, invalidate the cap timer, and clear/flash the HUD — in that order,
+    /// discarding whatever `stopCapture` returns. Deliberately does NOT call transcribe/insert/
+    /// record — no transcription, no Library entry, no failed-audio save. Exposed as a `static`
+    /// so SelfCheck can assert exactly this side-effect set fires, via injected hooks, without a
+    /// live `AppCoordinator`/real audio/HUD/timers. See PLAN.md Amendment B1a.
+    nonisolated static func performCancelRecording(
+        stopCapture: () -> Void,
+        cancelLivePreview: () -> Void,
+        invalidateCapTimer: () -> Void,
+        clearHUD: () -> Void
+    ) {
+        stopCapture()
+        cancelLivePreview()
+        invalidateCapTimer()
+        clearHUD()
     }
 
     /// Pure resolution of which Template a dictation should use: a rule mapping the snapshotted
@@ -230,6 +442,29 @@ final class AppCoordinator: ObservableObject {
             return (fallback, false)
         }
         return (matched, true)
+    }
+
+    /// Pure global routing rule (Amendment A1, replacing the removed per-Template
+    /// `Template.useCloud` toggle): the Cloud Post-Processor is used for every Template — never
+    /// selected per Template — iff the active provider's config is complete: trimmed base URL
+    /// non-empty, trimmed model non-empty, and a non-empty provider-scoped Keychain key present.
+    /// Any one missing falls back to the on-device `AppleFMProcessor`. Takes the same
+    /// `CloudLLMSettingsSnapshot` passed into `CloudLLMProcessor.process`, so the routing decision
+    /// and the request it drives can never disagree. See PLAN.md Amendment A.
+    nonisolated static func isCloudLLMConfigured(snapshot: CloudLLMSettingsSnapshot) -> Bool {
+        let baseURL = snapshot.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let model = snapshot.model.trimmingCharacters(in: .whitespacesAndNewlines)
+        let key = snapshot.key?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return !baseURL.isEmpty && !model.isEmpty && !key.isEmpty
+    }
+
+    /// Picks the Post-Processor for the dictation currently being handled: one `AppSettings`
+    /// snapshot taken here, at selection time, decides both *whether* Cloud is used
+    /// (`isCloudLLMConfigured`) and — if so — is threaded straight into the `CloudLLMProcessor`
+    /// instance that runs it, so the two can never observe different settings. See Amendment A1.
+    private func resolveActiveProcessor() -> any PostProcessor {
+        let snapshot = AppSettings.shared.cloudLLMSnapshot
+        return Self.isCloudLLMConfigured(snapshot: snapshot) ? CloudLLMProcessor(snapshot: snapshot) : appleFMProcessor
     }
 
     // MARK: - Live preview (PLAN 3)
@@ -366,7 +601,14 @@ final class AppCoordinator: ObservableObject {
         // flashing/resizing the pill every tick. See PLAN 3 "Failure modes to avoid".
         guard !text.isEmpty, text != lastLivePreviewText else { return }
         lastLivePreviewText = text
-        hud.show(text: HUDController.tailTruncate(text))
+        // Mode-aware (Amendment B3): while `locked`, the preview text is embedded inside the
+        // lock glyph/elapsed layout by `updateLockedHUD` — a tick must never replace that layout
+        // with a bare text pill.
+        if case .locked = recordingState {
+            updateLockedHUD()
+        } else {
+            hud.show(text: HUDController.tailTruncate(text))
+        }
     }
 
     private func runPipeline(samples: [Float], engine: any TranscriptionEngine, engineName: String, template: Template, appName: String?, target: InsertionTarget?) async {
@@ -374,12 +616,26 @@ final class AppCoordinator: ObservableObject {
 
         do {
             let result = try await processDictation(samples: samples, engine: engine, engineName: engineName, template: template, appName: appName, target: target)
-            // Busy state hides immediately on success; nothing terminal to show the user.
-            // See Round 2 Codex finding 6.
-            if result.posted {
-                hud.hide()
-            } else {
+            if let fallbackReason = result.fallbackReason {
+                logPostProcessingFallback(fallbackReason)
+            }
+            // The manual-paste notice is the actionable signal that the user's words are on the
+            // clipboard, not inserted — it must never be silently clobbered by the (less urgent)
+            // post-processing fallback notice. Neither must it silently clobber the fallback
+            // notice the other way: when BOTH conditions hold, a single-condition message would
+            // drop half the story (either "why is this the raw transcript" or "why do I need to
+            // paste manually"), so that case gets its own combined message instead of falling
+            // through the two single-condition branches below. Busy state otherwise hides
+            // immediately on success; nothing terminal to show the user. See Round 2 Codex
+            // finding 6, PLAN.md step 8.
+            if !result.posted, result.fallbackReason != nil {
+                hud.flash("Post-processing failed — raw transcript copied, paste manually (check API key/model in Settings)")
+            } else if !result.posted {
                 hud.flash("Copied — paste manually")
+            } else if result.fallbackReason != nil {
+                hud.flash("Cloud post-processing failed — used raw transcript (check API key/model in Settings)")
+            } else {
+                hud.hide()
             }
         } catch PipelineError.emptyTranscript {
             let saved = saveFailedAudio(samples)
@@ -396,6 +652,40 @@ final class AppCoordinator: ObservableObject {
     enum PipelineError: Error {
         case emptyTranscript
         case recordFailed(Error)
+    }
+
+    /// Why post-processing fell back to the raw transcript — a thrown error, or output that
+    /// came back empty/whitespace-only without throwing. Reported (logged + surfaced) by the two
+    /// call sites (`runPipeline`, `reprocess`) rather than inside `processDictation` itself, so
+    /// SelfCheck's pipeline contract check (which calls `processDictation` directly with a fake
+    /// processor) never triggers a real HUD panel. See PLAN.md step 8, Round 2/3 Codex findings.
+    enum PostProcessingFallbackReason {
+        case error(Error)
+        case emptyOutput
+    }
+
+    /// Redacted diagnostic log for a post-processing fallback — provider label and HTTP status
+    /// only, never a response body. Shared by both silent-fallback sites. See PLAN.md step 8,
+    /// Round 2 Codex finding 5.
+    private func logPostProcessingFallback(_ reason: PostProcessingFallbackReason) {
+        switch reason {
+        case .error(let error):
+            if case CloudLLMProcessor.CloudLLMError.badResponse(let provider, let status) = error {
+                Self.logger.notice("post-processing fallback: \(provider, privacy: .public) returned HTTP \(status, privacy: .public)")
+            } else {
+                Self.logger.notice("post-processing fallback: \(String(describing: type(of: error)), privacy: .public)")
+            }
+        case .emptyOutput:
+            Self.logger.notice("post-processing fallback: empty output")
+        }
+    }
+
+    /// Logs + shows the non-blocking HUD notice for a post-processing fallback. Used by
+    /// `reprocess`, which (unlike `runPipeline`) has no separate "posted vs. not posted" HUD
+    /// state to preserve. See PLAN.md step 8.
+    private func reportPostProcessingFallback(_ reason: PostProcessingFallbackReason) {
+        logPostProcessingFallback(reason)
+        hud.flash("Cloud post-processing failed — used raw transcript (check API key/model in Settings)")
     }
 
     /// Core transcribe → post-process (with empty-refined fallback) → insert → record pipeline,
@@ -417,23 +707,30 @@ final class AppCoordinator: ObservableObject {
         record: (_ language: String, _ template: String, _ transcript: String, _ refined: String, _ engine: String) throws -> Void = { language, template, transcript, refined, engine in
             try LibraryStore.shared.record(language: language, template: template, transcript: transcript, refined: refined, engine: engine)
         }
-    ) async throws -> (transcript: String, refined: String, posted: Bool) {
+    ) async throws -> (transcript: String, refined: String, posted: Bool, fallbackReason: PostProcessingFallbackReason?) {
         let transcription = try await engine.transcribe(samples: samples)
         guard !transcription.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw PipelineError.emptyTranscript
         }
 
-        let activeProcessor: any PostProcessor = processor ?? (template.useCloud ? cloudLLMProcessor : appleFMProcessor)
+        let activeProcessor: any PostProcessor = processor ?? resolveActiveProcessor()
         let refined: String
+        var fallbackReason: PostProcessingFallbackReason?
         do {
             let processed = try await activeProcessor.process(transcript: transcription.text, template: template, appName: appName)
             let trimmed = processed.trimmingCharacters(in: .whitespacesAndNewlines)
             // Never lose the user's words — fall back to the raw transcript if post-processing
             // returns empty output without throwing. See Round 1 Codex finding 3.
-            refined = trimmed.isEmpty ? transcription.text : trimmed
+            if trimmed.isEmpty {
+                refined = transcription.text
+                fallbackReason = .emptyOutput
+            } else {
+                refined = trimmed
+            }
         } catch {
             // Never lose the user's words — fall back to the raw transcript. See PLAN.md step 4.
             refined = transcription.text
+            fallbackReason = .error(error)
         }
 
         let posted = insert(refined, target)
@@ -444,7 +741,7 @@ final class AppCoordinator: ObservableObject {
             throw PipelineError.recordFailed(error)
         }
 
-        return (transcription.text, refined, posted)
+        return (transcription.text, refined, posted, fallbackReason)
     }
 
     /// Persists captured audio that failed transcription (or transcribed to nothing) so the
@@ -494,16 +791,23 @@ final class AppCoordinator: ObservableObject {
     /// different Template, inserting the result and appending a new Library row.
     /// See CONTEXT.md: "Re-process".
     func reprocess(dictation: Dictation, with template: Template) async {
-        let processor: PostProcessor = template.useCloud ? cloudLLMProcessor : appleFMProcessor
+        let processor: PostProcessor = resolveActiveProcessor()
         let refined: String
+        var fallbackReason: PostProcessingFallbackReason?
         do {
             // No known frontmost app for a historical re-process — appName: nil.
             let processed = try await processor.process(transcript: dictation.transcript, template: template, appName: nil)
             let trimmed = processed.trimmingCharacters(in: .whitespacesAndNewlines)
             // Same empty-refined fallback as processDictation. See Round 2 Codex finding 5.
-            refined = trimmed.isEmpty ? dictation.transcript : trimmed
+            if trimmed.isEmpty {
+                refined = dictation.transcript
+                fallbackReason = .emptyOutput
+            } else {
+                refined = trimmed
+            }
         } catch {
             refined = dictation.transcript
+            fallbackReason = .error(error)
         }
         Insertion.insert(refined)
         do {
@@ -517,6 +821,13 @@ final class AppCoordinator: ObservableObject {
             )
         } catch {
             hud.flash("Library save failed")
+            return
+        }
+        // A Library-save failure above takes priority (a data-loss-adjacent error the user must
+        // see right now) — the fallback notice is only reported once the record succeeded, so it
+        // can't be silently overwritten by "Library save failed". See PLAN.md step 8.
+        if let fallbackReason {
+            reportPostProcessingFallback(fallbackReason)
         }
     }
 }
