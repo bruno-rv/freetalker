@@ -810,6 +810,15 @@ final class AppCoordinator: ObservableObject {
             fallbackReason = .error(error)
         }
         Insertion.insert(refined)
+        // Re-check the source row still exists immediately before persisting — a Delete
+        // (single-row or Delete All) may have removed it while the LLM call above was in
+        // flight. The result is still inserted at the cursor (already happened above); only the
+        // Library write is skipped, so a derived row never points at a source the user just
+        // deleted. `nil` (database unavailable) is not treated as "deleted" — the record() call
+        // below still runs and surfaces its own error the normal way. See PLAN.md step 5.
+        if LibraryStore.shared.exists(id: dictation.id) == false {
+            return
+        }
         do {
             try LibraryStore.shared.record(
                 language: dictation.language,
