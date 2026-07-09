@@ -214,9 +214,10 @@ enum SelfCheck {
             failures.append(contentsOf: keychainMigrationChecks())
             failures.append(contentsOf: cloudLLMRoutingChecks())
             failures.append(contentsOf: handsFreeChecks())
+            failures.append(contentsOf: libraryDeletionChecks())
 
             if failures.isEmpty {
-                print("SelfCheck PASSED (template seeding, FTS round-trip, pipeline contract, mic device enumeration, hotkey spec/matcher, vocabulary normalization/injection, app rule resolution, paste-target drift, prompt app-name sanitization, live preview gating/availability, SerialGate cancellation, preview early-cancel decisions, built-in template prompt upgrade, LLM provider defaults, BYOK Keychain key migration, global cloud-selection routing, hands-free recording state machine/esc/cap-clamp/cancel)")
+                print("SelfCheck PASSED (template seeding, FTS round-trip, pipeline contract, mic device enumeration, hotkey spec/matcher, vocabulary normalization/injection, app rule resolution, paste-target drift, prompt app-name sanitization, live preview gating/availability, SerialGate cancellation, preview early-cancel decisions, built-in template prompt upgrade, LLM provider defaults, BYOK Keychain key migration, global cloud-selection routing, hands-free recording state machine/esc/cap-clamp/cancel, Library deletion: per-row/Delete All/latestDictation tiebreak/dangling source_id/secure_delete)")
                 exit(0)
             } else {
                 print("SelfCheck FAILED:")
@@ -1328,6 +1329,142 @@ enum SelfCheck {
         )
         if calls != ["stopCapture", "cancelLivePreview", "invalidateCapTimer", "clearHUD"] {
             failures.append("performCancelRecording: expected exactly [stopCapture, cancelLivePreview, invalidateCapTimer, clearHUD] in order, got \(calls)")
+        }
+
+        return failures
+    }
+
+    /// Library deletion (Feature A): per-row delete + FTS sync, Delete All (table + FTS +
+    /// latestDictation), dangling source_id after a source row is deleted, latestDictation()'s
+    /// id tiebreak on equal `ts`, and the secure_delete pragma readback. Each temp-dir DB is
+    /// exercised in isolation and removed afterward — never touches the user's real Library.
+    /// See PLAN.md step 6.
+    private static func libraryDeletionChecks() -> [String] {
+        var failures: [String] = []
+
+        // secure_delete pragma reads back ON (1) — confirms the on-open PRAGMA in Database.init
+        // actually took effect.
+        do {
+            let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tempDir) }
+            let db = try Database(path: tempDir.appendingPathComponent("secure-delete-check.db"))
+            let status = try db.secureDeleteStatus()
+            if status != 1 {
+                failures.append("secure_delete: expected PRAGMA secure_delete to read back 1, got \(status)")
+            }
+        } catch {
+            failures.append("secure_delete readback check threw: \(error)")
+        }
+
+        // Per-row delete: FTS no longer finds the deleted row's text, still finds the survivor's,
+        // and the row count reflects exactly one deletion.
+        do {
+            let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tempDir) }
+            let db = try Database(path: tempDir.appendingPathComponent("delete-row-check.db"))
+
+            let keepID = try db.insertDictation(timestamp: Date(), language: "en", template: "Clean Dictation", transcript: "alpha bravo charlie", refined: "Alpha bravo charlie.", engine: "WhisperKit")
+            let deleteID = try db.insertDictation(timestamp: Date(), language: "en", template: "Clean Dictation", transcript: "delta echo foxtrot", refined: "Delta echo foxtrot.", engine: "WhisperKit")
+
+            try db.deleteDictation(id: deleteID)
+
+            let remaining = try db.allDictations()
+            if remaining.count != 1 {
+                failures.append("deleteDictation: expected 1 row to remain after deleting 1 of 2, got \(remaining.count)")
+            }
+            if remaining.contains(where: { $0.id == deleteID }) {
+                failures.append("deleteDictation: deleted row still present in allDictations()")
+            }
+            if !remaining.contains(where: { $0.id == keepID }) {
+                failures.append("deleteDictation: surviving row missing from allDictations()")
+            }
+            let survivorHits = try db.searchDictations(query: "alpha")
+            if !survivorHits.contains(where: { $0.id == keepID }) {
+                failures.append("deleteDictation: FTS search no longer finds the surviving row's text")
+            }
+            let deletedHits = try db.searchDictations(query: "delta")
+            if deletedHits.contains(where: { $0.id == deleteID }) {
+                failures.append("deleteDictation: FTS search still finds the deleted row's text")
+            }
+        } catch {
+            failures.append("Per-row delete check threw: \(error)")
+        }
+
+        // Delete All: empties the table and FTS, and latestDictation() reports nil on the
+        // now-empty table.
+        do {
+            let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tempDir) }
+            let db = try Database(path: tempDir.appendingPathComponent("delete-all-check.db"))
+
+            _ = try db.insertDictation(timestamp: Date(), language: "en", template: "Clean Dictation", transcript: "golf hotel india", refined: "Golf hotel india.", engine: "WhisperKit")
+            _ = try db.insertDictation(timestamp: Date(), language: "en", template: "Clean Dictation", transcript: "juliet kilo lima", refined: "Juliet kilo lima.", engine: "WhisperKit")
+
+            try db.deleteAllDictations()
+
+            let remaining = try db.allDictations()
+            if !remaining.isEmpty {
+                failures.append("deleteAllDictations: expected 0 rows after Delete All, got \(remaining.count)")
+            }
+            let ftsHits = try db.searchDictations(query: "golf")
+            if !ftsHits.isEmpty {
+                failures.append("deleteAllDictations: FTS search still finds text after Delete All")
+            }
+            if try db.latestDictation() != nil {
+                failures.append("deleteAllDictations: expected latestDictation() to return nil on an empty table")
+            }
+        } catch {
+            failures.append("Delete All check threw: \(error)")
+        }
+
+        // Deleting a source row leaves the derived row readable, with a dangling source_id
+        // (intended provenance behavior — FKs stay OFF).
+        do {
+            let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tempDir) }
+            let db = try Database(path: tempDir.appendingPathComponent("dangling-source-check.db"))
+
+            let sourceID = try db.insertDictation(timestamp: Date(), language: "en", template: "Clean Dictation", transcript: "source text", refined: "Source text.", engine: "WhisperKit")
+            let derivedID = try db.insertDictation(timestamp: Date(), language: "en", template: "Refined Message", transcript: "source text", refined: "Derived refined.", engine: "WhisperKit", sourceID: sourceID)
+
+            try db.deleteDictation(id: sourceID)
+
+            let remaining = try db.allDictations()
+            if let derived = remaining.first(where: { $0.id == derivedID }) {
+                if derived.sourceID != sourceID {
+                    failures.append("dangling source_id: expected derived row's source_id to remain \(sourceID), got \(String(describing: derived.sourceID))")
+                }
+            } else {
+                failures.append("dangling source_id: derived row missing from allDictations() after its source was deleted")
+            }
+        } catch {
+            failures.append("Dangling source_id check threw: \(error)")
+        }
+
+        // latestDictation() picks the higher id when two rows share an identical ts.
+        do {
+            let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tempDir) }
+            let db = try Database(path: tempDir.appendingPathComponent("latest-tiebreak-check.db"))
+
+            let ts = Date()
+            _ = try db.insertDictation(timestamp: ts, language: "en", template: "Clean Dictation", transcript: "first", refined: "First.", engine: "WhisperKit")
+            let secondID = try db.insertDictation(timestamp: ts, language: "en", template: "Clean Dictation", transcript: "second", refined: "Second.", engine: "WhisperKit")
+
+            if let latest = try db.latestDictation() {
+                if latest.id != secondID {
+                    failures.append("latestDictation: expected the higher id (\(secondID)) to win an identical-ts tie, got \(latest.id)")
+                }
+            } else {
+                failures.append("latestDictation: expected a row for a non-empty table, got nil")
+            }
+        } catch {
+            failures.append("latestDictation tiebreak check threw: \(error)")
         }
 
         return failures
