@@ -3,9 +3,10 @@
 # FreeTalker
 
 System-wide push-to-talk dictation for macOS. Hold a hotkey (default **Right-⌥**), speak,
-release — the transcript is refined by the Active Template and inserted at your cursor. Local
-Whisper transcription and on-device Apple post-processing by default; cloud engines are
-BYOK-only. See `PLAN.md` for the full spec and `CONTEXT.md` for terminology.
+release — the transcript is refined by the Active Template and inserted at your cursor. Tap
+the same key instead of holding it for hands-free recording. Local Whisper transcription and
+on-device Apple post-processing by default; cloud engines are optional and BYOK-only. See
+`PLAN.md` for the full spec and `CONTEXT.md` for terminology.
 
 ## Requirements
 
@@ -49,11 +50,59 @@ Settings (menu bar → "Settings…") shows live permission status.
 - Menu bar icon → pick the **Active Template** (Clean Dictation, Refined Message, Refined
   Prompt, Email — editable in Settings → Templates).
 - Hold **Right-⌥**, speak (English or Portuguese, auto-detected), release. A small pill HUD
-  shows "Recording…" then "Processing…".
+  shows "Recording…" then "Processing…". Turn on **Live preview while recording** in
+  Settings → General and the HUD streams the transcript as you speak, before refinement.
+- Tap the key instead (under 0.4s) to start **hands-free recording**: it keeps going until you
+  tap the key again, click the HUD pill, or press Esc to cancel. Holding the key down is still
+  classic push-to-talk. An auto-stop cap (default 5 minutes, configurable 1–60 in Settings →
+  General) guards against a stuck key.
 - The refined text is pasted at your cursor. If pasting isn't possible, it's left on the
   pasteboard and the HUD says "Copied — paste manually".
 - **Library…** opens the searchable history of past Dictations, with "Re-process with…" to
   re-run a stored transcript through a different Template.
+
+## Templates
+
+Four built-ins ship with the app: **Clean Dictation** (default), **Refined Message**,
+**Refined Prompt**, and **Email**. Every Template strips disfluencies ("um", "uh", "hmm") and
+collapses self-corrections — "I'll do A… actually, I'll do B" becomes "I'll do B" — even when
+the correction spans multiple sentences.
+
+A built-in Template you've never edited quietly picks up improved prompts as the app evolves;
+once you edit one yourself, it's yours and is never touched automatically.
+
+### Context awareness
+
+Settings → Templates → **App Rules** maps an app (by bundle ID) to a Template, so dictating in
+Slack can default to Refined Message while Mail defaults to Email. The Active Template is still
+used when no rule matches. The frontmost app's identity is also passed to the post-processor as
+context, so refined output can account for where it's headed.
+
+### Custom vocabulary
+
+Settings → Templates → **Vocabulary** takes a list of names, jargon, or acronyms your dictation
+tends to get wrong. Terms bias WhisperKit's decoding toward the right spelling and are also
+enforced as corrections during post-processing, so they hold even if the transcript missed them.
+
+## Cloud engines (BYOK)
+
+Both the transcription and post-processing stages default to on-device models and can
+optionally be pointed at a cloud provider — bring your own API key, nothing is bundled. Keys
+live in the macOS Keychain only; they're never written to disk unencrypted, bundled with the
+app, or logged.
+
+- **Cloud STT** — Settings → General → **Transcription engine** toggles between WhisperKit
+  (on-device, default) and Cloud.
+- **Cloud post-processing** — Settings → General → **Cloud post-processing** accepts a
+  provider, base URL, and model. Supported providers are OpenAI-compatible endpoints
+  (including [Ollama cloud](https://ollama.com/v1)) and Anthropic. Once a provider has a key,
+  endpoint, and model all set, cloud post-processing runs automatically for every Dictation —
+  it isn't chosen per Template. Leave any of the three unset and FreeTalker falls back to the
+  on-device Apple model.
+
+![Settings](docs/settings.png)
+*Settings → General: permissions status, hotkey, hands-free auto-stop, microphone, engine
+selection, and cloud post-processing.*
 
 ## Running tests
 
@@ -93,10 +142,11 @@ substitute for today's environment.
 8. Settings → General → "Change…" next to the push-to-talk key, press a different modifier
    (e.g. Left-⌃), confirm the label updates and that key now triggers recording instead of
    Right-⌥.
-9. (Optional, BYOK) Settings → set a Cloud STT or Cloud LLM key; toggle a Template's
-   "Use cloud model"; dictate and confirm the cloud path is used and the Library row's
-   `engine` reflects it. Then unplug network / clear the key and confirm post-processing
-   failure falls back to the raw transcript being pasted (never silently drops the dictation).
+9. (Optional, BYOK) Settings → General → set a Cloud STT key, or fill in Cloud post-processing
+   (provider, base URL, model, key); dictate and confirm the cloud path is used and the
+   Library row's `engine` reflects it. Then unplug network / clear the key and confirm
+   post-processing failure falls back to the raw transcript being pasted (never silently
+   drops the dictation).
 
 ## Known deviations / ponytail shortcuts
 
