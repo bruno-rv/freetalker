@@ -122,6 +122,13 @@ private struct GeneralSettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
+                Toggle("Live preview while recording", isOn: $settings.livePreviewEnabled)
+                if settings.sttEngine == .cloud && !coordinator.whisperEngine.isLoaded {
+                    Text("Cloud STT is active and the on-device model isn't loaded, so preview is disabled (avoids per-chunk cloud uploads).")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
                 if settings.sttEngine == .cloud {
                     TextField("Base URL", text: $settings.cloudSTTBaseURL)
                     SecureField("API key", text: $cloudSTTKey)

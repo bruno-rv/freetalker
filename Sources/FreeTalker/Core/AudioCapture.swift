@@ -51,6 +51,41 @@ final class AudioCapture {
         isCapturing = true
     }
 
+    /// Thread-safe copy of the samples accumulated so far, without stopping capture. Used by
+    /// the live preview loop to periodically re-transcribe the growing buffer. See PLAN 3.
+    func snapshot() -> [Float] {
+        samplesLock.lock()
+        defer { samplesLock.unlock() }
+        return samples
+    }
+
+    /// Pure tail-window slice: the most recent `maxSamples` samples of `samples`, or all of
+    /// `samples` unchanged if it's already at or under `maxSamples`. Extracted so SelfCheck can
+    /// verify the suffix logic without audio hardware; `snapshotSuffix` is the only production
+    /// caller, and it always invokes this while already holding `samplesLock`.
+    nonisolated static func boundedSuffix(_ samples: [Float], maxSamples: Int) -> [Float] {
+        Array(samples.suffix(maxSamples))
+    }
+
+    /// Thread-safe bounded copy: only the last `min(count, maxSamples)` samples, plus the total
+    /// sample count. The bound is applied *inside* `samplesLock`, before any array leaves the
+    /// lock — `Array(samples.suffix(maxSamples))` materializes a fresh, independently-storaged
+    /// array rather than an `ArraySlice` that shares the big buffer's storage, so no returned
+    /// value retains the full recording. That matters because `consume(buffer:inputFormat:)`
+    /// runs on the AVAudioEngine tap thread and appends to `samples` on every buffer; if a
+    /// caller-held slice referenced that storage, the next append would trigger copy-on-write of
+    /// the *entire* growing buffer instead of Array's amortized-O(1) append. Used by the live
+    /// preview loop so a tick's copy cost — and the COW risk on the tap thread — is bounded by
+    /// the window, not by total recording length (Codex round-4 finding: the bound must apply at
+    /// the copy, not by slicing an already-full-size copy after the fact). `totalCount` lets
+    /// callers gate on the *whole* recording's size (e.g. the tick's <1s skip gate) without a
+    /// second, separate `snapshot()` call.
+    func snapshotSuffix(maxSamples: Int) -> (suffix: [Float], totalCount: Int) {
+        samplesLock.lock()
+        defer { samplesLock.unlock() }
+        return (Self.boundedSuffix(samples, maxSamples: maxSamples), samples.count)
+    }
+
     /// Stops capturing and returns the accumulated 16 kHz mono Float32 samples.
     func stop() -> [Float] {
         if isCapturing {

@@ -37,6 +37,13 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(cloudSTTBaseURL, forKey: Keys.cloudSTTBaseURL) }
     }
 
+    /// Whether the HUD shows a live rolling transcript while push-to-talk is held. Default ON.
+    /// See PLAN 3 "Settings" — `AppCoordinator.isLivePreviewEnabled` combines this with the
+    /// active engine/loaded-model state to decide whether preview actually runs.
+    @Published var livePreviewEnabled: Bool {
+        didSet { defaults.set(livePreviewEnabled, forKey: Keys.livePreviewEnabled) }
+    }
+
     @Published var llmProvider: LLMProviderKind {
         didSet { defaults.set(llmProvider.rawValue, forKey: Keys.llmProvider) }
     }
@@ -202,6 +209,7 @@ final class AppSettings: ObservableObject {
         static let legacyHotKeyDeviceMask = "hotKeyDeviceMask"
         static let sttEngine = "sttEngine"
         static let cloudSTTBaseURL = "cloudSTTBaseURL"
+        static let livePreviewEnabled = "livePreviewEnabled"
         static let llmProvider = "llmProvider"
         static let cloudLLMBaseURL = "cloudLLMBaseURL"
         static let cloudLLMModel = "cloudLLMModel"
@@ -223,6 +231,9 @@ final class AppSettings: ObservableObject {
         }
         sttEngine = STTEngineKind(rawValue: defaults.string(forKey: Keys.sttEngine) ?? "") ?? .whisperKit
         cloudSTTBaseURL = defaults.string(forKey: Keys.cloudSTTBaseURL) ?? "https://api.openai.com/v1"
+        // Default ON — `.object(forKey:)` (not `.bool(forKey:)`) so an unset key is distinguished
+        // from an explicit `false`, which `.bool(forKey:)` can't do (it returns false for both).
+        livePreviewEnabled = defaults.object(forKey: Keys.livePreviewEnabled) as? Bool ?? true
         llmProvider = LLMProviderKind(rawValue: defaults.string(forKey: Keys.llmProvider) ?? "") ?? .anthropic
         cloudLLMBaseURL = defaults.string(forKey: Keys.cloudLLMBaseURL) ?? "https://api.anthropic.com/v1"
         cloudLLMModel = defaults.string(forKey: Keys.cloudLLMModel) ?? "claude-sonnet-4-5"
