@@ -14,11 +14,17 @@ Glossary of canonical terms. No implementation details.
 
 **Template** — a stored, user-editable instruction set that transforms a Transcript into a Refined Output (tone, structure, output shape). Ships with four built-ins: Clean Dictation (default), Refined Message, Refined Prompt, Email.
 
+**Built-in Template** — one of the four Templates the app ships with. A Built-in Template the user has never edited may be silently upgraded when the app improves its default instructions; an edited one is never touched.
+
+**Disfluency** — speech noise in a Transcript that carries no meaning: fillers ("um", "uh", "hmm"), stutters, repeated words, and false starts. Templates remove Disfluencies when producing a Refined Output.
+
+**Self-correction** — a speaker revising themselves mid-Dictation ("I'll do A… actually, I'll do B"). Only the final intent ("I'll do B") belongs in the Refined Output.
+
 **Active Template** — the single currently-selected Template, switched from the menu bar. Every Dictation uses it; there is no per-dictation picker.
 
 **Transcription Engine** — the component turning audio into a Transcript. Local-first (on-device Whisper) with an optional user-configured cloud engine.
 
-**Post-Processor** — the component applying a Template to a Transcript. Local-first (on-device Apple model) with optional user-supplied cloud API key (BYOK) per heavier Templates.
+**Post-Processor** — the component applying a Template to a Transcript. Cloud (BYOK) whenever the user has a fully configured cloud provider (key, endpoint, model); otherwise the on-device Apple model. Never selected per Template.
 
 **BYOK** — "bring your own key": cloud engines/models are only ever used with the user's own API credentials, never a bundled key.
 

@@ -16,14 +16,27 @@ final class TemplateStore: ObservableObject {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         fileURL = dir.appendingPathComponent("templates.json")
 
+        let loadedTemplates: [Template]
+        let didSeed: Bool
         if let data = try? Data(contentsOf: fileURL),
            let loaded = try? JSONDecoder().decode([Template].self, from: data),
            !loaded.isEmpty {
-            templates = loaded
+            loadedTemplates = loaded
+            didSeed = false
         } else {
-            templates = Template.builtIns
+            loadedTemplates = Template.builtIns
+            didSeed = true
         }
-        save()
+
+        // Upgrade-if-unedited migration (PLAN.md step 7): a never-edited built-in prompt is
+        // upgraded to the current default; an edited one, or a built-in the user deleted, is
+        // left alone. Only rewrite the file when something actually changed, so an unchanged
+        // `templates.json` isn't rewritten on every launch.
+        let (upgraded, changed) = Template.upgradingBuiltIns(loadedTemplates)
+        templates = upgraded
+        if didSeed || changed {
+            save()
+        }
     }
 
     func template(id: String) -> Template? {

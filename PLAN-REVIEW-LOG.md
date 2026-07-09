@@ -1,74 +1,99 @@
-# Plan Review Log: FreeTalker
-Act 1 (grill-with-docs) complete — plan locked, CONTEXT.md/ADR-0001 created. MAX_ROUNDS=5.
-
-## Act 2 — skipped
-Codex round 1 failed on usage limit (reset 10:22 PM); OpenRouter judge unavailable (no API key by choice). User signed off on PLAN.md directly on 2026-07-07 and ordered implementation. Cloud BYOK stays a settings-only affordance; all default processing local (WhisperKit + Apple Foundation Models).
-
-# Implementation Review (Codex, post-build) — thread 019f3e9f-0cb2-7c62-80fa-699357de6ddf
+# Plan Review Log: Ollama preset + Disfluency/Self-correction cleanup
+Act 1 (grill-with-docs) complete — plan locked, CONTEXT.md updated (Built-in Template, Disfluency, Self-correction). MAX_ROUNDS=5.
 
 ## Round 1 — Codex
-14 findings, VERDICT: REVISE. Full text:
+VERDICT: REVISE. Findings:
+1. Ollama cloud URL unverified — docs show native `/api/chat`; `/v1` examples are localhost.
+2. "Empty base URL → Ollama default" never triggers: `cloudLLMBaseURL` defaults to Anthropic URL (AppSettings.swift:238).
+3. Shared `cloudLLMKey` Keychain account sends one provider's secret to another's endpoint on provider switch.
+4. Model default `claude-sonnet-4-5` silently wrong for Ollama.
+5. `CloudLLMProcessor.process` reads settings via separate `await`s — mixed snapshot possible mid-request.
+6. SelfCheck migration tests would touch real `templates.json` (TemplateStore singleton, private init).
+7. "Save only if changed" conflicts with unconditional `save()` in store init (TemplateStore.swift:26).
+8. UI can delete built-ins; migration only updates existing IDs — deleted built-ins never upgraded.
+9. Exact new prompt strings deferred to build — unreviewable; "repeated words" removal may destroy meaning.
+10. Cloud failure silently falls back to raw Transcript — misconfiguration looks like weak cleanup.
 
-> Findings:
-> 
-> 1. `Sources/FreeTalker/AppCoordinator.swift:86`: Transcription errors discard the only captured audio and return with no Library row, no retry artifact, and no pasteboard fallback; a Whisper download/decoder/cloud error loses the dictated words. Fix: keep a temporary audio retry item until transcription succeeds or the user explicitly discards it.
-> 
-> 2. `Sources/FreeTalker/AppCoordinator.swift:94`: Empty transcription silently returns and hides the HUD, also losing the captured utterance with no error path. Fix: treat empty transcript as a failed dictation with retry/manual recovery instead of returning.
-> 
-> 3. `Sources/FreeTalker/AppCoordinator.swift:102`: Post-processors can return `""` without throwing, and the app will paste/record empty Refined Output instead of falling back to the Transcript. Fix: trim and validate `refined`, falling back to `transcription.text` when empty.
-> 
-> 4. `Sources/FreeTalker/Core/Insertion.swift:26`: `postCommandV()` reports success merely because events were constructed; it never checks AX focused element, so rejected paste still restores the old clipboard and strands the user. Fix: check the frontmost app’s AX focused element/editability before restore, and leave text on pasteboard when paste cannot be accepted.
-> 
-> 5. `Sources/FreeTalker/Core/Insertion.swift:29`: Fixed 0.3s pasteboard restore races both slow paste consumers and user clipboard changes; the dictated text can be replaced before the target app reads it. Fix: restore only if pasteboard `changeCount` is unchanged and after a safer paste confirmation/delay strategy.
-> 
-> 6. `Sources/FreeTalker/Core/AudioCapture.swift:20`: If `engine.start()` throws after `installTap`, the tap is left installed while `isCapturing` stays false, so the next start can crash/fail installing another tap. Fix: remove the tap in a `catch`/cleanup path when start fails.
-> 
-> 7. `Sources/FreeTalker/Core/AudioCapture.swift:59`: The AVAudioEngine tap thread appends to `samples` while `stop()` reads/returns it on the main actor; Swift Array mutation across threads is undefined and can corrupt or drop audio. Fix: serialize audio-buffer writes with a lock/queue or copy buffers off the render callback before aggregation.
-> 
-> 8. `Sources/FreeTalker/App.swift:15`: Initial event-tap creation failure is ignored; after the user grants Accessibility/Input Monitoring, the listener is not retried unless they relaunch or change hotkey. Fix: surface failed listener state and restart automatically when permission becomes trusted.
-> 
-> 9. `Sources/FreeTalker/UI/SettingsView.swift:30`: Settings only tracks Accessibility and gives no Microphone/Input Monitoring status/buttons despite PLAN.md requiring all three; denied mic/input permissions become dead-end setup. Fix: add live microphone/input-monitoring status and direct System Settings actions.
-> 
-> 10. `Sources/FreeTalker/Storage/LibraryStore.swift:16`: Database open/write failures are swallowed with `try?`, and `AppCoordinator` ignores `record` failure, so “All Dictations land in Library” is false under disk/permission/corruption errors. Fix: make persistence failures explicit and keep the transcript on pasteboard/export fallback until recorded.
-> 
-> 11. `Sources/FreeTalker/Engines/CloudSTTEngine.swift:49`: Cloud STT decodes `language` but does not request a response format that returns it; OpenAI-compatible default responses commonly contain only `text`, so every cloud dictation falls back to `"en"`. Fix: request verbose JSON/language metadata or run language detection before recording.
-> 
-> 12. `Sources/FreeTalker/AppCoordinator.swift:96`: The Active Template and engine name are read after async transcription; changing settings during a long model download/transcription can process/record the dictation under a different template or engine than the one active at key release. Fix: snapshot engine and template at key-up and pass them through the pipeline.
-> 
-> 13. `Sources/FreeTalker/Core/Keychain.swift:16`: `set` deletes the existing key before adding the new one and ignores `SecItemAdd` status, so a transient Keychain failure can erase a valid BYOK secret silently. Fix: use `SecItemUpdate`/checked add semantics and return/throw OSStatus.
-> 
-> 14. `Tests/FreeTalkerTests/FreeTalkerTests.swift:5`: The PLAN requires a runnable pipeline unit test with canned WAV -> non-empty Transcript, but tests/selfcheck only cover templates and FTS. Fix: add a canned-audio pipeline check or injectable fake engine test that exercises capture-to-transcript contract.
-> 
-> VERDICT: REVISE
-### Claude's response (round 1)
-Accepted all 14, minimal-diff fixes applied: failed/empty transcription now saves audio WAV to failed-dictations/ + HUD note (1,2); empty refined output falls back to raw transcript (3); AX focused-element check before ⌘V, else leave on pasteboard (4); pasteboard restore guarded by changeCount (5); tap removed if engine.start() throws (6); NSLock around sample buffer (7); 2s AXIsProcessTrusted poll retries dead event tap (8); Microphone + Input Monitoring permission rows added (9); LibraryStore.record throws, HUD on save failure (10); response_format=verbose_json for cloud STT language (11); engine+template snapshotted at key-up (12); Keychain SecItemUpdate-then-Add with checked OSStatus (13); fake-engine pipeline contract check in SelfCheck + swift-testing test (14). Verified: swift build green, `SelfCheck PASSED (template seeding, FTS round-trip, pipeline contract)`.
+### Claude's response
+- (1) Resolved empirically: unauthenticated POST probes — `https://ollama.com/v1/chat/completions` → 401, `/api/chat` → 401. Both exist; 401 not 404 ⇒ OpenAI-compatible cloud endpoint is real. Plan cites probe + keeps native `/api/chat` as E2E contingency.
+- (2,4) Accepted: provider-aware defaults — on provider switch, base URL/model that are empty or equal another provider's known default swap to the new provider's default.
+- (3) Accepted (security): provider-scoped Keychain accounts + legacy key migration.
+- (5) Accepted: single MainActor settings snapshot.
+- (6,7) Accepted: pure static migration function over `[Template]`; store saves on init only when seeded or migrated.
+- (8) REJECTED: deleted built-in = deliberate user edit; re-seeding is hostile. Migration upgrades existing unedited built-ins only. Documented in plan.
+- (9) Accepted: exact four prompts now in PLAN.md; wording targets *accidental* disfluencies, preserves intentional repetition/quotes/names.
+- (10) Accepted: HUD notice + redacted log when post-processing falls back to raw Transcript.
 
 ## Round 2 — Codex
-8 findings, VERDICT: REVISE. Full text:
+VERDICT: REVISE. Prior findings 2-7, 9, 10 addressed; rejection of 8 accepted as defensible; 1 accepted given E2E + contingency. New findings:
+1. Switching Ollama → generic openAICompatible leaves ollama.com URL/model → generic key sent to Ollama.
+2. Default normalization only in `didSet`; init assignments don't run `didSet` — persisted mismatches survive until manual toggle.
+3. Legacy Keychain migration (copy-then-delete) unchecked; SelfCheck excludes Keychain IO — untested secret handling.
+4. `reprocess` (AppCoordinator.swift:496) has same silent fallback as `processDictation` — fallback visibility incomplete.
+5. `CloudLLMError.badResponse(Int, String)` exposes response body via LocalizedError — conflicts with redacted-logging goal.
+6. Trim-whitespace compare silently overwrites whitespace-only user edits — contradicts "any edit makes it not match".
 
-> Findings:
-> 
-> 1. `Sources/FreeTalker/Core/Insertion.swift:54`: Prior finding 4 is not actually fixed; `hasFocusedElement()` accepts any focused AX element, not a focused editable text field, so a focused button/list/window still gets ⌘V and then clipboard restore. Fix: require a writable text-capable AX role/value before posting paste, otherwise leave text on pasteboard.
-> 
-> 2. `Sources/FreeTalker/Core/Insertion.swift:37`: Prior finding 5 is still present; `changeCount` only detects writes, not whether the target app has read the pasteboard, so slow paste consumers can still receive the restored old clipboard after 0.3s. Fix: avoid timed restore unless paste completion is known, or leave dictated text on pasteboard/manual restore.
-> 
-> 3. `Sources/FreeTalker/AppCoordinator.swift:122`: Prior findings 1/2 are only partially fixed; `saveFailedAudio()` can fail, but the caller still shows “audio saved” unconditionally. Fix: make recovery save return/throw and only show “audio saved” with a confirmed file URL.
-> 
-> 4. `Sources/FreeTalker/AppCoordinator.swift:177`: Failed-audio filenames use whole seconds, so two failed dictations in the same second overwrite each other. Fix: use UUID or nanosecond timestamp filenames.
-> 
-> 5. `Sources/FreeTalker/AppCoordinator.swift:192`: Prior finding 3 is fixed only for normal dictation; Re-process can still accept an empty post-processor result and insert/record empty text instead of falling back to the original Transcript. Fix: apply the same trimmed-empty fallback in `reprocess`.
-> 
-> 6. `Sources/FreeTalker/AppCoordinator.swift:149`: The terminal HUD messages for manual paste and library-save failure are immediately hidden by the `defer` at lines 112-114, so the user likely never sees the required notification. Fix: do not run unconditional `hud.hide()` after terminal error/manual-paste messages, or delay it after those messages.
-> 
-> 7. `Sources/FreeTalker/UI/SettingsView.swift:96`: Prior finding 13 is only half fixed; `Keychain.set` returns failure now, but both Settings callers ignore it, so the UI can appear to save a key that was rejected. Fix: handle `false` with visible error state and keep/restore the last persisted value.
-> 
-> 8. `Tests/FreeTalkerTests/FreeTalkerTests.swift:45`: Prior finding 14 is not really fixed; this test manually calls a fake engine and writes a DB row, but never exercises `AppCoordinator.runPipeline`, insertion fallback, post-processing fallback, or a canned WAV transcription path. Fix: expose an injectable pipeline unit and test fake STT/postprocessor through the actual pipeline contract, or add the specified canned WAV -> transcript check.
-> 
-> I did not run build/tests because this session is read-only and those commands would write build artifacts.
-> 
-> VERDICT: REVISE
-### Claude's response (round 2)
-Accepted 3,4,5,6,7 fully; 1,2,8 with arbiter modifications (logged reasons): (1) permissive AX editability heuristic — skip paste only when AX affirmatively reports non-text focused element; strict role matching rejected because it breaks Electron/web paste targets. (2) timed pasteboard restore kept (1.0s + changeCount guard) — abandoning restore rejected; residual race accepted for personal use, upgrade path = Settings toggle. (3→) saveFailedAudio returns URL?, HUD honest on failure. (4) UUID-suffixed failed-audio filenames. (5) reprocess got same empty-refined fallback. (6) HUD flash(_:duration:) keeps terminal notices visible 2.5s. (7) Settings shows inline Keychain save errors. (8) extracted injectable AppCoordinator.processDictation exercising real transcribe→post-process→insert→record contract with fakes in SelfCheck + tests; real-Whisper canned-WAV check rejected (model download in a unit check). Verified: build green, SelfCheck PASSED incl. pipeline contract + empty-fallback.
+### Claude's response — all 6 accepted
+- (1) Switching to a provider with no known default clears URL/model if they equal any known provider default; cloud call requires non-empty base URL (error → existing fallback).
+- (2) `resolveProviderDefaults` also applied once in `AppSettings.init` after load (idempotent pure helper).
+- (3) Migration idempotent + checked: skip if target account already set; delete legacy only after verified write to provider account. Logic extracted over an injectable key-store interface; SelfCheck tests it with an in-memory fake (no real Keychain IO).
+- (4) Single fallback reporter used by both `processDictation` and `reprocess`.
+- (5) `badResponse` no longer carries body into `LocalizedError` — status + provider label only; body never logged.
+- (6) Invariant re-worded: "semantic edits are preserved; boundary-whitespace-only edits may upgrade" — trim compare kept deliberately.
 
 ## Round 3 — Codex
-VERDICT: APPROVED. "No blocking findings." Codex verified round-2 fixes in code and judged the three modified resolutions sound for the personal-use PLAN (permissive AX heuristic, 1s timed restore tradeoff, fake-engine injectable pipeline test). Reconciliation reached in 3 rounds (cap 5).
+VERDICT: REVISE. Round-2 resolutions accepted. New findings:
+1. Empty-model requests not guarded — only base URL validated; all three providers require a model.
+2. Fallback reporter covers thrown failures only; empty/whitespace processor output also falls back silently.
+3. "Empty"/"verbatim-equals" matching on user-typed fields — whitespace variants bypass defaulting/validation.
+
+### Claude's response — all 3 accepted
+- (1) `CloudLLMProcessor` validates trimmed base URL AND trimmed model non-empty before any request; typed error → shared fallback reporter.
+- (2) Shared reporter invoked on both throw and empty-output fallback, in `processDictation` and `reprocess`.
+- (3) All default-matching and validation on trimmed values; request uses the trimmed snapshot.
+
+## Round 4 — Codex
+VERDICT: APPROVED. All round-3 findings verified resolved. Remaining risks acknowledged as bounded: Ollama /v1 compat E2E-gated with native /api/chat contingency; deleted built-ins stay deleted by design; whitespace-only edits may upgrade by design.
+
+## Resolution
+Converged in 4 rounds (3× REVISE → APPROVED). 19 findings raised, 18 accepted, 1 rejected with logged rationale (re-seeding deleted built-ins). Awaiting user sign-off before implementation.
+
+## Round 5 — Codex (Amendment A)
+VERDICT: REVISE. Findings:
+1. Stale approved-plan text contradicts amendment (step 7 "useCloud untouched", step 11 "enable Use cloud model", key decision "built-ins stay useCloud:false").
+2. Silent behavior migration: existing complete config → all templates cloud without consent (privacy).
+3. Expired/revoked key globally degrades refinement to raw with no recovery hint; A4 forbids FM retry.
+4. Selection/execution race: coordinator checks key, processor re-reads Keychain later — can select cloud then fail raw.
+5. SelfCheck misses legacy useCloud:false + complete-config routing case.
+
+### Claude's response
+- (1) Accepted: stale lines amended (marked "superseded by Amendment A").
+- (2) REJECTED: implicit-on-config is the user's explicitly requested semantics (single-user personal app; the toggle caused 3 failed E2E rounds). A3 caption documents the rule. Consent ceremony would reintroduce the friction the change removes.
+- (3) Partially accepted: FM retry stays out (user explicitly chose raw fallback when asked). Accepted: fallback HUD text gains recovery hint ("check API key/model in Settings; clear key for on-device").
+- (4) Accepted: one snapshot (provider, base URL, model, key, vocabulary) captured at selection time and passed into CloudLLMProcessor — routing and request always agree.
+- (5) Accepted: SelfCheck adds legacy useCloud:false decode + isCloudLLMConfigured routing truth table.
+
+## Round 6 — Codex (Amendment A rev + Amendment B)
+VERDICT: REVISE. A: step 4 still says processor reads settings itself (conflicts A1). B: (1) Esc not in event tap — would leak to frontmost app; (2) HUD ignoresMouseEvents=true today; clickable pill needs cannot-become-key panel + pre-click target snapshot; (3) cap timer can double-stop — needs recording generation + cancellation on terminal transitions; (4) pill-lock during PTT must ignore the subsequent physical key-up; (5) cancel side effects unspecified (capture, preview, timer, HUD, samples, no Library); (6) handsFreeMaxMinutes unbounded.
+
+### Claude's response — all accepted
+- A: step 4 amended to defer to A1 (single snapshot passed in).
+- B1: tap detects keyCode 53 while recording only; swallowed then, passes through otherwise; selfcheck covers decision.
+- B2: pill = NSPanel subclass overriding canBecomeKey/Main → false, mouse events enabled deliberately; insertion target snapshotted BEFORE handling click-stop.
+- B3: recording generation ID; every terminal transition invalidates the cap timer; stale capReached(gen) for old gen = no-op, selfcheck-tested.
+- B4: pttRecording + pillClick → locked(ignoreNextKeyUp); locked + keyUp → no-op. In transition table.
+- B5: single cancelRecording terminal action: stop capture, cancel live preview, invalidate cap timer, clear HUD, discard samples, no pipeline/Library work. Selfcheck asserts via injected hooks.
+- B6: handsFreeMaxMinutes clamped 1–60 on read and persist; clamp selfcheck-tested.
+
+## Round 7 — Codex
+VERDICT: REVISE. A coherent. B: (1) live-preview ticks replace whole pill text → would erase lock/elapsed state; (2) handsFreeMaxMinutes live-read vs snapshot at lock unspecified.
+
+### Claude's response — both accepted
+- (1) HUD rendering becomes mode-aware: locked layout = lock glyph + elapsed/cap, preview text embedded inside that layout; preview updates can never replace lock state.
+- (2) Clamped cap snapshotted on entering locked, tied to the recording generation; Settings changes mid-recording don't affect the live recording.
+
+## Round 8 — Codex
+VERDICT: APPROVED. Amendments A and B clear; no new blocking issues.
+
+## Resolution (amendments)
+A + B converged in 4 rounds (5–8). 13 findings; 11 accepted, 2 rejected with logged rationale (consent ceremony, FM retry — both contradicted explicit user decisions). Building.
