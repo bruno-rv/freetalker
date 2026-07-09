@@ -51,6 +51,15 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(activeTemplateID, forKey: Keys.activeTemplateID) }
     }
 
+    /// Per-app template rules: bundle identifier -> template id. `[String: String]` is a
+    /// property-list type UserDefaults stores natively — no JSON encoding needed (unlike
+    /// `hotKeySpec` above, which isn't). Consulted by `AppCoordinator.resolveTemplate`; a rule
+    /// whose template id no longer exists is not cleaned up here — resolution falls back to the
+    /// Active Template instead. See PLAN "App Rules".
+    @Published var appRules: [String: String] {
+        didSet { defaults.set(appRules, forKey: Keys.appRules) }
+    }
+
     /// CoreAudio UID of the input device to capture from. nil means "System default" — the
     /// UID (not AudioDeviceID) is persisted since device ids can change across reboots.
     @Published var microphoneDeviceUID: String? {
@@ -197,6 +206,7 @@ final class AppSettings: ObservableObject {
         static let cloudLLMBaseURL = "cloudLLMBaseURL"
         static let cloudLLMModel = "cloudLLMModel"
         static let activeTemplateID = "activeTemplateID"
+        static let appRules = "appRules"
         static let microphoneDeviceUID = "microphoneDeviceUID"
         static let vocabularyText = "vocabularyText"
     }
@@ -217,6 +227,7 @@ final class AppSettings: ObservableObject {
         cloudLLMBaseURL = defaults.string(forKey: Keys.cloudLLMBaseURL) ?? "https://api.anthropic.com/v1"
         cloudLLMModel = defaults.string(forKey: Keys.cloudLLMModel) ?? "claude-sonnet-4-5"
         activeTemplateID = defaults.string(forKey: Keys.activeTemplateID) ?? Template.defaultID
+        appRules = defaults.dictionary(forKey: Keys.appRules) as? [String: String] ?? [:]
         microphoneDeviceUID = defaults.string(forKey: Keys.microphoneDeviceUID)
         // Direct init assignment doesn't trigger `didSet`'s clamp, so clamp explicitly here too
         // — covers a value persisted before maxVocabularyRawTextLength existed. Also

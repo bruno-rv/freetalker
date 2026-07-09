@@ -11,7 +11,7 @@ struct AppleFMProcessor: PostProcessor {
         case unavailable
     }
 
-    func process(transcript: String, template: Template) async throws -> String {
+    func process(transcript: String, template: Template, appName: String?) async throws -> String {
         guard case .available = SystemLanguageModel.default.availability else {
             throw FMError.unavailable
         }
@@ -20,7 +20,8 @@ struct AppleFMProcessor: PostProcessor {
         let instructions = buildProcessorInstructions(
             template: template,
             vocabulary: vocabulary,
-            trailing: "Always respond in the same language as the transcript below."
+            trailing: "Always respond in the same language as the transcript below.",
+            appName: appName
         )
         let session = LanguageModelSession(instructions: instructions)
         let response = try await session.respond(to: transcript)
