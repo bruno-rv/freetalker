@@ -100,3 +100,6 @@ All 10 ACCEPTED (3 with fail-open semantics: on unknown DB state reprocess persi
 
 ### Claude's response
 All 4 ACCEPTED: split committed-row-deletion from VACUUM/checkpoint at the Database API; store always refreshes (and purges, for deleteAll) once rows are committed-deleted, then surfaces privacy-step errors; enumeration failures feed audioPurgeFailed; purge checks isRegularFileKey.
+
+## Code Round 3 — Codex
+Blocked: Codex usage limit exhausted (resets 2026-07-10 00:46). Rounds 1–2 findings (10 + 4) all fixed and mutation-verified; no unaddressed findings. Bruno authorized push without the confirmatory round ("Push now"); round 3 to run later as post-merge audit.
