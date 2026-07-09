@@ -34,6 +34,16 @@ final class HUDController {
         panel?.orderOut(nil)
     }
 
+    /// Tail-truncates live preview text to fit the HUD's ~2-line pill: keeps the most recent
+    /// `maxCharacters` characters (what the user is currently saying, not where they started),
+    /// prefixed with an ellipsis when truncated. A cheap, testable heuristic — not exact
+    /// line-wrapping (the view's own `lineLimit`/truncation is the layout-level backstop). See
+    /// PLAN 3 "HUD".
+    nonisolated static func tailTruncate(_ text: String, maxCharacters: Int = 120) -> String {
+        guard text.count > maxCharacters else { return text }
+        return "…" + text.suffix(maxCharacters)
+    }
+
     private func display(text: String) {
         let hosting = NSHostingView(rootView: HUDView(text: text))
         let fitting = hosting.fittingSize
@@ -79,8 +89,10 @@ struct HUDView: View {
     var body: some View {
         Text(text)
             .font(.system(size: 13, weight: .medium))
-            .lineLimit(1)
-            .fixedSize()
+            .lineLimit(2)
+            .truncationMode(.head)
+            .multilineTextAlignment(.leading)
+            .frame(maxWidth: 320, alignment: .leading)
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
             .background(.regularMaterial, in: Capsule())

@@ -150,6 +150,7 @@ final class AppCoordinator: ObservableObject {
             } else {
                 hud.show(text: "Recording…")
             }
+            startLivePreviewIfNeeded()
         } catch {
             lastError = "Mic error: \(error.localizedDescription)"
         }
@@ -157,6 +158,11 @@ final class AppCoordinator: ObservableObject {
 
     private func handleKeyUp() {
         guard isRecording else { return }
+        // Cancel the preview loop immediately, before anything else — the final pipeline below
+        // owns the buffer from here on. See PLAN 3 "Partial loop": "Key release: cancel loop
+        // immediately, ignore any in-flight partial result, run existing final pipeline
+        // untouched."
+        stopLivePreview()
         isRecording = false
         let samples = audioCapture.stop()
 
@@ -173,25 +179,201 @@ final class AppCoordinator: ObservableObject {
             return
         }
         isProcessing = true
-        hud.show(text: "Processing…")
 
-        // Snapshot the engine and Active Template synchronously, at key-release, before any
-        // `await` — settings changed mid-transcription (e.g. during a long model download)
-        // must not retroactively change which engine/template this dictation is processed
-        // and recorded under. See Round 1 Codex finding 12.
+        // Snapshot the engine, frontmost app, and resolved Template synchronously, at
+        // key-release, before any `await` — settings/app-switching mid-transcription (e.g.
+        // during a long model download) must not retroactively change which engine/template
+        // this dictation is processed and recorded under. See Round 1 Codex finding 12.
+        //
+        // Frontmost app is read here rather than at keyDown: this is the only existing snapshot
+        // point in the pipeline (engine/template are already captured here, not at keyDown).
+        // `insertionTarget` (bundle id, pid, and best-effort focused element/window — see
+        // `InsertionTarget`) is carried through the pipeline and re-checked against the live
+        // frontmost app/element immediately before paste (`Insertion.insert`'s `target`) — if
+        // the user switched apps, or switched focus *within* the same app (a different Slack
+        // channel, a different Mail draft), during the async transcribe/post-process work, the
+        // synthetic ⌘V is skipped and the text is left on the pasteboard instead of landing in
+        // the wrong place. See Codex finding: paste-target drift / same-app target drift.
         let engine = activeSTTEngine
         let engineName = engine.name
-        let template = TemplateStore.shared.template(id: AppSettings.shared.activeTemplateID)
-            ?? Template.builtIns.first!
+        let frontmostApp = NSWorkspace.shared.frontmostApplication
+        let bundleID = frontmostApp?.bundleIdentifier
+        let appName = frontmostApp?.localizedName
+        let insertionTarget = Insertion.snapshotTarget(app: frontmostApp)
+        let (template, ruleFired) = Self.resolveTemplate(
+            bundleID: bundleID,
+            rules: AppSettings.shared.appRules,
+            templates: TemplateStore.shared.templates,
+            activeTemplateID: AppSettings.shared.activeTemplateID
+        )
 
-        Task { await runPipeline(samples: samples, engine: engine, engineName: engineName, template: template) }
+        hud.show(text: ruleFired ? "Processing… (\(template.name))" : "Processing…")
+
+        Task { await runPipeline(samples: samples, engine: engine, engineName: engineName, template: template, appName: appName, target: insertionTarget) }
     }
 
-    private func runPipeline(samples: [Float], engine: any TranscriptionEngine, engineName: String, template: Template) async {
+    /// Pure resolution of which Template a dictation should use: a rule mapping the snapshotted
+    /// app's bundle id wins; a missing bundle id, no matching rule, or a rule pointing at a
+    /// template id that no longer exists (deleted after the rule was created) all fall back to
+    /// the Active Template — never crashes. `templates`/`activeTemplateID` are passed in (rather
+    /// than read from the singletons directly) so this stays a pure function SelfCheck can drive
+    /// with synthetic inputs. See PLAN 2 "Template resolution".
+    nonisolated static func resolveTemplate(
+        bundleID: String?,
+        rules: [String: String],
+        templates: [Template],
+        activeTemplateID: String
+    ) -> (template: Template, ruleFired: Bool) {
+        let fallback = templates.first(where: { $0.id == activeTemplateID }) ?? Template.builtIns.first!
+        guard let bundleID, let ruleTemplateID = rules[bundleID],
+              let matched = templates.first(where: { $0.id == ruleTemplateID }) else {
+            return (fallback, false)
+        }
+        return (matched, true)
+    }
+
+    // MARK: - Live preview (PLAN 3)
+
+    /// Seconds between re-transcription ticks of the growing recording buffer. Periodic
+    /// re-transcription (not WhisperKit's streaming API) — see PLAN 3 "Design".
+    private static let livePreviewTickInterval: TimeInterval = 1.5
+    /// 1s of 16kHz mono audio — a tick on anything shorter is mostly silence/noise and wastes a
+    /// WhisperKit pass. See PLAN 3 "Partial loop".
+    private static let livePreviewMinSamples = 16_000
+    /// Constant-cost preview bound (Codex round-3 finding: early-stop is best-effort only —
+    /// WhisperKit 0.18.0's pre-decode stages (logmel, encoder CoreML calls) aren't interruptible
+    /// and the `TranscriptionCallback` fires from a low-priority detached task, so on a long
+    /// recording a preview tick's `keyUp` cancellation can still delay the final transcription
+    /// unboundedly. The hard bound is here, not in cancellation: every preview tick transcribes
+    /// only the last `livePreviewWindowSeconds` of the buffer (see `AudioCapture.snapshotSuffix`),
+    /// so a tick's worst-case cost — and therefore the final path's worst-case wait behind one —
+    /// is constant regardless of how long the recording has run. The early-stop callback in
+    /// `WhisperKitEngine` remains a second, opportunistic layer on top of this, not the bound
+    /// itself.
+    private static let livePreviewWindowSeconds: TimeInterval = 12
+    /// 16kHz mono → 12s * 16,000 samples/s.
+    private static let livePreviewWindowMaxSamples = Int(livePreviewWindowSeconds) * 16_000
+
+    private var livePreviewTask: Task<Void, Never>?
+    private var livePreviewGeneration = 0
+    private var livePreviewInFlight = false
+    private var lastLivePreviewText: String?
+
+    /// Pure gating for a single tick: whether it's even worth taking a buffer snapshot and
+    /// running a WhisperKit pass right now. No timers/audio/async — SelfCheck drives this
+    /// directly. See PLAN 3 "Partial loop": skip if not recording, skip if a partial is already
+    /// in flight (single in-flight gate, no backlog), skip if the buffer is still short.
+    nonisolated static func shouldRunLivePreviewTick(isRecording: Bool, isPartialInFlight: Bool, sampleCount: Int, minSamples: Int) -> Bool {
+        isRecording && !isPartialInFlight && sampleCount >= minSamples
+    }
+
+    /// Pure gating for whether a completed partial's text should actually reach the HUD: the
+    /// recording must still be in progress AND still be the same one the tick was started for
+    /// (generation match) — a fast keyUp→keyDown re-press bumps the generation, so a late result
+    /// from the previous recording can't land on top of the new one even though `isRecording` is
+    /// true again. See PLAN 3 "Failure modes to avoid".
+    nonisolated static func shouldAcceptLivePreviewResult(isRecording: Bool, resultGeneration: Int, currentGeneration: Int) -> Bool {
+        isRecording && resultGeneration == currentGeneration
+    }
+
+    /// Whether live preview should run at all for the current settings. Preview only ever
+    /// transcribes with the local WhisperKit engine (never per-chunk cloud uploads — cost/
+    /// latency/privacy, see PLAN 3 "Settings"): if WhisperKit itself is the active engine,
+    /// preview is enabled by the toggle alone; if Cloud STT is the active engine, preview only
+    /// runs when WhisperKit already happens to be loaded (never triggers a fresh load just for a
+    /// tick).
+    nonisolated static func isLivePreviewEnabled(settingEnabled: Bool, sttEngine: STTEngineKind, whisperKitLoaded: Bool) -> Bool {
+        guard settingEnabled else { return false }
+        return sttEngine == .whisperKit || whisperKitLoaded
+    }
+
+    /// Starts the periodic re-transcription loop for the recording that just began, if enabled.
+    /// Bumps the generation counter so any result from a previous recording's loop (already
+    /// cancelled, but possibly still finishing an in-flight tick) is discarded by
+    /// `shouldAcceptLivePreviewResult` rather than shown here.
+    private func startLivePreviewIfNeeded() {
+        livePreviewGeneration += 1
+        let generation = livePreviewGeneration
+        livePreviewInFlight = false
+        lastLivePreviewText = nil
+
+        guard Self.isLivePreviewEnabled(
+            settingEnabled: AppSettings.shared.livePreviewEnabled,
+            sttEngine: AppSettings.shared.sttEngine,
+            whisperKitLoaded: whisperEngine.isLoaded
+        ) else { return }
+
+        livePreviewTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(AppCoordinator.livePreviewTickInterval * 1_000_000_000))
+                guard let self, !Task.isCancelled else { return }
+                await self.runLivePreviewTick(generation: generation)
+            }
+        }
+    }
+
+    /// Cancels the loop. This is the opportunistic *second* layer, not the bound: the hard bound
+    /// on a preview tick's worst-case cost is `AudioCapture.snapshotSuffix`'s constant-size copy
+    /// plus `WhisperKitEngine`'s reduced preview `DecodingOptions`, both applied unconditionally
+    /// before this ever runs. `whisperEngine.transcribe(allowEarlyCancel:)` in
+    /// `runLivePreviewTick` additionally installs a per-token early-stop callback, so cancelling
+    /// `livePreviewTask` here *can* abort an in-flight decode within one decode step — but
+    /// WhisperKit 0.18.0's pre-decode stages (logmel, encoder CoreML calls) aren't interruptible
+    /// and that callback fires from a low-priority detached task, so this alone cannot bound
+    /// worst-case delay (Codex round-3 finding). With the window in place, worst-case final-path
+    /// delay behind an in-flight tick is now ≈ one `previewWindowSeconds`-window WhisperKit pass,
+    /// regardless of total recording length, whether or not this cancellation ever lands in
+    /// time. Any result from a tick that still squeezes out a completion in that window is
+    /// discarded anyway by `shouldAcceptLivePreviewResult` once `isRecording` flips false.
+    private func stopLivePreview() {
+        livePreviewTask?.cancel()
+        livePreviewTask = nil
+    }
+
+    private func runLivePreviewTick(generation: Int) async {
+        // Bounded at the copy, not after (Codex round-4 finding): `snapshotSuffix` takes only
+        // the last `livePreviewWindowMaxSamples` samples *inside* `samplesLock`, so a tick's
+        // copy cost — and the COW risk it would otherwise impose on the tap thread's append path
+        // — is constant regardless of total recording length. `totalCount` is the *whole*
+        // buffer's size, used below for the <1s skip gate, which is about whether there's enough
+        // real audio captured yet at all (a property of the whole recording, not of the window).
+        let (window, totalCount) = audioCapture.snapshotSuffix(maxSamples: Self.livePreviewWindowMaxSamples)
+        guard Self.shouldRunLivePreviewTick(
+            isRecording: isRecording,
+            isPartialInFlight: livePreviewInFlight,
+            sampleCount: totalCount,
+            minSamples: Self.livePreviewMinSamples
+        ) else { return }
+
+        livePreviewInFlight = true
+        defer { livePreviewInFlight = false }
+
+        // Runs through WhisperKitEngine's shared serial gate, so this never overlaps the final
+        // transcription. `allowEarlyCancel: true` (preview-only — never passed by the final
+        // pipeline) also selects `WhisperKitEngine`'s reduced preview `DecodingOptions` (see
+        // `performTranscribe`) and lets `stopLivePreview`'s cancellation opportunistically abort
+        // this decode within one decode step if it's already running when `keyUp` fires; a
+        // cancelled/early-stopped attempt throws and lands here as `try?`. Errors are otherwise
+        // non-fatal — the unchanged final pipeline still owns the real result; just let the next
+        // tick retry.
+        guard let result = try? await whisperEngine.transcribe(samples: window, allowEarlyCancel: true) else { return }
+
+        guard Self.shouldAcceptLivePreviewResult(isRecording: isRecording, resultGeneration: generation, currentGeneration: livePreviewGeneration) else { return }
+
+        let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Empty partial leaves whatever the HUD already shows (e.g. "Recording…", or a device
+        // fallback note) untouched, and only update when the text actually changed — avoids
+        // flashing/resizing the pill every tick. See PLAN 3 "Failure modes to avoid".
+        guard !text.isEmpty, text != lastLivePreviewText else { return }
+        lastLivePreviewText = text
+        hud.show(text: HUDController.tailTruncate(text))
+    }
+
+    private func runPipeline(samples: [Float], engine: any TranscriptionEngine, engineName: String, template: Template, appName: String?, target: InsertionTarget?) async {
         defer { isProcessing = false }
 
         do {
-            let result = try await processDictation(samples: samples, engine: engine, engineName: engineName, template: template)
+            let result = try await processDictation(samples: samples, engine: engine, engineName: engineName, template: template, appName: appName, target: target)
             // Busy state hides immediately on success; nothing terminal to show the user.
             // See Round 2 Codex finding 6.
             if result.posted {
@@ -226,8 +408,10 @@ final class AppCoordinator: ObservableObject {
         engine: any TranscriptionEngine,
         engineName: String,
         template: Template,
+        appName: String? = nil,
+        target: InsertionTarget? = nil,
         processor: (any PostProcessor)? = nil,
-        insert: (String) -> Bool = { Insertion.insert($0) },
+        insert: (String, InsertionTarget?) -> Bool = { Insertion.insert($0, target: $1) },
         // ponytail: closure default (not a protocol/factory) keeps SelfCheck hermetic to a temp
         // DB instead of writing test rows into the user's real Library on every run.
         record: (_ language: String, _ template: String, _ transcript: String, _ refined: String, _ engine: String) throws -> Void = { language, template, transcript, refined, engine in
@@ -242,7 +426,7 @@ final class AppCoordinator: ObservableObject {
         let activeProcessor: any PostProcessor = processor ?? (template.useCloud ? cloudLLMProcessor : appleFMProcessor)
         let refined: String
         do {
-            let processed = try await activeProcessor.process(transcript: transcription.text, template: template)
+            let processed = try await activeProcessor.process(transcript: transcription.text, template: template, appName: appName)
             let trimmed = processed.trimmingCharacters(in: .whitespacesAndNewlines)
             // Never lose the user's words — fall back to the raw transcript if post-processing
             // returns empty output without throwing. See Round 1 Codex finding 3.
@@ -252,7 +436,7 @@ final class AppCoordinator: ObservableObject {
             refined = transcription.text
         }
 
-        let posted = insert(refined)
+        let posted = insert(refined, target)
 
         do {
             try record(transcription.language, template.name, transcription.text, refined, engineName)
@@ -313,7 +497,8 @@ final class AppCoordinator: ObservableObject {
         let processor: PostProcessor = template.useCloud ? cloudLLMProcessor : appleFMProcessor
         let refined: String
         do {
-            let processed = try await processor.process(transcript: dictation.transcript, template: template)
+            // No known frontmost app for a historical re-process — appName: nil.
+            let processed = try await processor.process(transcript: dictation.transcript, template: template, appName: nil)
             let trimmed = processed.trimmingCharacters(in: .whitespacesAndNewlines)
             // Same empty-refined fallback as processDictation. See Round 2 Codex finding 5.
             refined = trimmed.isEmpty ? dictation.transcript : trimmed
