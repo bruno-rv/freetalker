@@ -90,3 +90,13 @@ Plus 2 carried from the mistargeted round (real redo-code findings): 9. redoLast
 
 ### Claude's response
 All 10 ACCEPTED (3 with fail-open semantics: on unknown DB state reprocess persists rather than drops). Fix agent dispatched.
+
+## Code Round 2 — Codex
+4 findings, VERDICT: REVISE (all partial-success refinements).
+1. deleteAllDictations bundles DELETE+VACUUM — VACUUM failure after autocommitted DELETE skips purge/refresh.
+2. Per-row delete same shape: checkpoint throw after committed DELETE skips refresh, deleted row stays visible.
+3. contentsOfDirectory try? swallows enumeration failure — unreadable failed-dictations dir reports clean purge.
+4. Extension-only purge scoping would recursively remove a DIRECTORY named *.wav.
+
+### Claude's response
+All 4 ACCEPTED: split committed-row-deletion from VACUUM/checkpoint at the Database API; store always refreshes (and purges, for deleteAll) once rows are committed-deleted, then surfaces privacy-step errors; enumeration failures feed audioPurgeFailed; purge checks isRegularFileKey.

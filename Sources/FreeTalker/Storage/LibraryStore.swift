@@ -88,42 +88,63 @@ final class LibraryStore: ObservableObject {
     }
 
     /// Deletes one Dictation row. Throws (never silently no-ops) when the database is
-    /// unavailable — a confirmed destructive action must always surface a failure. See
-    /// PLAN.md step 2.
+    /// unavailable — a confirmed destructive action must always surface a failure. Once the row
+    /// deletion (`Database.deleteRow`) commits, the deletion is real regardless of what happens
+    /// next — `refresh()` always runs before a trailing checkpoint failure is allowed to escape,
+    /// so a deleted row can never stay visible in the UI just because the WAL truncate failed.
+    /// See PLAN.md step 2, Round 2 Codex finding 2.
     func delete(id: Int64) throws {
         guard let db else { throw LibraryStoreError.databaseUnavailable }
-        try db.deleteDictation(id: id)
-        refresh()
+        try db.deleteRow(id: id)
+        try Self.runThenAlways({ try db.checkpointTruncate() }, always: { self.refresh() })
     }
 
     /// Clears the entire Library, including the transient on-disk debug audio artifacts
     /// (`last-dictation.wav` and any saved failed-transcription recordings) — those live outside
     /// the DB but must not survive "clear the archive". See PLAN.md step 2/3.
     ///
-    /// Row deletion (`Database.deleteAllDictations`, DELETE + VACUUM) and the WAL checkpoint
-    /// (`Database.checkpointTruncate`) are separate throwing steps (see their doc comments): once
-    /// row deletion succeeds the archive is already gone from the DB, so the debug-audio purge
-    /// and the UI refresh must happen regardless of whether the checkpoint or the purge itself
-    /// then fails — both run unconditionally (errors captured, not thrown immediately) before
-    /// either error is allowed to escape to the caller. See Round 1 Codex findings 4/5.
+    /// Row deletion (`Database.deleteAllRows`) and the privacy cleanup (`Database
+    /// .vacuumAndCheckpoint`, VACUUM + WAL checkpoint) are separate throwing steps (see their
+    /// doc comments): once row deletion commits the archive is already gone from the DB, so the
+    /// debug-audio purge and the UI refresh must happen regardless of whether the privacy
+    /// cleanup then fails — both run unconditionally before either error is allowed to escape to
+    /// the caller. See Round 1 Codex findings 4/5, Round 2 Codex findings 1/2.
     func deleteAll() throws {
         guard let db else { throw LibraryStoreError.databaseUnavailable }
-        try db.deleteAllDictations()
-        var checkpointError: Error?
+        try db.deleteAllRows()
+        try Self.runThenAlways(
+            { try db.vacuumAndCheckpoint() },
+            always: {
+                self.refresh()
+                try self.purgeDebugAudio()
+            }
+        )
+    }
+
+    /// Runs `step` (a privacy-cleanup step — VACUUM/checkpoint — that presumes the row deletion
+    /// it follows already committed), capturing rather than immediately propagating any error,
+    /// then unconditionally runs `always` (UI refresh, and for `deleteAll()` also the
+    /// debug-audio purge) — itself captured, never swallowed — and only then rethrows whichever
+    /// error occurred, `step`'s taking priority. Extracted as a standalone function (rather than
+    /// inlined per call site) because `LibraryStore` is a hard singleton (`private init()`, no
+    /// injectable `Database`) that SelfCheck can't drive end-to-end with a fake DB — this is the
+    /// actual sequencing `delete(id:)`/`deleteAll()` run, not a simulation of it. See PLAN.md
+    /// step 2, Round 2 Codex finding 2.
+    nonisolated static func runThenAlways(_ step: () throws -> Void, always: () throws -> Void) throws {
+        var stepError: Error?
         do {
-            try db.checkpointTruncate()
+            try step()
         } catch {
-            checkpointError = error
+            stepError = error
         }
-        var purgeError: Error?
+        var alwaysError: Error?
         do {
-            try purgeDebugAudio()
+            try always()
         } catch {
-            purgeError = error
+            alwaysError = error
         }
-        refresh()
-        if let checkpointError { throw checkpointError }
-        if let purgeError { throw purgeError }
+        if let stepError { throw stepError }
+        if let alwaysError { throw alwaysError }
     }
 
     /// Whether a Dictation row with this id still exists. `nil` means "unknown" (database
@@ -145,14 +166,27 @@ final class LibraryStore: ObservableObject {
     }
 
     /// Removes debug audio written outside the Library DB (AppCoordinator's
-    /// `writeLastCaptureDebugArtifact` / `saveFailedAudio`): `last-dictation.wav` and any
-    /// `*.wav` file under `failed-dictations/` — scoped by `shouldPurgeFailedDictationFile`, not
-    /// "every child of the directory". A missing file (the common case — most dictations produce
-    /// neither artifact) is not an error; every other removal failure is collected and thrown as
-    /// one `audioPurgeFailed`, rather than silently swallowed. See Round 1 Codex finding 5.
+    /// `writeLastCaptureDebugArtifact` / `saveFailedAudio`) under the real Application Support
+    /// directory — see `purgeDebugAudio(in:)` for the testable core logic.
     private func purgeDebugAudio() throws {
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        let dir = support.appendingPathComponent("FreeTalker", isDirectory: true)
+        try Self.purgeDebugAudio(in: support.appendingPathComponent("FreeTalker", isDirectory: true))
+    }
+
+    /// Core purge logic for `last-dictation.wav` and any `*.wav` file under `failed-dictations/`
+    /// — scoped by `shouldPurgeFailedDictationFile`, not "every child of the directory" — taking
+    /// `dir` as a parameter (rather than hardcoding the real Application Support path) so
+    /// SelfCheck can exercise it against an isolated temp directory. See Round 1 Codex finding 5.
+    ///
+    /// A missing file (the common case — most dictations produce neither artifact) is not an
+    /// error; every other removal failure is collected and thrown as one `audioPurgeFailed`,
+    /// rather than silently swallowed. Two refinements from Round 2 Codex review: an unreadable
+    /// `failed-dictations/` directory feeds into `audioPurgeFailed` too, rather than a `try?`
+    /// silently reporting a clean purge while audio is actually left behind (finding 3); and a
+    /// non-regular entry that happens to be named `*.wav` (e.g. a directory) is left alone, not
+    /// recursively removed, since extension-only scoping doesn't guarantee it's a file (finding
+    /// 4).
+    nonisolated static func purgeDebugAudio(in dir: URL) throws {
         var errors: [Error] = []
 
         let lastDictationURL = dir.appendingPathComponent("last-dictation.wav")
@@ -165,13 +199,22 @@ final class LibraryStore: ObservableObject {
         }
 
         let failedDir = dir.appendingPathComponent("failed-dictations", isDirectory: true)
-        if let contents = try? FileManager.default.contentsOfDirectory(at: failedDir, includingPropertiesForKeys: nil) {
-            for file in contents where Self.shouldPurgeFailedDictationFile(pathExtension: file.pathExtension) {
-                do {
-                    try FileManager.default.removeItem(at: file)
-                } catch {
-                    errors.append(error)
+        if FileManager.default.fileExists(atPath: failedDir.path) {
+            do {
+                let contents = try FileManager.default.contentsOfDirectory(
+                    at: failedDir, includingPropertiesForKeys: [.isRegularFileKey]
+                )
+                for file in contents where shouldPurgeFailedDictationFile(pathExtension: file.pathExtension) {
+                    let isRegularFile = (try? file.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile ?? false
+                    guard isRegularFile else { continue } // e.g. a directory named "foo.wav" — leave it alone
+                    do {
+                        try FileManager.default.removeItem(at: file)
+                    } catch {
+                        errors.append(error)
+                    }
                 }
+            } catch {
+                errors.append(error) // directory exists but couldn't be enumerated — audio may remain
             }
         }
 
