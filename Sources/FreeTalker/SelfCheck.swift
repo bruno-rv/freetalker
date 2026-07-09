@@ -39,6 +39,27 @@ struct EmptyPostProcessor: PostProcessor {
     }
 }
 
+/// One-shot async signal — any number of `wait()` callers resume once `fire()` is called; a
+/// `wait()` after `fire()` returns immediately. Used only by the `SerialGate` cancellation
+/// check below, to pin down the interleaving of its concurrent tasks deterministically —
+/// no wall-clock sleeps, no "give it a moment and hope" — see that check's doc comment.
+private actor OneShotSignal {
+    private var fired = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        if fired { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func fire() {
+        guard !fired else { return }
+        fired = true
+        for waiter in waiters { waiter.resume() }
+        waiters.removeAll()
+    }
+}
+
 enum SelfCheck {
     static func runAndExit() -> Never {
         // `AppCoordinator.processDictation` is `@MainActor`, so the check below must run on the
@@ -158,9 +179,12 @@ enum SelfCheck {
             failures.append(contentsOf: appRuleChecks())
             failures.append(contentsOf: pasteTargetChecks())
             failures.append(contentsOf: promptAppNameChecks())
+            failures.append(contentsOf: livePreviewChecks())
+            failures.append(contentsOf: await serialGateCancellationChecks())
+            failures.append(contentsOf: previewEarlyCancelChecks())
 
             if failures.isEmpty {
-                print("SelfCheck PASSED (template seeding, FTS round-trip, pipeline contract, mic device enumeration, hotkey spec/matcher, vocabulary normalization/injection, app rule resolution, paste-target drift, prompt app-name sanitization)")
+                print("SelfCheck PASSED (template seeding, FTS round-trip, pipeline contract, mic device enumeration, hotkey spec/matcher, vocabulary normalization/injection, app rule resolution, paste-target drift, prompt app-name sanitization, live preview gating/availability, SerialGate cancellation, preview early-cancel decisions)")
                 exit(0)
             } else {
                 print("SelfCheck FAILED:")
@@ -681,6 +705,234 @@ enum SelfCheck {
         let withNilAppName = buildProcessorInstructions(template: Template.builtIns.first!, vocabulary: [], trailing: "TRAILING", appName: nil)
         if withNilAppName.contains("inserted into the app") {
             failures.append("buildProcessorInstructions: expected nil app name to omit the app-context sentence")
+        }
+
+        return failures
+    }
+
+    /// Checks for the live-preview pure functions: `AppCoordinator.shouldRunLivePreviewTick`
+    /// (tick gating), `AppCoordinator.shouldAcceptLivePreviewResult` (stale-result discard),
+    /// `AppCoordinator.isLivePreviewEnabled` (setting/engine/loaded-model resolution),
+    /// `HUDController.tailTruncate` (HUD text heuristic), and `AudioCapture.boundedSuffix` (the
+    /// tail-window logic behind `snapshotSuffix`'s constant-cost bound). No timers, no audio, no
+    /// WhisperKit — see PLAN 3 "Self-check".
+    private static func livePreviewChecks() -> [String] {
+        var failures: [String] = []
+
+        if !AppCoordinator.shouldRunLivePreviewTick(isRecording: true, isPartialInFlight: false, sampleCount: 20_000, minSamples: 16_000) {
+            failures.append("shouldRunLivePreviewTick: expected recording + idle + enough audio to run")
+        }
+        if AppCoordinator.shouldRunLivePreviewTick(isRecording: false, isPartialInFlight: false, sampleCount: 20_000, minSamples: 16_000) {
+            failures.append("shouldRunLivePreviewTick: expected not-recording to skip")
+        }
+        if AppCoordinator.shouldRunLivePreviewTick(isRecording: true, isPartialInFlight: true, sampleCount: 20_000, minSamples: 16_000) {
+            failures.append("shouldRunLivePreviewTick: expected an in-flight partial to skip the tick (single in-flight gate, no backlog)")
+        }
+        if AppCoordinator.shouldRunLivePreviewTick(isRecording: true, isPartialInFlight: false, sampleCount: 1_000, minSamples: 16_000) {
+            failures.append("shouldRunLivePreviewTick: expected a short (<1s) buffer to skip the tick")
+        }
+        if !AppCoordinator.shouldRunLivePreviewTick(isRecording: true, isPartialInFlight: false, sampleCount: 16_000, minSamples: 16_000) {
+            failures.append("shouldRunLivePreviewTick: expected a buffer exactly at minSamples to run")
+        }
+
+        if !AppCoordinator.shouldAcceptLivePreviewResult(isRecording: true, resultGeneration: 3, currentGeneration: 3) {
+            failures.append("shouldAcceptLivePreviewResult: expected a matching generation while still recording to be accepted")
+        }
+        if AppCoordinator.shouldAcceptLivePreviewResult(isRecording: false, resultGeneration: 3, currentGeneration: 3) {
+            failures.append("shouldAcceptLivePreviewResult: expected a stale result after keyUp to be discarded even with a matching generation")
+        }
+        if AppCoordinator.shouldAcceptLivePreviewResult(isRecording: true, resultGeneration: 1, currentGeneration: 2) {
+            failures.append("shouldAcceptLivePreviewResult: expected a generation mismatch (fast keyUp->keyDown re-press) to be discarded")
+        }
+
+        if AppCoordinator.isLivePreviewEnabled(settingEnabled: false, sttEngine: .whisperKit, whisperKitLoaded: true) {
+            failures.append("isLivePreviewEnabled: expected the setting toggle off to disable preview regardless of engine")
+        }
+        if !AppCoordinator.isLivePreviewEnabled(settingEnabled: true, sttEngine: .whisperKit, whisperKitLoaded: false) {
+            failures.append("isLivePreviewEnabled: expected the WhisperKit engine to enable preview even before it has loaded")
+        }
+        if AppCoordinator.isLivePreviewEnabled(settingEnabled: true, sttEngine: .cloud, whisperKitLoaded: false) {
+            failures.append("isLivePreviewEnabled: expected Cloud STT without a loaded local WhisperKit to disable preview (no per-chunk cloud uploads)")
+        }
+        if !AppCoordinator.isLivePreviewEnabled(settingEnabled: true, sttEngine: .cloud, whisperKitLoaded: true) {
+            failures.append("isLivePreviewEnabled: expected Cloud STT with WhisperKit already loaded to enable preview")
+        }
+
+        let short = "hello world"
+        if HUDController.tailTruncate(short, maxCharacters: 120) != short {
+            failures.append("tailTruncate: expected short text to pass through unchanged")
+        }
+        let long = String(repeating: "a", count: 50) + " the quick brown fox jumps over the lazy dog"
+        let truncated = HUDController.tailTruncate(long, maxCharacters: 20)
+        if !truncated.hasPrefix("…") {
+            failures.append("tailTruncate: expected an ellipsis prefix once text is truncated")
+        }
+        if !long.hasSuffix(String(truncated.dropFirst())) {
+            failures.append("tailTruncate: expected the kept text to be an exact tail suffix of the source (most recent words, not the start)")
+        }
+
+        // `AudioCapture.boundedSuffix`: the constant-cost preview bound, applied at the copy
+        // (Codex round-4 finding — bounding a snapshot's *slice* after a full-buffer copy still
+        // pays the full-buffer cost; the bound must be inside the lock, at the copy itself. See
+        // `AudioCapture.snapshotSuffix`, which calls this under `samplesLock`). Longer-than-window
+        // → exact suffix of `maxSamples` length; shorter-or-equal → identity; empty → empty.
+        let longSamples = (0..<30).map { Float($0) }
+        let windowed = AudioCapture.boundedSuffix(longSamples, maxSamples: 12)
+        if windowed.count != 12 {
+            failures.append("boundedSuffix: expected a buffer longer than the window to be truncated to maxSamples")
+        }
+        if windowed != Array(longSamples.suffix(12)) {
+            failures.append("boundedSuffix: expected the truncated result to be the exact tail suffix, not e.g. the head")
+        }
+        if windowed == Array(longSamples.prefix(12)) {
+            failures.append("boundedSuffix: expected the truncated result to NOT be the head prefix (mutation guard against an off-by-direction bug)")
+        }
+        let shortSamples: [Float] = [1, 2, 3]
+        if AudioCapture.boundedSuffix(shortSamples, maxSamples: 12) != shortSamples {
+            failures.append("boundedSuffix: expected a buffer shorter than the window to pass through unchanged")
+        }
+        let exactSamples = (0..<12).map { Float($0) }
+        if AudioCapture.boundedSuffix(exactSamples, maxSamples: 12) != exactSamples {
+            failures.append("boundedSuffix: expected a buffer exactly at maxSamples to pass through unchanged")
+        }
+        if AudioCapture.boundedSuffix([], maxSamples: 12) != [] {
+            failures.append("boundedSuffix: expected an empty buffer to stay empty")
+        }
+        if AudioCapture.boundedSuffix(longSamples, maxSamples: 0) != [] {
+            failures.append("boundedSuffix: expected maxSamples: 0 to yield an empty result")
+        }
+
+        return failures
+    }
+
+    /// Checks `SerialGate`'s cancellation-awareness (Codex finding, live-preview streaming
+    /// PLAN): a waiter cancelled while still queued must never run its operation, and the
+    /// waiter behind it must still get the gate once the holder releases it. This is the
+    /// mechanism `keyUp` relies on to drop a queued, now-useless preview tick instead of
+    /// making the final transcription wait behind it.
+    ///
+    /// Deterministic by construction, not by timing luck:
+    ///   - A acquires the gate (it's free) and signals `aStarted`, then blocks on `releaseA` —
+    ///     standing in for a slow, in-flight WhisperKit pass. `aStarted` only fires *after*
+    ///     `SerialGate.acquire()` has already synchronously set `isBusy = true` (see that
+    ///     method — the fast path never awaits), so once this check observes `aStarted`, A is
+    ///     provably holding the gate.
+    ///   - B and C are only created after `aStarted` fires, so both are guaranteed to hit the
+    ///     "queued" branch of `acquire()` rather than possibly racing A for the free gate.
+    ///   - B is cancelled immediately. Because A cannot let go of the gate until this check
+    ///     calls `releaseA.fire()` — which happens strictly after B is cancelled — B can never
+    ///     slip through and acquire the gate before its cancellation takes effect, regardless
+    ///     of exactly when B's task gets scheduled. "B never runs" is therefore guaranteed, not
+    ///     probabilistic.
+    ///   - C can only run after A's `release()` hands the gate onward, so "C runs, and only
+    ///     after A" falls out of the gate's own mutual-exclusion guarantee — true no matter
+    ///     when C's task happens to be scheduled relative to A/B.
+    /// No `Task.sleep`/wall-clock waits anywhere in this check.
+    private static func serialGateCancellationChecks() async -> [String] {
+        var failures: [String] = []
+
+        final class Counters: @unchecked Sendable {
+            private let lock = NSLock()
+            private(set) var ran: [String] = []
+            func record(_ label: String) {
+                lock.lock(); defer { lock.unlock() }
+                ran.append(label)
+            }
+        }
+
+        let gate = SerialGate()
+        let counters = Counters()
+        let aStarted = OneShotSignal()
+        let releaseA = OneShotSignal()
+
+        let taskA = Task {
+            try? await gate.run {
+                await aStarted.fire()
+                await releaseA.wait()
+                counters.record("A")
+            }
+        }
+
+        await aStarted.wait()
+
+        let taskB = Task {
+            try? await gate.run {
+                counters.record("B")
+            }
+        }
+        taskB.cancel()
+
+        let taskC = Task {
+            try? await gate.run {
+                counters.record("C")
+            }
+        }
+
+        await releaseA.fire()
+
+        await taskA.value
+        await taskB.value
+        await taskC.value
+
+        if counters.ran.contains("B") {
+            failures.append("SerialGate: a waiter cancelled while still queued ran its operation instead of being dropped")
+        }
+        if counters.ran != ["A", "C"] {
+            failures.append("SerialGate: expected exactly [\"A\", \"C\"] to run, in that order, got \(counters.ran)")
+        }
+
+        return failures
+    }
+
+    /// Checks the pure decision functions `WhisperKitEngine.earlyStopDecision` and
+    /// `.shouldDiscardPreviewResult` — the flag/callback plumbing behind aborting an in-flight
+    /// preview decode once `keyUp` cancels it (Round 2 Codex finding: final-path priority). No
+    /// real WhisperKit invocation, no `Task`/lock involved: both functions are plain `Bool ->
+    /// Bool`, deliberately factored out of `performTranscribe` so this logic — "what does the
+    /// early-stop callback tell WhisperKit to do", "is a completed result actually trustworthy"
+    /// — can be pinned down without a model load.
+    ///
+    /// Includes a mutation check: a deliberately inverted stand-in for `earlyStopDecision` (as if
+    /// the cancellation flag were read but never acted on) must disagree with the real function
+    /// once cancelled, proving the assertions above are actually discriminating rather than
+    /// vacuously true.
+    private static func previewEarlyCancelChecks() -> [String] {
+        var failures: [String] = []
+
+        // Before the flag is set: continue decoding (WhisperKit's callback returns `true`/`nil`
+        // to continue; `earlyStopDecision` returns `true` here for exactly that reason).
+        if WhisperKitEngine.earlyStopDecision(cancelled: false) != true {
+            failures.append("earlyStopDecision: expected `continue` (true) while the cancellation flag is unset")
+        }
+        // Once the flag is set: `false` is WhisperKit's documented "stop decoding early" signal.
+        if WhisperKitEngine.earlyStopDecision(cancelled: true) != false {
+            failures.append("earlyStopDecision: expected `stop` (false) once the cancellation flag is set")
+        }
+
+        // A cancelled preview's result must be discarded even though WhisperKit returns it
+        // normally (no throw) rather than surfacing the early stop as an error.
+        if WhisperKitEngine.shouldDiscardPreviewResult(cancelled: true) != true {
+            failures.append("shouldDiscardPreviewResult: expected a cancelled preview's partial result to be discarded")
+        }
+        if WhisperKitEngine.shouldDiscardPreviewResult(cancelled: false) != false {
+            failures.append("shouldDiscardPreviewResult: expected an uncancelled result to be kept")
+        }
+
+        // Mutation test: a stand-in that reads the flag but ignores it (equivalent to the
+        // early-stop check being "disabled") always says "keep decoding" — confirm it disagrees
+        // with the real function once cancelled, i.e. the real function's cancelled-case
+        // assertion above would actually have caught this regression.
+        func disabledEarlyStopDecision(cancelled: Bool) -> Bool { true }
+        if WhisperKitEngine.earlyStopDecision(cancelled: true) == disabledEarlyStopDecision(cancelled: true) {
+            failures.append("mutation test: earlyStopDecision(cancelled: true) must disagree with a disabled (never-stop) stand-in — the check above isn't discriminating")
+        }
+
+        // Same mutation shape for the discard decision: a stand-in that never discards (as if
+        // the cancellation flag were ignored after decode) must disagree with the real function
+        // once cancelled.
+        func disabledDiscardDecision(cancelled: Bool) -> Bool { false }
+        if WhisperKitEngine.shouldDiscardPreviewResult(cancelled: true) == disabledDiscardDecision(cancelled: true) {
+            failures.append("mutation test: shouldDiscardPreviewResult(cancelled: true) must disagree with a disabled (never-discard) stand-in — the check above isn't discriminating")
         }
 
         return failures

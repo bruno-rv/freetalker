@@ -150,6 +150,7 @@ final class AppCoordinator: ObservableObject {
             } else {
                 hud.show(text: "Recording…")
             }
+            startLivePreviewIfNeeded()
         } catch {
             lastError = "Mic error: \(error.localizedDescription)"
         }
@@ -157,6 +158,11 @@ final class AppCoordinator: ObservableObject {
 
     private func handleKeyUp() {
         guard isRecording else { return }
+        // Cancel the preview loop immediately, before anything else — the final pipeline below
+        // owns the buffer from here on. See PLAN 3 "Partial loop": "Key release: cancel loop
+        // immediately, ignore any in-flight partial result, run existing final pipeline
+        // untouched."
+        stopLivePreview()
         isRecording = false
         let samples = audioCapture.stop()
 
@@ -224,6 +230,143 @@ final class AppCoordinator: ObservableObject {
             return (fallback, false)
         }
         return (matched, true)
+    }
+
+    // MARK: - Live preview (PLAN 3)
+
+    /// Seconds between re-transcription ticks of the growing recording buffer. Periodic
+    /// re-transcription (not WhisperKit's streaming API) — see PLAN 3 "Design".
+    private static let livePreviewTickInterval: TimeInterval = 1.5
+    /// 1s of 16kHz mono audio — a tick on anything shorter is mostly silence/noise and wastes a
+    /// WhisperKit pass. See PLAN 3 "Partial loop".
+    private static let livePreviewMinSamples = 16_000
+    /// Constant-cost preview bound (Codex round-3 finding: early-stop is best-effort only —
+    /// WhisperKit 0.18.0's pre-decode stages (logmel, encoder CoreML calls) aren't interruptible
+    /// and the `TranscriptionCallback` fires from a low-priority detached task, so on a long
+    /// recording a preview tick's `keyUp` cancellation can still delay the final transcription
+    /// unboundedly. The hard bound is here, not in cancellation: every preview tick transcribes
+    /// only the last `livePreviewWindowSeconds` of the buffer (see `AudioCapture.snapshotSuffix`),
+    /// so a tick's worst-case cost — and therefore the final path's worst-case wait behind one —
+    /// is constant regardless of how long the recording has run. The early-stop callback in
+    /// `WhisperKitEngine` remains a second, opportunistic layer on top of this, not the bound
+    /// itself.
+    private static let livePreviewWindowSeconds: TimeInterval = 12
+    /// 16kHz mono → 12s * 16,000 samples/s.
+    private static let livePreviewWindowMaxSamples = Int(livePreviewWindowSeconds) * 16_000
+
+    private var livePreviewTask: Task<Void, Never>?
+    private var livePreviewGeneration = 0
+    private var livePreviewInFlight = false
+    private var lastLivePreviewText: String?
+
+    /// Pure gating for a single tick: whether it's even worth taking a buffer snapshot and
+    /// running a WhisperKit pass right now. No timers/audio/async — SelfCheck drives this
+    /// directly. See PLAN 3 "Partial loop": skip if not recording, skip if a partial is already
+    /// in flight (single in-flight gate, no backlog), skip if the buffer is still short.
+    nonisolated static func shouldRunLivePreviewTick(isRecording: Bool, isPartialInFlight: Bool, sampleCount: Int, minSamples: Int) -> Bool {
+        isRecording && !isPartialInFlight && sampleCount >= minSamples
+    }
+
+    /// Pure gating for whether a completed partial's text should actually reach the HUD: the
+    /// recording must still be in progress AND still be the same one the tick was started for
+    /// (generation match) — a fast keyUp→keyDown re-press bumps the generation, so a late result
+    /// from the previous recording can't land on top of the new one even though `isRecording` is
+    /// true again. See PLAN 3 "Failure modes to avoid".
+    nonisolated static func shouldAcceptLivePreviewResult(isRecording: Bool, resultGeneration: Int, currentGeneration: Int) -> Bool {
+        isRecording && resultGeneration == currentGeneration
+    }
+
+    /// Whether live preview should run at all for the current settings. Preview only ever
+    /// transcribes with the local WhisperKit engine (never per-chunk cloud uploads — cost/
+    /// latency/privacy, see PLAN 3 "Settings"): if WhisperKit itself is the active engine,
+    /// preview is enabled by the toggle alone; if Cloud STT is the active engine, preview only
+    /// runs when WhisperKit already happens to be loaded (never triggers a fresh load just for a
+    /// tick).
+    nonisolated static func isLivePreviewEnabled(settingEnabled: Bool, sttEngine: STTEngineKind, whisperKitLoaded: Bool) -> Bool {
+        guard settingEnabled else { return false }
+        return sttEngine == .whisperKit || whisperKitLoaded
+    }
+
+    /// Starts the periodic re-transcription loop for the recording that just began, if enabled.
+    /// Bumps the generation counter so any result from a previous recording's loop (already
+    /// cancelled, but possibly still finishing an in-flight tick) is discarded by
+    /// `shouldAcceptLivePreviewResult` rather than shown here.
+    private func startLivePreviewIfNeeded() {
+        livePreviewGeneration += 1
+        let generation = livePreviewGeneration
+        livePreviewInFlight = false
+        lastLivePreviewText = nil
+
+        guard Self.isLivePreviewEnabled(
+            settingEnabled: AppSettings.shared.livePreviewEnabled,
+            sttEngine: AppSettings.shared.sttEngine,
+            whisperKitLoaded: whisperEngine.isLoaded
+        ) else { return }
+
+        livePreviewTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(AppCoordinator.livePreviewTickInterval * 1_000_000_000))
+                guard let self, !Task.isCancelled else { return }
+                await self.runLivePreviewTick(generation: generation)
+            }
+        }
+    }
+
+    /// Cancels the loop. This is the opportunistic *second* layer, not the bound: the hard bound
+    /// on a preview tick's worst-case cost is `AudioCapture.snapshotSuffix`'s constant-size copy
+    /// plus `WhisperKitEngine`'s reduced preview `DecodingOptions`, both applied unconditionally
+    /// before this ever runs. `whisperEngine.transcribe(allowEarlyCancel:)` in
+    /// `runLivePreviewTick` additionally installs a per-token early-stop callback, so cancelling
+    /// `livePreviewTask` here *can* abort an in-flight decode within one decode step — but
+    /// WhisperKit 0.18.0's pre-decode stages (logmel, encoder CoreML calls) aren't interruptible
+    /// and that callback fires from a low-priority detached task, so this alone cannot bound
+    /// worst-case delay (Codex round-3 finding). With the window in place, worst-case final-path
+    /// delay behind an in-flight tick is now ≈ one `previewWindowSeconds`-window WhisperKit pass,
+    /// regardless of total recording length, whether or not this cancellation ever lands in
+    /// time. Any result from a tick that still squeezes out a completion in that window is
+    /// discarded anyway by `shouldAcceptLivePreviewResult` once `isRecording` flips false.
+    private func stopLivePreview() {
+        livePreviewTask?.cancel()
+        livePreviewTask = nil
+    }
+
+    private func runLivePreviewTick(generation: Int) async {
+        // Bounded at the copy, not after (Codex round-4 finding): `snapshotSuffix` takes only
+        // the last `livePreviewWindowMaxSamples` samples *inside* `samplesLock`, so a tick's
+        // copy cost — and the COW risk it would otherwise impose on the tap thread's append path
+        // — is constant regardless of total recording length. `totalCount` is the *whole*
+        // buffer's size, used below for the <1s skip gate, which is about whether there's enough
+        // real audio captured yet at all (a property of the whole recording, not of the window).
+        let (window, totalCount) = audioCapture.snapshotSuffix(maxSamples: Self.livePreviewWindowMaxSamples)
+        guard Self.shouldRunLivePreviewTick(
+            isRecording: isRecording,
+            isPartialInFlight: livePreviewInFlight,
+            sampleCount: totalCount,
+            minSamples: Self.livePreviewMinSamples
+        ) else { return }
+
+        livePreviewInFlight = true
+        defer { livePreviewInFlight = false }
+
+        // Runs through WhisperKitEngine's shared serial gate, so this never overlaps the final
+        // transcription. `allowEarlyCancel: true` (preview-only — never passed by the final
+        // pipeline) also selects `WhisperKitEngine`'s reduced preview `DecodingOptions` (see
+        // `performTranscribe`) and lets `stopLivePreview`'s cancellation opportunistically abort
+        // this decode within one decode step if it's already running when `keyUp` fires; a
+        // cancelled/early-stopped attempt throws and lands here as `try?`. Errors are otherwise
+        // non-fatal — the unchanged final pipeline still owns the real result; just let the next
+        // tick retry.
+        guard let result = try? await whisperEngine.transcribe(samples: window, allowEarlyCancel: true) else { return }
+
+        guard Self.shouldAcceptLivePreviewResult(isRecording: isRecording, resultGeneration: generation, currentGeneration: livePreviewGeneration) else { return }
+
+        let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Empty partial leaves whatever the HUD already shows (e.g. "Recording…", or a device
+        // fallback note) untouched, and only update when the text actually changed — avoids
+        // flashing/resizing the pill every tick. See PLAN 3 "Failure modes to avoid".
+        guard !text.isEmpty, text != lastLivePreviewText else { return }
+        lastLivePreviewText = text
+        hud.show(text: HUDController.tailTruncate(text))
     }
 
     private func runPipeline(samples: [Float], engine: any TranscriptionEngine, engineName: String, template: Template, appName: String?, target: InsertionTarget?) async {
