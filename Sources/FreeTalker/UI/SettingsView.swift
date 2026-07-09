@@ -17,12 +17,16 @@ struct SettingsView: View {
 private struct GeneralSettingsView: View {
     @ObservedObject private var settings = AppSettings.shared
     @ObservedObject private var coordinator = AppCoordinator.shared
+    @ObservedObject private var templateStore = TemplateStore.shared
     @State private var accessibilityTrusted = Permissions.isAccessibilityTrusted()
     @State private var microphoneAuthorized = Permissions.isMicrophoneAuthorized()
     @State private var inputMonitoringAuthorized = Permissions.isInputMonitoringAuthorized()
     @State private var capturingHotKey = false
     @State private var captureSession: HotKeyCapture.Session?
     @State private var inputDevices: [AudioInputDevices.Device] = []
+    @State private var runningApps: [NSRunningApplication] = []
+    @State private var newRuleBundleID: String?
+    @State private var newRuleTemplateID: String?
 
     @State private var cloudSTTKey = Keychain.get(account: Keychain.Account.cloudSTTKey) ?? ""
     @State private var cloudLLMKey = Keychain.get(account: Keychain.Account.cloudLLMKey) ?? ""
@@ -118,6 +122,13 @@ private struct GeneralSettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
+                Toggle("Live preview while recording", isOn: $settings.livePreviewEnabled)
+                if settings.sttEngine == .cloud && !coordinator.whisperEngine.isLoaded {
+                    Text("Cloud STT is active and the on-device model isn't loaded, so preview is disabled (avoids per-chunk cloud uploads).")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
                 if settings.sttEngine == .cloud {
                     TextField("Base URL", text: $settings.cloudSTTBaseURL)
                     SecureField("API key", text: $cloudSTTKey)
@@ -152,14 +163,86 @@ private struct GeneralSettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+
+            Section("Vocabulary") {
+                Text("One term per line — proper nouns, names, or jargon that should be recognized and spelled correctly. Used to bias transcription and post-processing.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                TextEditor(text: $settings.vocabularyText)
+                    .frame(minHeight: 100)
+                if let truncation = settings.vocabularyTruncation {
+                    Text("Using first \(truncation.kept) of \(truncation.total) terms (limit: \(AppSettings.maxVocabularyTerms) terms / \(AppSettings.maxVocabularyCharacterBudget) characters).")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+            }
+
+            Section("App Rules") {
+                Text("Automatically use a specific Template when dictating into a chosen app, instead of the Active Template.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                ForEach(settings.appRules.keys.sorted(), id: \.self) { bundleID in
+                    HStack {
+                        Text(displayName(forBundleID: bundleID))
+                        Spacer()
+                        Text(templateStore.template(id: settings.appRules[bundleID] ?? "")?.name ?? "Unknown Template")
+                            .foregroundStyle(.secondary)
+                        Button {
+                            settings.appRules.removeValue(forKey: bundleID)
+                        } label: { Image(systemName: "minus.circle") }
+                        .buttonStyle(.borderless)
+                    }
+                }
+                HStack {
+                    Picker("App", selection: $newRuleBundleID) {
+                        Text("Choose an app").tag(nil as String?)
+                        ForEach(runningApps, id: \.bundleIdentifier) { app in
+                            Text(app.localizedName ?? app.bundleIdentifier ?? "Unknown").tag(app.bundleIdentifier)
+                        }
+                    }
+                    Picker("Template", selection: $newRuleTemplateID) {
+                        Text("Choose a template").tag(nil as String?)
+                        ForEach(templateStore.templates) { template in
+                            Text(template.name).tag(template.id as String?)
+                        }
+                    }
+                    Button("Add") {
+                        guard let newRuleBundleID, let newRuleTemplateID else { return }
+                        settings.appRules[newRuleBundleID] = newRuleTemplateID
+                        self.newRuleBundleID = nil
+                        self.newRuleTemplateID = nil
+                    }
+                    .disabled(newRuleBundleID == nil || newRuleTemplateID == nil)
+                }
+                Button("Refresh app list") { runningApps = Self.enumerateRunningApps() }
+                    .font(.caption)
+            }
         }
         .formStyle(.grouped)
-        .onAppear { inputDevices = AudioInputDevices.enumerate() }
+        .onAppear {
+            inputDevices = AudioInputDevices.enumerate()
+            runningApps = Self.enumerateRunningApps()
+        }
         .onReceive(refreshTimer) { _ in
             accessibilityTrusted = Permissions.isAccessibilityTrusted()
             microphoneAuthorized = Permissions.isMicrophoneAuthorized()
             inputMonitoringAuthorized = Permissions.isInputMonitoringAuthorized()
         }
+    }
+
+    /// Running, user-facing (`.regular` activation policy — excludes menu-bar-only/background
+    /// agents) apps, sorted by name, for the App Rules "App" picker. See PLAN 2 "Settings UI".
+    private static func enumerateRunningApps() -> [NSRunningApplication] {
+        NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular && $0.bundleIdentifier != nil }
+            .sorted { ($0.localizedName ?? "") < ($1.localizedName ?? "") }
+    }
+
+    /// Best-effort display name for an existing rule's bundle id: the running app's name if
+    /// still running, else the bundle id itself (no new API surface just to resolve a name for
+    /// an app that isn't running — see ponytail).
+    private func displayName(forBundleID bundleID: String) -> String {
+        runningApps.first(where: { $0.bundleIdentifier == bundleID })?.localizedName ?? bundleID
     }
 
     private func beginCapture() {
