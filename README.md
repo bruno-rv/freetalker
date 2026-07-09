@@ -59,7 +59,12 @@ Settings (menu bar → "Settings…") shows live permission status.
 - The refined text is pasted at your cursor. If pasting isn't possible, it's left on the
   pasteboard and the HUD says "Copied — paste manually".
 - **Library…** opens the searchable history of past Dictations, with "Re-process with…" to
-  re-run a stored transcript through a different Template.
+  re-run a stored transcript through a different Template. Each entry can be deleted
+  individually, or wiped entirely with **Delete All** — which also purges any saved debug audio
+  (`last-dictation.wav`, failed-transcription recordings) alongside the database rows.
+- An optional **Redo-last key** (Settings → General, unbound by default) re-inserts the newest
+  Library entry at your cursor without re-recording — handy when a paste got dismissed or
+  overwritten.
 
 ## Templates
 
