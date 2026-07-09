@@ -72,3 +72,21 @@ No blocking findings. VERDICT: APPROVED.
 
 ## Resolution
 Converged in 5 rounds (12 + 5 + 2 + 1 + 0 findings; all 20 accepted, none rejected). Plan locked; parallel build dispatched.
+
+# Code Review Log (post-merge, main @ 573fe58)
+
+## Code Round 1 — Codex (thread 019f4847-8468-7bb0-87fa-f592bab7903d, model pinned gpt-5.5)
+(Notes: first attempt hung on stdin — fixed with </dev/null; second 400'd on new default model gpt-5.6-sol — pinned gpt-5.5; third accidentally reviewed a stale worktree due to persisted shell cwd — worktrees removed, rerun from root.)
+8 findings, VERDICT: REVISE.
+1. Delete All confirmation shows FILTERED count ("0 Entries" under active search) while wiping whole archive.
+2. Database.readAll treats any non-ROW step as EOF — latestDictation() turns SQLITE_BUSY/ERROR into nil, collapsing empty-vs-unavailable.
+3. dictationExists returns false on SQLite errors — reprocess silently skips persistence as if source deleted.
+4. deleteAll: checkpoint throw after successful DELETE skips audio purge + refresh.
+5. Audio purge removes EVERY child of failed-dictations and swallows failures.
+6. Hotkey re-plumb is manual in SettingsView — direct AppSettings changes leave stale matchers.
+7. Redo two-matcher SelfCheck mirrors the dispatch instead of exercising production path.
+8. wal_checkpoint busy path never exercised by SelfCheck.
+Plus 2 carried from the mistargeted round (real redo-code findings): 9. redoLast shows success HUD even when Insertion.insert returns false; 10. persisted redoHotKeySpec decoded without constraint validation vs PTT.
+
+### Claude's response
+All 10 ACCEPTED (3 with fail-open semantics: on unknown DB state reprocess persists rather than drops). Fix agent dispatched.

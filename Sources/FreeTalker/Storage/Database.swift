@@ -111,33 +111,65 @@ final class Database {
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.sqlFailed(lastError())
         }
-        try walCheckpointTruncate()
+        try checkpointTruncate()
     }
 
     /// Clears the entire Library. `VACUUM` reclaims (and overwrites) freed pages so cleared text
-    /// doesn't linger there, then a verified WAL truncate clears the write-ahead log. See
-    /// PLAN.md step 1.
+    /// doesn't linger there. Deliberately does NOT also checkpoint (see `checkpointTruncate`,
+    /// called as a separate step by `LibraryStore.deleteAll()`) — splitting them lets a caller
+    /// tell "rows are gone, only the checkpoint housekeeping failed" apart from "nothing was
+    /// deleted at all", so a checkpoint-only failure never masks that the row deletion itself
+    /// already succeeded. See PLAN.md step 1, Round 1 Codex finding 4.
     func deleteAllDictations() throws {
         try exec("DELETE FROM dictations;")
         try exec("VACUUM;")
-        try walCheckpointTruncate()
     }
 
     /// Whether a Dictation row with this id still exists — used by `AppCoordinator.reprocess` to
     /// detect a source row deleted mid-flight (e.g. by Delete All while an LLM call was in
-    /// flight). See PLAN.md step 5.
+    /// flight). A definitive answer only: a genuine SQLite error (busy/corrupt/etc., classified
+    /// as `.other` below) throws rather than being coerced to `false` — `LibraryStore.exists(id:)`
+    /// turns that throw into `nil` ("unknown"), which `reprocess`'s fail-open check treats
+    /// differently from a confirmed-deleted row. See PLAN.md step 5, Round 1 Codex finding 3.
     func dictationExists(id: Int64) throws -> Bool {
         let stmt = try prepare("SELECT 1 FROM dictations WHERE id = ? LIMIT 1;")
         defer { sqlite3_finalize(stmt) }
         sqlite3_bind_int64(stmt, 1, id)
-        return sqlite3_step(stmt) == SQLITE_ROW
+        switch Self.classifyStep(sqlite3_step(stmt)) {
+        case .row: return true
+        case .done: return false
+        case .other: throw DatabaseError.sqlFailed(lastError())
+        }
+    }
+
+    /// Three-way classification of a `sqlite3_step` result: `.row` (more data), `.done` (clean
+    /// EOF/success), or `.other` (anything else — `SQLITE_BUSY`, `SQLITE_ERROR`, etc.). Shared by
+    /// `readAll`'s scan-loop-end check and `dictationExists`'s existence check, so neither
+    /// mistakes a genuine SQLite error for a normal "no more rows"/"row not found" outcome — the
+    /// bug both Round 1 Codex findings 2/3 caught (any non-`SQLITE_ROW` step silently read as
+    /// EOF/false instead of a failure). Pure `Int32 -> StepOutcome`, exercised directly by
+    /// SelfCheck with real SQLite result codes: deterministically forcing a genuine mid-scan
+    /// `SQLITE_BUSY`/`SQLITE_ERROR` from Swift would require faults WAL mode is specifically
+    /// designed to avoid (a concurrent reader never blocks on a writer), so the decision this fix
+    /// hinges on is tested directly instead of via fault injection.
+    enum StepOutcome: Equatable { case row, done, other }
+
+    static func classifyStep(_ result: Int32) -> StepOutcome {
+        switch result {
+        case SQLITE_ROW: return .row
+        case SQLITE_DONE: return .done
+        default: return .other
+        }
     }
 
     /// Runs `PRAGMA wal_checkpoint(TRUNCATE)` as a prepared statement and checks the result
     /// row's busy column (first column) — SQLite reports checkpoint-busy via the result row, not
-    /// an exec error, so a plain `exec(...)` would silently ignore a failed truncate. See
-    /// PLAN.md step 1.
-    private func walCheckpointTruncate() throws {
+    /// an exec error, so a plain `exec(...)` would silently ignore a failed truncate. Called
+    /// after `deleteDictation`/`deleteAllDictations` complete their row mutation — kept as a
+    /// separate throwing step (not folded back into `deleteAllDictations`) so
+    /// `LibraryStore.deleteAll()` can tell a checkpoint-only failure apart from a row-deletion
+    /// failure. See PLAN.md step 1, Round 1 Codex finding 4.
+    func checkpointTruncate() throws {
         let stmt = try prepare("PRAGMA wal_checkpoint(TRUNCATE);")
         defer { sqlite3_finalize(stmt) }
         guard sqlite3_step(stmt) == SQLITE_ROW else {
@@ -147,6 +179,18 @@ final class Database {
         guard busy == 0 else {
             throw DatabaseError.sqlFailed("wal_checkpoint(TRUNCATE) busy — checkpoint incomplete")
         }
+    }
+
+    /// Total (unfiltered) Library row count — the source of truth for
+    /// `LibraryStore.totalCount()` (the Delete All confirmation dialog), immune to an active
+    /// Library search filter. See Round 1 Codex finding 1.
+    func totalCount() throws -> Int {
+        let stmt = try prepare("SELECT COUNT(*) FROM dictations;")
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            throw DatabaseError.sqlFailed(lastError())
+        }
+        return Int(sqlite3_column_int64(stmt, 0))
     }
 
     /// Reads back `PRAGMA secure_delete` (0/1) — exercised by SelfCheck to confirm the on-open
@@ -225,9 +269,16 @@ final class Database {
         return tokens.joined(separator: " ")
     }
 
+    /// Scans every row via `sqlite3_step`, throwing unless the loop ends at a clean `SQLITE_DONE`
+    /// EOF — a `SQLITE_BUSY`/`SQLITE_ERROR`/etc. mid-scan (`.other`, see `classifyStep`) is a
+    /// failure, not "no more rows", so callers (notably `latestDictation()`, which
+    /// `AppCoordinator.redoLast()` depends on to distinguish "empty Library" from "Library
+    /// unavailable") never silently see a truncated result as a normal empty/short one. See
+    /// Round 1 Codex finding 2.
     private func readAll(_ stmt: OpaquePointer?) throws -> [Dictation] {
         var results: [Dictation] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var stepResult = sqlite3_step(stmt)
+        while Self.classifyStep(stepResult) == .row {
             let id = sqlite3_column_int64(stmt, 0)
             let ts = sqlite3_column_double(stmt, 1)
             let language = columnText(stmt, 2)
@@ -246,6 +297,10 @@ final class Database {
                 engine: engine,
                 sourceID: sourceID
             ))
+            stepResult = sqlite3_step(stmt)
+        }
+        guard Self.classifyStep(stepResult) == .done else {
+            throw DatabaseError.sqlFailed(lastError())
         }
         return results
     }

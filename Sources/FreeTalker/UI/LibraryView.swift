@@ -10,6 +10,11 @@ struct LibraryView: View {
     @State private var errorMessage: String?
 
     var body: some View {
+        // Unfiltered total, straight from the DB — NOT `store.dictations.count`, which is
+        // filtered by an active search and would otherwise misreport e.g. "0 Entries" in the
+        // Delete All dialog while the whole archive is about to be wiped. See Round 1 Codex
+        // finding 1.
+        let deleteAllCount = store.totalCount()
         HSplitView {
             VStack(spacing: 0) {
                 TextField("Search", text: $store.searchText)
@@ -76,7 +81,7 @@ struct LibraryView: View {
             Text("This cannot be undone. Re-processed copies of this Dictation, if any, are separate entries and remain.")
         }
         .confirmationDialog(
-            "Delete All \(store.dictations.count) \(store.dictations.count == 1 ? "Entry" : "Entries")?",
+            "Delete All \(deleteAllCount) \(deleteAllCount == 1 ? "Entry" : "Entries")?",
             isPresented: $showDeleteAllConfirm,
             titleVisibility: .visible
         ) {
@@ -96,7 +101,7 @@ struct LibraryView: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Permanently deletes all \(store.dictations.count) Library entries and any saved debug audio. This cannot be undone.")
+            Text("Permanently deletes all \(deleteAllCount) Library entries and any saved debug audio. This cannot be undone.")
         }
         .alert(
             "Library Error",

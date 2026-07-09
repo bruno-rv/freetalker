@@ -1,4 +1,5 @@
 import CoreGraphics
+import CSQLite
 import Foundation
 
 /// Runnable without any test framework. This CLT-only environment (no Xcode.app) has no
@@ -215,10 +216,13 @@ enum SelfCheck {
             failures.append(contentsOf: cloudLLMRoutingChecks())
             failures.append(contentsOf: handsFreeChecks())
             failures.append(contentsOf: libraryDeletionChecks())
+            failures.append(contentsOf: databaseStepClassificationChecks())
+            failures.append(contentsOf: checkpointBusyChecks())
+            failures.append(contentsOf: libraryPurgeScopeChecks())
             failures.append(contentsOf: redoLastChecks())
 
             if failures.isEmpty {
-                print("SelfCheck PASSED (template seeding, FTS round-trip, pipeline contract, mic device enumeration, hotkey spec/matcher, vocabulary normalization/injection, app rule resolution, paste-target drift, prompt app-name sanitization, live preview gating/availability, SerialGate cancellation, preview early-cancel decisions, built-in template prompt upgrade, LLM provider defaults, BYOK Keychain key migration, global cloud-selection routing, hands-free recording state machine/esc/cap-clamp/cancel, Library deletion: per-row/Delete All/latestDictation tiebreak/dangling source_id/secure_delete, Redo Last gating/spec-constraints/matcher)")
+                print("SelfCheck PASSED (template seeding, FTS round-trip, pipeline contract, mic device enumeration, hotkey spec/matcher, vocabulary normalization/injection, app rule resolution, paste-target drift, prompt app-name sanitization, live preview gating/availability, SerialGate cancellation, preview early-cancel decisions, built-in template prompt upgrade, LLM provider defaults, BYOK Keychain key migration, global cloud-selection routing, hands-free recording state machine/esc/cap-clamp/cancel, Library deletion: per-row/Delete All/latestDictation tiebreak/dangling source_id/secure_delete/unfiltered total count, SQLite step classification (readAll/dictationExists error propagation), WAL checkpoint busy path, debug-audio purge scoping, Redo Last gating/spec-constraints/matcher/result message/spec validation)")
                 exit(0)
             } else {
                 print("SelfCheck FAILED:")
@@ -1369,7 +1373,28 @@ enum SelfCheck {
             let keepID = try db.insertDictation(timestamp: Date(), language: "en", template: "Clean Dictation", transcript: "alpha bravo charlie", refined: "Alpha bravo charlie.", engine: "WhisperKit")
             let deleteID = try db.insertDictation(timestamp: Date(), language: "en", template: "Clean Dictation", transcript: "delta echo foxtrot", refined: "Delta echo foxtrot.", engine: "WhisperKit")
 
+            // totalCount() (Round 1 Codex finding 1): unfiltered row count, the source of truth
+            // behind LibraryStore.totalCount() / the Delete All confirmation dialog text.
+            if try db.totalCount() != 2 {
+                failures.append("totalCount: expected 2 rows before deletion, got \(try db.totalCount())")
+            }
+
+            // dictationExists (Round 1 Codex finding 3): row present -> true, absent -> false.
+            if try db.dictationExists(id: keepID) != true {
+                failures.append("dictationExists: expected true for an existing row")
+            }
+            if try db.dictationExists(id: deleteID + 1_000_000) != false {
+                failures.append("dictationExists: expected false for a nonexistent id")
+            }
+
             try db.deleteDictation(id: deleteID)
+
+            if try db.totalCount() != 1 {
+                failures.append("totalCount: expected 1 row after deleting 1 of 2, got \(try db.totalCount())")
+            }
+            if try db.dictationExists(id: deleteID) != false {
+                failures.append("dictationExists: expected false for a just-deleted row")
+            }
 
             let remaining = try db.allDictations()
             if remaining.count != 1 {
@@ -1471,6 +1496,195 @@ enum SelfCheck {
         return failures
     }
 
+    /// Checks for `Database.classifyStep` (Round 1 Codex findings 2/3): the three-way
+    /// `sqlite3_step` result classification that `readAll`'s scan-loop-end check and
+    /// `dictationExists`'s existence check both hinge on — `.row`/`.done` are the two "normal"
+    /// outcomes; everything else (`SQLITE_BUSY`, `SQLITE_ERROR`, ...) must classify as `.other`
+    /// so a genuine SQLite error is never mistaken for "no more rows"/"row not found". Real
+    /// SQLite result-code constants, no live database needed — see `Database.classifyStep`'s doc
+    /// comment for why a genuine mid-scan error isn't forced live here (WAL mode is specifically
+    /// designed so a concurrent reader never blocks/errors on a writer, unlike the checkpoint
+    /// busy path below, which genuinely can be forced).
+    private static func databaseStepClassificationChecks() -> [String] {
+        var failures: [String] = []
+
+        if Database.classifyStep(SQLITE_ROW) != .row {
+            failures.append("classifyStep: expected SQLITE_ROW to classify as .row")
+        }
+        if Database.classifyStep(SQLITE_DONE) != .done {
+            failures.append("classifyStep: expected SQLITE_DONE to classify as .done")
+        }
+        if Database.classifyStep(SQLITE_BUSY) != .other {
+            failures.append("classifyStep: expected SQLITE_BUSY to classify as .other (must throw, not silently read as EOF/false)")
+        }
+        if Database.classifyStep(SQLITE_ERROR) != .other {
+            failures.append("classifyStep: expected SQLITE_ERROR to classify as .other")
+        }
+        if Database.classifyStep(SQLITE_MISUSE) != .other {
+            failures.append("classifyStep: expected SQLITE_MISUSE to classify as .other")
+        }
+
+        // Mutation test: a stand-in that treats anything-not-ROW as .done (the pre-fix behavior
+        // readAll had) must disagree with the real function on SQLITE_BUSY/SQLITE_ERROR — proves
+        // the assertions above actually discriminate the fix from the bug they replaced.
+        func preFixClassify(_ result: Int32) -> Database.StepOutcome { result == SQLITE_ROW ? .row : .done }
+        if Database.classifyStep(SQLITE_BUSY) == preFixClassify(SQLITE_BUSY) {
+            failures.append("mutation test: classifyStep(SQLITE_BUSY) must disagree with a pre-fix any-non-ROW-is-EOF stand-in — the check above isn't discriminating")
+        }
+
+        return failures
+    }
+
+    /// Checks for the WAL checkpoint busy path (Round 1 Codex finding 8) and, alongside it, that
+    /// row deletion succeeds independently of the checkpoint (Round 1 Codex finding 4's premise,
+    /// which `LibraryStore.deleteAll()`'s ordering fix relies on). A second raw sqlite3
+    /// connection to the same file holds an open read transaction (`BEGIN; SELECT`, uncommitted)
+    /// — `PRAGMA wal_checkpoint(TRUNCATE)` cannot complete while a reader is active, so SQLite
+    /// reports the checkpoint busy via the result row (not a query error — see
+    /// `Database.checkpointTruncate`'s doc comment), which must surface as a thrown error rather
+    /// than being silently swallowed. Releasing the reader (`COMMIT`) lets a follow-up checkpoint
+    /// succeed, confirming the busy result above genuinely came from the concurrent reader.
+    private static func checkpointBusyChecks() -> [String] {
+        var failures: [String] = []
+
+        // deleteDictation: DELETE succeeds and commits immediately (implicit autocommit), but the
+        // checkpoint that follows it inside the same call is blocked by the reader — the whole
+        // call must throw, not silently succeed with an untruncated WAL.
+        do {
+            let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tempDir) }
+            let dbPath = tempDir.appendingPathComponent("checkpoint-busy-check.db")
+
+            let db = try Database(path: dbPath)
+            let firstID = try db.insertDictation(timestamp: Date(), language: "en", template: "Clean Dictation", transcript: "mike november oscar", refined: "Mike november oscar.", engine: "WhisperKit")
+            let secondID = try db.insertDictation(timestamp: Date(), language: "en", template: "Clean Dictation", transcript: "papa quebec romeo", refined: "Papa quebec romeo.", engine: "WhisperKit")
+
+            var readerHandle: OpaquePointer?
+            guard sqlite3_open(dbPath.path, &readerHandle) == SQLITE_OK else {
+                failures.append("checkpointBusyChecks: failed to open second raw connection")
+                return failures
+            }
+            defer { sqlite3_close(readerHandle) }
+            guard sqlite3_exec(readerHandle, "BEGIN; SELECT * FROM dictations LIMIT 1;", nil, nil, nil) == SQLITE_OK else {
+                failures.append("checkpointBusyChecks: failed to start reader transaction")
+                return failures
+            }
+
+            var threwWhileBusy = false
+            do {
+                try db.deleteDictation(id: firstID)
+            } catch {
+                threwWhileBusy = true
+            }
+            if !threwWhileBusy {
+                failures.append("deleteDictation: expected a busy WAL checkpoint (blocked by a concurrent reader) to throw, but it succeeded")
+            }
+            // The row DELETE itself already committed (SQLite autocommits each statement absent
+            // an explicit transaction) before the checkpoint ran and threw — confirms the failure
+            // really is checkpoint-only, the same fact `deleteAllDictations`'s split relies on.
+            if try db.dictationExists(id: firstID) != false {
+                failures.append("deleteDictation: expected the row itself to be gone even though the trailing checkpoint threw busy")
+            }
+
+            sqlite3_exec(readerHandle, "COMMIT;", nil, nil, nil)
+
+            do {
+                try db.deleteDictation(id: secondID)
+            } catch {
+                failures.append("deleteDictation: expected checkpoint to succeed once the concurrent reader released its transaction, threw \(error)")
+            }
+        } catch {
+            failures.append("checkpointBusyChecks (deleteDictation) setup threw: \(error)")
+        }
+
+        // deleteAllDictations: row deletion (DELETE + VACUUM) must succeed even while a
+        // concurrent reader blocks the checkpoint — this is the guarantee
+        // `LibraryStore.deleteAll()`'s defer-free explicit sequencing (Round 1 Codex finding 4)
+        // depends on to purge debug audio + refresh regardless of a checkpoint-only failure.
+        do {
+            let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tempDir) }
+            let dbPath = tempDir.appendingPathComponent("delete-all-busy-check.db")
+
+            let db = try Database(path: dbPath)
+            _ = try db.insertDictation(timestamp: Date(), language: "en", template: "Clean Dictation", transcript: "sierra tango uniform", refined: "Sierra tango uniform.", engine: "WhisperKit")
+
+            var readerHandle: OpaquePointer?
+            guard sqlite3_open(dbPath.path, &readerHandle) == SQLITE_OK else {
+                failures.append("checkpointBusyChecks (deleteAll): failed to open second raw connection")
+                return failures
+            }
+            defer { sqlite3_close(readerHandle) }
+            guard sqlite3_exec(readerHandle, "BEGIN; SELECT * FROM dictations LIMIT 1;", nil, nil, nil) == SQLITE_OK else {
+                failures.append("checkpointBusyChecks (deleteAll): failed to start reader transaction")
+                return failures
+            }
+
+            do {
+                try db.deleteAllDictations()
+            } catch {
+                failures.append("deleteAllDictations: expected row deletion to succeed even while a concurrent reader blocks the checkpoint, threw \(error)")
+            }
+            let remaining = try db.allDictations()
+            if !remaining.isEmpty {
+                failures.append("deleteAllDictations: expected 0 rows after Delete All even while the checkpoint is blocked, got \(remaining.count)")
+            }
+
+            var checkpointThrew = false
+            do {
+                try db.checkpointTruncate()
+            } catch {
+                checkpointThrew = true
+            }
+            if !checkpointThrew {
+                failures.append("checkpointTruncate: expected the blocked checkpoint to throw while the reader still holds its transaction")
+            }
+
+            sqlite3_exec(readerHandle, "COMMIT;", nil, nil, nil)
+            do {
+                try db.checkpointTruncate()
+            } catch {
+                failures.append("checkpointTruncate: expected checkpoint to succeed once the reader released its transaction, threw \(error)")
+            }
+        } catch {
+            failures.append("checkpointBusyChecks (deleteAllDictations) setup threw: \(error)")
+        }
+
+        return failures
+    }
+
+    /// Checks for `LibraryStore.shouldPurgeFailedDictationFile` (Round 1 Codex finding 5): only
+    /// `.wav` files (case-insensitive) under `failed-dictations/` are purged — never every child
+    /// of the directory indiscriminately. Pure `String -> Bool`, no filesystem/real Library
+    /// touched.
+    private static func libraryPurgeScopeChecks() -> [String] {
+        var failures: [String] = []
+
+        if !LibraryStore.shouldPurgeFailedDictationFile(pathExtension: "wav") {
+            failures.append("shouldPurgeFailedDictationFile: expected \"wav\" to be purged")
+        }
+        if !LibraryStore.shouldPurgeFailedDictationFile(pathExtension: "WAV") {
+            failures.append("shouldPurgeFailedDictationFile: expected extension matching to be case-insensitive")
+        }
+        if LibraryStore.shouldPurgeFailedDictationFile(pathExtension: "txt") {
+            failures.append("shouldPurgeFailedDictationFile: expected a non-wav file to be left alone")
+        }
+        if LibraryStore.shouldPurgeFailedDictationFile(pathExtension: "") {
+            failures.append("shouldPurgeFailedDictationFile: expected an extensionless entry (e.g. a stray directory or dotfile) to be left alone")
+        }
+
+        // Mutation test: a stand-in that purges everything (the pre-fix behavior) must disagree
+        // with the real function for a non-wav extension.
+        func preFixShouldPurge(pathExtension: String) -> Bool { true }
+        if LibraryStore.shouldPurgeFailedDictationFile(pathExtension: "txt") == preFixShouldPurge(pathExtension: "txt") {
+            failures.append("mutation test: shouldPurgeFailedDictationFile(\"txt\") must disagree with a purge-everything stand-in — the check above isn't discriminating")
+        }
+
+        return failures
+    }
+
     /// Redo Last checks (CONTEXT.md "Redo Last"): the gating+outcome truth table
     /// (`AppCoordinator.redoLastAction`, PLAN.md step 10), the recorder-level spec constraints
     /// (`HotKeySpec` helpers, step 9), and the two-matcher-on-one-tap contract (step 8) — all
@@ -1495,6 +1709,23 @@ enum SelfCheck {
         expectAction("idle + DB error -> libraryUnavailable", isRecording: false, isProcessing: false, fetchResult: .failure(FakeDatabaseError()), want: .libraryUnavailable)
         expectAction("idle + empty Library -> nothingToRedo", isRecording: false, isProcessing: false, fetchResult: .success(nil), want: .nothingToRedo)
         expectAction("idle + row present -> insert(refined)", isRecording: false, isProcessing: false, fetchResult: .success(sample), want: .insert(refined: "r"))
+
+        // MARK: Result message (Round 1 Codex finding 9).
+        //
+        // `redoLast()` must never report "Redone" when `Insertion.insert` actually left the text
+        // on the pasteboard only (e.g. paste-target drift, no focused element) — mirrors the
+        // existing manual-paste wording `runPipeline` uses for the same distinction.
+        if AppCoordinator.redoLastResultMessage(posted: true) != "Redone" {
+            failures.append("redoLastResultMessage: expected \"Redone\" when the paste was posted")
+        }
+        if AppCoordinator.redoLastResultMessage(posted: false) != "Copied — paste manually" {
+            failures.append("redoLastResultMessage: expected \"Copied — paste manually\" when the paste was not posted")
+        }
+        // Mutation test: a stand-in that always reports success must disagree once posted:false.
+        func alwaysRedoneMessage(posted: Bool) -> String { "Redone" }
+        if AppCoordinator.redoLastResultMessage(posted: false) == alwaysRedoneMessage(posted: false) {
+            failures.append("mutation test: redoLastResultMessage(posted: false) must disagree with an always-\"Redone\" stand-in — the check above isn't discriminating")
+        }
 
         // MARK: Recorder-level spec constraints (step 9).
         let dLCtrl: UInt64 = 0x0001, dRCtrl: UInt64 = 0x2000
@@ -1534,31 +1765,64 @@ enum SelfCheck {
             failures.append("redoShadowsHeldPTT: a modifiers+key PTT spec should never be considered shadowed (it already needs its own keyDown)")
         }
 
-        // MARK: Two-matcher-on-one-tap contract (step 8).
+        // MARK: Combined recorder-level validity (Round 1 Codex finding 10).
         //
-        // Mirrors HotKeyManager.handle: the SAME synthetic event stream fed to two independent
-        // HotKeyMatcher instances (one per spec), exactly as the real event tap callback feeds
-        // both `matcher` and `redoMatcher`. Verifies the redo chord's matcher fires exactly once
-        // per press (autorepeat suppressed, release never fires) while the PTT matcher's own
-        // engage/release sequence — fed the identical stream — is completely unaffected.
+        // `HotKeySpec.validRedoSpec` is what `AppSettings` re-validates a persisted/hand-edited
+        // Redo Last pair against on load and whenever either spec changes — folds
+        // isValidRedoSpec/collides/redoShadowsHeldPTT into the single accept-or-nil decision.
+        // Exercising `AppSettings.shared` itself is deliberately avoided here: its
+        // `hotKeySpec`/`redoHotKeySpec` are now wired (via `AppCoordinator`'s central re-plumb
+        // subscription, Round 1 Codex finding 6) to attempt a real CGEventTap recreation on
+        // change, which SelfCheck never triggers — see that subscription's doc comment.
+        let validCandidate = HotKeySpec(modifiers: dLCmd, keyCode: 2) // ⌘D
+        let disjointPTT = HotKeySpec(modifiers: 0x0040, keyCode: nil) // Right ⌥ (dRAlt), unrelated
+        if HotKeySpec.validRedoSpec(validCandidate, pttSpec: disjointPTT) != validCandidate {
+            failures.append("validRedoSpec: expected a valid, non-colliding, non-shadowed candidate to be accepted unchanged")
+        }
+        let modifierOnlyCandidate = HotKeySpec(modifiers: dLCtrl | dLAlt, keyCode: nil)
+        if HotKeySpec.validRedoSpec(modifierOnlyCandidate, pttSpec: disjointPTT) != nil {
+            failures.append("validRedoSpec: expected a modifier-only candidate to be rejected (nil)")
+        }
+        let collidingPTT = HotKeySpec(modifiers: dLCmd, keyCode: 2) // same as validCandidate
+        if HotKeySpec.validRedoSpec(validCandidate, pttSpec: collidingPTT) != nil {
+            failures.append("validRedoSpec: expected a candidate colliding with the PTT spec to be rejected (nil)")
+        }
+        let shadowedPTT = HotKeySpec(modifiers: dLCtrl | dLAlt, keyCode: nil) // modifier-only, subset of the candidate below
+        let shadowedCandidate = HotKeySpec(modifiers: dLCtrl | dLAlt, keyCode: 2)
+        if HotKeySpec.validRedoSpec(shadowedCandidate, pttSpec: shadowedPTT) != nil {
+            failures.append("validRedoSpec: expected a candidate that shadow-engages the held PTT modifiers to be rejected (nil)")
+        }
+        // Mutation test: a stand-in that always accepts must disagree once the candidate collides.
+        func alwaysValid(_ candidate: HotKeySpec, pttSpec: HotKeySpec) -> HotKeySpec? { candidate }
+        if HotKeySpec.validRedoSpec(validCandidate, pttSpec: collidingPTT) == alwaysValid(validCandidate, pttSpec: collidingPTT) {
+            failures.append("mutation test: validRedoSpec must disagree with an always-valid stand-in once the candidate collides — the check above isn't discriminating")
+        }
+
+        // MARK: Two-matcher-on-one-tap contract (step 8, Round 1 Codex finding 7).
+        //
+        // Drives `HotKeyManager.dispatch` — the actual production dispatch decision
+        // `handle(type:event:)` delegates to, not a re-derived mirror of it — with the SAME
+        // synthetic event stream, exactly as the real event tap callback feeds both `matcher` and
+        // `redoMatcher`. Verifies the redo chord's matcher fires exactly once per press
+        // (autorepeat suppressed, release never fires) while the PTT matcher's own engage/release
+        // sequence — fed the identical stream — is completely unaffected.
         do {
             let alt = CGEventFlags.maskAlternate.rawValue
             let cmd = CGEventFlags.maskCommand.rawValue
             let dRAlt: UInt64 = 0x0040
 
             var ptt = HotKeyMatcher(spec: HotKeySpec(modifiers: dRAlt, keyCode: nil)) // Right ⌥
-            var redo = HotKeyMatcher(spec: HotKeySpec(modifiers: dLCmd, keyCode: 2)) // ⌘D
+            var redo: HotKeyMatcher? = HotKeyMatcher(spec: HotKeySpec(modifiers: dLCmd, keyCode: 2)) // ⌘D
 
             var redoEngageCount = 0
             var pttEngageCount = 0
             var pttReleaseCount = 0
 
             func feed(_ kind: KeyEventKind, keyCode: UInt16 = 0, flags: UInt64, isAutorepeat: Bool = false) {
-                let pttOutcome = ptt.handle(kind, keyCode: keyCode, flags: flags, isAutorepeat: isAutorepeat)
-                let redoOutcome = redo.handle(kind, keyCode: keyCode, flags: flags, isAutorepeat: isAutorepeat)
-                if pttOutcome.engaged { pttEngageCount += 1 }
-                if pttOutcome.released { pttReleaseCount += 1 }
-                if redoOutcome.engaged { redoEngageCount += 1 }
+                let outcome = HotKeyManager.dispatch(kind: kind, keyCode: keyCode, flags: flags, isAutorepeat: isAutorepeat, matcher: &ptt, redoMatcher: &redo)
+                if outcome.pttEngaged { pttEngageCount += 1 }
+                if outcome.pttReleased { pttReleaseCount += 1 }
+                if outcome.redoEngaged { redoEngageCount += 1 }
             }
 
             feed(.flagsChanged, flags: alt | dRAlt) // PTT press: Right ⌥ held alone -> PTT engages.

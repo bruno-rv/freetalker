@@ -115,6 +115,22 @@ struct HotKeySpec: Codable, Equatable {
         return redoGeneric & pttGeneric == pttGeneric
     }
 
+    /// Full recorder-level validity check for a candidate Redo Last spec against the currently
+    /// bound PTT spec: must end in a real key (`isValidRedoSpec`), must not collide with the PTT
+    /// spec, and must not be shadow-engaged before its own keyDown by holding the PTT spec's
+    /// modifiers. Returns the candidate unchanged when valid, nil otherwise. Used both by the
+    /// interactive recorders (SettingsView, which give per-reason rejection messages) and by
+    /// `AppSettings` to re-validate a persisted/hand-edited pair on load and whenever either spec
+    /// changes — a hand-edited default, or a PTT change that lands outside the recorder, must
+    /// never let an invalid pair (modifier-only, side-normalized collision, or prefix-shadow vs.
+    /// PTT) persist. See PLAN.md step 9, Round 1 Codex finding 10.
+    static func validRedoSpec(_ candidate: HotKeySpec, pttSpec: HotKeySpec) -> HotKeySpec? {
+        guard isValidRedoSpec(candidate), !collides(candidate, pttSpec), !redoShadowsHeldPTT(pttSpec: pttSpec, redoSpec: candidate) else {
+            return nil
+        }
+        return candidate
+    }
+
     /// ANSI-US virtual keycode names for display. Fallback covers anything unmapped.
     static func keyName(for keyCode: UInt16) -> String {
         Self.keyNames[keyCode] ?? "Key\(keyCode)"

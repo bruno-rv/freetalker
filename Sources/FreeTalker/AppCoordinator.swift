@@ -80,6 +80,32 @@ final class AppCoordinator: ObservableObject {
         // when the menu happens to reopen.
         whisperEngine.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }.store(in: &cancellables)
         cloudSTTEngine.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }.store(in: &cancellables)
+        // Central hotkey re-plumb (Round 1 Codex finding 6): every call site that changes
+        // `AppSettings.shared.hotKeySpec`/`redoHotKeySpec` used to have to remember to also call
+        // `restartHotKeyListening()` itself (SettingsView's Change…/Clear buttons did, three
+        // times over) — a direct assignment from anywhere else would silently leave the event
+        // tap's matchers stale. Subscribing here instead makes AppCoordinator itself the one
+        // place either setting's change re-plumbs the tap, so no call site needs to remember to;
+        // the matching manual calls in SettingsView are removed. `dropFirst()` skips the initial
+        // replay each `@Published` projected publisher sends on subscribe.
+        //
+        // Not exercised by SelfCheck: like `ensureHotKeyListening()`/`hotKeyManager.start()`
+        // elsewhere in this file, the callback attempts a real `CGEventTap` creation —
+        // SelfCheck never triggers that (see `hotKeyChecks()`/`redoLastChecks()`, which only
+        // drive the pure `HotKeyMatcher`/`HotKeySpec` decision logic), so no check assigns to
+        // `AppSettings.shared.hotKeySpec`/`redoHotKeySpec` directly; doing so would fire this
+        // subscription against `AppCoordinator.shared`, which is already live by the time
+        // SelfCheck runs (see the pipeline contract check above).
+        AppSettings.shared.$hotKeySpec
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.restartHotKeyListening() }
+            .store(in: &cancellables)
+        AppSettings.shared.$redoHotKeySpec
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.restartHotKeyListening() }
+            .store(in: &cancellables)
         // Cheap catch-all: the user activating the app (opening Settings, the Library, even
         // just the menu bar popover focusing a window) re-checks the tap — catching
         // permissions granted in System Settings while the app was already running.
@@ -866,6 +892,15 @@ final class AppCoordinator: ObservableObject {
         }
     }
 
+    /// The HUD message `redoLast()` shows after attempting to insert the newest Library entry's
+    /// Refined Output — mirrors the existing "posted vs. not" wording `runPipeline` uses for the
+    /// same distinction (manual-paste fallback, `Insertion.insert`'s `Bool` result), so a failed
+    /// synthetic paste (text left on the pasteboard only) is never reported to the user as if it
+    /// had actually landed at the cursor. See Round 1 Codex finding 9.
+    nonisolated static func redoLastResultMessage(posted: Bool) -> String {
+        posted ? "Redone" : "Copied — paste manually"
+    }
+
     /// Fires from `HotKeyManager.onRedoKeyDown` (Redo Last hotkey, CONTEXT.md "Redo Last"):
     /// re-inserts the newest Library entry's Refined Output at the cursor. Never records or
     /// re-processes — same permissive (no target) insert path `reprocess` uses above.
@@ -883,8 +918,8 @@ final class AppCoordinator: ObservableObject {
         case .libraryUnavailable:
             hud.flash("Library unavailable")
         case .insert(let refined):
-            Insertion.insert(refined)
-            hud.flash("Redone")
+            let posted = Insertion.insert(refined)
+            hud.flash(Self.redoLastResultMessage(posted: posted))
         }
     }
 }
