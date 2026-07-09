@@ -173,25 +173,64 @@ final class AppCoordinator: ObservableObject {
             return
         }
         isProcessing = true
-        hud.show(text: "Processing…")
 
-        // Snapshot the engine and Active Template synchronously, at key-release, before any
-        // `await` — settings changed mid-transcription (e.g. during a long model download)
-        // must not retroactively change which engine/template this dictation is processed
-        // and recorded under. See Round 1 Codex finding 12.
+        // Snapshot the engine, frontmost app, and resolved Template synchronously, at
+        // key-release, before any `await` — settings/app-switching mid-transcription (e.g.
+        // during a long model download) must not retroactively change which engine/template
+        // this dictation is processed and recorded under. See Round 1 Codex finding 12.
+        //
+        // Frontmost app is read here rather than at keyDown: this is the only existing snapshot
+        // point in the pipeline (engine/template are already captured here, not at keyDown).
+        // `insertionTarget` (bundle id, pid, and best-effort focused element/window — see
+        // `InsertionTarget`) is carried through the pipeline and re-checked against the live
+        // frontmost app/element immediately before paste (`Insertion.insert`'s `target`) — if
+        // the user switched apps, or switched focus *within* the same app (a different Slack
+        // channel, a different Mail draft), during the async transcribe/post-process work, the
+        // synthetic ⌘V is skipped and the text is left on the pasteboard instead of landing in
+        // the wrong place. See Codex finding: paste-target drift / same-app target drift.
         let engine = activeSTTEngine
         let engineName = engine.name
-        let template = TemplateStore.shared.template(id: AppSettings.shared.activeTemplateID)
-            ?? Template.builtIns.first!
+        let frontmostApp = NSWorkspace.shared.frontmostApplication
+        let bundleID = frontmostApp?.bundleIdentifier
+        let appName = frontmostApp?.localizedName
+        let insertionTarget = Insertion.snapshotTarget(app: frontmostApp)
+        let (template, ruleFired) = Self.resolveTemplate(
+            bundleID: bundleID,
+            rules: AppSettings.shared.appRules,
+            templates: TemplateStore.shared.templates,
+            activeTemplateID: AppSettings.shared.activeTemplateID
+        )
 
-        Task { await runPipeline(samples: samples, engine: engine, engineName: engineName, template: template) }
+        hud.show(text: ruleFired ? "Processing… (\(template.name))" : "Processing…")
+
+        Task { await runPipeline(samples: samples, engine: engine, engineName: engineName, template: template, appName: appName, target: insertionTarget) }
     }
 
-    private func runPipeline(samples: [Float], engine: any TranscriptionEngine, engineName: String, template: Template) async {
+    /// Pure resolution of which Template a dictation should use: a rule mapping the snapshotted
+    /// app's bundle id wins; a missing bundle id, no matching rule, or a rule pointing at a
+    /// template id that no longer exists (deleted after the rule was created) all fall back to
+    /// the Active Template — never crashes. `templates`/`activeTemplateID` are passed in (rather
+    /// than read from the singletons directly) so this stays a pure function SelfCheck can drive
+    /// with synthetic inputs. See PLAN 2 "Template resolution".
+    nonisolated static func resolveTemplate(
+        bundleID: String?,
+        rules: [String: String],
+        templates: [Template],
+        activeTemplateID: String
+    ) -> (template: Template, ruleFired: Bool) {
+        let fallback = templates.first(where: { $0.id == activeTemplateID }) ?? Template.builtIns.first!
+        guard let bundleID, let ruleTemplateID = rules[bundleID],
+              let matched = templates.first(where: { $0.id == ruleTemplateID }) else {
+            return (fallback, false)
+        }
+        return (matched, true)
+    }
+
+    private func runPipeline(samples: [Float], engine: any TranscriptionEngine, engineName: String, template: Template, appName: String?, target: InsertionTarget?) async {
         defer { isProcessing = false }
 
         do {
-            let result = try await processDictation(samples: samples, engine: engine, engineName: engineName, template: template)
+            let result = try await processDictation(samples: samples, engine: engine, engineName: engineName, template: template, appName: appName, target: target)
             // Busy state hides immediately on success; nothing terminal to show the user.
             // See Round 2 Codex finding 6.
             if result.posted {
@@ -226,8 +265,10 @@ final class AppCoordinator: ObservableObject {
         engine: any TranscriptionEngine,
         engineName: String,
         template: Template,
+        appName: String? = nil,
+        target: InsertionTarget? = nil,
         processor: (any PostProcessor)? = nil,
-        insert: (String) -> Bool = { Insertion.insert($0) },
+        insert: (String, InsertionTarget?) -> Bool = { Insertion.insert($0, target: $1) },
         // ponytail: closure default (not a protocol/factory) keeps SelfCheck hermetic to a temp
         // DB instead of writing test rows into the user's real Library on every run.
         record: (_ language: String, _ template: String, _ transcript: String, _ refined: String, _ engine: String) throws -> Void = { language, template, transcript, refined, engine in
@@ -242,7 +283,7 @@ final class AppCoordinator: ObservableObject {
         let activeProcessor: any PostProcessor = processor ?? (template.useCloud ? cloudLLMProcessor : appleFMProcessor)
         let refined: String
         do {
-            let processed = try await activeProcessor.process(transcript: transcription.text, template: template)
+            let processed = try await activeProcessor.process(transcript: transcription.text, template: template, appName: appName)
             let trimmed = processed.trimmingCharacters(in: .whitespacesAndNewlines)
             // Never lose the user's words — fall back to the raw transcript if post-processing
             // returns empty output without throwing. See Round 1 Codex finding 3.
@@ -252,7 +293,7 @@ final class AppCoordinator: ObservableObject {
             refined = transcription.text
         }
 
-        let posted = insert(refined)
+        let posted = insert(refined, target)
 
         do {
             try record(transcription.language, template.name, transcription.text, refined, engineName)
@@ -313,7 +354,8 @@ final class AppCoordinator: ObservableObject {
         let processor: PostProcessor = template.useCloud ? cloudLLMProcessor : appleFMProcessor
         let refined: String
         do {
-            let processed = try await processor.process(transcript: dictation.transcript, template: template)
+            // No known frontmost app for a historical re-process — appName: nil.
+            let processed = try await processor.process(transcript: dictation.transcript, template: template, appName: nil)
             let trimmed = processed.trimmingCharacters(in: .whitespacesAndNewlines)
             // Same empty-refined fallback as processDictation. See Round 2 Codex finding 5.
             refined = trimmed.isEmpty ? dictation.transcript : trimmed

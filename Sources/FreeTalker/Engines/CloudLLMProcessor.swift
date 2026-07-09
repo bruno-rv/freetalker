@@ -16,7 +16,7 @@ struct CloudLLMProcessor: PostProcessor {
         }
     }
 
-    func process(transcript: String, template: Template) async throws -> String {
+    func process(transcript: String, template: Template, appName: String?) async throws -> String {
         guard let apiKey = Keychain.get(account: Keychain.Account.cloudLLMKey), !apiKey.isEmpty else {
             throw CloudLLMError.missingAPIKey
         }
@@ -25,7 +25,8 @@ struct CloudLLMProcessor: PostProcessor {
         let instructions = buildProcessorInstructions(
             template: template,
             vocabulary: await settings.vocabulary,
-            trailing: "Always respond in the same language as the transcript. Output only the result, no commentary."
+            trailing: "Always respond in the same language as the transcript. Output only the result, no commentary.",
+            appName: appName
         )
 
         switch await settings.llmProvider {
