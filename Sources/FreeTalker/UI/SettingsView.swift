@@ -112,9 +112,10 @@ private struct GeneralSettingsView: View {
                     Text("Redo-last key: \(settings.redoHotKeySpec?.displayLabel ?? "Unbound")")
                     Spacer()
                     Button("Clear") {
+                        // AppCoordinator re-plumbs the tap itself on any hotKeySpec/redoHotKeySpec
+                        // change (see its Combine subscriptions) — no manual call needed here.
                         settings.redoHotKeySpec = nil
                         redoRecorderMessage = nil
-                        AppCoordinator.shared.restartHotKeyListening()
                     }
                     .disabled(settings.redoHotKeySpec == nil)
                     Button(capturingRedoHotKey ? "Press a key or combination… (⎋ cancels)" : "Change…") {
@@ -334,8 +335,9 @@ private struct GeneralSettingsView: View {
                 }
             }
             hotKeyRecorderMessage = nil
+            // AppCoordinator re-plumbs the tap itself on any hotKeySpec/redoHotKeySpec change
+            // (see its Combine subscriptions) — no manual call needed here.
             settings.hotKeySpec = spec
-            AppCoordinator.shared.restartHotKeyListening()
         }
     }
 
@@ -368,8 +370,9 @@ private struct GeneralSettingsView: View {
                 return
             }
             redoRecorderMessage = nil
+            // AppCoordinator re-plumbs the tap itself on any hotKeySpec/redoHotKeySpec change
+            // (see its Combine subscriptions) — no manual call needed here.
             settings.redoHotKeySpec = spec
-            AppCoordinator.shared.restartHotKeyListening()
         }
     }
 }

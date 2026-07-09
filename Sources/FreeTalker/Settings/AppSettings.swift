@@ -36,6 +36,15 @@ final class AppSettings: ObservableObject {
             if let data = try? JSONEncoder().encode(hotKeySpec) {
                 defaults.set(data, forKey: Keys.hotKeySpec)
             }
+            // A PTT change can invalidate a previously-valid Redo Last pair (now colliding with
+            // it, or shadow-engaged before its own keyDown) even outside the recorder's own
+            // pre-check in SettingsView — e.g. a hand-edited default, or any future call site
+            // that assigns `hotKeySpec` directly. Re-validating here keeps the two settings
+            // consistent no matter how `hotKeySpec` changes; `redoHotKeySpec`'s own `didSet`
+            // below handles dropping the now-stale persisted key. See Round 1 Codex finding 10.
+            if let redoHotKeySpec, HotKeySpec.validRedoSpec(redoHotKeySpec, pttSpec: hotKeySpec) == nil {
+                self.redoHotKeySpec = nil
+            }
         }
     }
 
@@ -46,6 +55,21 @@ final class AppSettings: ObservableObject {
     /// the user clears it. See PLAN.md step 7.
     @Published var redoHotKeySpec: HotKeySpec? {
         didSet {
+            // Re-validate against the current PTT spec on every assignment, not just the ones
+            // coming from SettingsView's recorder (which already checks before assigning) — a
+            // hand-edited default, or a direct assignment from any future call site, must never
+            // let an invalid pair (modifier-only, side-normalized collision, or prefix-shadow vs.
+            // PTT) persist. Invalid candidates silently drop to unbound (nil) rather than raising
+            // a user prompt from here, which has no synchronous UI to surface one to. Reassigning
+            // `self.redoHotKeySpec` from inside this same observer does not re-invoke it (same
+            // reasoning as `vocabularyText`/`handsFreeMaxMinutes` above), so this falls straight
+            // through to the persistence branch below on the next (nil) value. See Round 1 Codex
+            // finding 10.
+            if let redoHotKeySpec, HotKeySpec.validRedoSpec(redoHotKeySpec, pttSpec: hotKeySpec) == nil {
+                self.redoHotKeySpec = nil
+                defaults.removeObject(forKey: Keys.redoHotKeySpec)
+                return
+            }
             if let redoHotKeySpec, let data = try? JSONEncoder().encode(redoHotKeySpec) {
                 defaults.set(data, forKey: Keys.redoHotKeySpec)
             } else {
@@ -370,6 +394,16 @@ final class AppSettings: ObservableObject {
             defaults.set(clamped, forKey: Keys.vocabularyText)
         } else {
             vocabularyText = storedVocabularyText
+        }
+        // All stored properties are initialized past this point, so `self`/`hotKeySpec` can be
+        // read: a persisted Redo Last pair that's since become invalid — hand-edited
+        // UserDefaults, or `hotKeySpec` migrated from a legacy value above in a way that now
+        // collides/shadows it — must be re-validated here, since a direct init assignment (like
+        // the `redoHotKeySpec =` above) doesn't trigger its own `didSet` (same reasoning as
+        // `vocabularyText`'s clamp above). See Round 1 Codex finding 10.
+        if let redoHotKeySpec, HotKeySpec.validRedoSpec(redoHotKeySpec, pttSpec: hotKeySpec) == nil {
+            self.redoHotKeySpec = nil
+            defaults.removeObject(forKey: Keys.redoHotKeySpec)
         }
     }
 }

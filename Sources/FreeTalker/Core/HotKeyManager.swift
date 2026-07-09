@@ -59,6 +59,46 @@ final class HotKeyManager: @unchecked Sendable {
         keyCode == escapeKeyCode && isRecording
     }
 
+    /// Combined per-event dispatch outcome for the production two-matcher-on-one-tap scheme (PTT
+    /// + optional Redo Last, both fed from the same `CGEventTap`).
+    struct DispatchOutcome: Equatable {
+        var pttEngaged = false
+        var pttReleased = false
+        var redoEngaged = false
+        var swallow = false
+    }
+
+    /// Feeds one synthetic event to both matchers and combines their outcomes into the single
+    /// decision `handle(type:event:)` needs: which callbacks to fire, and whether to swallow the
+    /// event. This is the entire "two matchers, one tap" dispatch logic, factored out of
+    /// `handle(type:event:)` (a thin CGEvent-to-primitive adapter around it) so SelfCheck can
+    /// drive the exact production decision with synthetic `(kind, keyCode, flags, isAutorepeat)`
+    /// tuples and two `HotKeyMatcher` instances, instead of re-deriving its own combine-two-
+    /// matchers loop that could silently drift from what the real tap callback does. See Round 1
+    /// Codex finding 7.
+    static func dispatch(
+        kind: KeyEventKind,
+        keyCode: UInt16,
+        flags: UInt64,
+        isAutorepeat: Bool,
+        matcher: inout HotKeyMatcher,
+        redoMatcher: inout HotKeyMatcher?
+    ) -> DispatchOutcome {
+        let outcome = matcher.handle(kind, keyCode: keyCode, flags: flags, isAutorepeat: isAutorepeat)
+        // Same event, fed to the second (Redo Last) matcher — keyUp/flagsChanged included so its
+        // internal isEngaged/key-swallow state resets on release, even though only `.engaged`
+        // below ever invokes a callback. PTT's `matcher` above is completely unaffected: this
+        // matcher is a separate state machine, never consulted by `matcher.handle`. See PLAN.md
+        // step 8.
+        let redoOutcome = redoMatcher?.handle(kind, keyCode: keyCode, flags: flags, isAutorepeat: isAutorepeat)
+        return DispatchOutcome(
+            pttEngaged: outcome.engaged,
+            pttReleased: outcome.released,
+            redoEngaged: redoOutcome?.engaged == true,
+            swallow: outcome.swallow || redoOutcome?.swallow == true
+        )
+    }
+
     /// True while the event tap exists and is enabled. `ensureHotKeyListening()` uses this to
     /// decide whether the tap must be (re)created — a tap the system disabled counts as dead.
     var isListening: Bool {
@@ -161,27 +201,21 @@ final class HotKeyManager: @unchecked Sendable {
         default: return Unmanaged.passUnretained(event)
         }
         let isAutorepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
-        let outcome = matcher.handle(kind, keyCode: keyCode, flags: event.flags.rawValue, isAutorepeat: isAutorepeat)
-        // Same event, fed to the second (Redo Last) matcher — keyUp/flagsChanged included so its
-        // internal isEngaged/key-swallow state resets on release, even though only `.engaged`
-        // below ever invokes a callback. PTT's `matcher` above is completely unaffected: this
-        // matcher is a separate state machine, never consulted by `matcher.handle`. See PLAN.md
-        // step 8.
-        let redoOutcome = redoMatcher?.handle(kind, keyCode: keyCode, flags: event.flags.rawValue, isAutorepeat: isAutorepeat)
+        let outcome = Self.dispatch(kind: kind, keyCode: keyCode, flags: event.flags.rawValue, isAutorepeat: isAutorepeat, matcher: &matcher, redoMatcher: &redoMatcher)
         // CGEventTimestamp is nanoseconds since system startup (excluding sleep) — converted to
         // seconds here, at the tap callback, so `AppCoordinator`'s tap-vs-hold elapsed-time
         // calculation is immune to any delay between this event firing and the hop to the
         // `@MainActor` callback actually running. See `onKeyDown`/`onKeyUp` doc comments above.
         let eventSeconds = TimeInterval(event.timestamp) / 1_000_000_000
-        if outcome.engaged {
+        if outcome.pttEngaged {
             Task { @MainActor in self.onKeyDown?(eventSeconds) }
         }
-        if outcome.released {
+        if outcome.pttReleased {
             Task { @MainActor in self.onKeyUp?(eventSeconds) }
         }
-        if redoOutcome?.engaged == true {
+        if outcome.redoEngaged {
             Task { @MainActor in self.onRedoKeyDown?(eventSeconds) }
         }
-        return (outcome.swallow || redoOutcome?.swallow == true) ? nil : Unmanaged.passUnretained(event)
+        return outcome.swallow ? nil : Unmanaged.passUnretained(event)
     }
 }

@@ -7,9 +7,18 @@ final class LibraryStore: ObservableObject {
 
     enum LibraryStoreError: LocalizedError {
         case databaseUnavailable
+        /// One or more debug-audio files under Application Support couldn't be removed during
+        /// `deleteAll()` — surfaced rather than swallowed so a failed purge is never silently
+        /// reported as a clean wipe. See Round 1 Codex finding 5.
+        case audioPurgeFailed([Error])
 
         var errorDescription: String? {
-            "Library database is unavailable."
+            switch self {
+            case .databaseUnavailable:
+                return "Library database is unavailable."
+            case .audioPurgeFailed(let errors):
+                return "Failed to delete \(errors.count) debug audio file\(errors.count == 1 ? "" : "s")."
+            }
         }
     }
 
@@ -37,6 +46,16 @@ final class LibraryStore: ObservableObject {
         } catch {
             print("FreeTalker: LibraryStore refresh failed: \(error)")
         }
+    }
+
+    /// Total (unfiltered) Library entry count — used by the Delete All confirmation dialog so an
+    /// active search doesn't misreport e.g. "0 Entries" while the whole archive is about to be
+    /// wiped. 0 when the database is unavailable, matching `dictations`' empty-array fallback —
+    /// the Delete All button is already disabled/inert with no database. See Round 1 Codex
+    /// finding 1.
+    func totalCount() -> Int {
+        guard let db else { return 0 }
+        return (try? db.totalCount()) ?? 0
     }
 
     /// The newest Library entry, straight from the database — deliberately NOT
@@ -80,33 +99,84 @@ final class LibraryStore: ObservableObject {
     /// Clears the entire Library, including the transient on-disk debug audio artifacts
     /// (`last-dictation.wav` and any saved failed-transcription recordings) — those live outside
     /// the DB but must not survive "clear the archive". See PLAN.md step 2/3.
+    ///
+    /// Row deletion (`Database.deleteAllDictations`, DELETE + VACUUM) and the WAL checkpoint
+    /// (`Database.checkpointTruncate`) are separate throwing steps (see their doc comments): once
+    /// row deletion succeeds the archive is already gone from the DB, so the debug-audio purge
+    /// and the UI refresh must happen regardless of whether the checkpoint or the purge itself
+    /// then fails — both run unconditionally (errors captured, not thrown immediately) before
+    /// either error is allowed to escape to the caller. See Round 1 Codex findings 4/5.
     func deleteAll() throws {
         guard let db else { throw LibraryStoreError.databaseUnavailable }
         try db.deleteAllDictations()
-        purgeDebugAudio()
+        var checkpointError: Error?
+        do {
+            try db.checkpointTruncate()
+        } catch {
+            checkpointError = error
+        }
+        var purgeError: Error?
+        do {
+            try purgeDebugAudio()
+        } catch {
+            purgeError = error
+        }
         refresh()
+        if let checkpointError { throw checkpointError }
+        if let purgeError { throw purgeError }
     }
 
     /// Whether a Dictation row with this id still exists. `nil` means "unknown" (database
-    /// unavailable) rather than "deleted" — callers must not conflate the two. Used by
-    /// `AppCoordinator.reprocess` to detect a source row deleted mid-flight. See PLAN.md step 5.
+    /// unavailable, or the existence check itself threw — see `Database.dictationExists`) rather
+    /// than "deleted" — callers must not conflate the two. Used by `AppCoordinator.reprocess`,
+    /// fail-open, to detect a source row deleted mid-flight without dropping a Library write on a
+    /// transient error. See PLAN.md step 5, Round 1 Codex finding 3.
     func exists(id: Int64) -> Bool? {
         guard let db else { return nil }
         return try? db.dictationExists(id: id)
     }
 
-    /// Best-effort removal of debug audio written outside the Library DB (AppCoordinator's
-    /// `writeLastCaptureDebugArtifact` / `saveFailedAudio`). A failed removal here doesn't
-    /// undo the DB wipe that already succeeded, so failures are swallowed rather than thrown.
-    private func purgeDebugAudio() {
+    /// Whether a file inside `failed-dictations/` should be purged by `purgeDebugAudio` — `.wav`
+    /// only (case-insensitive extension), never every child of the directory indiscriminately
+    /// (which would also sweep up anything else that happened to land there). Pure `String ->
+    /// Bool` so SelfCheck can drive it directly. See Round 1 Codex finding 5.
+    nonisolated static func shouldPurgeFailedDictationFile(pathExtension: String) -> Bool {
+        pathExtension.lowercased() == "wav"
+    }
+
+    /// Removes debug audio written outside the Library DB (AppCoordinator's
+    /// `writeLastCaptureDebugArtifact` / `saveFailedAudio`): `last-dictation.wav` and any
+    /// `*.wav` file under `failed-dictations/` — scoped by `shouldPurgeFailedDictationFile`, not
+    /// "every child of the directory". A missing file (the common case — most dictations produce
+    /// neither artifact) is not an error; every other removal failure is collected and thrown as
+    /// one `audioPurgeFailed`, rather than silently swallowed. See Round 1 Codex finding 5.
+    private func purgeDebugAudio() throws {
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         let dir = support.appendingPathComponent("FreeTalker", isDirectory: true)
-        try? FileManager.default.removeItem(at: dir.appendingPathComponent("last-dictation.wav"))
+        var errors: [Error] = []
+
+        let lastDictationURL = dir.appendingPathComponent("last-dictation.wav")
+        if FileManager.default.fileExists(atPath: lastDictationURL.path) {
+            do {
+                try FileManager.default.removeItem(at: lastDictationURL)
+            } catch {
+                errors.append(error)
+            }
+        }
+
         let failedDir = dir.appendingPathComponent("failed-dictations", isDirectory: true)
         if let contents = try? FileManager.default.contentsOfDirectory(at: failedDir, includingPropertiesForKeys: nil) {
-            for file in contents {
-                try? FileManager.default.removeItem(at: file)
+            for file in contents where Self.shouldPurgeFailedDictationFile(pathExtension: file.pathExtension) {
+                do {
+                    try FileManager.default.removeItem(at: file)
+                } catch {
+                    errors.append(error)
+                }
             }
+        }
+
+        guard errors.isEmpty else {
+            throw LibraryStoreError.audioPurgeFailed(errors)
         }
     }
 }
