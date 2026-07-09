@@ -39,6 +39,16 @@ final class LibraryStore: ObservableObject {
         }
     }
 
+    /// The newest Library entry, straight from the database — deliberately NOT
+    /// `dictations.first`, which is filtered by `searchText` and would silently redo a search
+    /// result instead of the actual latest Dictation. Throws when the database is unavailable so
+    /// `AppCoordinator.redoLast()` can distinguish "no database" from "empty Library" (nil). See
+    /// CONTEXT.md "Redo Last", PLAN.md step 10.
+    func latestDictation() throws -> Dictation? {
+        guard let db else { throw LibraryStoreError.databaseUnavailable }
+        return try db.latestDictation()
+    }
+
     /// Inserts a Dictation row. Throws (rather than silently swallowing) so callers can surface
     /// the failure — the transcript is already inserted/pasteboarded by this point, so a failure
     /// here only loses the Library row, not the user's words. See Round 1 Codex finding 10.

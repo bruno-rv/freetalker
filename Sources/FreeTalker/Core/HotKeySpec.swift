@@ -81,6 +81,40 @@ struct HotKeySpec: Codable, Equatable {
         return symbols.isEmpty ? "None" : symbols
     }
 
+    // MARK: - Redo Last recorder constraints (PLAN.md step 9)
+    //
+    // Pure so both the PTT and Redo-last key recorders (SettingsView) and SelfCheck can share
+    // and exercise them without any capture session. See CONTEXT.md "Redo Last".
+
+    /// A valid Redo Last spec must end in a real key: unlike PTT, redo needs an unambiguous
+    /// keyDown to fire on, so a modifier-only chord (which `HotKeyCapture` otherwise allows) is
+    /// rejected by the redo recorder.
+    static func isValidRedoSpec(_ spec: HotKeySpec) -> Bool {
+        spec.keyCode != nil
+    }
+
+    /// True when `a` and `b` are the same chord at runtime: same `keyCode` and the same
+    /// side-normalized (⌃⌥⇧⌘) modifier set — not raw struct equality, since e.g. Left ⌃⌥ and
+    /// Right ⌃⌥ match identically at runtime (`modifiersExactlyMatch`/`configuredModifiersHeld`
+    /// above both compare side-agnostically for chords and modifiers+key).
+    static func collides(_ a: HotKeySpec, _ b: HotKeySpec) -> Bool {
+        a.keyCode == b.keyCode
+            && genericMask(forDeviceMask: a.modifiers) == genericMask(forDeviceMask: b.modifiers)
+    }
+
+    /// True when holding `redoSpec`'s modifiers alone would already satisfy `pttSpec`'s engage
+    /// condition before `redoSpec`'s own keyDown ever arrives — i.e. `pttSpec` is modifier-only
+    /// and its side-normalized modifier set is a (non-strict) subset of `redoSpec`'s. Example:
+    /// PTT=⌃⌥, redo=⌃⌥D — holding ⌃⌥ to reach for D already engages PTT. Checked both directions
+    /// by the recorders: the redo recorder against the bound PTT spec, and re-recording PTT
+    /// against any bound redo spec.
+    static func redoShadowsHeldPTT(pttSpec: HotKeySpec, redoSpec: HotKeySpec) -> Bool {
+        guard pttSpec.keyCode == nil, pttSpec.modifiers != 0 else { return false }
+        let pttGeneric = genericMask(forDeviceMask: pttSpec.modifiers)
+        let redoGeneric = genericMask(forDeviceMask: redoSpec.modifiers)
+        return redoGeneric & pttGeneric == pttGeneric
+    }
+
     /// ANSI-US virtual keycode names for display. Fallback covers anything unmapped.
     static func keyName(for keyCode: UInt16) -> String {
         Self.keyNames[keyCode] ?? "Key\(keyCode)"

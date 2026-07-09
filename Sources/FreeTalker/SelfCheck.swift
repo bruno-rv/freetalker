@@ -215,9 +215,10 @@ enum SelfCheck {
             failures.append(contentsOf: cloudLLMRoutingChecks())
             failures.append(contentsOf: handsFreeChecks())
             failures.append(contentsOf: libraryDeletionChecks())
+            failures.append(contentsOf: redoLastChecks())
 
             if failures.isEmpty {
-                print("SelfCheck PASSED (template seeding, FTS round-trip, pipeline contract, mic device enumeration, hotkey spec/matcher, vocabulary normalization/injection, app rule resolution, paste-target drift, prompt app-name sanitization, live preview gating/availability, SerialGate cancellation, preview early-cancel decisions, built-in template prompt upgrade, LLM provider defaults, BYOK Keychain key migration, global cloud-selection routing, hands-free recording state machine/esc/cap-clamp/cancel, Library deletion: per-row/Delete All/latestDictation tiebreak/dangling source_id/secure_delete)")
+                print("SelfCheck PASSED (template seeding, FTS round-trip, pipeline contract, mic device enumeration, hotkey spec/matcher, vocabulary normalization/injection, app rule resolution, paste-target drift, prompt app-name sanitization, live preview gating/availability, SerialGate cancellation, preview early-cancel decisions, built-in template prompt upgrade, LLM provider defaults, BYOK Keychain key migration, global cloud-selection routing, hands-free recording state machine/esc/cap-clamp/cancel, Library deletion: per-row/Delete All/latestDictation tiebreak/dangling source_id/secure_delete, Redo Last gating/spec-constraints/matcher)")
                 exit(0)
             } else {
                 print("SelfCheck FAILED:")
@@ -1465,6 +1466,116 @@ enum SelfCheck {
             }
         } catch {
             failures.append("latestDictation tiebreak check threw: \(error)")
+        }
+
+        return failures
+    }
+
+    /// Redo Last checks (CONTEXT.md "Redo Last"): the gating+outcome truth table
+    /// (`AppCoordinator.redoLastAction`, PLAN.md step 10), the recorder-level spec constraints
+    /// (`HotKeySpec` helpers, step 9), and the two-matcher-on-one-tap contract (step 8) — all
+    /// pure, no CGEvents/permissions, no real Database/HotKeyManager tap.
+    private static func redoLastChecks() -> [String] {
+        var failures: [String] = []
+
+        // MARK: Gating + outcome truth table (step 10).
+        struct FakeDatabaseError: Error {}
+        let sample = Dictation(id: 7, timestamp: Date(), language: "en", templateName: "Clean Dictation", transcript: "t", refined: "r", engine: "WhisperKit", sourceID: nil)
+
+        func expectAction(_ label: String, isRecording: Bool, isProcessing: Bool, fetchResult: Result<Dictation?, Error>, want: AppCoordinator.RedoLastAction) {
+            let got = AppCoordinator.redoLastAction(isRecording: isRecording, isProcessing: isProcessing, fetchResult: fetchResult)
+            if got != want {
+                failures.append("redoLastAction [\(label)]: got \(got), want \(want)")
+            }
+        }
+
+        expectAction("recording ignores even a ready row", isRecording: true, isProcessing: false, fetchResult: .success(sample), want: .ignored)
+        expectAction("processing ignores even a ready row", isRecording: false, isProcessing: true, fetchResult: .success(sample), want: .ignored)
+        expectAction("recording+processing both ignore a DB error", isRecording: true, isProcessing: true, fetchResult: .failure(FakeDatabaseError()), want: .ignored)
+        expectAction("idle + DB error -> libraryUnavailable", isRecording: false, isProcessing: false, fetchResult: .failure(FakeDatabaseError()), want: .libraryUnavailable)
+        expectAction("idle + empty Library -> nothingToRedo", isRecording: false, isProcessing: false, fetchResult: .success(nil), want: .nothingToRedo)
+        expectAction("idle + row present -> insert(refined)", isRecording: false, isProcessing: false, fetchResult: .success(sample), want: .insert(refined: "r"))
+
+        // MARK: Recorder-level spec constraints (step 9).
+        let dLCtrl: UInt64 = 0x0001, dRCtrl: UInt64 = 0x2000
+        let dLAlt: UInt64 = 0x0020
+        let dLCmd: UInt64 = 0x0008
+        let dLShift: UInt64 = 0x0002
+
+        // Modifier-only redo specs rejected; modifiers+key accepted.
+        if HotKeySpec.isValidRedoSpec(HotKeySpec(modifiers: dLCtrl | dLAlt, keyCode: nil)) {
+            failures.append("isValidRedoSpec: modifier-only spec should be rejected")
+        }
+        if !HotKeySpec.isValidRedoSpec(HotKeySpec(modifiers: dLCmd, keyCode: 2)) {
+            failures.append("isValidRedoSpec: modifiers+key spec should be accepted")
+        }
+
+        // Collision: side-normalized equality (left vs. right ⌃ fold together), not raw struct
+        // equality; different keyCodes never collide regardless of modifiers.
+        if !HotKeySpec.collides(HotKeySpec(modifiers: dLCtrl, keyCode: 2), HotKeySpec(modifiers: dRCtrl, keyCode: 2)) {
+            failures.append("collides: left vs. right ⌃ with the same key should collide (side-normalized)")
+        }
+        if HotKeySpec.collides(HotKeySpec(modifiers: dLCmd, keyCode: 2), HotKeySpec(modifiers: dLCmd, keyCode: 3)) {
+            failures.append("collides: different keyCodes should never collide")
+        }
+
+        // Prefix-shadow, both directions (redo recorder checks PTT->redo; PTT recorder checks
+        // redo->PTT — same function, roles swapped), plus a disjoint chord that must be accepted.
+        if !HotKeySpec.redoShadowsHeldPTT(pttSpec: HotKeySpec(modifiers: dLCtrl | dLAlt, keyCode: nil), redoSpec: HotKeySpec(modifiers: dLCtrl | dLAlt, keyCode: 2)) {
+            failures.append("redoShadowsHeldPTT: redo-recorder direction — redo superset of modifier-only PTT should be shadowed (e.g. PTT=⌃⌥, redo=⌃⌥D)")
+        }
+        if !HotKeySpec.redoShadowsHeldPTT(pttSpec: HotKeySpec(modifiers: dLCmd, keyCode: nil), redoSpec: HotKeySpec(modifiers: dLCmd | dLShift, keyCode: 2)) {
+            failures.append("redoShadowsHeldPTT: PTT-recorder direction — new modifier-only PTT subset of the bound redo chord should be shadowed")
+        }
+        if HotKeySpec.redoShadowsHeldPTT(pttSpec: HotKeySpec(modifiers: dLCtrl | dLAlt, keyCode: nil), redoSpec: HotKeySpec(modifiers: dLCmd, keyCode: 2)) {
+            failures.append("redoShadowsHeldPTT: disjoint modifier sets should never be shadowed")
+        }
+        if HotKeySpec.redoShadowsHeldPTT(pttSpec: HotKeySpec(modifiers: dLCtrl | dLAlt, keyCode: 3), redoSpec: HotKeySpec(modifiers: dLCtrl | dLAlt, keyCode: 2)) {
+            failures.append("redoShadowsHeldPTT: a modifiers+key PTT spec should never be considered shadowed (it already needs its own keyDown)")
+        }
+
+        // MARK: Two-matcher-on-one-tap contract (step 8).
+        //
+        // Mirrors HotKeyManager.handle: the SAME synthetic event stream fed to two independent
+        // HotKeyMatcher instances (one per spec), exactly as the real event tap callback feeds
+        // both `matcher` and `redoMatcher`. Verifies the redo chord's matcher fires exactly once
+        // per press (autorepeat suppressed, release never fires) while the PTT matcher's own
+        // engage/release sequence — fed the identical stream — is completely unaffected.
+        do {
+            let alt = CGEventFlags.maskAlternate.rawValue
+            let cmd = CGEventFlags.maskCommand.rawValue
+            let dRAlt: UInt64 = 0x0040
+
+            var ptt = HotKeyMatcher(spec: HotKeySpec(modifiers: dRAlt, keyCode: nil)) // Right ⌥
+            var redo = HotKeyMatcher(spec: HotKeySpec(modifiers: dLCmd, keyCode: 2)) // ⌘D
+
+            var redoEngageCount = 0
+            var pttEngageCount = 0
+            var pttReleaseCount = 0
+
+            func feed(_ kind: KeyEventKind, keyCode: UInt16 = 0, flags: UInt64, isAutorepeat: Bool = false) {
+                let pttOutcome = ptt.handle(kind, keyCode: keyCode, flags: flags, isAutorepeat: isAutorepeat)
+                let redoOutcome = redo.handle(kind, keyCode: keyCode, flags: flags, isAutorepeat: isAutorepeat)
+                if pttOutcome.engaged { pttEngageCount += 1 }
+                if pttOutcome.released { pttReleaseCount += 1 }
+                if redoOutcome.engaged { redoEngageCount += 1 }
+            }
+
+            feed(.flagsChanged, flags: alt | dRAlt) // PTT press: Right ⌥ held alone -> PTT engages.
+            feed(.flagsChanged, flags: 0) // PTT release: Right ⌥ dropped.
+            feed(.flagsChanged, flags: cmd | dLCmd) // Redo press begins: ⌘ held (PTT unaffected — no keyCode for modifier-only PTT means keyDown/keyUp below are no-ops for it, and flagsChanged here doesn't match Right ⌥).
+            feed(.keyDown, keyCode: 2, flags: cmd | dLCmd) // D down: redo engages.
+            feed(.keyDown, keyCode: 2, flags: cmd | dLCmd, isAutorepeat: true) // autorepeat: no new engage.
+            feed(.keyDown, keyCode: 2, flags: cmd | dLCmd, isAutorepeat: true) // autorepeat: no new engage.
+            feed(.keyUp, keyCode: 2, flags: cmd | dLCmd) // D up: redo releases (no callback).
+            feed(.flagsChanged, flags: 0) // ⌘ dropped.
+
+            if redoEngageCount != 1 {
+                failures.append("redo matcher: expected exactly 1 engage for one press+autorepeat+release, got \(redoEngageCount)")
+            }
+            if pttEngageCount != 1 || pttReleaseCount != 1 {
+                failures.append("PTT matcher fed alongside redo: expected exactly 1 engage/1 release, got engage=\(pttEngageCount) release=\(pttReleaseCount)")
+            }
         }
 
         return failures

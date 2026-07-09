@@ -171,9 +171,11 @@ final class Database {
         return try readAll(stmt)
     }
 
-    /// The newest dictation by id (not `ts` — id is the monotonic tiebreaker on equal
-    /// timestamps). Used by the Redo Last hotkey (Feature B) to fetch straight from the DB,
-    /// immune to the Library window's search-text filter. See PLAN.md step 10.
+    /// The most recently inserted Dictation, or nil if the Library is empty. `id` (not `ts`) is
+    /// the monotonic tiebreaker on equal timestamps — shared reasoning with `allDictations()`'s
+    /// ordering. Used by the Redo Last hotkey (`AppCoordinator.redoLast()` via `LibraryStore`) to
+    /// fetch straight from the DB, immune to the Library window's search-text filter. See
+    /// CONTEXT.md "Redo Last".
     func latestDictation() throws -> Dictation? {
         let sql = "SELECT id, ts, language, template, transcript, refined, engine, source_id FROM dictations ORDER BY id DESC LIMIT 1;"
         let stmt = try prepare(sql)
