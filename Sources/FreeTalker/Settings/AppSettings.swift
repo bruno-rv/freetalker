@@ -7,7 +7,16 @@ enum STTEngineKind: String, CaseIterable, Codable {
 
 enum LLMProviderKind: String, CaseIterable, Codable {
     case anthropic
+    case ollama
     case openAICompatible
+}
+
+/// Known (base URL, model) default for a provider — `nil` for a field means that provider has
+/// no known default (e.g. `openAICompatible`, an arbitrary user endpoint). See
+/// `AppSettings.resolveProviderDefaults`.
+struct LLMProviderDefault: Equatable {
+    let baseURL: String?
+    let model: String?
 }
 
 /// Persisted, non-secret app settings. Backed by UserDefaults (simplest storage that fits;
@@ -44,8 +53,17 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(livePreviewEnabled, forKey: Keys.livePreviewEnabled) }
     }
 
+    /// On every change, `cloudLLMBaseURL`/`cloudLLMModel` are re-resolved against the new
+    /// provider's known default via `resolveProviderDefaults` — a value that's empty or equals
+    /// another provider's known default is swapped for this provider's; a value the user
+    /// actually customized is left untouched. See PLAN.md step 2.
     @Published var llmProvider: LLMProviderKind {
-        didSet { defaults.set(llmProvider.rawValue, forKey: Keys.llmProvider) }
+        didSet {
+            defaults.set(llmProvider.rawValue, forKey: Keys.llmProvider)
+            let resolved = Self.resolveProviderDefaults(provider: llmProvider, baseURL: cloudLLMBaseURL, model: cloudLLMModel)
+            if resolved.baseURL != cloudLLMBaseURL { cloudLLMBaseURL = resolved.baseURL }
+            if resolved.model != cloudLLMModel { cloudLLMModel = resolved.model }
+        }
     }
     @Published var cloudLLMBaseURL: String {
         didSet { defaults.set(cloudLLMBaseURL, forKey: Keys.cloudLLMBaseURL) }
@@ -56,6 +74,29 @@ final class AppSettings: ObservableObject {
 
     @Published var activeTemplateID: String {
         didSet { defaults.set(activeTemplateID, forKey: Keys.activeTemplateID) }
+    }
+
+    /// Auto-stop cap for a `locked` (hands-free) recording, in minutes — clamped to [1, 60] both
+    /// here (on persist) and in `init` (on read), so a stale/out-of-range stored value or a
+    /// direct programmatic set can never reach a recording unclamped. Swift does not re-invoke
+    /// `didSet` for an assignment made from inside the same observer (same reasoning as
+    /// `vocabularyText` above), so the clamped branch persists the clamped value explicitly.
+    /// Held (PTT) recordings are unbounded, unaffected. See PLAN.md Amendment B2.
+    @Published var handsFreeMaxMinutes: Int {
+        didSet {
+            let clamped = Self.clampHandsFreeMaxMinutes(handsFreeMaxMinutes)
+            guard clamped == handsFreeMaxMinutes else {
+                handsFreeMaxMinutes = clamped
+                defaults.set(clamped, forKey: Keys.handsFreeMaxMinutes)
+                return
+            }
+            defaults.set(handsFreeMaxMinutes, forKey: Keys.handsFreeMaxMinutes)
+        }
+    }
+
+    /// Pure [1, 60]-minute clamp for `handsFreeMaxMinutes`. SelfCheck-tested directly.
+    nonisolated static func clampHandsFreeMaxMinutes(_ minutes: Int) -> Int {
+        min(max(minutes, 1), 60)
     }
 
     /// Per-app template rules: bundle identifier -> template id. `[String: String]` is a
@@ -203,6 +244,41 @@ final class AppSettings: ObservableObject {
         boundedVocabulary(raw).kept
     }
 
+    /// Known base URL / model per provider — the single source of truth `resolveProviderDefaults`
+    /// swaps values against. `openAICompatible` has no known default: it's an arbitrary,
+    /// user-supplied endpoint. See PLAN.md step 2.
+    nonisolated static let knownProviderDefaults: [LLMProviderKind: LLMProviderDefault] = [
+        .anthropic: LLMProviderDefault(baseURL: "https://api.anthropic.com/v1", model: "claude-sonnet-4-5"),
+        .ollama: LLMProviderDefault(baseURL: "https://ollama.com/v1", model: "gpt-oss:120b"),
+        .openAICompatible: LLMProviderDefault(baseURL: nil, model: nil)
+    ]
+
+    /// Swaps `baseURL`/`model` to `provider`'s known default when each (whitespace-trimmed)
+    /// value is empty, or verbatim-equals a known default belonging to a *different* provider —
+    /// a value the user actually customized (matches no known default) is never touched. When
+    /// `provider` itself has no known default (`openAICompatible`), a swap clears the field to
+    /// "" instead. Idempotent: re-applying to already-resolved values is a no-op. All matching
+    /// operates on trimmed values, and the result is the trimmed strings — see PLAN.md step 2,
+    /// Round 2/3 Codex findings (defaulting on init too; whitespace variants bypassing matching).
+    nonisolated static func resolveProviderDefaults(provider: LLMProviderKind, baseURL: String, model: String) -> (baseURL: String, model: String) {
+        let current = knownProviderDefaults[provider] ?? LLMProviderDefault(baseURL: nil, model: nil)
+        let allBaseURLs = Set(knownProviderDefaults.values.compactMap(\.baseURL))
+        let allModels = Set(knownProviderDefaults.values.compactMap(\.model))
+
+        func resolve(_ value: String, knownValues: Set<String>, currentDefault: String?) -> String {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty || (knownValues.contains(trimmed) && trimmed != currentDefault) {
+                return currentDefault ?? ""
+            }
+            return trimmed
+        }
+
+        return (
+            resolve(baseURL, knownValues: allBaseURLs, currentDefault: current.baseURL),
+            resolve(model, knownValues: allModels, currentDefault: current.model)
+        )
+    }
+
     private enum Keys {
         static let hotKeySpec = "hotKeySpec"
         /// Legacy (read-only, for migration): single-modifier NX device mask bit.
@@ -214,6 +290,7 @@ final class AppSettings: ObservableObject {
         static let cloudLLMBaseURL = "cloudLLMBaseURL"
         static let cloudLLMModel = "cloudLLMModel"
         static let activeTemplateID = "activeTemplateID"
+        static let handsFreeMaxMinutes = "handsFreeMaxMinutes"
         static let appRules = "appRules"
         static let microphoneDeviceUID = "microphoneDeviceUID"
         static let vocabularyText = "vocabularyText"
@@ -234,10 +311,30 @@ final class AppSettings: ObservableObject {
         // Default ON — `.object(forKey:)` (not `.bool(forKey:)`) so an unset key is distinguished
         // from an explicit `false`, which `.bool(forKey:)` can't do (it returns false for both).
         livePreviewEnabled = defaults.object(forKey: Keys.livePreviewEnabled) as? Bool ?? true
-        llmProvider = LLMProviderKind(rawValue: defaults.string(forKey: Keys.llmProvider) ?? "") ?? .anthropic
-        cloudLLMBaseURL = defaults.string(forKey: Keys.cloudLLMBaseURL) ?? "https://api.anthropic.com/v1"
-        cloudLLMModel = defaults.string(forKey: Keys.cloudLLMModel) ?? "claude-sonnet-4-5"
+        // Loaded into locals first, not `self.llmProvider`/`self.cloudLLMBaseURL`/
+        // `self.cloudLLMModel` directly: `self` can't be read (even its own not-yet-assigned
+        // stored properties) until every stored property is initialized, and
+        // `resolveProviderDefaults` needs all three together. No hardcoded base URL/model
+        // fallback here — `resolveProviderDefaults` is the single source of truth for provider
+        // defaults (an empty value resolves to the current provider's known default, if any).
+        // See Round 1 Codex findings 2/4, Round 2 Codex finding 2 (direct init assignment
+        // doesn't trigger `llmProvider`'s didSet, so this resolution must also run here, once).
+        let loadedProvider = LLMProviderKind(rawValue: defaults.string(forKey: Keys.llmProvider) ?? "") ?? .anthropic
+        let rawCloudLLMBaseURL = defaults.string(forKey: Keys.cloudLLMBaseURL) ?? ""
+        let rawCloudLLMModel = defaults.string(forKey: Keys.cloudLLMModel) ?? ""
+        let resolvedProviderDefaults = Self.resolveProviderDefaults(provider: loadedProvider, baseURL: rawCloudLLMBaseURL, model: rawCloudLLMModel)
+        llmProvider = loadedProvider
+        cloudLLMBaseURL = resolvedProviderDefaults.baseURL
+        cloudLLMModel = resolvedProviderDefaults.model
+        if resolvedProviderDefaults.baseURL != rawCloudLLMBaseURL {
+            defaults.set(resolvedProviderDefaults.baseURL, forKey: Keys.cloudLLMBaseURL)
+        }
+        if resolvedProviderDefaults.model != rawCloudLLMModel {
+            defaults.set(resolvedProviderDefaults.model, forKey: Keys.cloudLLMModel)
+        }
         activeTemplateID = defaults.string(forKey: Keys.activeTemplateID) ?? Template.defaultID
+        let storedHandsFreeMaxMinutes = defaults.object(forKey: Keys.handsFreeMaxMinutes) as? Int ?? 5
+        handsFreeMaxMinutes = Self.clampHandsFreeMaxMinutes(storedHandsFreeMaxMinutes)
         appRules = defaults.dictionary(forKey: Keys.appRules) as? [String: String] ?? [:]
         microphoneDeviceUID = defaults.string(forKey: Keys.microphoneDeviceUID)
         // Direct init assignment doesn't trigger `didSet`'s clamp, so clamp explicitly here too
@@ -253,5 +350,34 @@ final class AppSettings: ObservableObject {
         } else {
             vocabularyText = storedVocabularyText
         }
+    }
+}
+
+/// Snapshot of the settings `CloudLLMProcessor` needs, taken in one MainActor hop
+/// (`AppSettings.cloudLLMSnapshot`) so provider, base URL, model, key, and vocabulary can never
+/// observe a mid-update mix — e.g. a provider switch landing between separate `await` reads.
+/// Captured by `AppCoordinator` at processor-selection time and passed into
+/// `CloudLLMProcessor.process` — the processor itself never re-reads `AppSettings`/Keychain.
+/// See PLAN.md step 4, Round 1 Codex finding 5; Amendment A1/A2.
+struct CloudLLMSettingsSnapshot {
+    let provider: LLMProviderKind
+    let baseURL: String
+    let model: String
+    /// The active provider's scoped Keychain key, read as part of the same snapshot so routing
+    /// decision (`AppCoordinator.isCloudLLMConfigured`) and the request always agree on whether
+    /// a key is present. nil/empty both mean "no key".
+    let key: String?
+    let vocabulary: [String]
+}
+
+extension AppSettings {
+    var cloudLLMSnapshot: CloudLLMSettingsSnapshot {
+        CloudLLMSettingsSnapshot(
+            provider: llmProvider,
+            baseURL: cloudLLMBaseURL,
+            model: cloudLLMModel,
+            key: Keychain.get(account: Keychain.Account.cloudLLMKey(for: llmProvider)),
+            vocabulary: vocabulary
+        )
     }
 }
