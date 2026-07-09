@@ -107,7 +107,8 @@ final class AppCoordinator: ObservableObject {
         hotKeyManager.onKeyDown = { [weak self] eventSeconds in self?.handleKeyDown(eventSeconds: eventSeconds) }
         hotKeyManager.onKeyUp = { [weak self] eventSeconds in self?.handleKeyUp(eventSeconds: eventSeconds) }
         hotKeyManager.onEscape = { [weak self] in self?.handleEscape() }
-        if hotKeyManager.start(spec: AppSettings.shared.hotKeySpec) {
+        hotKeyManager.onRedoKeyDown = { [weak self] _ in self?.redoLast() }
+        if hotKeyManager.start(spec: AppSettings.shared.hotKeySpec, redoSpec: AppSettings.shared.redoHotKeySpec) {
             hotKeyStatusText = nil
             stopHotKeyRetryPoll()
         } else {
@@ -828,6 +829,53 @@ final class AppCoordinator: ObservableObject {
         // can't be silently overwritten by "Library save failed". See PLAN.md step 8.
         if let fallbackReason {
             reportPostProcessingFallback(fallbackReason)
+        }
+    }
+
+    /// Outcome of `redoLast()`'s guard + Library lookup — pure so SelfCheck can drive the full
+    /// truth table (active/idle, DB error, empty Library, happy path) without a real
+    /// HotKeyManager, Database, or Insertion side effect. See PLAN.md step 10.
+    enum RedoLastAction: Equatable {
+        /// `isRecording` or `isProcessing` was true — redo is silently ignored while active.
+        case ignored
+        case nothingToRedo
+        case libraryUnavailable
+        case insert(refined: String)
+    }
+
+    /// Guard + outcome decision for `redoLast()`. `fetchResult` is only consulted once the
+    /// active-recording/processing guard passes — matching `redoLast()`, which skips the
+    /// Database lookup entirely while active.
+    nonisolated static func redoLastAction(isRecording: Bool, isProcessing: Bool, fetchResult: Result<Dictation?, Error>) -> RedoLastAction {
+        guard !isRecording, !isProcessing else { return .ignored }
+        switch fetchResult {
+        case .failure:
+            return .libraryUnavailable
+        case .success(let dictation):
+            guard let dictation else { return .nothingToRedo }
+            return .insert(refined: dictation.refined)
+        }
+    }
+
+    /// Fires from `HotKeyManager.onRedoKeyDown` (Redo Last hotkey, CONTEXT.md "Redo Last"):
+    /// re-inserts the newest Library entry's Refined Output at the cursor. Never records or
+    /// re-processes — same permissive (no target) insert path `reprocess` uses above.
+    func redoLast() {
+        // Skip the Database lookup entirely while active — `redoLastAction` ignores
+        // `fetchResult` in that branch anyway, so `.success(nil)` here is just a placeholder.
+        let fetchResult: Result<Dictation?, Error> = (isRecording || isProcessing)
+            ? .success(nil)
+            : Result { try LibraryStore.shared.latestDictation() }
+        switch Self.redoLastAction(isRecording: isRecording, isProcessing: isProcessing, fetchResult: fetchResult) {
+        case .ignored:
+            break
+        case .nothingToRedo:
+            hud.flash("Nothing to redo")
+        case .libraryUnavailable:
+            hud.flash("Library unavailable")
+        case .insert(let refined):
+            Insertion.insert(refined)
+            hud.flash("Redone")
         }
     }
 }

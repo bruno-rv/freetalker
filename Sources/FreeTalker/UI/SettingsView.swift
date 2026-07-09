@@ -24,6 +24,14 @@ private struct GeneralSettingsView: View {
     @State private var inputMonitoringAuthorized = Permissions.isInputMonitoringAuthorized()
     @State private var capturingHotKey = false
     @State private var captureSession: HotKeyCapture.Session?
+    /// Set when re-recording the PTT key is refused because it would collide with, or
+    /// shadow-engage before, the bound Redo Last key. See HotKeySpec.swift constraint helpers.
+    @State private var hotKeyRecorderMessage: String?
+    @State private var capturingRedoHotKey = false
+    @State private var redoCaptureSession: HotKeyCapture.Session?
+    /// Set when a captured Redo Last spec is refused (modifier-only, collides with, or is
+    /// shadowed by, the PTT key). See PLAN.md step 9.
+    @State private var redoRecorderMessage: String?
     @State private var inputDevices: [AudioInputDevices.Device] = []
     @State private var runningApps: [NSRunningApplication] = []
     @State private var newRuleBundleID: String?
@@ -91,6 +99,34 @@ private struct GeneralSettingsView: View {
                 }
                 if let hotKeyStatusText = coordinator.hotKeyStatusText {
                     Text("⚠️ \(hotKeyStatusText)")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+                if let hotKeyRecorderMessage {
+                    Text(hotKeyRecorderMessage)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+
+                HStack {
+                    Text("Redo-last key: \(settings.redoHotKeySpec?.displayLabel ?? "Unbound")")
+                    Spacer()
+                    Button("Clear") {
+                        settings.redoHotKeySpec = nil
+                        redoRecorderMessage = nil
+                        AppCoordinator.shared.restartHotKeyListening()
+                    }
+                    .disabled(settings.redoHotKeySpec == nil)
+                    Button(capturingRedoHotKey ? "Press a key or combination… (⎋ cancels)" : "Change…") {
+                        beginRedoCapture()
+                    }
+                    .disabled(capturingRedoHotKey)
+                }
+                Text("Re-inserts your latest dictation at the cursor")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let redoRecorderMessage {
+                    Text(redoRecorderMessage)
                         .font(.caption)
                         .foregroundStyle(.red)
                 }
@@ -280,12 +316,60 @@ private struct GeneralSettingsView: View {
         let session = HotKeyCapture.Session()
         captureSession = session
         session.start { spec in
-            if let spec {
-                settings.hotKeySpec = spec
-                AppCoordinator.shared.restartHotKeyListening()
+            defer {
+                capturingHotKey = false
+                captureSession = nil
             }
-            capturingHotKey = false
-            captureSession = nil
+            guard let spec else { return } // Escape cancelled the capture.
+            // Refuse a PTT reassignment that would newly shadow the bound Redo Last key (PLAN.md
+            // step 9, "both directions") — or collide with it outright.
+            if let redo = settings.redoHotKeySpec {
+                if HotKeySpec.collides(spec, redo) {
+                    hotKeyRecorderMessage = "Same as the Redo-last key — pick a different chord."
+                    return
+                }
+                if HotKeySpec.redoShadowsHeldPTT(pttSpec: spec, redoSpec: redo) {
+                    hotKeyRecorderMessage = "Would trigger before the Redo-last key — pick a different chord."
+                    return
+                }
+            }
+            hotKeyRecorderMessage = nil
+            settings.hotKeySpec = spec
+            AppCoordinator.shared.restartHotKeyListening()
+        }
+    }
+
+    /// Captures a spec for the optional Redo Last key, applying the recorder-level constraints
+    /// from PLAN.md step 9 before accepting it: must end in a real key (not modifier-only), must
+    /// not collide with the PTT key, and must not be shadow-engaged by holding the PTT key's
+    /// modifiers en route to it. See CONTEXT.md "Redo Last".
+    private func beginRedoCapture() {
+        capturingRedoHotKey = true
+        NSApp.activate()
+        NSApp.windows.first(where: { $0.title == "Settings" })?.makeKeyAndOrderFront(nil)
+        let session = HotKeyCapture.Session()
+        redoCaptureSession = session
+        session.start { spec in
+            defer {
+                capturingRedoHotKey = false
+                redoCaptureSession = nil
+            }
+            guard let spec else { return } // Escape cancelled the capture.
+            guard HotKeySpec.isValidRedoSpec(spec) else {
+                redoRecorderMessage = "Redo needs a key, not just modifiers."
+                return
+            }
+            guard !HotKeySpec.collides(spec, settings.hotKeySpec) else {
+                redoRecorderMessage = "Same as the push-to-talk key — pick a different chord."
+                return
+            }
+            guard !HotKeySpec.redoShadowsHeldPTT(pttSpec: settings.hotKeySpec, redoSpec: spec) else {
+                redoRecorderMessage = "Would trigger push-to-talk before this key — pick a different chord."
+                return
+            }
+            redoRecorderMessage = nil
+            settings.redoHotKeySpec = spec
+            AppCoordinator.shared.restartHotKeyListening()
         }
     }
 }

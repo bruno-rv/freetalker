@@ -22,6 +22,10 @@ final class HotKeyManager: @unchecked Sendable {
     /// Fired when Esc is swallowed while recording (Amendment B1) — the pure decision itself is
     /// `shouldSwallowEscape` below.
     var onEscape: (@MainActor () -> Void)?
+    /// Fires once per Redo Last chord press (autorepeat ignored, release never fires) — see
+    /// `redoMatcher` below and CONTEXT.md "Redo Last". nil (unbound) when `start(spec:redoSpec:)`
+    /// is passed a nil `redoSpec`.
+    var onRedoKeyDown: (@MainActor (TimeInterval) -> Void)?
 
     /// True while a hands-free recording is in progress (ptt or locked) — mirrored synchronously
     /// by `AppCoordinator` on every `recordingState` transition. Both run on the main thread (the
@@ -34,6 +38,10 @@ final class HotKeyManager: @unchecked Sendable {
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var matcher = HotKeyMatcher(spec: .default)
+    /// Second matcher fed from the SAME event tap as `matcher` (no second CGEventTap — one tap,
+    /// two independent state machines) — nil when Redo Last is unbound. See PLAN.md step 8,
+    /// CONTEXT.md "Redo Last".
+    private var redoMatcher: HotKeyMatcher?
     /// Mirrors `HotKeyMatcher.keyIsSwallowed` for Esc: true between a swallowed Esc keyDown and
     /// its keyUp, so the keyUp is swallowed too even if `isRecording` has already flipped false
     /// by the time it arrives (cancellation is dispatched asynchronously — see `onEscape`).
@@ -58,13 +66,17 @@ final class HotKeyManager: @unchecked Sendable {
         return CGEvent.tapIsEnabled(tap: tap)
     }
 
-    /// Starts listening for the given hotkey spec, replacing any existing tap.
-    /// Returns false if the tap could not be created (missing Accessibility/Input Monitoring
-    /// permission — both TCC states are logged for diagnosis).
+    /// Starts listening for the given PTT spec and optional Redo Last spec, replacing any
+    /// existing tap. Both matchers are fed by the one CGEventTap created here — a `redoSpec`
+    /// change alone still requires calling this (via `AppCoordinator.restartHotKeyListening`) to
+    /// take effect, same as a `spec` change. Returns false if the tap could not be created
+    /// (missing Accessibility/Input Monitoring permission — both TCC states are logged for
+    /// diagnosis).
     @discardableResult
-    func start(spec: HotKeySpec) -> Bool {
+    func start(spec: HotKeySpec, redoSpec: HotKeySpec?) -> Bool {
         stop()
         matcher = HotKeyMatcher(spec: spec)
+        redoMatcher = redoSpec.map { HotKeyMatcher(spec: $0) }
 
         let axTrusted = AXIsProcessTrusted()
         let hidAccess = IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)
@@ -150,6 +162,12 @@ final class HotKeyManager: @unchecked Sendable {
         }
         let isAutorepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
         let outcome = matcher.handle(kind, keyCode: keyCode, flags: event.flags.rawValue, isAutorepeat: isAutorepeat)
+        // Same event, fed to the second (Redo Last) matcher — keyUp/flagsChanged included so its
+        // internal isEngaged/key-swallow state resets on release, even though only `.engaged`
+        // below ever invokes a callback. PTT's `matcher` above is completely unaffected: this
+        // matcher is a separate state machine, never consulted by `matcher.handle`. See PLAN.md
+        // step 8.
+        let redoOutcome = redoMatcher?.handle(kind, keyCode: keyCode, flags: event.flags.rawValue, isAutorepeat: isAutorepeat)
         // CGEventTimestamp is nanoseconds since system startup (excluding sleep) — converted to
         // seconds here, at the tap callback, so `AppCoordinator`'s tap-vs-hold elapsed-time
         // calculation is immune to any delay between this event firing and the hop to the
@@ -161,6 +179,9 @@ final class HotKeyManager: @unchecked Sendable {
         if outcome.released {
             Task { @MainActor in self.onKeyUp?(eventSeconds) }
         }
-        return outcome.swallow ? nil : Unmanaged.passUnretained(event)
+        if redoOutcome?.engaged == true {
+            Task { @MainActor in self.onRedoKeyDown?(eventSeconds) }
+        }
+        return (outcome.swallow || redoOutcome?.swallow == true) ? nil : Unmanaged.passUnretained(event)
     }
 }
