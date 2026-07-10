@@ -60,7 +60,12 @@ struct LibraryView: View {
                 Text("Select a Dictation").foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .frame(width: 720, height: 480)
+        // Same bug shape as Settings (Task 1): `.frame(width:height:)` is a FIXED frame — it
+        // pins the content to exactly 720x480 regardless of what size the window scene actually
+        // grants it, so maximizing the window stretches the window chrome only. A flexible frame
+        // with min == the old fixed size and max == infinity keeps the same starting size but
+        // lets the content track the window when resized/maximized.
+        .frame(minWidth: 720, maxWidth: .infinity, minHeight: 480, maxHeight: .infinity)
         .confirmationDialog(
             "Delete this Dictation?",
             isPresented: Binding(get: { pendingDeleteID != nil }, set: { if !$0 { pendingDeleteID = nil } }),

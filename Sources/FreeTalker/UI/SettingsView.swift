@@ -10,8 +10,15 @@ struct SettingsView: View {
                 .tabItem { Label("Templates", systemImage: "text.badge.checkmark") }
         }
         .padding(20)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .frame(minWidth: 520, minHeight: 480)
+        // A SINGLE frame call with both min and max: chaining `.frame(maxWidth: .infinity, ...)`
+        // followed by a separate `.frame(minWidth: 520, ...)` (the previous, insufficient fix)
+        // makes the second call the outermost layout container SwiftUI proposes the window's
+        // size to — and since that second call has no maxWidth/maxHeight of its own, it reports
+        // its *ideal* (roughly minimum) size upward, discarding the first call's "fill available
+        // space" entirely. The window itself still resizes/maximizes fine (that's a property of
+        // the Window scene, not this view), but the content stops tracking it. One call with
+        // min *and* max keeps both constraints on the same flexible frame.
+        .frame(minWidth: 520, maxWidth: .infinity, minHeight: 480, maxHeight: .infinity)
     }
 }
 
@@ -44,6 +51,14 @@ private struct GeneralSettingsView: View {
     // Codex finding 7.
     @State private var cloudSTTKeyError = false
     @State private var cloudLLMKeyError = false
+
+    // "Test connection" (Task 3): in-flight flag gates the button + shows a ProgressView;
+    // result holds only the fixed, already-classified message from `ConnectionTestOutcome` —
+    // never a raw response body or the key. See ConnectionTest.swift.
+    @State private var cloudSTTTesting = false
+    @State private var cloudSTTTestResult: String?
+    @State private var cloudLLMTesting = false
+    @State private var cloudLLMTestResult: String?
 
     private let refreshTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
@@ -187,6 +202,17 @@ private struct GeneralSettingsView: View {
                             .font(.caption)
                             .foregroundStyle(.red)
                     }
+                    HStack {
+                        Button("Test connection") { testCloudSTTConnection() }
+                            .disabled(cloudSTTTesting || !AppCoordinator.isCloudSTTConfigured(baseURL: settings.cloudSTTBaseURL, key: cloudSTTKey))
+                        if cloudSTTTesting {
+                            ProgressView().controlSize(.small)
+                        } else if let cloudSTTTestResult {
+                            Text(cloudSTTTestResult)
+                                .font(.caption)
+                                .foregroundStyle(cloudSTTTestResult.hasSuffix("Connected ✓") ? .green : .red)
+                        }
+                    }
                 }
             }
 
@@ -214,6 +240,17 @@ private struct GeneralSettingsView: View {
                     Text("Failed to save key to Keychain")
                         .font(.caption)
                         .foregroundStyle(.red)
+                }
+                HStack {
+                    Button("Test connection") { testCloudLLMConnection() }
+                        .disabled(cloudLLMTesting || !AppCoordinator.isCloudLLMConfigured(snapshot: settings.cloudLLMSnapshot))
+                    if cloudLLMTesting {
+                        ProgressView().controlSize(.small)
+                    } else if let cloudLLMTestResult {
+                        Text(cloudLLMTestResult)
+                            .font(.caption)
+                            .foregroundStyle(cloudLLMTestResult.hasSuffix("Connected ✓") ? .green : .red)
+                    }
                 }
                 Text("Used for all templates whenever provider, model, and API key are configured. Clear the key to go back to on-device processing.")
                     .font(.caption)
@@ -375,6 +412,53 @@ private struct GeneralSettingsView: View {
             settings.redoHotKeySpec = spec
         }
     }
+
+    /// "Test connection" for the Cloud STT (BYOK) section. Snapshots the base URL/key into
+    /// locals before the `await` so a mid-flight edit to the fields can't retroactively change
+    /// what's being tested. `ConnectionTestOutcome.message` is the only thing ever assigned to
+    /// `cloudSTTTestResult` — never the thrown error's description, which could carry a response
+    /// body. See Task 3 security requirement.
+    private func testCloudSTTConnection() {
+        cloudSTTTesting = true
+        cloudSTTTestResult = nil
+        let baseURL = settings.cloudSTTBaseURL
+        let key = cloudSTTKey
+        Task {
+            let outcome: ConnectionTestOutcome
+            do {
+                let status = try await CloudSTTEngine.testConnection(baseURL: baseURL, apiKey: key)
+                outcome = .fromStatusCode(status)
+            } catch {
+                outcome = .fromTransportError(error)
+            }
+            cloudSTTTesting = false
+            cloudSTTTestResult = "Cloud STT: \(outcome.message)"
+        }
+    }
+
+    /// "Test connection" for the Cloud post-processing (BYOK) section. Same snapshot-before-await
+    /// discipline as `testCloudSTTConnection`, via `AppSettings.cloudLLMSnapshot` — the same
+    /// snapshot type `CloudLLMProcessor.process` (the real dictation path) and
+    /// `AppCoordinator.isCloudLLMConfigured` (this button's `.disabled` gate) both use, so all
+    /// three can never disagree about what's being tested. See CloudLLMSettingsSnapshot's doc
+    /// comment.
+    private func testCloudLLMConnection() {
+        cloudLLMTesting = true
+        cloudLLMTestResult = nil
+        let processor = CloudLLMProcessor(snapshot: settings.cloudLLMSnapshot)
+        let providerLabel = settings.llmProvider.rawValue
+        Task {
+            let outcome: ConnectionTestOutcome
+            do {
+                let status = try await processor.testConnection()
+                outcome = .fromStatusCode(status)
+            } catch {
+                outcome = .fromTransportError(error)
+            }
+            cloudLLMTesting = false
+            cloudLLMTestResult = "\(providerLabel): \(outcome.message)"
+        }
+    }
 }
 
 private struct TemplatesSettingsView: View {
@@ -396,7 +480,14 @@ private struct TemplatesSettingsView: View {
                     .tag(template.id)
                 }
             }
-            .frame(minWidth: 160)
+            // Master list stays compact — a bounded maxWidth so it doesn't compete for space
+            // with the (flexible) detail editor. Previously this had no maxWidth at all, and
+            // since List is inherently greedy (defaults to filling all available width when
+            // unconstrained) while the old Form-based TemplateEditor reported a small ideal
+            // width, HSplitView handed nearly all the window's width to this list and squeezed
+            // the editor down to its minimum — exactly the reported "list occupies almost the
+            // whole screen, prompt editor is shrunk" bug.
+            .frame(minWidth: 160, idealWidth: 200, maxWidth: 260)
             .toolbar {
                 ToolbarItemGroup {
                     Button {
@@ -427,8 +518,15 @@ private struct TemplateEditor: View {
     @ObservedObject private var settings = AppSettings.shared
 
     var body: some View {
-        Form {
+        // A plain VStack, not a Form: Form/List lay out as a scrollable stack of rows sized to
+        // their own content, so a `maxHeight: .infinity` TextEditor row inside one does not
+        // reliably claim the Form's leftover vertical space. A VStack of fixed-height header
+        // rows plus one flexible child (the TextEditor, `maxHeight: .infinity`) is the standard
+        // pattern for "everything else stays compact, this one view eats the rest" and is what
+        // makes the prompt editor grow with the window per Task 2.
+        VStack(alignment: .leading, spacing: 12) {
             TextField("Name", text: $template.name)
+                .textFieldStyle(.roundedBorder)
                 .onChange(of: template.name) { _, _ in store.upsert(template) }
             Button(template.id == settings.activeTemplateID ? "Active Template" : "Make Active") {
                 settings.activeTemplateID = template.id
@@ -439,7 +537,8 @@ private struct TemplateEditor: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             TextEditor(text: $template.prompt)
-                .frame(minHeight: 200)
+                .font(.body)
+                .frame(maxWidth: .infinity, minHeight: 200, maxHeight: .infinity)
                 .onChange(of: template.prompt) { _, _ in store.upsert(template) }
         }
         .padding()
