@@ -2213,6 +2213,44 @@ enum SelfCheck {
             failures.append("mutation test: removingAppRule must disagree with an only-clears-template-rule stand-in — the check above isn't discriminating")
         }
 
+        // applyingAppRule REPLACES the bundle id's whole row rather than merging into whatever
+        // halves already exist. Re-adding Slack (which starts as both-template-and-language, per
+        // `appRules`/`appLanguageRules` above) as language-only EN must clear its old template
+        // override, not leave it active alongside the new language. See Codex finding on
+        // SettingsView.swift:332.
+        let afterReplaceSlack = AppSettings.applyingAppRule(bundleID: "com.tinyspeck.slackmacgap", templateID: nil, language: "en", appRules: appRules, appLanguageRules: appLanguageRules)
+        if afterReplaceSlack.appRules["com.tinyspeck.slackmacgap"] != nil {
+            failures.append("applyingAppRule: expected the old template override cleared when re-adding as language-only, got \(afterReplaceSlack.appRules["com.tinyspeck.slackmacgap"] as Any)")
+        }
+        if afterReplaceSlack.appLanguageRules["com.tinyspeck.slackmacgap"] != "en" {
+            failures.append("applyingAppRule: expected the new language applied, got \(afterReplaceSlack.appLanguageRules["com.tinyspeck.slackmacgap"] as Any)")
+        }
+        // Symmetric case: re-adding as template-only must clear the old language override.
+        let afterReplaceSlackTemplateOnly = AppSettings.applyingAppRule(bundleID: "com.tinyspeck.slackmacgap", templateID: "email", language: nil, appRules: appRules, appLanguageRules: appLanguageRules)
+        if afterReplaceSlackTemplateOnly.appLanguageRules["com.tinyspeck.slackmacgap"] != nil {
+            failures.append("applyingAppRule: expected the old language override cleared when re-adding as template-only, got \(afterReplaceSlackTemplateOnly.appLanguageRules["com.tinyspeck.slackmacgap"] as Any)")
+        }
+        if afterReplaceSlackTemplateOnly.appRules["com.tinyspeck.slackmacgap"] != "email" {
+            failures.append("applyingAppRule: expected the new template applied, got \(afterReplaceSlackTemplateOnly.appRules["com.tinyspeck.slackmacgap"] as Any)")
+        }
+        // Untouched entries survive a replace on a different bundle id.
+        if afterReplaceSlack.appRules["com.apple.mail"] != "email" || afterReplaceSlack.appLanguageRules["com.apple.finder"] != "en" {
+            failures.append("applyingAppRule: expected unrelated entries left untouched")
+        }
+        // Mutation test: a stand-in that merges instead of replacing (the original bug — only
+        // writes the non-nil halves, leaving a stale template override active) must disagree.
+        func mergingInsteadOfReplacing(bundleID: String, templateID: String?, language: String?, appRules: [String: String], appLanguageRules: [String: String]) -> (appRules: [String: String], appLanguageRules: [String: String]) {
+            var rules = appRules
+            var languageRules = appLanguageRules
+            if let templateID { rules[bundleID] = templateID }
+            if let language { languageRules[bundleID] = language }
+            return (rules, languageRules)
+        }
+        let buggyMerge = mergingInsteadOfReplacing(bundleID: "com.tinyspeck.slackmacgap", templateID: nil, language: "en", appRules: appRules, appLanguageRules: appLanguageRules)
+        if afterReplaceSlack.appRules == buggyMerge.appRules {
+            failures.append("mutation test: applyingAppRule must disagree with a merge-instead-of-replace stand-in — the check above isn't discriminating")
+        }
+
         return failures
     }
 

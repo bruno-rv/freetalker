@@ -234,6 +234,27 @@ final class AppSettings: ObservableObject {
         return (rules, languageRules)
     }
 
+    /// Pure "Add" for a unified App Rules row: REPLACES the bundle id's whole row rather than
+    /// merging into whatever halves already exist — a nil half clears that dict's entry instead
+    /// of leaving a stale one active. E.g. re-adding Slack as language-only EN must drop its old
+    /// template override, not just leave it untouched alongside the new language. See Codex
+    /// finding on SettingsView.swift:332.
+    nonisolated static func applyingAppRule(bundleID: String, templateID: String?, language: String?, appRules: [String: String], appLanguageRules: [String: String]) -> (appRules: [String: String], appLanguageRules: [String: String]) {
+        var rules = appRules
+        var languageRules = appLanguageRules
+        if let templateID {
+            rules[bundleID] = templateID
+        } else {
+            rules.removeValue(forKey: bundleID)
+        }
+        if let language {
+            languageRules[bundleID] = language
+        } else {
+            languageRules.removeValue(forKey: bundleID)
+        }
+        return (rules, languageRules)
+    }
+
     /// CoreAudio UID of the input device to capture from. nil means "System default" — the
     /// UID (not AudioDeviceID) is persisted since device ids can change across reboots.
     @Published var microphoneDeviceUID: String? {
