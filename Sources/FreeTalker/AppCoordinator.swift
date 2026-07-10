@@ -49,6 +49,12 @@ final class AppCoordinator: ObservableObject {
     private var lockedCapSeconds: TimeInterval?
     /// Ticks the HUD's elapsed/cap display roughly once a second while `locked`.
     private var lockedHUDTimer: Timer?
+    /// Recording Panel one-shot language choice (CONTEXT.md "Language Pin", PLAN.md step 12):
+    /// beats the app rule AND the pin, but only for the in-flight Dictation. Set/cleared only
+    /// through `Self.nextOneShotLanguage` (see below) so every touch point — set, tap-again-
+    /// clears, and the three clear sites (stop, cancel, new recording) — goes through the same
+    /// pure decision SelfCheck exercises directly.
+    private var oneShotLanguage: String?
 
     let whisperEngine = WhisperKitEngine()
     let cloudSTTEngine = CloudSTTEngine()
@@ -115,6 +121,14 @@ final class AppCoordinator: ObservableObject {
         // Amendment B3: clicking the HUD pill locks an in-progress PTT recording or stops a
         // locked one — wired once, not per-`ensureHotKeyListening()` call.
         hud.onPillClick = { [weak self] in self?.handlePillClick() }
+        // Recording Panel (Feature 3): each control's own callback, wired once — see
+        // PLAN.md step 9/10.
+        hud.onPanelCancel = { [weak self] in self?.handlePanelCancel() }
+        hud.onPanelDone = { [weak self] in self?.handlePanelDone() }
+        hud.onPanelRaw = { [weak self] in self?.handlePanelRaw() }
+        hud.onPanelLanguage = { [weak self] code in self?.handlePanelOneShotLanguage(code) }
+        hud.onPanelCycleTemplate = { [weak self] in self?.handlePanelCycleTemplate() }
+        hud.onPanelLock = { [weak self] in self?.handlePillClick() }
     }
 
     /// Single entry point that (re)creates the global hotkey event tap whenever it is dead.
@@ -273,6 +287,112 @@ final class AppCoordinator: ObservableObject {
         }
     }
 
+    // MARK: - Recording Panel (Feature 3)
+    //
+    // Every panel button that can stop/lock/cancel the recording routes through
+    // `RecordingStateMachine.transition` from the CURRENT state, via the pure
+    // `recordingEvent(for:)` mapping below — so a stale/double click (the state already back at
+    // idle by the time it's handled) always resolves to `.none` from the same table
+    // `handsFreeChecks`/`panelActionRoutingChecks` cover, rather than a bespoke per-button guard.
+    // See PLAN.md step 9/10.
+
+    /// Which `RecordingEvent` a Recording Panel button press maps to — the routing table
+    /// SelfCheck drives directly against `RecordingStateMachine.transition`. EN/PT and the
+    /// template-cycle button aren't lifecycle transitions (they don't stop/lock/cancel a
+    /// recording) — they're metadata toggles gated on "a recording is in progress", handled by
+    /// their own methods below rather than through this table.
+    enum PanelButton: Equatable {
+        case cancel
+        case done
+        case raw
+        case lock
+    }
+
+    nonisolated static func recordingEvent(for button: PanelButton) -> RecordingEvent {
+        switch button {
+        case .cancel: return .esc
+        case .done, .raw: return .panelFinish
+        case .lock: return .pillClick
+        }
+    }
+
+    /// ✕ Cancel — same esc/cancel path as pressing Esc while recording. See PLAN.md step 9.
+    private func handlePanelCancel() { handleEscape() }
+
+    /// 🔒 Lock — visible only in `pttRecording` (PLAN.md step 9); the only panel control mapped
+    /// to `pillClick`, reusing `handlePillClick`'s existing pre-snapshot + enterLocked path.
+    private func handlePanelLock() { handlePillClick() }
+
+    /// ✓ Done — stop+transcribe with post-processing.
+    private func handlePanelDone() { handlePanelFinish(skipPostProcessing: false) }
+
+    /// "Raw" — stop+transcribe verbatim (Post-Processor never invoked). See PLAN.md step 11.
+    private func handlePanelRaw() { handlePanelFinish(skipPostProcessing: true) }
+
+    /// Shared Done/Raw implementation (PLAN.md step 10): Done/Raw CANNOT reuse `pillClick` —
+    /// from `pttRecording`, `pillClick` LOCKS rather than stopping — so this routes `.panelFinish`
+    /// instead, with the same pre-snapshot discipline as `handlePillClick` (InsertionTarget
+    /// captured BEFORE the state-machine transition and its side effects, for the same
+    /// paste-target-drift reason).
+    private func handlePanelFinish(skipPostProcessing: Bool) {
+        let preSnapshottedFrontmostApp = NSWorkspace.shared.frontmostApplication
+        let preSnapshottedTarget = Insertion.snapshotTarget(app: preSnapshottedFrontmostApp)
+        let (newState, action) = RecordingStateMachine.transition(state: recordingState, event: Self.recordingEvent(for: skipPostProcessing ? .raw : .done), currentGeneration: recordingGeneration)
+        recordingState = newState
+        switch action {
+        case .stopAndTranscribe:
+            stopAndTranscribe(preSnapshotted: (app: preSnapshottedFrontmostApp, target: preSnapshottedTarget), skipPostProcessing: skipPostProcessing)
+        case .none, .startCapture, .enterLocked, .cancel:
+            break
+        }
+    }
+
+    /// Pure decision for what `oneShotLanguage` should become after each lifecycle event PLAN.md
+    /// step 12 names: a panel EN/PT tap sets/toggles it (tapping the already-active choice clears
+    /// it back to standing behavior); a stop (`stopAndTranscribe`, every terminal path including
+    /// the empty-samples early return), a cancel, or a new recording starting all clear it back
+    /// to nil. Every real touch point below calls this — not a re-derived mirror — so SelfCheck's
+    /// coverage is of the actual production decision.
+    enum OneShotLanguageEvent: Equatable {
+        case panelLanguageTap(String)
+        case clear
+    }
+
+    nonisolated static func nextOneShotLanguage(current: String?, event: OneShotLanguageEvent) -> String? {
+        switch event {
+        case .panelLanguageTap(let code): return current == code ? nil : code
+        case .clear: return nil
+        }
+    }
+
+    /// EN | PT one-shot buttons (PLAN.md step 9): sets/clears `oneShotLanguage` for the IN-FLIGHT
+    /// Dictation only. Gated on "a recording is in progress" — a stale press after the recording
+    /// already ended must not set state for a future, unrelated Dictation.
+    private func handlePanelOneShotLanguage(_ code: String) {
+        guard recordingState != .idle else { return }
+        oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .panelLanguageTap(code))
+        updateRecordingPanel()
+    }
+
+    /// Pure "next template in store order" decision for the panel's template-cycle button —
+    /// wraps around; a current id no longer present in the list (e.g. deleted mid-recording)
+    /// falls back to the first template rather than crashing/no-op'ing forever.
+    nonisolated static func nextTemplateID(current: String, templateIDsInOrder: [String]) -> String? {
+        guard !templateIDsInOrder.isEmpty else { return nil }
+        guard let index = templateIDsInOrder.firstIndex(of: current) else { return templateIDsInOrder.first }
+        return templateIDsInOrder[(index + 1) % templateIDsInOrder.count]
+    }
+
+    /// Template-cycle button (PLAN.md step 9): advances the GLOBAL Active Template through the
+    /// store's order — not a one-shot; the stop-time template resolution read makes it apply
+    /// naturally to the in-flight Dictation. Gated the same way as the language buttons.
+    private func handlePanelCycleTemplate() {
+        guard recordingState != .idle else { return }
+        guard let next = Self.nextTemplateID(current: AppSettings.shared.activeTemplateID, templateIDsInOrder: TemplateStore.shared.templates.map(\.id)) else { return }
+        AppSettings.shared.activeTemplateID = next
+        updateRecordingPanel()
+    }
+
     /// A `locked` recording's duration-cap timer fired (Amendment B2). Routed through the state
     /// machine so a stale generation (superseded by a newer recording) is a no-op even if the
     /// timer somehow fired after `invalidateCapTimer()` should have cancelled it.
@@ -292,6 +412,9 @@ final class AppCoordinator: ObservableObject {
     /// capture-start failure, so the caller never commits the state transition for a recording
     /// that never actually started.
     private func beginCapture() -> Bool {
+        // Reset for the new Dictation (PLAN.md step 12) — a one-shot choice never leaks across
+        // recordings.
+        oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .clear)
         let micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
         Self.logger.log("key down: micAuthorizationStatus=\(micStatus.rawValue, privacy: .public)")
         // Guard unconditionally rather than proceeding to record silence — a denied/stale TCC
@@ -305,12 +428,14 @@ final class AppCoordinator: ObservableObject {
         do {
             try audioCapture.start(deviceUID: AppSettings.shared.microphoneDeviceUID)
             recordingGeneration += 1
-            if let note = audioCapture.deviceFallbackNote {
-                hud.show(text: note)
-            } else {
-                hud.show(text: "Recording…")
-            }
             startLivePreviewIfNeeded()
+            // startLivePreviewIfNeeded() just reset lastLivePreviewText to nil — seed it with the
+            // device-fallback note (if any) so it's visible in the panel until real preview text
+            // arrives.
+            if let note = audioCapture.deviceFallbackNote {
+                lastLivePreviewText = note
+            }
+            updateRecordingPanel()
             return true
         } catch {
             lastError = "Mic error: \(error.localizedDescription)"
@@ -342,16 +467,43 @@ final class AppCoordinator: ObservableObject {
         capTimer = newCapTimer
         lockedHUDTimer?.invalidate()
         let newHUDTimer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.updateLockedHUD() }
+            Task { @MainActor in self?.updateRecordingPanel() }
         }
         RunLoop.main.add(newHUDTimer, forMode: .common)
         lockedHUDTimer = newHUDTimer
-        updateLockedHUD()
+        updateRecordingPanel()
     }
 
-    private func updateLockedHUD() {
-        guard case .locked = recordingState, let start = lockedStartTime, let cap = lockedCapSeconds else { return }
-        hud.showLocked(elapsed: Date().timeIntervalSince(start), cap: cap, previewText: lastLivePreviewText.map { HUDController.tailTruncate($0, maxCharacters: 60) })
+    /// Rebuilds and re-renders the Recording Panel (Feature 3) from current coordinator state —
+    /// called at capture start, on every live-preview tick, on every locked-mode timer tick, and
+    /// whenever the one-shot language or Active Template selection changes, so the panel's own
+    /// displayed state always agrees with what a stop-time resolution would actually pick. A
+    /// no-op once the recording has ended (`recordingState == .idle`) — the terminal
+    /// hide/flash calls own the HUD from that point on.
+    private func updateRecordingPanel() {
+        guard recordingState != .idle else { return }
+        let isLocked: Bool
+        let elapsed: TimeInterval
+        let cap: TimeInterval
+        if case .locked = recordingState, let start = lockedStartTime, let capSeconds = lockedCapSeconds {
+            isLocked = true
+            elapsed = Date().timeIntervalSince(start)
+            cap = capSeconds
+        } else {
+            isLocked = false
+            elapsed = 0
+            cap = 0
+        }
+        let activeTemplateName = TemplateStore.shared.template(id: AppSettings.shared.activeTemplateID)?.name ?? "Template"
+        let state = HUDController.RecordingPanelState(
+            isLocked: isLocked,
+            elapsed: elapsed,
+            cap: cap,
+            previewText: lastLivePreviewText.map { HUDController.tailTruncate($0, maxCharacters: 60) },
+            activeTemplateName: activeTemplateName,
+            oneShotLanguage: oneShotLanguage
+        )
+        hud.showRecordingPanel(state)
     }
 
     private func invalidateCapTimer() {
@@ -361,14 +513,24 @@ final class AppCoordinator: ObservableObject {
         lockedHUDTimer = nil
     }
 
-    /// Terminal "stop" action (B4/B5) — shared by all four stop triggers: classic PTT release,
-    /// re-pressing the hotkey while locked, clicking the pill while locked, and the duration cap
-    /// firing while locked. Reads the frontmost app/insertion-target snapshot at the moment this
-    /// runs (i.e. at STOP time) unless `preSnapshotted` is supplied — used only by the pill-click
-    /// path, whose FULL snapshot (app + AX element/window, not just the app) must be taken BEFORE
-    /// the click itself is processed (B3). For the PTT path this is the same moment as before
-    /// Amendment B: synchronous, at key-up, before any `await`.
-    private func stopAndTranscribe(preSnapshotted: (app: NSRunningApplication?, target: InsertionTarget?)? = nil) {
+    /// Terminal "stop" action (B4/B5) — shared by every stop trigger: classic PTT release,
+    /// re-pressing the hotkey while locked, clicking the pill while locked, the duration cap
+    /// firing while locked, and the Recording Panel's Done/Raw buttons (Feature 3). Reads the
+    /// frontmost app/insertion-target snapshot at the moment this runs (i.e. at STOP time) unless
+    /// `preSnapshotted` is supplied — used by the pill-click and panel-finish paths, whose FULL
+    /// snapshot (app + AX element/window, not just the app) must be taken BEFORE the click itself
+    /// is processed (B3). For the PTT path this is the same moment as before Amendment B:
+    /// synchronous, at key-up, before any `await`. `skipPostProcessing` (Feature 3's "Raw"
+    /// button) rides straight through to `processDictation` — the raw flag is pipeline config,
+    /// not lifecycle, so it isn't part of the state machine.
+    private func stopAndTranscribe(preSnapshotted: (app: NSRunningApplication?, target: InsertionTarget?)? = nil, skipPostProcessing: Bool = false) {
+        // Consumed into the forced-language snapshot below, before the pipeline `Task` starts;
+        // cleared on EVERY terminal path of this function via `defer` (including the
+        // empty-samples early return just below) so a one-shot choice never leaks into the next
+        // Dictation. See PLAN.md step 12.
+        let capturedOneShotLanguage = oneShotLanguage
+        defer { oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .clear) }
+
         invalidateCapTimer()
         // Cancel the preview loop immediately, before anything else — the final pipeline below
         // owns the buffer from here on. See PLAN 3 "Partial loop": "Key release: cancel loop
@@ -415,16 +577,27 @@ final class AppCoordinator: ObservableObject {
             templates: TemplateStore.shared.templates,
             activeTemplateID: AppSettings.shared.activeTemplateID
         )
+        // Language Pin resolution (CONTEXT.md "Language Pin"): resolved here, at stop time,
+        // using the same already-snapshotted `bundleID` template resolution just used — passed
+        // as a parameter through the pipeline, never re-read from AppSettings mid-transcribe. See
+        // PLAN.md step 4/12.
+        let forcedLanguage = Self.resolveLanguage(
+            oneShot: capturedOneShotLanguage,
+            bundleID: bundleID,
+            appLanguageRules: AppSettings.shared.appLanguageRules,
+            pin: AppSettings.shared.languagePin
+        )
 
         hud.show(text: ruleFired ? "Processing… (\(template.name))" : "Processing…")
 
-        Task { await runPipeline(samples: samples, engine: engine, engineName: engineName, template: template, appName: appName, target: insertionTarget) }
+        Task { await runPipeline(samples: samples, engine: engine, engineName: engineName, template: template, appName: appName, target: insertionTarget, forcedLanguage: forcedLanguage, skipPostProcessing: skipPostProcessing) }
     }
 
     /// Terminal `cancelRecording` action (B1a) — the production call site, wired to the real
     /// audio/HUD/timer objects. See `performCancelRecording` for the pure, injectable version
     /// SelfCheck exercises.
     private func cancelRecording() {
+        oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .clear)
         Self.performCancelRecording(
             stopCapture: { _ = self.audioCapture.stop() },
             cancelLivePreview: { self.stopLivePreview() },
@@ -469,6 +642,30 @@ final class AppCoordinator: ObservableObject {
             return (fallback, false)
         }
         return (matched, true)
+    }
+
+    /// Pure Language Pin resolution (CONTEXT.md "Language Pin"): returns nil for auto-detect, or
+    /// a forced "en"/"pt" code. Precedence: one-shot (panel) > app rule > pin > auto. Each
+    /// candidate is normalized INDEPENDENTLY (`AppSettings.normalizeLanguageCode`: trim/lowercase,
+    /// must be "en"/"pt") — an invalid candidate falls through to the next rather than blocking a
+    /// valid one further down the chain (an invalid one-shot never blocks a valid rule/pin; an
+    /// invalid rule never blocks a valid pin). A nil `bundleID` skips the app-rule step entirely.
+    /// See PLAN.md step 4.
+    nonisolated static func resolveLanguage(
+        oneShot: String?,
+        bundleID: String?,
+        appLanguageRules: [String: String],
+        pin: String
+    ) -> String? {
+        if let oneShot, let normalized = AppSettings.normalizeLanguageCode(oneShot) {
+            return normalized
+        }
+        if let bundleID, let ruleValue = appLanguageRules[bundleID], let normalized = AppSettings.normalizeLanguageCode(ruleValue) {
+            return normalized
+        }
+        // "auto" (or any other invalid value) normalizes to nil here — auto-detect — which is
+        // exactly this function's own final fallback, so no extra branch is needed.
+        return AppSettings.normalizeLanguageCode(pin)
     }
 
     /// Pure global routing rule (Amendment A1, replacing the removed per-Template
@@ -629,7 +826,7 @@ final class AppCoordinator: ObservableObject {
         // cancelled/early-stopped attempt throws and lands here as `try?`. Errors are otherwise
         // non-fatal — the unchanged final pipeline still owns the real result; just let the next
         // tick retry.
-        guard let result = try? await whisperEngine.transcribe(samples: window, allowEarlyCancel: true) else { return }
+        guard let result = try? await whisperEngine.transcribe(samples: window, forcedLanguage: nil, allowEarlyCancel: true) else { return }
 
         guard Self.shouldAcceptLivePreviewResult(isRecording: isRecording, resultGeneration: generation, currentGeneration: livePreviewGeneration) else { return }
 
@@ -639,21 +836,17 @@ final class AppCoordinator: ObservableObject {
         // flashing/resizing the pill every tick. See PLAN 3 "Failure modes to avoid".
         guard !text.isEmpty, text != lastLivePreviewText else { return }
         lastLivePreviewText = text
-        // Mode-aware (Amendment B3): while `locked`, the preview text is embedded inside the
-        // lock glyph/elapsed layout by `updateLockedHUD` — a tick must never replace that layout
-        // with a bare text pill.
-        if case .locked = recordingState {
-            updateLockedHUD()
-        } else {
-            hud.show(text: HUDController.tailTruncate(text))
-        }
+        // Recording Panel (Feature 3): the preview text is embedded inside the panel's own row
+        // layout in both recording states — a tick must never replace that layout with a bare
+        // text pill.
+        updateRecordingPanel()
     }
 
-    private func runPipeline(samples: [Float], engine: any TranscriptionEngine, engineName: String, template: Template, appName: String?, target: InsertionTarget?) async {
+    private func runPipeline(samples: [Float], engine: any TranscriptionEngine, engineName: String, template: Template, appName: String?, target: InsertionTarget?, forcedLanguage: String?, skipPostProcessing: Bool) async {
         defer { isProcessing = false }
 
         do {
-            let result = try await processDictation(samples: samples, engine: engine, engineName: engineName, template: template, appName: appName, target: target)
+            let result = try await processDictation(samples: samples, engine: engine, engineName: engineName, template: template, appName: appName, target: target, forcedLanguage: forcedLanguage, skipPostProcessing: skipPostProcessing)
             if let fallbackReason = result.fallbackReason {
                 logPostProcessingFallback(fallbackReason)
             }
@@ -665,13 +858,17 @@ final class AppCoordinator: ObservableObject {
             // paste manually"), so that case gets its own combined message instead of falling
             // through the two single-condition branches below. Busy state otherwise hides
             // immediately on success; nothing terminal to show the user. See Round 2 Codex
-            // finding 6, PLAN.md step 8.
+            // finding 6, PLAN.md step 8. Raw dictations (Feature 3, `skipPostProcessing`) never
+            // have a fallback reason (the Post-Processor is never invoked) — their own terminal
+            // message ("Pasted (raw)") only applies on the success path.
             if !result.posted, result.fallbackReason != nil {
                 hud.flash("Post-processing failed — raw transcript copied, paste manually (check API key/model in Settings)")
             } else if !result.posted {
-                hud.flash("Copied — paste manually")
+                hud.flash(skipPostProcessing ? "Copied (raw) — paste manually" : "Copied — paste manually")
             } else if result.fallbackReason != nil {
                 hud.flash("Cloud post-processing failed — used raw transcript (check API key/model in Settings)")
+            } else if skipPostProcessing {
+                hud.flash("Pasted (raw)")
             } else {
                 hud.hide()
             }
@@ -738,6 +935,10 @@ final class AppCoordinator: ObservableObject {
         template: Template,
         appName: String? = nil,
         target: InsertionTarget? = nil,
+        forcedLanguage: String? = nil,
+        // Raw path (CONTEXT.md/PLAN.md step 11): skips the Post-Processor entirely — refined IS
+        // the transcript verbatim — and records the reserved "Raw Transcript" Library row name.
+        skipPostProcessing: Bool = false,
         processor: (any PostProcessor)? = nil,
         insert: (String, InsertionTarget?) -> Bool = { Insertion.insert($0, target: $1) },
         // ponytail: closure default (not a protocol/factory) keeps SelfCheck hermetic to a temp
@@ -746,35 +947,46 @@ final class AppCoordinator: ObservableObject {
             try LibraryStore.shared.record(language: language, template: template, transcript: transcript, refined: refined, engine: engine)
         }
     ) async throws -> (transcript: String, refined: String, posted: Bool, fallbackReason: PostProcessingFallbackReason?) {
-        let transcription = try await engine.transcribe(samples: samples)
+        let transcription = try await engine.transcribe(samples: samples, forcedLanguage: forcedLanguage)
         guard !transcription.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw PipelineError.emptyTranscript
         }
 
-        let activeProcessor: any PostProcessor = processor ?? resolveActiveProcessor()
         let refined: String
         var fallbackReason: PostProcessingFallbackReason?
-        do {
-            let processed = try await activeProcessor.process(transcript: transcription.text, template: template, appName: appName)
-            let trimmed = processed.trimmingCharacters(in: .whitespacesAndNewlines)
-            // Never lose the user's words — fall back to the raw transcript if post-processing
-            // returns empty output without throwing. See Round 1 Codex finding 3.
-            if trimmed.isEmpty {
-                refined = transcription.text
-                fallbackReason = .emptyOutput
-            } else {
-                refined = trimmed
-            }
-        } catch {
-            // Never lose the user's words — fall back to the raw transcript. See PLAN.md step 4.
+        let recordedTemplateName: String
+        if skipPostProcessing {
+            // Raw path: the Post-Processor is never invoked — the Library row records the
+            // reserved sentinel name instead of the resolved Template's, so raw rows are
+            // distinguishable from ordinary post-processing-fallback rows (which keep their real
+            // template name). See PLAN.md step 11.
             refined = transcription.text
-            fallbackReason = .error(error)
+            recordedTemplateName = TemplateStore.rawTranscriptTemplateName
+        } else {
+            let activeProcessor: any PostProcessor = processor ?? resolveActiveProcessor()
+            do {
+                let processed = try await activeProcessor.process(transcript: transcription.text, template: template, appName: appName)
+                let trimmed = processed.trimmingCharacters(in: .whitespacesAndNewlines)
+                // Never lose the user's words — fall back to the raw transcript if post-processing
+                // returns empty output without throwing. See Round 1 Codex finding 3.
+                if trimmed.isEmpty {
+                    refined = transcription.text
+                    fallbackReason = .emptyOutput
+                } else {
+                    refined = trimmed
+                }
+            } catch {
+                // Never lose the user's words — fall back to the raw transcript. See PLAN.md step 4.
+                refined = transcription.text
+                fallbackReason = .error(error)
+            }
+            recordedTemplateName = template.name
         }
 
         let posted = insert(refined, target)
 
         do {
-            try record(transcription.language, template.name, transcription.text, refined, engineName)
+            try record(transcription.language, recordedTemplateName, transcription.text, refined, engineName)
         } catch {
             throw PipelineError.recordFailed(error)
         }
