@@ -224,7 +224,7 @@ enum SelfCheck {
             failures.append(contentsOf: redoLastChecks())
 
             if failures.isEmpty {
-                print("SelfCheck PASSED (template seeding, FTS round-trip, pipeline contract, mic device enumeration, hotkey spec/matcher, vocabulary normalization/injection, app rule resolution, paste-target drift, prompt app-name sanitization, live preview gating/availability, SerialGate cancellation, preview early-cancel decisions, built-in template prompt upgrade, LLM provider defaults, BYOK Keychain key migration, global cloud-selection routing, BYOK connection-test status-code mapping/config gating, hands-free recording state machine/esc/cap-clamp/cancel, Library deletion: per-row/Delete All/latestDictation tiebreak/dangling source_id/secure_delete/unfiltered total count, SQLite step classification (readAll/dictationExists error propagation), WAL checkpoint busy path, debug-audio purge scoping (incl. directory-named-*.wav skip, unreadable-directory error), LibraryStore privacy-step-then-always sequencing, Redo Last gating/spec-constraints/matcher/result message/spec validation)")
+                print("SelfCheck PASSED (template seeding, FTS round-trip, pipeline contract, mic device enumeration, hotkey spec/matcher, vocabulary normalization/injection, app rule resolution, paste-target drift, prompt app-name sanitization, live preview gating/availability, SerialGate cancellation, preview early-cancel decisions, built-in template prompt upgrade (incl. v3->v4 Spoken Commands), LLM provider defaults, BYOK Keychain key migration, global cloud-selection routing, BYOK connection-test status-code mapping/config gating, hands-free recording state machine/esc/cap-clamp/cancel, Library deletion: per-row/Delete All/latestDictation tiebreak/dangling source_id/secure_delete/unfiltered total count, SQLite step classification (readAll/dictationExists error propagation), WAL checkpoint busy path, debug-audio purge scoping (incl. directory-named-*.wav skip, unreadable-directory error), LibraryStore privacy-step-then-always sequencing, Redo Last gating/spec-constraints/matcher/result message/spec validation)")
                 exit(0)
             } else {
                 print("SelfCheck FAILED:")
@@ -983,7 +983,10 @@ enum SelfCheck {
     /// alone, a second pass is a no-op (idempotent), and a built-in the user deleted is not
     /// re-seeded. Also covers (e): a v2 legacy prompt (not just the oldest v1 one) upgrades to
     /// the current default, exercising the multi-entry `legacyPrompts` array added for the
-    /// cross-sentence self-correction prompt revision (v2 -> v3).
+    /// cross-sentence self-correction prompt revision (v2 -> v3). Also covers (f)-(g), added for
+    /// the Spoken Commands prompt revision (v3 -> v4, PLAN.md Feature 1): the v3 text of every
+    /// built-in is now a `legacyPrompts` entry and upgrades to v4, and every built-in's v4 prompt
+    /// carries the Spoken Commands marker phrases and the descriptive-use guard.
     private static func templateUpgradeChecks() -> [String] {
         var failures: [String] = []
 
@@ -1034,6 +1037,36 @@ enum SelfCheck {
         let (upgradedMissing, _) = Template.upgradingBuiltIns(missingOneBuiltIn)
         if upgradedMissing.count != missingOneBuiltIn.count || upgradedMissing.contains(where: { $0.id == "email" }) {
             failures.append("upgradingBuiltIns: expected a deleted built-in to NOT be re-seeded")
+        }
+
+        // (f) Spoken Commands v4 revision (PLAN.md Feature 1): for every built-in, the pre-v4
+        // (v3) prompt is now present as a `legacyPrompts` entry, and a template holding that v3
+        // text unedited upgrades to the current (v4) prompt.
+        for builtIn in Template.builtIns {
+            guard let legacyPromptsForID = Template.legacyPrompts[builtIn.id], legacyPromptsForID.count >= 3 else {
+                failures.append("templateUpgradeChecks: expected at least 3 legacy prompt fixtures (v1, v2, v3) for \(builtIn.id)")
+                continue
+            }
+            let v3Prompt = legacyPromptsForID[2]
+            if v3Prompt == builtIn.prompt {
+                failures.append("templateUpgradeChecks: expected the v3 legacy fixture for \(builtIn.id) to differ from the current v4 prompt")
+            }
+            let uneditedV3 = [Template(id: builtIn.id, name: builtIn.name, prompt: v3Prompt)]
+            let (uneditedV3Upgraded, uneditedV3Changed) = Template.upgradingBuiltIns(uneditedV3)
+            if !uneditedV3Changed || uneditedV3Upgraded.first?.prompt != builtIn.prompt {
+                failures.append("upgradingBuiltIns: expected an unedited v3 legacy prompt for \(builtIn.id) to upgrade to the current v4 default")
+            }
+        }
+
+        // (g) Every built-in's v4 prompt carries the Spoken Commands marker phrases and the
+        // descriptive-use guard sentence (CONTEXT.md "Spoken Command").
+        let spokenCommandMarkers = ["scratch that", "new paragraph", "unquote", "transcribe it literally"]
+        for builtIn in Template.builtIns {
+            for marker in spokenCommandMarkers {
+                if !builtIn.prompt.contains(marker) {
+                    failures.append("templateUpgradeChecks: expected \(builtIn.id) v4 prompt to contain Spoken Commands marker \"\(marker)\"")
+                }
+            }
         }
 
         return failures
