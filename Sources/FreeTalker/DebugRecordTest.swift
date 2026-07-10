@@ -32,7 +32,7 @@ enum DebugRecordTest {
                         try? await Task.sleep(nanoseconds: 300_000_000)
                     }
                 }
-                let output = try await engine.transcribe(samples: samples)
+                let output = try await engine.transcribe(samples: samples, forcedLanguage: nil)
                 statusTask.cancel()
                 print("samples: \(samples.count)")
                 print("peak: \(peak)")

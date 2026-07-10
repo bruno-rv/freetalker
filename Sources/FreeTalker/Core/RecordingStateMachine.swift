@@ -26,6 +26,10 @@ enum RecordingEvent: Equatable {
     case pillClick
     case esc
     case capReached(generation: Int)
+    /// Recording Panel "Done"/"Raw" (Feature 3): unlike `pillClick`, which LOCKS an in-progress
+    /// `pttRecording` rather than stopping it, this stops immediately from either recording
+    /// state. See PLAN.md step 10.
+    case panelFinish
 }
 
 /// What the caller must actually do as a result of a transition. `RecordingStateMachine` never
@@ -84,8 +88,11 @@ enum RecordingStateMachine {
         case (.locked, .capReached(let generation)):
             return generation == currentGeneration ? (.idle, .stopAndTranscribe) : (state, .none)
 
+        case (.pttRecording, .panelFinish), (.locked, .panelFinish):
+            return (.idle, .stopAndTranscribe)
+
         default:
-            // idle+{keyUp,pillClick,esc,capReached}, pttRecording+capReached: no-op.
+            // idle+{keyUp,pillClick,esc,capReached,panelFinish}, pttRecording+capReached: no-op.
             return (state, .none)
         }
     }
