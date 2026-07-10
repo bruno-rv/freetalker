@@ -326,11 +326,14 @@ private struct GeneralSettingsView: View {
                         Text("Portuguese").tag("pt" as String?)
                     }
                     Button("Add") {
-                        // Requires an app plus at least one of template/language. See PLAN.md
-                        // step 7.
+                        // Requires an app plus at least one of template/language. Replaces the
+                        // bundle id's whole row — a nil half clears that dict's existing entry
+                        // rather than leaving a stale override active. See PLAN.md step 7 and
+                        // AppSettings.applyingAppRule.
                         guard let newRuleBundleID, newRuleTemplateID != nil || newRuleLanguage != nil else { return }
-                        if let newRuleTemplateID { settings.appRules[newRuleBundleID] = newRuleTemplateID }
-                        if let newRuleLanguage { settings.appLanguageRules[newRuleBundleID] = newRuleLanguage }
+                        let updated = AppSettings.applyingAppRule(bundleID: newRuleBundleID, templateID: newRuleTemplateID, language: newRuleLanguage, appRules: settings.appRules, appLanguageRules: settings.appLanguageRules)
+                        settings.appRules = updated.appRules
+                        settings.appLanguageRules = updated.appLanguageRules
                         self.newRuleBundleID = nil
                         self.newRuleTemplateID = nil
                         self.newRuleLanguage = nil
