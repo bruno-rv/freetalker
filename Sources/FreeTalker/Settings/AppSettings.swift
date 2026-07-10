@@ -147,6 +147,93 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(appRules, forKey: Keys.appRules) }
     }
 
+    /// Persistent Language Pin (CONTEXT.md/menu bar "Language" section): forces the Transcript
+    /// language absent a more specific override (an app rule, or the panel's one-shot choice).
+    /// "auto" | "en" | "pt" — any other assigned/persisted value falls back to "auto". See
+    /// PLAN.md step 3.
+    @Published var languagePin: String {
+        didSet {
+            let normalized = Self.normalizeLanguagePin(languagePin)
+            guard normalized == languagePin else {
+                languagePin = normalized
+                defaults.set(normalized, forKey: Keys.languagePin)
+                return
+            }
+            defaults.set(languagePin, forKey: Keys.languagePin)
+        }
+    }
+
+    /// Per-app language rules: bundle identifier -> "en"/"pt", same plist-dict pattern as
+    /// `appRules`. An entry whose value isn't a valid language code is dropped on set/load — see
+    /// `sanitizedLanguageRules`. Consulted by `AppCoordinator.resolveLanguage`. See PLAN.md
+    /// step 3/7.
+    @Published var appLanguageRules: [String: String] {
+        didSet {
+            let sanitized = Self.sanitizedLanguageRules(appLanguageRules)
+            guard sanitized == appLanguageRules else {
+                appLanguageRules = sanitized
+                defaults.set(sanitized, forKey: Keys.appLanguageRules)
+                return
+            }
+            defaults.set(appLanguageRules, forKey: Keys.appLanguageRules)
+        }
+    }
+
+    /// Normalizes a single language CANDIDATE (a one-shot choice, an app rule value, or the pin)
+    /// for `AppCoordinator.resolveLanguage`'s precedence chain: trims/lowercases, and accepts
+    /// only "en"/"pt" — anything else (including "auto", empty, garbage) is invalid and returns
+    /// nil so the caller falls through to the next candidate. Also used to sanitize
+    /// `appLanguageRules` entries (whose valid domain is the same: "en"/"pt", never "auto" — a
+    /// rule is either present forcing a language, or simply absent). See PLAN.md step 4.
+    nonisolated static func normalizeLanguageCode(_ raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return ["en", "pt"].contains(trimmed) ? trimmed : nil
+    }
+
+    /// Normalizes the `languagePin` property's own value, whose valid domain also includes
+    /// "auto" (unlike a rule/one-shot candidate) — any other value falls back to "auto".
+    nonisolated static func normalizeLanguagePin(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return ["auto", "en", "pt"].contains(trimmed) ? trimmed : "auto"
+    }
+
+    /// Drops any `appLanguageRules` entry whose value doesn't normalize to a valid language code
+    /// — an unknown/garbage code is dropped, not silently coerced. Keys (bundle ids) are passed
+    /// through unchanged.
+    nonisolated static func sanitizedLanguageRules(_ raw: [String: String]) -> [String: String] {
+        raw.compactMapValues { normalizeLanguageCode($0) }
+    }
+
+    /// One row of the Settings "App Rules" list — a UI-level join over `appRules`' and
+    /// `appLanguageRules`' keys (PLAN.md step 7); storage stays the two separate dicts. A row can
+    /// be template-only, language-only, or both.
+    struct AppRuleRow: Identifiable, Equatable {
+        let bundleID: String
+        let templateID: String?
+        let language: String?
+        var id: String { bundleID }
+    }
+
+    /// Pure join producing the unified App Rules row list, sorted by bundle id for a stable
+    /// display order. See PLAN.md step 7.
+    nonisolated static func unifiedAppRuleRows(appRules: [String: String], appLanguageRules: [String: String]) -> [AppRuleRow] {
+        let allBundleIDs = Set(appRules.keys).union(appLanguageRules.keys)
+        return allBundleIDs.sorted().map { bundleID in
+            AppRuleRow(bundleID: bundleID, templateID: appRules[bundleID], language: appLanguageRules[bundleID])
+        }
+    }
+
+    /// Pure removal for a unified App Rules row: clears the bundle id from BOTH dicts, never
+    /// leaving an invisible stale language override behind once the row appears gone (or vice
+    /// versa). See PLAN.md step 7.
+    nonisolated static func removingAppRule(bundleID: String, appRules: [String: String], appLanguageRules: [String: String]) -> (appRules: [String: String], appLanguageRules: [String: String]) {
+        var rules = appRules
+        var languageRules = appLanguageRules
+        rules.removeValue(forKey: bundleID)
+        languageRules.removeValue(forKey: bundleID)
+        return (rules, languageRules)
+    }
+
     /// CoreAudio UID of the input device to capture from. nil means "System default" — the
     /// UID (not AudioDeviceID) is persisted since device ids can change across reboots.
     @Published var microphoneDeviceUID: String? {
@@ -332,6 +419,8 @@ final class AppSettings: ObservableObject {
         static let activeTemplateID = "activeTemplateID"
         static let handsFreeMaxMinutes = "handsFreeMaxMinutes"
         static let appRules = "appRules"
+        static let languagePin = "languagePin"
+        static let appLanguageRules = "appLanguageRules"
         static let microphoneDeviceUID = "microphoneDeviceUID"
         static let vocabularyText = "vocabularyText"
     }
@@ -381,6 +470,18 @@ final class AppSettings: ObservableObject {
         let storedHandsFreeMaxMinutes = defaults.object(forKey: Keys.handsFreeMaxMinutes) as? Int ?? 5
         handsFreeMaxMinutes = Self.clampHandsFreeMaxMinutes(storedHandsFreeMaxMinutes)
         appRules = defaults.dictionary(forKey: Keys.appRules) as? [String: String] ?? [:]
+        let storedLanguagePin = defaults.string(forKey: Keys.languagePin) ?? "auto"
+        let normalizedLanguagePin = Self.normalizeLanguagePin(storedLanguagePin)
+        languagePin = normalizedLanguagePin
+        if normalizedLanguagePin != storedLanguagePin {
+            defaults.set(normalizedLanguagePin, forKey: Keys.languagePin)
+        }
+        let storedLanguageRules = defaults.dictionary(forKey: Keys.appLanguageRules) as? [String: String] ?? [:]
+        let sanitizedLanguageRulesAtLoad = Self.sanitizedLanguageRules(storedLanguageRules)
+        appLanguageRules = sanitizedLanguageRulesAtLoad
+        if sanitizedLanguageRulesAtLoad != storedLanguageRules {
+            defaults.set(sanitizedLanguageRulesAtLoad, forKey: Keys.appLanguageRules)
+        }
         microphoneDeviceUID = defaults.string(forKey: Keys.microphoneDeviceUID)
         // Direct init assignment doesn't trigger `didSet`'s clamp, so clamp explicitly here too
         // — covers a value persisted before maxVocabularyRawTextLength existed. Also

@@ -3,7 +3,8 @@ import Foundation
 import SwiftUI
 
 /// Small floating borderless pill shown while recording/processing. See PLAN.md step 2,
-/// Amendment B3 (clickable pill + mode-aware `locked` rendering).
+/// Amendment B3 (clickable pill), and PLAN.md step 9 (Recording Panel: a button row while
+/// actually recording).
 @MainActor
 final class HUDController {
     private var panel: HUDPanel?
@@ -14,15 +15,52 @@ final class HUDController {
 
     /// Fired when the pill is clicked (Amendment B3) — wired once by `AppCoordinator` to the
     /// recording state machine's `pillClick` event. The panel never becomes key/main (see
-    /// `HUDPanel` below), so this never steals focus from the frontmost app.
+    /// `HUDPanel` below), so this never steals focus from the frontmost app. Only meaningful in
+    /// `.text` mode — `.recordingPanel` mode has no whole-capsule tap target (each control is its
+    /// own), see PLAN.md step 9.
     var onPillClick: (() -> Void)?
 
-    /// What the pill currently displays. `locked`'s `previewText` is embedded INSIDE the lock
-    /// glyph/elapsed layout — a live-preview tick must never replace that layout with a bare
-    /// text pill. See PLAN.md Amendment B3.
+    /// Recording Panel button callbacks (Feature 3) — each control's own explicit tap target,
+    /// wired once by `AppCoordinator`. See PLAN.md step 9/10.
+    var onPanelCancel: (() -> Void)?
+    var onPanelDone: (() -> Void)?
+    var onPanelRaw: (() -> Void)?
+    var onPanelLanguage: ((String) -> Void)?
+    var onPanelCycleTemplate: (() -> Void)?
+    var onPanelLock: (() -> Void)?
+
+    /// What the pill currently displays.
     enum Mode: Equatable {
         case text(String)
-        case locked(elapsed: TimeInterval, cap: TimeInterval, previewText: String?)
+        /// Both recording states (pttRecording + locked) — a button row inside the same
+        /// floating panel. See PLAN.md step 9.
+        case recordingPanel(RecordingPanelState)
+    }
+
+    /// Everything the Recording Panel's view needs to render one frame — a plain value so
+    /// `AppCoordinator` can rebuild it fresh from its own state on every update (capture start,
+    /// live-preview tick, locked-mode timer tick, one-shot/template change). See PLAN.md step 9.
+    struct RecordingPanelState: Equatable {
+        /// `true` only while `locked` — gates the elapsed/cap readout and hides the Lock button
+        /// (already locked). See PLAN.md step 9.
+        var isLocked: Bool
+        var elapsed: TimeInterval
+        var cap: TimeInterval
+        var previewText: String?
+        var activeTemplateName: String
+        /// nil / "en" / "pt" — which one-shot choice (if any) is currently highlighted.
+        var oneShotLanguage: String?
+    }
+
+    /// Bundles the Recording Panel's button callbacks for `HUDView` — closures aren't Equatable,
+    /// so this stays out of `Mode`/`RecordingPanelState`.
+    struct PanelCallbacks {
+        var onCancel: () -> Void = {}
+        var onDone: () -> Void = {}
+        var onRaw: () -> Void = {}
+        var onLanguage: (String) -> Void = { _ in }
+        var onCycleTemplate: () -> Void = {}
+        var onLock: () -> Void = {}
     }
 
     func show(text: String) {
@@ -43,13 +81,13 @@ final class HUDController {
         DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: workItem)
     }
 
-    /// Shows the `locked`-mode layout: lock glyph + elapsed/cap time, with `previewText` (if any)
-    /// embedded inside — never a bare text pill. Ticked roughly once a second by `AppCoordinator`
-    /// while `locked`; live-preview ticks update only `previewText`. See PLAN.md Amendment B3.
-    func showLocked(elapsed: TimeInterval, cap: TimeInterval, previewText: String?) {
+    /// Shows the Recording Panel's button-row layout (Feature 3) for the given state — ticked
+    /// roughly once a second while `locked`, and on capture start / live-preview ticks /
+    /// one-shot-language / template-cycle changes. See PLAN.md step 9.
+    func showRecordingPanel(_ state: RecordingPanelState) {
         pendingHide?.cancel()
         pendingHide = nil
-        display(mode: .locked(elapsed: elapsed, cap: cap, previewText: previewText))
+        display(mode: .recordingPanel(state))
     }
 
     func hide() {
@@ -69,7 +107,19 @@ final class HUDController {
     }
 
     private func display(mode: Mode) {
-        let hosting = NSHostingView(rootView: HUDView(mode: mode, onPillClick: { [weak self] in self?.onPillClick?() }))
+        let callbacks = PanelCallbacks(
+            onCancel: { [weak self] in self?.onPanelCancel?() },
+            onDone: { [weak self] in self?.onPanelDone?() },
+            onRaw: { [weak self] in self?.onPanelRaw?() },
+            onLanguage: { [weak self] code in self?.onPanelLanguage?(code) },
+            onCycleTemplate: { [weak self] in self?.onPanelCycleTemplate?() },
+            onLock: { [weak self] in self?.onPanelLock?() }
+        )
+        let hosting = NSHostingView(rootView: HUDView(
+            mode: mode,
+            onPillClick: { [weak self] in self?.onPillClick?() },
+            panelCallbacks: callbacks
+        ))
         let fitting = hosting.fittingSize
         let size = NSSize(width: max(fitting.width, 60), height: max(fitting.height, 36))
         hosting.frame = NSRect(origin: .zero, size: size)
@@ -88,9 +138,10 @@ final class HUDController {
             panel.isOpaque = false
             panel.backgroundColor = .clear
             panel.hasShadow = true
-            // Deliberately NOT true (unlike a plain notification HUD): the pill must receive
-            // clicks (lock/stop gesture, B3). `HUDPanel` overrides canBecomeKey/canBecomeMain to
-            // false so accepting mouse events here never steals focus from the frontmost app.
+            // Deliberately NOT true (unlike a plain notification HUD): the pill/panel must
+            // receive clicks (lock/stop gesture, B3; per-control taps, Feature 3). `HUDPanel`
+            // overrides canBecomeKey/canBecomeMain to false so accepting mouse events here never
+            // steals focus from the frontmost app.
             panel.ignoresMouseEvents = false
             panel.collectionBehavior = [.canJoinAllSpaces, .stationary]
             self.panel = panel
@@ -125,39 +176,89 @@ private final class HUDPanel: NSPanel {
 struct HUDView: View {
     let mode: HUDController.Mode
     var onPillClick: () -> Void = {}
+    var panelCallbacks: HUDController.PanelCallbacks = .init()
 
     var body: some View {
-        content
-            .font(.system(size: 13, weight: .medium))
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
-            .background(.regularMaterial, in: Capsule())
-            .onTapGesture(perform: onPillClick)
+        Group {
+            switch mode {
+            case .text(let text):
+                Text(text)
+                    .lineLimit(2)
+                    .truncationMode(.head)
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: 320, alignment: .leading)
+                    .onTapGesture(perform: onPillClick)
+            case .recordingPanel(let state):
+                // Layout contract (PLAN.md step 9): fixed maxWidth 460; the whole-capsule tap
+                // gesture is REMOVED in this mode — each control below is its own explicit tap
+                // target, so no parent gesture exists to double-fire or swallow a child tap.
+                // `ViewThatFits` drops the preview text first when the row doesn't fit; every
+                // other control is fixed-size and never dropped.
+                ViewThatFits(in: .horizontal) {
+                    panelRow(state, includePreview: true)
+                    panelRow(state, includePreview: false)
+                }
+                .frame(maxWidth: 460, alignment: .leading)
+            }
+        }
+        .font(.system(size: 13, weight: .medium))
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.regularMaterial, in: Capsule())
     }
 
     @ViewBuilder
-    private var content: some View {
-        switch mode {
-        case .text(let text):
-            Text(text)
-                .lineLimit(2)
-                .truncationMode(.head)
-                .multilineTextAlignment(.leading)
-                .frame(maxWidth: 320, alignment: .leading)
-        case .locked(let elapsed, let cap, let previewText):
-            HStack(spacing: 8) {
+    private func panelRow(_ state: HUDController.RecordingPanelState, includePreview: Bool) -> some View {
+        HStack(spacing: 8) {
+            if state.isLocked {
                 Image(systemName: "lock.fill")
-                Text(Self.formatMMSS(elapsed) + " / " + Self.formatMMSS(cap))
+                Text(Self.formatMMSS(state.elapsed) + " / " + Self.formatMMSS(state.cap))
                     .monospacedDigit()
-                if let previewText, !previewText.isEmpty {
-                    Text(previewText)
-                        .lineLimit(1)
-                        .truncationMode(.head)
-                        .foregroundStyle(.secondary)
-                }
+                    .font(.caption)
             }
-            .frame(maxWidth: 320, alignment: .leading)
+            if includePreview, let previewText = state.previewText, !previewText.isEmpty {
+                Text(previewText)
+                    .lineLimit(1)
+                    .truncationMode(.head)
+                    .foregroundStyle(.secondary)
+                    .font(.caption)
+            }
+
+            Button(action: panelCallbacks.onCancel) {
+                Image(systemName: "xmark.circle")
+            }
+            .help("Cancel")
+
+            Button(action: panelCallbacks.onDone) {
+                Image(systemName: "checkmark.circle")
+            }
+            .help("Done")
+
+            Button("Raw", action: panelCallbacks.onRaw)
+                .font(.caption)
+                .help("Finish without post-processing")
+
+            Button("EN") { panelCallbacks.onLanguage("en") }
+                .font(.caption)
+                .foregroundStyle(state.oneShotLanguage == "en" ? Color.accentColor : Color.primary)
+            Button("PT") { panelCallbacks.onLanguage("pt") }
+                .font(.caption)
+                .foregroundStyle(state.oneShotLanguage == "pt" ? Color.accentColor : Color.primary)
+
+            Button(action: panelCallbacks.onCycleTemplate) {
+                Text(state.activeTemplateName)
+                    .lineLimit(1)
+                    .frame(maxWidth: 120, alignment: .leading)
+            }
+
+            if !state.isLocked {
+                Button(action: panelCallbacks.onLock) {
+                    Image(systemName: "lock")
+                }
+                .help("Lock (hands-free)")
+            }
         }
+        .buttonStyle(.plain)
     }
 
     private static func formatMMSS(_ seconds: TimeInterval) -> String {

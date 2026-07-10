@@ -18,8 +18,8 @@ struct FakeTranscriptionEngine: TranscriptionEngine {
     @MainActor var statusText: String { "Ready" }
     let cannedText: String
 
-    func transcribe(samples: [Float]) async throws -> TranscriptionOutput {
-        TranscriptionOutput(text: cannedText, language: "en")
+    func transcribe(samples: [Float], forcedLanguage: String?) async throws -> TranscriptionOutput {
+        TranscriptionOutput(text: cannedText, language: forcedLanguage ?? "en")
     }
 }
 
@@ -222,9 +222,16 @@ enum SelfCheck {
             failures.append(contentsOf: libraryPurgeScopeChecks())
             failures.append(contentsOf: libraryStorePrivacyStepChecks())
             failures.append(contentsOf: redoLastChecks())
+            failures.append(contentsOf: languageResolutionChecks())
+            failures.append(contentsOf: unifiedAppRuleRowChecks())
+            failures.append(contentsOf: panelActionRoutingChecks())
+            failures.append(contentsOf: oneShotLanguageLifecycleChecks())
+            failures.append(contentsOf: await rawPathChecks())
+            failures.append(contentsOf: reservedTemplateNameChecks())
+            failures.append(contentsOf: cloudSTTErrorChecks())
 
             if failures.isEmpty {
-                print("SelfCheck PASSED (template seeding, FTS round-trip, pipeline contract, mic device enumeration, hotkey spec/matcher, vocabulary normalization/injection, app rule resolution, paste-target drift, prompt app-name sanitization, live preview gating/availability, SerialGate cancellation, preview early-cancel decisions, built-in template prompt upgrade (incl. v3->v4 Spoken Commands), LLM provider defaults, BYOK Keychain key migration, global cloud-selection routing, BYOK connection-test status-code mapping/config gating, hands-free recording state machine/esc/cap-clamp/cancel, Library deletion: per-row/Delete All/latestDictation tiebreak/dangling source_id/secure_delete/unfiltered total count, SQLite step classification (readAll/dictationExists error propagation), WAL checkpoint busy path, debug-audio purge scoping (incl. directory-named-*.wav skip, unreadable-directory error), LibraryStore privacy-step-then-always sequencing, Redo Last gating/spec-constraints/matcher/result message/spec validation)")
+                print("SelfCheck PASSED (template seeding, FTS round-trip, pipeline contract, mic device enumeration, hotkey spec/matcher, vocabulary normalization/injection, app rule resolution, paste-target drift, prompt app-name sanitization, live preview gating/availability, SerialGate cancellation, preview early-cancel decisions, built-in template prompt upgrade (incl. v3->v4 Spoken Commands), LLM provider defaults, BYOK Keychain key migration, global cloud-selection routing, BYOK connection-test status-code mapping/config gating, hands-free recording state machine/esc/cap-clamp/cancel, Library deletion: per-row/Delete All/latestDictation tiebreak/dangling source_id/secure_delete/unfiltered total count, SQLite step classification (readAll/dictationExists error propagation), WAL checkpoint busy path, debug-audio purge scoping (incl. directory-named-*.wav skip, unreadable-directory error), LibraryStore privacy-step-then-always sequencing, Redo Last gating/spec-constraints/matcher/result message/spec validation, Language Pin resolution (precedence/invalid-fallthrough/normalization), unified App Rules row join/removal, Recording Panel action routing (button×state incl. stale-click no-ops)/template-cycle order, one-shot language lifecycle (set/toggle/clear), Raw path (post-processor not invoked, refined==transcript, reserved template name recorded), Raw Transcript reserved-name rejection/load-time rename, Cloud STT error status classification)")
                 exit(0)
             } else {
                 print("SelfCheck FAILED:")
@@ -2077,6 +2084,366 @@ enum SelfCheck {
             if pttEngageCount != 1 || pttReleaseCount != 1 {
                 failures.append("PTT matcher fed alongside redo: expected exactly 1 engage/1 release, got engage=\(pttEngageCount) release=\(pttReleaseCount)")
             }
+        }
+
+        return failures
+    }
+
+    /// Checks for `AppCoordinator.resolveLanguage` — the pure Language Pin precedence chain
+    /// (PLAN.md step 4/8): one-shot > app rule > pin > auto, with each candidate normalized
+    /// INDEPENDENTLY so an invalid one falls through rather than blocking a valid one further
+    /// down. Also covers the normalization/sanitization helpers it's built from.
+    private static func languageResolutionChecks() -> [String] {
+        var failures: [String] = []
+
+        func expect(_ label: String, oneShot: String?, bundleID: String?, rules: [String: String], pin: String, want: String?) {
+            let got = AppCoordinator.resolveLanguage(oneShot: oneShot, bundleID: bundleID, appLanguageRules: rules, pin: pin)
+            if got != want {
+                failures.append("resolveLanguage [\(label)]: got \(got.map { "\"\($0)\"" } ?? "nil"), want \(want.map { "\"\($0)\"" } ?? "nil")")
+            }
+        }
+
+        // Precedence: one-shot > rule > pin > auto.
+        expect("one-shot beats rule and pin", oneShot: "pt", bundleID: "com.tinyspeck.slackmacgap", rules: ["com.tinyspeck.slackmacgap": "en"], pin: "en", want: "pt")
+        expect("rule beats pin (no one-shot)", oneShot: nil, bundleID: "com.tinyspeck.slackmacgap", rules: ["com.tinyspeck.slackmacgap": "pt"], pin: "en", want: "pt")
+        expect("pin used when no one-shot/rule", oneShot: nil, bundleID: "com.apple.finder", rules: ["com.tinyspeck.slackmacgap": "pt"], pin: "en", want: "en")
+        expect("auto (nil) when pin is auto and nothing else forces", oneShot: nil, bundleID: nil, rules: [:], pin: "auto", want: nil)
+
+        // Invalid-fallthrough (PLAN.md step 8): an invalid candidate at one precedence level
+        // falls through to the NEXT, rather than blocking a valid one further down the chain.
+        expect("invalid one-shot falls through to a valid rule", oneShot: "fr", bundleID: "com.tinyspeck.slackmacgap", rules: ["com.tinyspeck.slackmacgap": "pt"], pin: "en", want: "pt")
+        expect("invalid rule falls through to the pin", oneShot: nil, bundleID: "com.tinyspeck.slackmacgap", rules: ["com.tinyspeck.slackmacgap": "xx"], pin: "en", want: "en")
+        expect("invalid pin falls through to auto (nil)", oneShot: nil, bundleID: nil, rules: [:], pin: "garbage", want: nil)
+        expect("invalid one-shot AND invalid rule fall through to a valid pin", oneShot: "", bundleID: "com.tinyspeck.slackmacgap", rules: ["com.tinyspeck.slackmacgap": "  "], pin: "pt", want: "pt")
+
+        // nil bundleID skips the app-rule step entirely, even if some OTHER app has a rule.
+        expect("nil bundleID skips rules, falls to pin", oneShot: nil, bundleID: nil, rules: ["com.tinyspeck.slackmacgap": "pt"], pin: "en", want: "en")
+
+        // Per-candidate normalization: trim/lowercase.
+        expect("candidates are trimmed and lowercased", oneShot: "  PT  ", bundleID: nil, rules: [:], pin: "auto", want: "pt")
+
+        // Mutation test: a stand-in that always returns the pin (ignoring precedence) must
+        // disagree once a valid one-shot is present.
+        func alwaysPin(pin: String) -> String? { AppSettings.normalizeLanguageCode(pin) }
+        if AppCoordinator.resolveLanguage(oneShot: "pt", bundleID: nil, appLanguageRules: [:], pin: "en") == alwaysPin(pin: "en") {
+            failures.append("mutation test: resolveLanguage must disagree with an always-pin stand-in once a one-shot is present — the check above isn't discriminating")
+        }
+
+        // normalizeLanguageCode: en/pt only, "auto" is invalid here (unlike normalizeLanguagePin).
+        if AppSettings.normalizeLanguageCode("EN") != "en" || AppSettings.normalizeLanguageCode(" pt ") != "pt" {
+            failures.append("normalizeLanguageCode: expected trimmed/lowercased en/pt to normalize")
+        }
+        if AppSettings.normalizeLanguageCode("auto") != nil || AppSettings.normalizeLanguageCode("fr") != nil || AppSettings.normalizeLanguageCode("") != nil {
+            failures.append("normalizeLanguageCode: expected \"auto\"/unknown/empty to be invalid (nil)")
+        }
+
+        // normalizeLanguagePin: valid domain also includes "auto"; anything else falls back to it.
+        if AppSettings.normalizeLanguagePin("EN") != "en" || AppSettings.normalizeLanguagePin(" Auto ") != "auto" {
+            failures.append("normalizeLanguagePin: expected trimmed/lowercased auto/en/pt to normalize")
+        }
+        if AppSettings.normalizeLanguagePin("garbage") != "auto" || AppSettings.normalizeLanguagePin("") != "auto" {
+            failures.append("normalizeLanguagePin: expected an invalid value to fall back to \"auto\"")
+        }
+
+        // sanitizedLanguageRules: invalid entries dropped, keys untouched, valid entries kept.
+        let sanitized = AppSettings.sanitizedLanguageRules(["com.apple.mail": "EN", "com.apple.finder": "xx", "com.tinyspeck.slackmacgap": "pt"])
+        if sanitized != ["com.apple.mail": "en", "com.tinyspeck.slackmacgap": "pt"] {
+            failures.append("sanitizedLanguageRules: expected invalid-code entries dropped and valid entries normalized, got \(sanitized)")
+        }
+
+        return failures
+    }
+
+    /// Checks for `AppSettings.unifiedAppRuleRows`/`removingAppRule` — the pure UI-level join over
+    /// `appRules`/`appLanguageRules` and the paired-removal function backing the Settings App
+    /// Rules unified row model. See PLAN.md step 7.
+    private static func unifiedAppRuleRowChecks() -> [String] {
+        var failures: [String] = []
+
+        let appRules = ["com.apple.mail": "email", "com.tinyspeck.slackmacgap": "clean-dictation"]
+        let appLanguageRules = ["com.tinyspeck.slackmacgap": "pt", "com.apple.finder": "en"]
+        let rows = AppSettings.unifiedAppRuleRows(appRules: appRules, appLanguageRules: appLanguageRules)
+
+        if rows.count != 3 {
+            failures.append("unifiedAppRuleRows: expected 3 rows (union of both key sets), got \(rows.count)")
+        }
+        guard let mailRow = rows.first(where: { $0.bundleID == "com.apple.mail" }),
+              let slackRow = rows.first(where: { $0.bundleID == "com.tinyspeck.slackmacgap" }),
+              let finderRow = rows.first(where: { $0.bundleID == "com.apple.finder" }) else {
+            failures.append("unifiedAppRuleRows: expected rows for all three bundle ids")
+            return failures
+        }
+        if mailRow.templateID != "email" || mailRow.language != nil {
+            failures.append("unifiedAppRuleRows: expected a template-only row for Mail, got \(mailRow)")
+        }
+        if finderRow.templateID != nil || finderRow.language != "en" {
+            failures.append("unifiedAppRuleRows: expected a language-only row for Finder, got \(finderRow)")
+        }
+        if slackRow.templateID != "clean-dictation" || slackRow.language != "pt" {
+            failures.append("unifiedAppRuleRows: expected a both-template-and-language row for Slack, got \(slackRow)")
+        }
+        // Stable, sorted-by-bundle-id order.
+        if rows.map(\.bundleID) != rows.map(\.bundleID).sorted() {
+            failures.append("unifiedAppRuleRows: expected rows sorted by bundle id")
+        }
+
+        // Removal clears the bundle id from BOTH dicts — never leaves an invisible stale half
+        // behind. Removing the both-template-and-language row (Slack) must drop it from both.
+        let afterRemoveSlack = AppSettings.removingAppRule(bundleID: "com.tinyspeck.slackmacgap", appRules: appRules, appLanguageRules: appLanguageRules)
+        if afterRemoveSlack.appRules["com.tinyspeck.slackmacgap"] != nil {
+            failures.append("removingAppRule: expected the removed bundle id gone from appRules")
+        }
+        if afterRemoveSlack.appLanguageRules["com.tinyspeck.slackmacgap"] != nil {
+            failures.append("removingAppRule: expected the removed bundle id gone from appLanguageRules")
+        }
+        // Untouched entries survive.
+        if afterRemoveSlack.appRules["com.apple.mail"] != "email" || afterRemoveSlack.appLanguageRules["com.apple.finder"] != "en" {
+            failures.append("removingAppRule: expected unrelated entries left untouched")
+        }
+        // Mutation test: a stand-in that only clears appRules (not appLanguageRules) must
+        // disagree — this is exactly the "stale invisible override" bug the pure removal exists
+        // to prevent.
+        func onlyClearsTemplateRule(bundleID: String, appRules: [String: String], appLanguageRules: [String: String]) -> (appRules: [String: String], appLanguageRules: [String: String]) {
+            var rules = appRules
+            rules.removeValue(forKey: bundleID)
+            return (rules, appLanguageRules)
+        }
+        let buggyResult = onlyClearsTemplateRule(bundleID: "com.tinyspeck.slackmacgap", appRules: appRules, appLanguageRules: appLanguageRules)
+        if afterRemoveSlack.appLanguageRules == buggyResult.appLanguageRules {
+            failures.append("mutation test: removingAppRule must disagree with an only-clears-template-rule stand-in — the check above isn't discriminating")
+        }
+
+        return failures
+    }
+
+    /// Checks for the Recording Panel's action routing (PLAN.md step 9/10/13): each button
+    /// (`AppCoordinator.PanelButton`) maps to a `RecordingEvent`, driven through the SAME
+    /// `RecordingStateMachine.transition` table `handsFreeChecks` exercises — including the
+    /// stale/double-click no-op from `idle` every panel button resolves to once the recording has
+    /// already ended. Also covers `AppCoordinator.nextTemplateID`, the template-cycle button's
+    /// pure order decision.
+    private static func panelActionRoutingChecks() -> [String] {
+        var failures: [String] = []
+
+        func expect(_ label: String, button: AppCoordinator.PanelButton, state: RecordingState, wantState: RecordingState, wantAction: RecordingAction) {
+            let event = AppCoordinator.recordingEvent(for: button)
+            let (gotState, gotAction) = RecordingStateMachine.transition(state: state, event: event, currentGeneration: 0)
+            if gotState != wantState || gotAction != wantAction {
+                failures.append("panel routing [\(label)]: got (\(gotState), \(gotAction)), want (\(wantState), \(wantAction))")
+            }
+        }
+
+        // Done/Raw both map to .panelFinish -> stopAndTranscribe from EITHER recording state —
+        // unlike pillClick (Lock), which would instead lock a pttRecording. See PLAN.md step 10.
+        for button: AppCoordinator.PanelButton in [.done, .raw] {
+            expect("\(button) from pttRecording", button: button, state: .pttRecording, wantState: .idle, wantAction: .stopAndTranscribe)
+            expect("\(button) from locked", button: button, state: .locked(ignoreNextKeyUp: false), wantState: .idle, wantAction: .stopAndTranscribe)
+            expect("\(button) from idle is a stale-click no-op", button: button, state: .idle, wantState: .idle, wantAction: .none)
+        }
+
+        // Cancel maps to .esc -> cancel from either recording state; a stale idle click no-ops.
+        expect("cancel from pttRecording", button: .cancel, state: .pttRecording, wantState: .idle, wantAction: .cancel)
+        expect("cancel from locked", button: .cancel, state: .locked(ignoreNextKeyUp: false), wantState: .idle, wantAction: .cancel)
+        expect("cancel from idle is a stale-click no-op", button: .cancel, state: .idle, wantState: .idle, wantAction: .none)
+
+        // Lock maps to .pillClick -> enterLocked from pttRecording (never stops); a stale idle
+        // click no-ops. (Lock is never shown while already locked — no case to route there.)
+        expect("lock from pttRecording enters locked (does not stop)", button: .lock, state: .pttRecording, wantState: .locked(ignoreNextKeyUp: true), wantAction: .enterLocked)
+        expect("lock from idle is a stale-click no-op", button: .lock, state: .idle, wantState: .idle, wantAction: .none)
+
+        // Mutation test: a stand-in that maps Done to pillClick (the bug this design prevents —
+        // pillClick from pttRecording LOCKS instead of stopping) must disagree.
+        func buggyDoneEvent() -> RecordingEvent { .pillClick }
+        let (buggyState, buggyAction) = RecordingStateMachine.transition(state: .pttRecording, event: buggyDoneEvent(), currentGeneration: 0)
+        if buggyState == .idle && buggyAction == .stopAndTranscribe {
+            failures.append("mutation test setup invalid: buggyDoneEvent should NOT stop from pttRecording")
+        }
+        let (realState, realAction) = RecordingStateMachine.transition(state: .pttRecording, event: AppCoordinator.recordingEvent(for: .done), currentGeneration: 0)
+        if (realState, realAction) == (buggyState, buggyAction) {
+            failures.append("mutation test: Done's real routing must disagree with the buggy pillClick stand-in — the check above isn't discriminating")
+        }
+
+        // AppCoordinator.nextTemplateID: wraps around in store order; falls back to the first
+        // template when the current id is no longer present (e.g. deleted mid-recording).
+        let ids = ["a", "b", "c"]
+        if AppCoordinator.nextTemplateID(current: "a", templateIDsInOrder: ids) != "b" {
+            failures.append("nextTemplateID: expected the next id in order")
+        }
+        if AppCoordinator.nextTemplateID(current: "c", templateIDsInOrder: ids) != "a" {
+            failures.append("nextTemplateID: expected wraparound from the last id back to the first")
+        }
+        if AppCoordinator.nextTemplateID(current: "deleted", templateIDsInOrder: ids) != "a" {
+            failures.append("nextTemplateID: expected a current id no longer in the list to fall back to the first")
+        }
+        if AppCoordinator.nextTemplateID(current: "a", templateIDsInOrder: []) != nil {
+            failures.append("nextTemplateID: expected an empty template list to yield nil")
+        }
+
+        return failures
+    }
+
+    /// Checks for `AppCoordinator.nextOneShotLanguage` — the pure one-shot language lifecycle
+    /// decision (PLAN.md step 12): set/toggle from a panel EN/PT tap, and cleared by every one of
+    /// `stop`/`cancel`/`newRecording`'s events. This is the SAME function the real
+    /// `beginCapture`/`cancelRecording`/`stopAndTranscribe`/`handlePanelOneShotLanguage` call at
+    /// every real touch point — not a re-derived mirror.
+    private static func oneShotLanguageLifecycleChecks() -> [String] {
+        var failures: [String] = []
+
+        if AppCoordinator.nextOneShotLanguage(current: nil, event: .panelLanguageTap("en")) != "en" {
+            failures.append("nextOneShotLanguage: expected a tap from nil to set the choice")
+        }
+        if AppCoordinator.nextOneShotLanguage(current: "en", event: .panelLanguageTap("en")) != nil {
+            failures.append("nextOneShotLanguage: expected tapping the already-active choice again to clear it")
+        }
+        if AppCoordinator.nextOneShotLanguage(current: "en", event: .panelLanguageTap("pt")) != "pt" {
+            failures.append("nextOneShotLanguage: expected tapping the OTHER choice to switch to it")
+        }
+        if AppCoordinator.nextOneShotLanguage(current: "en", event: .clear) != nil {
+            failures.append("nextOneShotLanguage: expected .clear (stop/cancel/newRecording) to clear a set choice")
+        }
+        if AppCoordinator.nextOneShotLanguage(current: nil, event: .clear) != nil {
+            failures.append("nextOneShotLanguage: expected .clear on an already-nil choice to stay nil")
+        }
+
+        // Mutation test: a stand-in that never clears (always returns `current`) must disagree
+        // once a set choice is cleared.
+        func neverClears(current: String?, event: AppCoordinator.OneShotLanguageEvent) -> String? { current }
+        if AppCoordinator.nextOneShotLanguage(current: "pt", event: .clear) == neverClears(current: "pt", event: .clear) {
+            failures.append("mutation test: nextOneShotLanguage must disagree with a never-clears stand-in on .clear — the check above isn't discriminating")
+        }
+
+        return failures
+    }
+
+    /// Checks the Raw path (PLAN.md step 11) through the ACTUAL `AppCoordinator.processDictation`
+    /// pipeline — same discipline as the pipeline contract check above: a fake engine, a temp DB,
+    /// no real CGEvents. Uses `EmptyPostProcessor` as the injected processor specifically because
+    /// its distinguishing side effect (an `.emptyOutput` fallback reason) would appear if
+    /// `skipPostProcessing` were ever accidentally NOT honored — proving non-invocation, not just
+    /// asserting it.
+    @MainActor
+    private static func rawPathChecks() async -> [String] {
+        var failures: [String] = []
+
+        do {
+            let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tempDir) }
+            let db = try Database(path: tempDir.appendingPathComponent("raw-path-check.db"))
+
+            let cannedSamples: [Float] = [0.1, -0.2, 0.05, 0.3]
+            let fakeEngine = FakeTranscriptionEngine(cannedText: "the quick brown fox jumps over the lazy dog")
+            let template = Template.builtIns.first!
+            let recordToTempDB: (String, String, String, String, String) throws -> Void = { language, templateName, transcript, refined, engine in
+                try db.insertDictation(timestamp: Date(), language: language, template: templateName, transcript: transcript, refined: refined, engine: engine)
+            }
+
+            let result = try await AppCoordinator.shared.processDictation(
+                samples: cannedSamples,
+                engine: fakeEngine,
+                engineName: fakeEngine.name,
+                template: template,
+                skipPostProcessing: true,
+                processor: EmptyPostProcessor(),
+                insert: { _, _ in true },
+                record: recordToTempDB
+            )
+
+            if result.refined != result.transcript {
+                failures.append("raw path: expected refined == transcript (verbatim, no post-processing)")
+            }
+            // The tell: if skipPostProcessing were ignored, EmptyPostProcessor's "" output would
+            // set an .emptyOutput fallback reason — its absence proves the processor was never
+            // invoked, not just that the output happened to match.
+            if result.fallbackReason != nil {
+                failures.append("raw path: expected no fallback reason (proves the Post-Processor was never invoked), got \(String(describing: result.fallbackReason))")
+            }
+            let rows = try db.allDictations()
+            guard let row = rows.first(where: { $0.transcript == result.transcript }) else {
+                failures.append("raw path: expected a Library row for the raw dictation")
+                return failures
+            }
+            if row.templateName != TemplateStore.rawTranscriptTemplateName {
+                failures.append("raw path: expected the Library row's template name to be the reserved \"\(TemplateStore.rawTranscriptTemplateName)\" sentinel, got \"\(row.templateName)\"")
+            }
+        } catch {
+            failures.append("Raw path check threw: \(error)")
+        }
+
+        return failures
+    }
+
+    /// Checks for `TemplateStore.isReservedTemplateName`/`renamingReservedNameCollisions` — pure
+    /// functions so this never touches the real, file-backed `TemplateStore.shared` singleton.
+    /// See PLAN.md step 11.
+    private static func reservedTemplateNameChecks() -> [String] {
+        var failures: [String] = []
+
+        if !TemplateStore.isReservedTemplateName("Raw Transcript") {
+            failures.append("isReservedTemplateName: expected the exact sentinel to be reserved")
+        }
+        if !TemplateStore.isReservedTemplateName("  raw transcript  ") {
+            failures.append("isReservedTemplateName: expected case-insensitive/trimmed matching")
+        }
+        if TemplateStore.isReservedTemplateName("Raw Transcript (Template)") {
+            failures.append("isReservedTemplateName: expected the renamed-collision form to NOT itself be reserved")
+        }
+        if TemplateStore.isReservedTemplateName("Clean Dictation") {
+            failures.append("isReservedTemplateName: expected an ordinary name to not be reserved")
+        }
+
+        let withCollision = [
+            Template(id: "user-1", name: "Raw Transcript", prompt: "some prompt"),
+            Template(id: "clean-dictation", name: "Clean Dictation", prompt: Template.builtIns.first!.prompt)
+        ]
+        let (renamed, changed) = TemplateStore.renamingReservedNameCollisions(withCollision)
+        if !changed {
+            failures.append("renamingReservedNameCollisions: expected a collision to report changed == true")
+        }
+        if renamed.first(where: { $0.id == "user-1" })?.name != "Raw Transcript (Template)" {
+            failures.append("renamingReservedNameCollisions: expected the colliding template renamed to \"Raw Transcript (Template)\"")
+        }
+        if renamed.first(where: { $0.id == "clean-dictation" })?.name != "Clean Dictation" {
+            failures.append("renamingReservedNameCollisions: expected a non-colliding template left untouched")
+        }
+        // Idempotent: a second pass over the renamed result reports changed == false.
+        let (secondPass, secondPassChanged) = TemplateStore.renamingReservedNameCollisions(renamed)
+        if secondPassChanged || secondPass != renamed {
+            failures.append("renamingReservedNameCollisions: expected a second pass over the already-renamed result to be a no-op")
+        }
+        // Mutation test: a stand-in that never renames must disagree once a collision is present.
+        func neverRenames(_ templates: [Template]) -> (templates: [Template], changed: Bool) { (templates, false) }
+        if TemplateStore.renamingReservedNameCollisions(withCollision).changed == neverRenames(withCollision).changed {
+            failures.append("mutation test: renamingReservedNameCollisions must disagree with a never-renames stand-in — the check above isn't discriminating")
+        }
+
+        return failures
+    }
+
+    /// Checks for `CloudSTTEngine.CloudSTTError.classifyHint` — the status -> non-sensitive-hint
+    /// classification `badResponse` uses instead of ever carrying a raw response body. See
+    /// PLAN.md step 5.
+    private static func cloudSTTErrorChecks() -> [String] {
+        var failures: [String] = []
+
+        if CloudSTTEngine.CloudSTTError.classifyHint(status: 401) != "check API key" {
+            failures.append("classifyHint: expected 401 to hint \"check API key\"")
+        }
+        if CloudSTTEngine.CloudSTTError.classifyHint(status: 404) != "check model/URL" {
+            failures.append("classifyHint: expected 404 to hint \"check model/URL\"")
+        }
+        if CloudSTTEngine.CloudSTTError.classifyHint(status: 0) != "invalid base URL" {
+            failures.append("classifyHint: expected status 0 (no HTTP response, e.g. a malformed base URL) to hint \"invalid base URL\"")
+        }
+        if CloudSTTEngine.CloudSTTError.classifyHint(status: 500) != "request failed" {
+            failures.append("classifyHint: expected an unclassified status to fall back to \"request failed\"")
+        }
+        // The error description embeds the hint, never anything else — this is what makes the
+        // no-raw-body contract observable end to end.
+        let description = CloudSTTEngine.CloudSTTError.badResponse(status: 401, hint: CloudSTTEngine.CloudSTTError.classifyHint(status: 401)).errorDescription ?? ""
+        if !description.contains("check API key") || !description.contains("401") {
+            failures.append("badResponse.errorDescription: expected the status and classified hint, got \"\(description)\"")
         }
 
         return failures

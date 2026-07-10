@@ -9,17 +9,33 @@ final class CloudSTTEngine: ObservableObject, TranscriptionEngine, @unchecked Se
 
     enum CloudSTTError: LocalizedError {
         case missingAPIKey
-        case badResponse(Int, String)
+        /// HTTP status + a classified hint only — the raw response body is never carried into
+        /// the error description, logged, or otherwise surfaced. Same redaction contract as
+        /// `CloudLLMProcessor.CloudLLMError.badResponse` / `ConnectionTestOutcome`. See PLAN.md
+        /// step 5.
+        case badResponse(status: Int, hint: String)
 
         var errorDescription: String? {
             switch self {
             case .missingAPIKey: "No cloud STT API key set in Settings."
-            case .badResponse(let code, let body): "Cloud STT request failed (\(code)): \(body)"
+            case .badResponse(let status, let hint): "Cloud STT request failed (\(status)): \(hint)"
+            }
+        }
+
+        /// Classifies an HTTP status into a short, non-sensitive hint — derived only from the
+        /// status code, never the response body. Mirrors `ConnectionTestOutcome`'s 401/404
+        /// special-casing.
+        static func classifyHint(status: Int) -> String {
+            switch status {
+            case 401: return "check API key"
+            case 404: return "check model/URL"
+            case 0: return "invalid base URL"
+            default: return "request failed"
             }
         }
     }
 
-    func transcribe(samples: [Float]) async throws -> TranscriptionOutput {
+    func transcribe(samples: [Float], forcedLanguage: String?) async throws -> TranscriptionOutput {
         guard let apiKey = Keychain.get(account: Keychain.Account.cloudSTTKey), !apiKey.isEmpty else {
             throw CloudSTTError.missingAPIKey
         }
@@ -28,7 +44,7 @@ final class CloudSTTEngine: ObservableObject, TranscriptionEngine, @unchecked Se
 
         let baseURL = await AppSettings.shared.cloudSTTBaseURL
         guard let url = URL(string: baseURL)?.appendingPathComponent("audio/transcriptions") else {
-            throw CloudSTTError.badResponse(0, "Invalid base URL")
+            throw CloudSTTError.badResponse(status: 0, hint: CloudSTTError.classifyHint(status: 0))
         }
 
         let wavData = WAVEncoder.encode(samples: samples, sampleRate: 16_000)
@@ -39,12 +55,12 @@ final class CloudSTTEngine: ObservableObject, TranscriptionEngine, @unchecked Se
         request.httpMethod = "POST"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        request.httpBody = multipartBody(boundary: boundary, wavData: wavData, vocabulary: vocabulary)
+        request.httpBody = multipartBody(boundary: boundary, wavData: wavData, vocabulary: vocabulary, forcedLanguage: forcedLanguage)
 
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
             let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-            throw CloudSTTError.badResponse(code, String(data: data, encoding: .utf8) ?? "")
+            throw CloudSTTError.badResponse(status: code, hint: CloudSTTError.classifyHint(status: code))
         }
 
         struct TranscriptionResponse: Decodable {
@@ -52,7 +68,11 @@ final class CloudSTTEngine: ObservableObject, TranscriptionEngine, @unchecked Se
             let language: String?
         }
         let decoded = try JSONDecoder().decode(TranscriptionResponse.self, from: data)
-        return TranscriptionOutput(text: decoded.text, language: decoded.language ?? "en")
+        // Forced language always wins over whatever the server reports — never let `?? "en"`
+        // silently record English for a forced-PT dictation when the server omits/ignores the
+        // field. See PLAN.md step 5.
+        let language = forcedLanguage ?? decoded.language ?? "en"
+        return TranscriptionOutput(text: decoded.text, language: language)
     }
 
     @MainActor
@@ -71,7 +91,7 @@ final class CloudSTTEngine: ObservableObject, TranscriptionEngine, @unchecked Se
         let trimmedBase = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let url = URL(string: trimmedBase)?.appendingPathComponent("models") else {
-            throw CloudSTTError.badResponse(0, "Invalid base URL")
+            throw CloudSTTError.badResponse(status: 0, hint: CloudSTTError.classifyHint(status: 0))
         }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
@@ -81,13 +101,22 @@ final class CloudSTTEngine: ObservableObject, TranscriptionEngine, @unchecked Se
         return (response as? HTTPURLResponse)?.statusCode ?? 0
     }
 
-    private func multipartBody(boundary: String, wavData: Data, vocabulary: [String]) -> Data {
+    private func multipartBody(boundary: String, wavData: Data, vocabulary: [String], forcedLanguage: String?) -> Data {
         var body = Data()
         func append(_ string: String) { body.append(Data(string.utf8)) }
 
         append("--\(boundary)\r\n")
         append("Content-Disposition: form-data; name=\"model\"\r\n\r\n")
         append("whisper-1\r\n")
+
+        // Language Pin (CONTEXT.md): only sent when a language is actually forced — an
+        // OpenAI-compatible field; a provider that rejects/ignores it surfaces through the
+        // existing HTTP status mapping, no special casing. See PLAN.md step 5.
+        if let forcedLanguage {
+            append("--\(boundary)\r\n")
+            append("Content-Disposition: form-data; name=\"language\"\r\n\r\n")
+            append("\(forcedLanguage)\r\n")
+        }
 
         // Bias the cloud STT the same way as WhisperKitEngine's promptTokens — the
         // OpenAI-compatible `/audio/transcriptions` endpoint accepts a free-text `prompt` field

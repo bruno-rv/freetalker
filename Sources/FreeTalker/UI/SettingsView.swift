@@ -43,6 +43,7 @@ private struct GeneralSettingsView: View {
     @State private var runningApps: [NSRunningApplication] = []
     @State private var newRuleBundleID: String?
     @State private var newRuleTemplateID: String?
+    @State private var newRuleLanguage: String?
 
     @State private var cloudSTTKey = Keychain.get(account: Keychain.Account.cloudSTTKey) ?? ""
     @State private var cloudLLMKey = Keychain.get(account: Keychain.Account.cloudLLMKey(for: AppSettings.shared.llmProvider)) ?? ""
@@ -271,17 +272,37 @@ private struct GeneralSettingsView: View {
             }
 
             Section("App Rules") {
-                Text("Automatically use a specific Template when dictating into a chosen app, instead of the Active Template.")
+                Text("Automatically use a specific Template and/or force a Transcript language when dictating into a chosen app, instead of the Active Template / Language Pin.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                ForEach(settings.appRules.keys.sorted(), id: \.self) { bundleID in
+                // Unified row: a UI-level join over appRules/appLanguageRules' keys — a row can
+                // be template-only, language-only, or both; storage stays the two dicts. See
+                // PLAN.md step 7.
+                ForEach(AppSettings.unifiedAppRuleRows(appRules: settings.appRules, appLanguageRules: settings.appLanguageRules)) { row in
                     HStack {
-                        Text(displayName(forBundleID: bundleID))
+                        Text(displayName(forBundleID: row.bundleID))
                         Spacer()
-                        Text(templateStore.template(id: settings.appRules[bundleID] ?? "")?.name ?? "Unknown Template")
-                            .foregroundStyle(.secondary)
+                        if let templateID = row.templateID {
+                            // A stale template id (deleted after the rule was created) still
+                            // displays, distinctly, while the row's language half (if any) keeps
+                            // working independently — resolution already falls back for stale
+                            // template ids. See PLAN.md step 7.
+                            Text(templateStore.template(id: templateID)?.name ?? "(deleted template)")
+                                .foregroundStyle(.secondary)
+                        }
+                        if let language = row.language {
+                            Text(language == "en" ? "EN" : "PT")
+                                .font(.caption)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.secondary.opacity(0.15), in: Capsule())
+                        }
                         Button {
-                            settings.appRules.removeValue(forKey: bundleID)
+                            // Removing a row clears the bundle id from BOTH dicts — never leaves
+                            // an invisible stale language override behind. See PLAN.md step 7.
+                            let updated = AppSettings.removingAppRule(bundleID: row.bundleID, appRules: settings.appRules, appLanguageRules: settings.appLanguageRules)
+                            settings.appRules = updated.appRules
+                            settings.appLanguageRules = updated.appLanguageRules
                         } label: { Image(systemName: "minus.circle") }
                         .buttonStyle(.borderless)
                     }
@@ -294,18 +315,27 @@ private struct GeneralSettingsView: View {
                         }
                     }
                     Picker("Template", selection: $newRuleTemplateID) {
-                        Text("Choose a template").tag(nil as String?)
+                        Text("No template").tag(nil as String?)
                         ForEach(templateStore.templates) { template in
                             Text(template.name).tag(template.id as String?)
                         }
                     }
+                    Picker("Language", selection: $newRuleLanguage) {
+                        Text("No language").tag(nil as String?)
+                        Text("English").tag("en" as String?)
+                        Text("Portuguese").tag("pt" as String?)
+                    }
                     Button("Add") {
-                        guard let newRuleBundleID, let newRuleTemplateID else { return }
-                        settings.appRules[newRuleBundleID] = newRuleTemplateID
+                        // Requires an app plus at least one of template/language. See PLAN.md
+                        // step 7.
+                        guard let newRuleBundleID, newRuleTemplateID != nil || newRuleLanguage != nil else { return }
+                        if let newRuleTemplateID { settings.appRules[newRuleBundleID] = newRuleTemplateID }
+                        if let newRuleLanguage { settings.appLanguageRules[newRuleBundleID] = newRuleLanguage }
                         self.newRuleBundleID = nil
                         self.newRuleTemplateID = nil
+                        self.newRuleLanguage = nil
                     }
-                    .disabled(newRuleBundleID == nil || newRuleTemplateID == nil)
+                    .disabled(newRuleBundleID == nil || (newRuleTemplateID == nil && newRuleLanguage == nil))
                 }
                 Button("Refresh app list") { runningApps = Self.enumerateRunningApps() }
                     .font(.caption)
@@ -492,7 +522,7 @@ private struct TemplatesSettingsView: View {
                 ToolbarItemGroup {
                     Button {
                         let new = Template(id: UUID().uuidString, name: "New Template", prompt: "")
-                        store.upsert(new)
+                        try? store.upsert(new)
                         selectedID = new.id
                     } label: { Image(systemName: "plus") }
                     Button {
@@ -516,6 +546,10 @@ private struct TemplateEditor: View {
     @State var template: Template
     @ObservedObject private var store = TemplateStore.shared
     @ObservedObject private var settings = AppSettings.shared
+    /// Inline feedback when `store.upsert` rejects the reserved "Raw Transcript" name (PLAN.md
+    /// step 11) — the typed name stays visible in the field either way; only the store write is
+    /// refused.
+    @State private var nameError: String?
 
     var body: some View {
         // A plain VStack, not a Form: Form/List lay out as a scrollable stack of rows sized to
@@ -527,7 +561,12 @@ private struct TemplateEditor: View {
         VStack(alignment: .leading, spacing: 12) {
             TextField("Name", text: $template.name)
                 .textFieldStyle(.roundedBorder)
-                .onChange(of: template.name) { _, _ in store.upsert(template) }
+                .onChange(of: template.name) { _, _ in persist() }
+            if let nameError {
+                Text(nameError)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
             Button(template.id == settings.activeTemplateID ? "Active Template" : "Make Active") {
                 settings.activeTemplateID = template.id
             }
@@ -539,8 +578,17 @@ private struct TemplateEditor: View {
             TextEditor(text: $template.prompt)
                 .font(.body)
                 .frame(maxWidth: .infinity, minHeight: 200, maxHeight: .infinity)
-                .onChange(of: template.prompt) { _, _ in store.upsert(template) }
+                .onChange(of: template.prompt) { _, _ in persist() }
         }
         .padding()
+    }
+
+    private func persist() {
+        do {
+            try store.upsert(template)
+            nameError = nil
+        } catch {
+            nameError = error.localizedDescription
+        }
     }
 }
