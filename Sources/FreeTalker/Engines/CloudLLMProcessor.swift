@@ -129,4 +129,59 @@ struct CloudLLMProcessor: PostProcessor {
             throw CloudLLMError.badResponse(provider: provider, status: code)
         }
     }
+
+    /// Connectivity check for Settings' "Test connection" button — same endpoint/auth headers as
+    /// `process`, but a minimal fixed prompt, a small `max_tokens`, and a short (10s) timeout, so
+    /// it verifies the key/base URL/model without running a real dictation's system prompt/
+    /// vocabulary through it. Returns the raw HTTP status; a thrown error means the request never
+    /// got a response at all (see `ConnectionTestOutcome.fromTransportError`). Never reads the
+    /// response body.
+    func testConnection() async throws -> Int {
+        let providerLabel = snapshot.provider.rawValue
+        let baseURL = snapshot.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let model = snapshot.model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !baseURL.isEmpty, !model.isEmpty else {
+            throw CloudLLMError.missingConfiguration(provider: providerLabel)
+        }
+        guard let apiKey = snapshot.key?.trimmingCharacters(in: .whitespacesAndNewlines), !apiKey.isEmpty else {
+            throw CloudLLMError.missingAPIKey(provider: providerLabel)
+        }
+
+        var request: URLRequest
+        switch snapshot.provider {
+        case .anthropic:
+            guard let url = URL(string: baseURL)?.appendingPathComponent("messages") else {
+                throw CloudLLMError.missingConfiguration(provider: providerLabel)
+            }
+            request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+            request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            let body: [String: Any] = [
+                "model": model,
+                "max_tokens": 8,
+                "messages": [["role": "user", "content": "Reply with OK"]]
+            ]
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        case .ollama, .openAICompatible:
+            guard let url = URL(string: baseURL)?.appendingPathComponent("chat/completions") else {
+                throw CloudLLMError.missingConfiguration(provider: providerLabel)
+            }
+            request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            let body: [String: Any] = [
+                "model": model,
+                "max_tokens": 8,
+                "messages": [["role": "user", "content": "Reply with OK"]]
+            ]
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        }
+        request.timeoutInterval = 10
+
+        let (_, response) = try await URLSession.shared.data(for: request)
+        return (response as? HTTPURLResponse)?.statusCode ?? 0
+    }
 }

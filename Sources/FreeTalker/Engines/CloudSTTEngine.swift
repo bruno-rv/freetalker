@@ -60,6 +60,27 @@ final class CloudSTTEngine: ObservableObject, TranscriptionEngine, @unchecked Se
         statusText = text
     }
 
+    /// Connectivity check for Settings' "Test connection" button. `transcribe` only ever POSTs
+    /// audio to `/audio/transcriptions`, which has no cheap no-upload variant — but the base URL
+    /// follows the OpenAI-compatible convention (e.g. `.../v1`) that also serves `GET /models`,
+    /// a standard, auth-gated, response-body-free endpoint most OpenAI-compatible servers
+    /// (including OpenAI itself) implement — so this GETs that instead of uploading real audio.
+    /// Returns the raw HTTP status; a thrown error means the request never got a response at all
+    /// (see `ConnectionTestOutcome.fromTransportError`). Never reads the response body.
+    static func testConnection(baseURL: String, apiKey: String) async throws -> Int {
+        let trimmedBase = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmedBase)?.appendingPathComponent("models") else {
+            throw CloudSTTError.badResponse(0, "Invalid base URL")
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(trimmedKey)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 10
+        let (_, response) = try await URLSession.shared.data(for: request)
+        return (response as? HTTPURLResponse)?.statusCode ?? 0
+    }
+
     private func multipartBody(boundary: String, wavData: Data, vocabulary: [String]) -> Data {
         var body = Data()
         func append(_ string: String) { body.append(Data(string.utf8)) }

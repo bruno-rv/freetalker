@@ -485,6 +485,17 @@ final class AppCoordinator: ObservableObject {
         return !baseURL.isEmpty && !model.isEmpty && !key.isEmpty
     }
 
+    /// Same shape as `isCloudLLMConfigured` for Cloud STT's config: trimmed base URL and trimmed
+    /// API key both non-empty. (Cloud STT has no user-configurable model field — `CloudSTTEngine`
+    /// always sends `model: "whisper-1"` — so unlike the LLM check there's no model to validate.)
+    /// Used to gate both the real Cloud STT engine selection contract and the Settings "Test
+    /// connection" button's enabled state, so they can never disagree about what counts as
+    /// "configured".
+    nonisolated static func isCloudSTTConfigured(baseURL: String, key: String) -> Bool {
+        !baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     /// Picks the Post-Processor for the dictation currently being handled: one `AppSettings`
     /// snapshot taken here, at selection time, decides both *whether* Cloud is used
     /// (`isCloudLLMConfigured`) and — if so — is threaded straight into the `CloudLLMProcessor`

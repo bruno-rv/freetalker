@@ -214,6 +214,7 @@ enum SelfCheck {
             failures.append(contentsOf: providerDefaultsChecks())
             failures.append(contentsOf: keychainMigrationChecks())
             failures.append(contentsOf: cloudLLMRoutingChecks())
+            failures.append(contentsOf: connectionTestChecks())
             failures.append(contentsOf: handsFreeChecks())
             failures.append(contentsOf: libraryDeletionChecks())
             failures.append(contentsOf: databaseStepClassificationChecks())
@@ -223,7 +224,7 @@ enum SelfCheck {
             failures.append(contentsOf: redoLastChecks())
 
             if failures.isEmpty {
-                print("SelfCheck PASSED (template seeding, FTS round-trip, pipeline contract, mic device enumeration, hotkey spec/matcher, vocabulary normalization/injection, app rule resolution, paste-target drift, prompt app-name sanitization, live preview gating/availability, SerialGate cancellation, preview early-cancel decisions, built-in template prompt upgrade, LLM provider defaults, BYOK Keychain key migration, global cloud-selection routing, hands-free recording state machine/esc/cap-clamp/cancel, Library deletion: per-row/Delete All/latestDictation tiebreak/dangling source_id/secure_delete/unfiltered total count, SQLite step classification (readAll/dictationExists error propagation), WAL checkpoint busy path, debug-audio purge scoping (incl. directory-named-*.wav skip, unreadable-directory error), LibraryStore privacy-step-then-always sequencing, Redo Last gating/spec-constraints/matcher/result message/spec validation)")
+                print("SelfCheck PASSED (template seeding, FTS round-trip, pipeline contract, mic device enumeration, hotkey spec/matcher, vocabulary normalization/injection, app rule resolution, paste-target drift, prompt app-name sanitization, live preview gating/availability, SerialGate cancellation, preview early-cancel decisions, built-in template prompt upgrade, LLM provider defaults, BYOK Keychain key migration, global cloud-selection routing, BYOK connection-test status-code mapping/config gating, hands-free recording state machine/esc/cap-clamp/cancel, Library deletion: per-row/Delete All/latestDictation tiebreak/dangling source_id/secure_delete/unfiltered total count, SQLite step classification (readAll/dictationExists error propagation), WAL checkpoint busy path, debug-audio purge scoping (incl. directory-named-*.wav skip, unreadable-directory error), LibraryStore privacy-step-then-always sequencing, Redo Last gating/spec-constraints/matcher/result message/spec validation)")
                 exit(0)
             } else {
                 print("SelfCheck FAILED:")
@@ -1209,6 +1210,58 @@ enum SelfCheck {
         // Amendment A5's documented intended behavior.
         if !AppCoordinator.isCloudLLMConfigured(snapshot: complete) {
             failures.append("isCloudLLMConfigured: expected routing under a complete config to be cloud, independent of any legacy per-Template value")
+        }
+
+        return failures
+    }
+
+    /// Checks for Task 3's BYOK "Test connection" buttons: the pure status-code -> user-message
+    /// mapping (`ConnectionTestOutcome`) and the Cloud STT config-completeness gate
+    /// (`isCloudSTTConfigured`), which mirrors `isCloudLLMConfigured`'s existing coverage above.
+    /// No networking here — these are the two pure functions the UI's `.disabled` gate and result
+    /// label are built from. See ConnectionTest.swift's doc comment for the security requirement
+    /// (`message` never carries a response body or key) that these assertions exist to guard.
+    private static func connectionTestChecks() -> [String] {
+        var failures: [String] = []
+
+        // 401 -> key hint.
+        if ConnectionTestOutcome.fromStatusCode(401).message != "Failed — HTTP 401 (check API key)" {
+            failures.append("ConnectionTestOutcome: expected 401 to map to the API-key hint, got \"\(ConnectionTestOutcome.fromStatusCode(401).message)\"")
+        }
+        // 404 -> model/URL hint.
+        if ConnectionTestOutcome.fromStatusCode(404).message != "Failed — HTTP 404 (check model/URL)" {
+            failures.append("ConnectionTestOutcome: expected 404 to map to the model/URL hint, got \"\(ConnectionTestOutcome.fromStatusCode(404).message)\"")
+        }
+        // Any other non-2xx status -> generic HTTP-code message (spot-checked with 500).
+        if ConnectionTestOutcome.fromStatusCode(500).message != "Failed — HTTP 500" {
+            failures.append("ConnectionTestOutcome: expected 500 to map to a generic HTTP-code message, got \"\(ConnectionTestOutcome.fromStatusCode(500).message)\"")
+        }
+        // 2xx -> success (spot-checked with 200).
+        if ConnectionTestOutcome.fromStatusCode(200).message != "Connected ✓" {
+            failures.append("ConnectionTestOutcome: expected 200 to map to success, got \"\(ConnectionTestOutcome.fromStatusCode(200).message)\"")
+        }
+        // Timeout and any other transport failure both read as "cannot reach host" to the user.
+        if ConnectionTestOutcome.fromTransportError(URLError(.timedOut)).message != "Failed — cannot reach host" {
+            failures.append("ConnectionTestOutcome: expected a timeout to map to the reachability hint")
+        }
+        if ConnectionTestOutcome.fromTransportError(URLError(.cannotFindHost)).message != "Failed — cannot reach host" {
+            failures.append("ConnectionTestOutcome: expected a DNS/host failure to map to the reachability hint")
+        }
+
+        // isCloudSTTConfigured: mirrors isCloudLLMConfigured's coverage above — both trimmed
+        // fields must be non-empty; a blank/whitespace-only field in either position fails
+        // closed (not configured), never open.
+        if !AppCoordinator.isCloudSTTConfigured(baseURL: "https://api.openai.com/v1", key: "sk-test") {
+            failures.append("isCloudSTTConfigured: expected a fully configured base URL + key to be eligible")
+        }
+        if AppCoordinator.isCloudSTTConfigured(baseURL: "", key: "sk-test") {
+            failures.append("isCloudSTTConfigured: expected a blank base URL to be ineligible")
+        }
+        if AppCoordinator.isCloudSTTConfigured(baseURL: "https://api.openai.com/v1", key: "   ") {
+            failures.append("isCloudSTTConfigured: expected a blank (whitespace-only) key to be ineligible")
+        }
+        if AppCoordinator.isCloudSTTConfigured(baseURL: "   ", key: "   ") {
+            failures.append("isCloudSTTConfigured: expected both fields blank to be ineligible")
         }
 
         return failures
