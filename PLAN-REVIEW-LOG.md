@@ -103,3 +103,6 @@ All 4 ACCEPTED: split committed-row-deletion from VACUUM/checkpoint at the Datab
 
 ## Code Round 3 — Codex
 Blocked: Codex usage limit exhausted (resets 2026-07-10 00:46). Rounds 1–2 findings (10 + 4) all fixed and mutation-verified; no unaddressed findings. Bruno authorized push without the confirmatory round ("Push now"); round 3 to run later as post-merge audit.
+
+## Review: Settings layout + BYOK connection tests (commit 44404ed)
+Codex review attempted 2026-07-10 (thread 019f4ae3-8c6f-76a2-88d9-895ef48a6c2a): usage limit hit before any findings (resets 10:21). Per Bruno's standing instruction ("if there is any issue with Codex in terms of budget, just go ahead and push and merge"), pushed without cross-model review. Internal verification stands: security sweep of ConnectionTest paths (no body/key leakage), 8 mutations covering all 10 new assertions, clean release build, selfcheck PASS, make app OK. Deferred: this commit + the round-3 confirmation of ac04a65/e96388a remain candidates for a post-hoc Codex audit when quota returns.
