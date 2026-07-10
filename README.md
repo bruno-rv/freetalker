@@ -76,6 +76,16 @@ the correction spans multiple sentences.
 A built-in Template you've never edited quietly picks up improved prompts as the app evolves;
 once you edit one yourself, it's yours and is never touched automatically.
 
+### Spoken Commands
+
+Every built-in Template also interprets a set of English instruction phrases spoken mid-dictation,
+regardless of what language the rest of the dictation is in — say "scratch that" partway through a
+Portuguese dictation and it's still interpreted as a command, not transcribed. Supported phrases:
+"new paragraph", "new line", "quote" … "unquote", "bullet point", "numbered list", "all caps" …
+"end caps", and "scratch that" (removes the sentence or clause you said immediately before it). A
+phrase used descriptively rather than as an instruction — "I added a new paragraph about
+pricing" — is still transcribed literally; when in doubt, the model transcribes rather than acts.
+
 ### Context awareness
 
 Settings → Templates → **App Rules** maps an app (by bundle ID) to a Template, so dictating in
@@ -88,6 +98,31 @@ context, so refined output can account for where it's headed.
 Settings → Templates → **Vocabulary** takes a list of names, jargon, or acronyms your dictation
 tends to get wrong. Terms bias WhisperKit's decoding toward the right spelling and are also
 enforced as corrections during post-processing, so they hold even if the transcript missed them.
+
+## Language
+
+The menu bar has an **Auto / English / Portuguese** pin below the Template list, forcing the
+transcript language instead of auto-detecting it. Settings → Templates → **App Rules** can
+override the pin per app, alongside its Template rule. The Recording Panel's EN/PT buttons
+(below) add a one-shot override on top of both, good for a single dictation without changing
+any standing setting. Precedence, most to least specific: **one-shot > app rule > pin > auto**.
+
+## Recording Panel
+
+While recording (both push-to-talk hold and hands-free), the HUD shows a row of controls instead
+of a plain pill:
+
+- **Cancel** (✕) discards the recording.
+- **Done** (✓) stops and runs it through the Active Template, same as releasing the key.
+- **Raw** stops and pastes the transcript verbatim, skipping post-processing entirely; the
+  Library entry is filed under the reserved Template name "Raw Transcript" rather than whatever
+  Template was active.
+- **EN** / **PT** set a one-shot language override for this recording only (tap the active one
+  again to clear it) — see "Language" above for how it fits with the pin and App Rules.
+- The Template name button cycles the Active Template without leaving the recording.
+- **Lock** (only shown while not already locked) switches a held push-to-talk key into
+  hands-free recording without releasing it — the elapsed/cap readout replaces the Lock button
+  once locked.
 
 ## Cloud engines (BYOK)
 
