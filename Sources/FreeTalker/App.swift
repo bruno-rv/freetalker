@@ -89,6 +89,23 @@ private struct MenuBarContentView: View {
 
             Divider()
 
+            // Language Pin (CONTEXT.md): persistent Auto/English/Portuguese toggle forcing
+            // Transcript language, absent a more specific override (an app rule, or the panel's
+            // one-shot choice). See PLAN.md step 6.
+            ForEach(Self.languagePinOptions, id: \.code) { option in
+                Button {
+                    settings.languagePin = option.code
+                } label: {
+                    if settings.languagePin == option.code {
+                        Label(option.label, systemImage: "checkmark")
+                    } else {
+                        Text(option.label)
+                    }
+                }
+            }
+
+            Divider()
+
             Text(coordinator.engineStatusText)
 
             if let hotKeyStatusText = coordinator.hotKeyStatusText {
@@ -113,4 +130,10 @@ private struct MenuBarContentView: View {
         }
         .onAppear { accessibilityTrusted = Permissions.isAccessibilityTrusted() }
     }
+
+    private static let languagePinOptions: [(code: String, label: String)] = [
+        ("auto", "Auto"),
+        ("en", "English"),
+        ("pt", "Portuguese")
+    ]
 }

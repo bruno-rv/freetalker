@@ -14,5 +14,9 @@ protocol TranscriptionEngine: Sendable {
     var name: String { get }
     /// Free-text status for the menu bar / Settings (e.g. download progress, "Ready").
     @MainActor var statusText: String { get }
-    func transcribe(samples: [Float]) async throws -> TranscriptionOutput
+    /// `forcedLanguage`: nil = auto-detect (existing behavior); "en"/"pt" pins the Transcript
+    /// language (CONTEXT.md "Language Pin"). Resolved once at stop time by
+    /// `AppCoordinator.resolveLanguage` and passed in — engines never read AppSettings for this
+    /// themselves. See PLAN.md step 5.
+    func transcribe(samples: [Float], forcedLanguage: String?) async throws -> TranscriptionOutput
 }

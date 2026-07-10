@@ -185,19 +185,19 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
     ///
     /// Never pass `true` for the final transcription — the plan invariant is that the final path
     /// always runs to completion, uninterrupted. `TranscriptionEngine`'s protocol requirement
-    /// (`transcribe(samples:)`, no `allowEarlyCancel`) is satisfied by the overload just below,
-    /// which hardcodes `false` — so every call reached through the protocol (i.e. the final
+    /// (`transcribe(samples:forcedLanguage:)`, no `allowEarlyCancel`) is satisfied by the overload
+    /// just below, which hardcodes `false` — so every call reached through the protocol (i.e. the final
     /// pipeline, which only ever holds an `any TranscriptionEngine`) is final-path behavior by
     /// construction, and can never behave differently than before this fix. Swift's protocol
     /// witness matching doesn't accept a defaulted extra parameter as satisfying a stricter
     /// requirement, which is why this is two overloads rather than one method with a default.
-    func transcribe(samples: [Float], allowEarlyCancel: Bool) async throws -> TranscriptionOutput {
+    func transcribe(samples: [Float], forcedLanguage: String?, allowEarlyCancel: Bool) async throws -> TranscriptionOutput {
         guard allowEarlyCancel else {
-            return try await gate.run { [self] in try await performTranscribe(samples: samples, cancelFlag: nil) }
+            return try await gate.run { [self] in try await performTranscribe(samples: samples, forcedLanguage: forcedLanguage, cancelFlag: nil) }
         }
         let cancelFlag = OSAllocatedUnfairLock(initialState: false)
         return try await withTaskCancellationHandler {
-            try await gate.run { [self] in try await performTranscribe(samples: samples, cancelFlag: cancelFlag) }
+            try await gate.run { [self] in try await performTranscribe(samples: samples, forcedLanguage: forcedLanguage, cancelFlag: cancelFlag) }
         } onCancel: {
             cancelFlag.withLock { $0 = true }
         }
@@ -205,8 +205,8 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
 
     /// `TranscriptionEngine` conformance — the final-transcription entry point. Always
     /// `allowEarlyCancel: false`; see the overload above.
-    func transcribe(samples: [Float]) async throws -> TranscriptionOutput {
-        try await transcribe(samples: samples, allowEarlyCancel: false)
+    func transcribe(samples: [Float], forcedLanguage: String?) async throws -> TranscriptionOutput {
+        try await transcribe(samples: samples, forcedLanguage: forcedLanguage, allowEarlyCancel: false)
     }
 
     /// Pure decision for the preview-only early-stop `TranscriptionCallback` WhisperKit invokes
@@ -240,19 +240,27 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
         }
     }
 
-    private func performTranscribe(samples: [Float], cancelFlag: OSAllocatedUnfairLock<Bool>?) async throws -> TranscriptionOutput {
+    private func performTranscribe(samples: [Float], forcedLanguage: String?, cancelFlag: OSAllocatedUnfairLock<Bool>?) async throws -> TranscriptionOutput {
         let kit = try await loadedKit()
         try checkPreviewCancellation(cancelFlag)
-        await setStatus("Detecting language…")
 
         do {
-            // Whisper's unconstrained auto-detect spans ~99 languages and misfires badly on
-            // short utterances (e.g. English "Hello, 1 2 3 4 5 6" hallucinated as Portuguese).
-            // Restrict the winner to the two languages this app actually supports, then pin
-            // the real decode to it instead of letting WhisperKit detect+decode freely.
-            let (_, langProbs) = try await kit.detectLangauge(audioArray: samples)
-            try checkPreviewCancellation(cancelFlag)
-            let language = Self.supportedLanguages.max { langProbs[$0, default: -.infinity] < langProbs[$1, default: -.infinity] } ?? "en"
+            let language: String
+            if let forcedLanguage {
+                // Language Pin (CONTEXT.md): the caller already resolved this to "en"/"pt" (one-
+                // shot > app rule > pin) — skip auto-detect entirely and decode directly in that
+                // language. See PLAN.md step 5.
+                language = forcedLanguage
+            } else {
+                await setStatus("Detecting language…")
+                // Whisper's unconstrained auto-detect spans ~99 languages and misfires badly on
+                // short utterances (e.g. English "Hello, 1 2 3 4 5 6" hallucinated as Portuguese).
+                // Restrict the winner to the two languages this app actually supports, then pin
+                // the real decode to it instead of letting WhisperKit detect+decode freely.
+                let (_, langProbs) = try await kit.detectLangauge(audioArray: samples)
+                try checkPreviewCancellation(cancelFlag)
+                language = Self.supportedLanguages.max { langProbs[$0, default: -.infinity] < langProbs[$1, default: -.infinity] } ?? "en"
+            }
 
             await setStatus("Transcribing…")
             var options = DecodingOptions()
@@ -311,7 +319,10 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
 
             await setStatus("Ready")
             let text = results.map(\.text).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
-            return TranscriptionOutput(text: text, language: results.first?.language ?? language)
+            // When forced, the recorded language is always the forced code — never whatever
+            // WhisperKit's decode result happens to report — mirroring CloudSTTEngine's contract.
+            // See PLAN.md step 5.
+            return TranscriptionOutput(text: text, language: forcedLanguage ?? results.first?.language ?? language)
         } catch {
             await setStatus("Ready")
             throw error

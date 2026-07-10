@@ -64,7 +64,7 @@ enum DebugTranscribe {
             do {
                 let samples = try AudioFileLoader.loadSamples16kMono(from: URL(fileURLWithPath: path))
                 FileHandle.standardError.write("[debug] loaded \(samples.count) samples from \(path)\n".data(using: .utf8)!)
-                let output = try await engine.transcribe(samples: samples)
+                let output = try await engine.transcribe(samples: samples, forcedLanguage: nil)
                 statusTask.cancel()
                 let transcript = output.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 print("language: \(output.language)")
