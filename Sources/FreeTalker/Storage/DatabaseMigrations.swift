@@ -1,7 +1,7 @@
 import CSQLite
 
 enum DatabaseMigrator {
-    static let latestVersion = 4
+    static let latestVersion = 5
 
     static func migrate(_ db: OpaquePointer) throws {
         try execute(db, "BEGIN IMMEDIATE;")
@@ -112,7 +112,29 @@ enum DatabaseMigrator {
         ON transcription_jobs (needs_source_cleanup);
     """
 
-    private static let migrations = [migration1, migration2, migration3, migration4]
+    private static let migration5 = """
+    ALTER TABLE snippets RENAME TO legacy_snippets;
+    CREATE TABLE snippets (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        replacement TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL
+    );
+    CREATE TABLE snippet_triggers (
+        snippet_id TEXT NOT NULL,
+        trigger TEXT NOT NULL,
+        normalized_trigger TEXT NOT NULL,
+        PRIMARY KEY (snippet_id, trigger)
+    );
+    INSERT INTO snippets (id, name, replacement, created_at, updated_at)
+        SELECT id, trigger, replacement, created_at, updated_at FROM legacy_snippets;
+    INSERT INTO snippet_triggers (snippet_id, trigger, normalized_trigger)
+        SELECT id, trigger, lower(trim(trigger)) FROM legacy_snippets;
+    DROP TABLE legacy_snippets;
+    """
+
+    private static let migrations = [migration1, migration2, migration3, migration4, migration5]
 
     private static func appliedVersions(_ db: OpaquePointer) throws -> [Int] {
         var statement: OpaquePointer?

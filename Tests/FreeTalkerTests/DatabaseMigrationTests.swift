@@ -10,7 +10,7 @@ import Testing
 
         #expect(try db.tableNames() == [
             "transcription_jobs", "job_attempts", "speaker_segments",
-            "speaker_names", "snippets", "schema_migrations"
+            "speaker_names", "snippets", "snippet_triggers", "schema_migrations"
         ])
         #expect(try db.indexNames() == [
             "idx_transcription_jobs_state_expires_at",
@@ -59,6 +59,7 @@ import Testing
         #expect(try db.integer("SELECT COUNT(*) FROM speaker_segments WHERE id = 8 AND transcript = 'hello';") == 1)
         #expect(try db.integer("SELECT COUNT(*) FROM speaker_names WHERE name = 'Alice';") == 1)
         #expect(try db.integer("SELECT COUNT(*) FROM snippets WHERE replacement = 'be right back';") == 1)
+        #expect(try db.integer("SELECT COUNT(*) FROM snippet_triggers WHERE trigger = 'brb';") == 1)
 
         try db.execute("""
         UPDATE job_attempts
@@ -84,7 +85,7 @@ import Testing
 
         try DatabaseMigrator.migrate(db.handle)
 
-        #expect(try db.migrationVersions() == [1, 2, 3, 4])
+        #expect(try db.migrationVersions() == Array(1...DatabaseMigrator.latestVersion))
         #expect(try db.integer("SELECT COUNT(*) FROM transcription_jobs WHERE id = 'ready-recovery';") == 1)
         #expect(try db.integer("SELECT needs_source_cleanup FROM transcription_jobs WHERE id = 'ready-recovery';") == 0)
         #expect(try db.integer("SELECT source_cleanup_error IS NULL FROM transcription_jobs WHERE id = 'ready-recovery';") == 1)
