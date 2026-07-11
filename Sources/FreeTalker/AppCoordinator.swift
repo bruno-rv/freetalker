@@ -57,6 +57,8 @@ final class AppCoordinator: ObservableObject {
     private let screenshotService: any ActiveWindowScreenshotCapturing = ActiveWindowScreenshotService()
     private let ocrService: any VisionOCRServicing = VisionOCRService()
     private let contextTargetSnapshotter = ContextTargetSnapshotter()
+    private let selectionAccess: any SelectionAccessing = SelectionAccess()
+    private(set) var pendingVoiceEditSelection: SelectionSnapshot?
 
     private let hotKeyManager = HotKeyManager()
     private let audioCapture = AudioCapture()
@@ -187,6 +189,9 @@ final class AppCoordinator: ObservableObject {
         hotKeyManager.onKeyUp = { [weak self] eventSeconds in self?.handleKeyUp(eventSeconds: eventSeconds) }
         hotKeyManager.onEscape = { [weak self] in self?.handleEscape() }
         hotKeyManager.onRedoKeyDown = { [weak self] _ in self?.redoLast() }
+        Self.configureVoiceEditHotKey(manager: hotKeyManager) { [weak self] in
+            self?.handleVoiceEditHotKey()
+        }
         if hotKeyManager.start(
             spec: AppSettings.shared.hotKeySpec,
             redoSpec: AppSettings.shared.redoHotKeySpec,
@@ -197,6 +202,43 @@ final class AppCoordinator: ObservableObject {
         } else {
             updateHotKeyStatusText()
             beginHotKeyRetryPollIfNeeded()
+        }
+    }
+
+    static func configureVoiceEditHotKey(manager: HotKeyManager, handler: @escaping @MainActor () -> Void) {
+        manager.onVoiceEditKeyDown = { _ in handler() }
+    }
+
+    private func handleVoiceEditHotKey() {
+        Self.handleVoiceEditHotKey(
+            selectionAccess: selectionAccess,
+            pendingSelection: &pendingVoiceEditSelection,
+            flash: { hud.flash($0) }
+        )
+    }
+
+    static func handleVoiceEditHotKey(
+        selectionAccess: any SelectionAccessing,
+        pendingSelection: inout SelectionSnapshot?,
+        flash: (String) -> Void
+    ) {
+        do {
+            pendingSelection = try selectionAccess.capture()
+        } catch let error as SelectionAccessError {
+            pendingSelection = nil
+            switch error {
+            case .secureField:
+                flash("Voice Edit is unavailable in secure fields")
+            case .noEditableSelection, .noFrontmostApplication:
+                flash("Select editable text first")
+            case .targetChanged, .selectionChanged:
+                flash("Selection changed — select text and try again")
+            case .replacementFailed:
+                flash("Could not access the selected text")
+            }
+        } catch {
+            pendingSelection = nil
+            flash("Could not access the selected text")
         }
     }
 
