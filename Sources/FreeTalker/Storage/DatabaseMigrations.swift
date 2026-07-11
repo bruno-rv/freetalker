@@ -13,9 +13,14 @@ enum DatabaseMigrator {
             );
             """)
 
-            if try currentVersion(db) < 1 {
-                try execute(db, migration1)
-                try execute(db, "INSERT INTO schema_migrations (version) VALUES (1);")
+            let appliedVersions = try appliedVersions(db)
+            try validate(appliedVersions)
+
+            for (offset, migration) in migrations.enumerated() {
+                let version = offset + 1
+                guard version > appliedVersions.count else { continue }
+                try execute(db, migration)
+                try execute(db, "INSERT INTO schema_migrations (version) VALUES (\(version));")
             }
 
             try execute(db, "COMMIT;")
@@ -86,11 +91,13 @@ enum DatabaseMigrator {
         ON job_attempts (job_id);
     """
 
-    private static func currentVersion(_ db: OpaquePointer) throws -> Int {
+    private static let migrations = [migration1]
+
+    private static func appliedVersions(_ db: OpaquePointer) throws -> [Int] {
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(
             db,
-            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations;",
+            "SELECT version FROM schema_migrations ORDER BY version;",
             -1,
             &statement,
             nil
@@ -99,10 +106,27 @@ enum DatabaseMigrator {
         }
         defer { sqlite3_finalize(statement) }
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        var versions: [Int] = []
+        var result = sqlite3_step(statement)
+        while result == SQLITE_ROW {
+            versions.append(Int(sqlite3_column_int(statement, 0)))
+            result = sqlite3_step(statement)
+        }
+        guard result == SQLITE_DONE else {
             throw DatabaseError.sqlFailed(lastError(db))
         }
-        return Int(sqlite3_column_int(statement, 0))
+        return versions
+    }
+
+    private static func validate(_ versions: [Int]) throws {
+        if let newest = versions.last, newest > latestVersion {
+            throw DatabaseError.sqlFailed(
+                "Database schema version \(newest) is newer than supported version \(latestVersion)"
+            )
+        }
+        if !versions.isEmpty && versions != Array(1...versions.count) {
+            throw DatabaseError.sqlFailed("Database migration ledger is not contiguous from version 1")
+        }
     }
 
     private static func execute(_ db: OpaquePointer, _ sql: String) throws {
