@@ -2,8 +2,10 @@ import AppKit
 import SwiftUI
 
 struct LibraryView: View {
+    private enum Section: String, CaseIterable { case dictations = "Dictations", recoveries = "Recoveries", imports = "Imports" }
     @ObservedObject private var store = LibraryStore.shared
     @ObservedObject private var coordinator = AppCoordinator.shared
+    @State private var section: Section = .dictations
     @State private var selectedID: Int64?
     @State private var pendingDeleteID: Int64?
     @State private var showDeleteAllConfirm = false
@@ -14,8 +16,35 @@ struct LibraryView: View {
         // filtered by an active search and would otherwise misreport e.g. "0 Entries" in the
         // Delete All dialog while the whole archive is about to be wiped. See Round 1 Codex
         // finding 1.
+        VStack(spacing: 0) {
+            Picker("Library section", selection: $section) {
+                Text("Dictations").tag(Section.dictations)
+                if let recoveryStore = coordinator.jobLibraryStore {
+                    RecoveryPickerLabel(store: recoveryStore).tag(Section.recoveries)
+                } else {
+                    Text("Recoveries").tag(Section.recoveries)
+                }
+                Text("Imports").tag(Section.imports)
+            }
+            .pickerStyle(.segmented)
+            .padding(8)
+
+            switch section {
+            case .dictations: dictationsView
+            case .recoveries:
+                if let recoveryStore = coordinator.jobLibraryStore { RecoveriesView(store: recoveryStore) }
+                else { ContentUnavailableView("Recoveries Unavailable", systemImage: "exclamationmark.triangle") }
+            case .imports:
+                if let importStore = coordinator.jobLibraryStore { ImportsView(store: importStore) }
+                else { ContentUnavailableView("Imports Unavailable", systemImage: "exclamationmark.triangle") }
+            }
+        }
+        .frame(minWidth: 720, maxWidth: .infinity, minHeight: 480, maxHeight: .infinity)
+    }
+
+    private var dictationsView: some View {
         let deleteAllCount = store.totalCount()
-        HSplitView {
+        return HSplitView {
             VStack(spacing: 0) {
                 TextField("Search", text: $store.searchText)
                     .textFieldStyle(.roundedBorder)
@@ -65,7 +94,6 @@ struct LibraryView: View {
         // grants it, so maximizing the window stretches the window chrome only. A flexible frame
         // with min == the old fixed size and max == infinity keeps the same starting size but
         // lets the content track the window when resized/maximized.
-        .frame(minWidth: 720, maxWidth: .infinity, minHeight: 480, maxHeight: .infinity)
         .confirmationDialog(
             "Delete this Dictation?",
             isPresented: Binding(get: { pendingDeleteID != nil }, set: { if !$0 { pendingDeleteID = nil } }),
@@ -114,6 +142,17 @@ struct LibraryView: View {
         } message: {
             Text(errorMessage ?? "")
         }
+    }
+}
+
+private struct RecoveryPickerLabel: View {
+    @ObservedObject var store: JobLibraryStore
+
+    var body: some View {
+        let count = RecoveryPresentation.badgeCount(store.recoveryJobs)
+        let badge = RecoveryPresentation.badgeText(count: count)
+        Text(badge.map { "Recoveries (\($0))" } ?? "Recoveries")
+            .accessibilityLabel(count == 0 ? "Recoveries" : "Recoveries, \(count) needing attention")
     }
 }
 

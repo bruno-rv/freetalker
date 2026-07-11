@@ -10,8 +10,10 @@ on-device Apple post-processing by default; cloud engines are optional and BYOK-
 ## Requirements
 
 - macOS 26, Apple Silicon.
-- Xcode Command Line Tools (Swift 6.3+). **No Xcode.app is required or used** — this is a
-  Swift Package, not an `.xcodeproj`.
+- Xcode Command Line Tools (Swift 6.3+) are sufficient to build and run the app; the app is
+  a Swift Package, not an `.xcodeproj`.
+- Contributors running the test suite need full Xcode installed at
+  `/Applications/Xcode.app` by default so Swift Testing is available.
 
 ## Build
 
@@ -21,6 +23,15 @@ open FreeTalker.app
 ```
 
 Or in one step: `make run`.
+
+The app build remains Command Line Tools-only and does not change the selected developer
+directory. To run tests, use `make test`. The Makefile checks for full Xcode and Swift Testing,
+prints the developer directory it uses, and scopes `DEVELOPER_DIR` to the test command without
+mutating `xcode-select`. Override a non-default Xcode location explicitly:
+
+```sh
+make test XCODE_DEVELOPER_DIR=/path/to/Xcode.app/Contents/Developer
+```
 
 `make app` copies the release binary into `FreeTalker.app/Contents/MacOS/`, writes
 `Contents/Info.plist` (from `Info.plist` at the repo root — `LSUIElement=true` so it's
@@ -73,6 +84,12 @@ Settings (menu bar → "Settings…") shows live permission status.
   re-run a stored transcript through a different Template. Each entry can be deleted
   individually, or wiped entirely with **Delete All** — which also purges any saved debug audio
   (`last-dictation.wav`, failed-transcription recordings) alongside the database rows.
+- **Library → Recoveries** keeps failed dictation audio locally on this Mac so you can listen,
+  retry with optional language/model/template overrides, or permanently delete it. Recovery
+  audio is never uploaded by the recovery library itself. Settings → General → Recovery controls
+  automatic deletion after 1, 7 (default), 30, or 90 days, or keeps it until you delete it.
+- **Library → Imports** accepts WAV, M4A, MP3, MP4, and MOV from the file picker or drag and drop. FreeTalker extracts video audio, transcribes it with the selected local Whisper model, separates speakers locally, and lets you rename speakers and export TXT, Markdown, SRT, or VTT. Imports default to 7-day retention (configurable in Settings). The source file is never modified or deleted, and imported media, derived audio, transcripts, and speaker data never leave your Mac.
+  The media integration suite generates a tiny MOV containing both video and audio, then verifies the production probe and decoder extract normalized 16 kHz mono frames without changing the MOV.
 - An optional **Redo-last key** (Settings → General, unbound by default) re-inserts the newest
   Library entry at your cursor without re-recording — handy when a paste got dismissed or
   overwritten.
@@ -105,6 +122,44 @@ Email — a rule can set either half alone or both together. The Active Template
 when no rule's Template half matches; see "Language" below for how the language half fits with
 the pin and the Recording Panel. The frontmost app's identity is also passed to the
 post-processor as context, so refined output can account for where it's headed.
+
+Settings → General → **Local context** can optionally capture selected text, the focused field,
+the active window's accessibility text, or a one-time active-window screenshot read by Apple
+Vision OCR. The scope defaults to Off and is captured exactly once when dictation stops. Manual
+App Rules always take precedence over the optional automatic local style.
+
+Selected text, Focused field, and Active window require Accessibility permission. Window + local
+OCR requires Screen Recording permission only; Accessibility can improve its window metadata but
+is not required for capture or OCR. If the exact stopped window is no longer available, FreeTalker
+continues without OCR instead of capturing another window.
+
+macOS exposes Screen Recording preflight as granted or not granted. Settings reflects that current
+state directly and offers explicit **Request Access** and **Open System Settings** actions when it
+is not granted; FreeTalker does not infer whether access was never requested or previously denied.
+
+**Local-only privacy boundary:** accessibility text, screenshots, and OCR output stay in memory
+and are supplied only to Apple's on-device Foundation Model. Screenshot bytes are released
+immediately after local OCR. Local context is never persisted, logged, or included in cloud/BYOK
+post-processing requests; when cloud post-processing is configured, FreeTalker omits it entirely.
+
+### Voice Edit and snippets
+
+Assign a **Voice Edit key** in Settings → General, select editable text, and press the key. Speak
+the instruction, then press the key again. Voice Edit transcribes the instruction with the local
+WhisperKit engine, resolves any exact snippet trigger from the on-device snippet database, and
+uses Apple's on-device Foundation Model when generation is needed. It always shows a preview of
+the original and proposed text; nothing is replaced until you explicitly confirm. If the app,
+field, selection, or selected text changed, replacement is refused and Copy remains available.
+
+Create, edit, rename, or delete reusable snippets under Settings → Snippets. Put one trigger phrase
+per line. Matching ignores case, surrounding punctuation, and repeated whitespace, while duplicate
+normalized triggers are rejected. Ambiguous snippets migrated from older versions require an
+explicit choice in the preview and can be resolved by editing their trigger phrases in Settings.
+Snippet renames update the persisted record used by future matches.
+
+Selected text, spoken instructions, and previews stay in memory and are never sent to a cloud service,
+saved to Library, or logged. Snippet names, triggers, and expansions are stored only in
+FreeTalker's local SQLite database.
 
 ### Custom vocabulary
 

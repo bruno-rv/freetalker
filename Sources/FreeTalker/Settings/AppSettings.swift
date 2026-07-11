@@ -26,7 +26,7 @@ struct LLMProviderDefault: Equatable {
 final class AppSettings: ObservableObject {
     static let shared = AppSettings()
 
-    private let defaults = UserDefaults.standard
+    private let defaults: UserDefaults
 
     /// The push-to-talk hotkey: modifier chord and/or non-modifier key. Persisted as JSON;
     /// legacy single-modifier installs (pre-HotKeySpec `hotKeyDeviceMask`) are migrated in
@@ -45,6 +45,10 @@ final class AppSettings: ObservableObject {
             if let redoHotKeySpec, HotKeySpec.validRedoSpec(redoHotKeySpec, pttSpec: hotKeySpec) == nil {
                 self.redoHotKeySpec = nil
             }
+            if let voiceEditHotKeySpec,
+               HotKeySpec.validActionSpec(voiceEditHotKeySpec, pttSpec: hotKeySpec, otherActionSpec: redoHotKeySpec) == nil {
+                self.voiceEditHotKeySpec = nil
+            }
         }
     }
 
@@ -60,7 +64,8 @@ final class AppSettings: ObservableObject {
             // reasoning as `vocabularyText`/`handsFreeMaxMinutes` above), so this falls straight
             // through to the persistence branch below on the next (nil) value. See Round 1 Codex
             // finding 10.
-            if let redoHotKeySpec, HotKeySpec.validRedoSpec(redoHotKeySpec, pttSpec: hotKeySpec) == nil {
+            if let redoHotKeySpec,
+               HotKeySpec.validActionSpec(redoHotKeySpec, pttSpec: hotKeySpec, otherActionSpec: voiceEditHotKeySpec) == nil {
                 self.redoHotKeySpec = nil
                 defaults.removeObject(forKey: Keys.redoHotKeySpec)
                 return
@@ -69,6 +74,22 @@ final class AppSettings: ObservableObject {
                 defaults.set(data, forKey: Keys.redoHotKeySpec)
             } else {
                 defaults.removeObject(forKey: Keys.redoHotKeySpec)
+            }
+        }
+    }
+
+    @Published var voiceEditHotKeySpec: HotKeySpec? {
+        didSet {
+            if let voiceEditHotKeySpec,
+               HotKeySpec.validActionSpec(voiceEditHotKeySpec, pttSpec: hotKeySpec, otherActionSpec: redoHotKeySpec) == nil {
+                self.voiceEditHotKeySpec = nil
+                defaults.removeObject(forKey: Keys.voiceEditHotKeySpec)
+                return
+            }
+            if let voiceEditHotKeySpec, let data = try? JSONEncoder().encode(voiceEditHotKeySpec) {
+                defaults.set(data, forKey: Keys.voiceEditHotKeySpec)
+            } else {
+                defaults.removeObject(forKey: Keys.voiceEditHotKeySpec)
             }
         }
     }
@@ -116,6 +137,22 @@ final class AppSettings: ObservableObject {
 
     @Published var activeTemplateID: String {
         didSet { defaults.set(activeTemplateID, forKey: Keys.activeTemplateID) }
+    }
+
+    @Published var recoveryRetention: RecoveryRetention {
+        didSet { defaults.set(recoveryRetention.rawValue, forKey: Keys.recoveryRetention) }
+    }
+
+    @Published var mediaImportRetention: MediaImportRetention {
+        didSet { defaults.set(mediaImportRetention.rawValue, forKey: Keys.mediaImportRetention) }
+    }
+
+    @Published var localContextScope: LocalContextScope {
+        didSet { defaults.set(localContextScope.rawValue, forKey: Keys.localContextScope) }
+    }
+
+    @Published var automaticStyleEnabled: Bool {
+        didSet { defaults.set(automaticStyleEnabled, forKey: Keys.automaticStyleEnabled) }
     }
 
     @Published var handsFreeMaxMinutes: Int {
@@ -388,6 +425,7 @@ final class AppSettings: ObservableObject {
     private enum Keys {
         static let hotKeySpec = "hotKeySpec"
         static let redoHotKeySpec = "redoHotKeySpec"
+        static let voiceEditHotKeySpec = "voiceEditHotKeySpec"
         /// Legacy (read-only, for migration): single-modifier NX device mask bit.
         static let legacyHotKeyDeviceMask = "hotKeyDeviceMask"
         static let sttEngine = "sttEngine"
@@ -399,6 +437,10 @@ final class AppSettings: ObservableObject {
         static let cloudLLMBaseURL = "cloudLLMBaseURL"
         static let cloudLLMModel = "cloudLLMModel"
         static let activeTemplateID = "activeTemplateID"
+        static let recoveryRetention = "recoveryRetention"
+        static let mediaImportRetention = "mediaImportRetention"
+        static let localContextScope = "localContextScope"
+        static let automaticStyleEnabled = "automaticStyleEnabled"
         static let handsFreeMaxMinutes = "handsFreeMaxMinutes"
         static let appRules = "appRules"
         static let languagePin = "languagePin"
@@ -407,7 +449,8 @@ final class AppSettings: ObservableObject {
         static let vocabularyText = "vocabularyText"
     }
 
-    private init() {
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
         if let data = defaults.data(forKey: Keys.hotKeySpec),
            let spec = try? JSONDecoder().decode(HotKeySpec.self, from: data) {
             hotKeySpec = spec
@@ -421,6 +464,11 @@ final class AppSettings: ObservableObject {
             redoHotKeySpec = try? JSONDecoder().decode(HotKeySpec.self, from: data)
         } else {
             redoHotKeySpec = nil
+        }
+        if let data = defaults.data(forKey: Keys.voiceEditHotKeySpec) {
+            voiceEditHotKeySpec = try? JSONDecoder().decode(HotKeySpec.self, from: data)
+        } else {
+            voiceEditHotKeySpec = nil
         }
         sttEngine = STTEngineKind(rawValue: defaults.string(forKey: Keys.sttEngine) ?? "") ?? .whisperKit
         cloudSTTBaseURL = defaults.string(forKey: Keys.cloudSTTBaseURL) ?? "https://api.openai.com/v1"
@@ -456,6 +504,14 @@ final class AppSettings: ObservableObject {
             defaults.set(resolvedProviderDefaults.model, forKey: Keys.cloudLLMModel)
         }
         activeTemplateID = defaults.string(forKey: Keys.activeTemplateID) ?? Template.defaultID
+        recoveryRetention = RecoveryRetention(rawValue: defaults.object(forKey: Keys.recoveryRetention) as? Int ?? 7) ?? .sevenDays
+        mediaImportRetention = MediaImportRetention(rawValue: defaults.object(forKey: Keys.mediaImportRetention) as? Int ?? 7) ?? .default
+        let storedLocalContextScope = defaults.string(forKey: Keys.localContextScope)
+        localContextScope = storedLocalContextScope.flatMap(LocalContextScope.init(rawValue:)) ?? .off
+        automaticStyleEnabled = defaults.bool(forKey: Keys.automaticStyleEnabled)
+        if let storedLocalContextScope, LocalContextScope(rawValue: storedLocalContextScope) == nil {
+            defaults.set(LocalContextScope.off.rawValue, forKey: Keys.localContextScope)
+        }
         let storedHandsFreeMaxMinutes = defaults.object(forKey: Keys.handsFreeMaxMinutes) as? Int ?? 5
         handsFreeMaxMinutes = Self.clampHandsFreeMaxMinutes(storedHandsFreeMaxMinutes)
         appRules = defaults.dictionary(forKey: Keys.appRules) as? [String: String] ?? [:]
@@ -491,9 +547,15 @@ final class AppSettings: ObservableObject {
         // collides/shadows it — must be re-validated here, since a direct init assignment (like
         // the `redoHotKeySpec =` above) doesn't trigger its own `didSet` (same reasoning as
         // `vocabularyText`'s clamp above). See Round 1 Codex finding 10.
-        if let redoHotKeySpec, HotKeySpec.validRedoSpec(redoHotKeySpec, pttSpec: hotKeySpec) == nil {
+        if let redoHotKeySpec,
+           HotKeySpec.validActionSpec(redoHotKeySpec, pttSpec: hotKeySpec, otherActionSpec: voiceEditHotKeySpec) == nil {
             self.redoHotKeySpec = nil
             defaults.removeObject(forKey: Keys.redoHotKeySpec)
+        }
+        if let voiceEditHotKeySpec,
+           HotKeySpec.validActionSpec(voiceEditHotKeySpec, pttSpec: hotKeySpec, otherActionSpec: redoHotKeySpec) == nil {
+            self.voiceEditHotKeySpec = nil
+            defaults.removeObject(forKey: Keys.voiceEditHotKeySpec)
         }
     }
 }

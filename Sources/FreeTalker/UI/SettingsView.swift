@@ -82,12 +82,20 @@ enum SpeechModelDeleteFailure {
 }
 
 struct SettingsView: View {
+    @ObservedObject private var coordinator = AppCoordinator.shared
+
     var body: some View {
         TabView {
             GeneralSettingsView()
                 .tabItem { Label("General", systemImage: "gearshape") }
             TemplatesSettingsView()
                 .tabItem { Label("Templates", systemImage: "text.badge.checkmark") }
+            SnippetsSettingsView(
+                store: coordinator.snippetStore,
+                initializationError: coordinator.snippetStoreInitializationError,
+                retry: { coordinator.retrySnippetStoreInitialization() }
+            )
+            .tabItem { Label("Snippets", systemImage: "text.quote") }
         }
         .padding(20)
         // A SINGLE frame call with both min and max: chaining `.frame(maxWidth: .infinity, ...)`
@@ -102,6 +110,33 @@ struct SettingsView: View {
     }
 }
 
+struct VoiceEditHotKeyPresentation: Equatable {
+    let label: String
+    let actionLabel: String
+
+    static func make(spec: HotKeySpec?, capturing: Bool) -> Self {
+        Self(
+            label: "Voice Edit key: \(spec?.displayLabel ?? "Unbound")",
+            actionLabel: capturing ? "Press a key or combination… (⎋ cancels)" : "Change…"
+        )
+    }
+}
+
+struct ScreenRecordingPermissionPresentation: Equatable {
+    let label: String
+    let showsRequestAccess: Bool
+    let showsOpenSystemSettings: Bool
+
+    static func make(status: ScreenRecordingAuthorization) -> Self {
+        let granted = status == .granted
+        return Self(
+            label: granted ? "Screen Recording granted" : "Screen Recording not granted",
+            showsRequestAccess: !granted,
+            showsOpenSystemSettings: !granted
+        )
+    }
+}
+
 private struct GeneralSettingsView: View {
     @ObservedObject private var settings = AppSettings.shared
     @ObservedObject private var coordinator = AppCoordinator.shared
@@ -110,6 +145,7 @@ private struct GeneralSettingsView: View {
     @State private var accessibilityTrusted = Permissions.isAccessibilityTrusted()
     @State private var microphoneAuthorized = Permissions.isMicrophoneAuthorized()
     @State private var inputMonitoringAuthorized = Permissions.isInputMonitoringAuthorized()
+    @State private var screenRecordingAuthorization = Permissions.screenRecordingAuthorization()
     @State private var capturingHotKey = false
     @State private var captureSession: HotKeyCapture.Session?
     /// Set when re-recording the PTT key is refused because it would collide with, or
@@ -118,6 +154,9 @@ private struct GeneralSettingsView: View {
     @State private var capturingRedoHotKey = false
     @State private var redoCaptureSession: HotKeyCapture.Session?
     @State private var redoRecorderMessage: String?
+    @State private var capturingVoiceEditHotKey = false
+    @State private var voiceEditCaptureSession: HotKeyCapture.Session?
+    @State private var voiceEditRecorderMessage: String?
     @State private var inputDevices: [AudioInputDevices.Device] = []
     @State private var runningApps: [NSRunningApplication] = []
     @State private var newRuleBundleID: String?
@@ -183,6 +222,42 @@ private struct GeneralSettingsView: View {
                         Button("Open System Settings") { Permissions.openInputMonitoringSettings() }
                     }
                 }
+                HStack {
+                    Circle()
+                        .fill(screenRecordingAuthorization == .granted ? .green : .red)
+                        .frame(width: 8, height: 8)
+                    Text(screenRecordingPermissionLabel)
+                    Spacer()
+                    if screenRecordingPresentation.showsRequestAccess {
+                        Button("Request Access") {
+                            screenRecordingAuthorization = Permissions.requestScreenRecording()
+                        }
+                    }
+                    if screenRecordingPresentation.showsOpenSystemSettings {
+                        Button("Open System Settings") { Permissions.openScreenRecordingSettings() }
+                    }
+                }
+            }
+
+            Section("Local context") {
+                Picker("Scope", selection: $settings.localContextScope) {
+                    ForEach(LocalContextScope.allCases, id: \.rawValue) { scope in
+                        Text(scope.displayName).tag(scope)
+                    }
+                }
+                Toggle("Automatic local style", isOn: $settings.automaticStyleEnabled)
+                Text("Captured once when dictation stops and used only by Apple's on-device Foundation Model. Window + local OCR uses Apple Vision and requires Screen Recording permission.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if settings.localContextScope == .windowOCR, screenRecordingAuthorization != .granted {
+                    Label("Screen Recording permission is required; processing will fall back to app identity only.", systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                } else if settings.localContextScope != .off, !accessibilityTrusted {
+                    Label("Accessibility permission is required; processing will fall back to app identity only.", systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
             }
 
             Section("Push-to-talk key") {
@@ -228,6 +303,30 @@ private struct GeneralSettingsView: View {
                         .font(.caption)
                         .foregroundStyle(.red)
                 }
+
+                let voiceEditPresentation = VoiceEditHotKeyPresentation.make(
+                    spec: settings.voiceEditHotKeySpec,
+                    capturing: capturingVoiceEditHotKey
+                )
+                HStack {
+                    Text(voiceEditPresentation.label)
+                    Spacer()
+                    Button("Clear") {
+                        settings.voiceEditHotKeySpec = nil
+                        voiceEditRecorderMessage = nil
+                    }
+                    .disabled(settings.voiceEditHotKeySpec == nil)
+                    Button(voiceEditPresentation.actionLabel) { beginVoiceEditCapture() }
+                        .disabled(capturingVoiceEditHotKey)
+                }
+                Text("Records an instruction for the selected text, then always shows a local preview before replacement.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let voiceEditRecorderMessage {
+                    Text(voiceEditRecorderMessage)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
             }
 
             Section("Hands-free recording") {
@@ -237,6 +336,27 @@ private struct GeneralSettingsView: View {
                 Text("Tap the push-to-talk key to start a hands-free recording that keeps going until you tap it again, click the HUD pill, or press Esc to cancel. Holding the key down instead is classic push-to-talk (unbounded, released to stop).")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
+
+            Section("Recovery") {
+                Picker("Keep failed dictation audio", selection: $settings.recoveryRetention) {
+                    ForEach(RecoveryRetention.allCases, id: \.rawValue) { value in
+                        Text(RecoveryPresentation.retentionLabel(value)).tag(value)
+                    }
+                }
+                Text("Recovery audio stays on this Mac and is removed automatically after the selected period. Choose Never to delete it yourself from Library → Recoveries.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Media imports") {
+                Picker("Keep imported transcripts", selection: $settings.mediaImportRetention) {
+                    ForEach(MediaImportRetention.allCases, id: \.rawValue) { value in
+                        Text(value.days.map { "\($0) day\($0 == 1 ? "" : "s")" } ?? "Until I delete them").tag(value)
+                    }
+                }
+                Text("Defaults to 7 days. Imported media, derived audio, transcripts, and speaker data stay on this Mac; the original source is never changed or deleted.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
 
             Section("Microphone") {
@@ -469,7 +589,16 @@ private struct GeneralSettingsView: View {
             accessibilityTrusted = Permissions.isAccessibilityTrusted()
             microphoneAuthorized = Permissions.isMicrophoneAuthorized()
             inputMonitoringAuthorized = Permissions.isInputMonitoringAuthorized()
+            screenRecordingAuthorization = Permissions.screenRecordingAuthorization()
         }
+    }
+
+    private var screenRecordingPermissionLabel: String {
+        screenRecordingPresentation.label
+    }
+
+    private var screenRecordingPresentation: ScreenRecordingPermissionPresentation {
+        .make(status: screenRecordingAuthorization)
     }
 
     @ViewBuilder
@@ -606,6 +735,35 @@ private struct GeneralSettingsView: View {
             // AppCoordinator re-plumbs the tap itself on any hotKeySpec/redoHotKeySpec change
             // (see its Combine subscriptions) — no manual call needed here.
             settings.redoHotKeySpec = spec
+        }
+    }
+
+    private func beginVoiceEditCapture() {
+        capturingVoiceEditHotKey = true
+        NSApp.activate()
+        NSApp.windows.first(where: { $0.title == "Settings" })?.makeKeyAndOrderFront(nil)
+        let session = HotKeyCapture.Session()
+        voiceEditCaptureSession = session
+        session.start { spec in
+            defer {
+                capturingVoiceEditHotKey = false
+                voiceEditCaptureSession = nil
+            }
+            guard let spec else { return }
+            guard HotKeySpec.isValidRedoSpec(spec) else {
+                voiceEditRecorderMessage = "Voice Edit needs a key, not just modifiers."
+                return
+            }
+            guard HotKeySpec.validActionSpec(
+                spec,
+                pttSpec: settings.hotKeySpec,
+                otherActionSpec: settings.redoHotKeySpec
+            ) != nil else {
+                voiceEditRecorderMessage = "This conflicts with another hotkey — pick a different chord."
+                return
+            }
+            voiceEditRecorderMessage = nil
+            settings.voiceEditHotKeySpec = spec
         }
     }
 
