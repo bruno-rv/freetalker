@@ -223,12 +223,6 @@ final class SystemAccessibilityNodeAdapter: AccessibilityNodeAdapting, Selection
         return CFEqual(lhs, rhs)
     }
 
-    func setSelectedTextRange(of element: AXUIElement, to range: NSRange) -> Bool {
-        var cfRange = CFRange(location: range.location, length: range.length)
-        guard let value = AXValueCreate(.cfRange, &cfRange) else { return false }
-        return AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, value) == .success
-    }
-
     func replaceSelectedText(of element: AXUIElement, with text: String) -> Bool {
         AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFTypeRef) == .success
     }

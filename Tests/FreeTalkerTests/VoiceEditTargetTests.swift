@@ -146,16 +146,17 @@ import Testing
                 try access.replace(snapshot, with: "replacement")
             }
             #expect(adapter.replacements.isEmpty)
+            #expect(adapter.rangesSet.isEmpty)
         }
     }
 
-    @Test func replaceReassertsRangeAndRevalidatesImmediatelyBeforeSettingText() throws {
+    @Test func replacePerformsOneWriteOnlyAfterFinalRevalidation() throws {
         let adapter = ScriptedSelectionAdapter(reads: Self.stableReads + Self.stableReads)
         let access = Self.access(adapter: adapter, targetCount: 4)
 
         try access.replace(Self.snapshot(text: "draft"), with: "replacement")
 
-        #expect(adapter.rangesSet == [NSRange(location: 0, length: 5)])
+        #expect(adapter.rangesSet.isEmpty)
         #expect(adapter.replacements == ["replacement"])
     }
 
@@ -174,19 +175,34 @@ import Testing
                     try access.replace(Self.snapshot(text: "draft"), with: "replacement")
                 }
                 #expect(adapter.replacements.isEmpty)
+                #expect(adapter.rangesSet.isEmpty)
             }
         }
     }
 
-    @Test func stoppingResetsSwallowedKeyState() {
+    @Test func stopStartPreservesSwallowedKeyUpExactlyOnce() {
         var ptt = HotKeyMatcher(spec: .default)
         var redo: HotKeyMatcher? = HotKeyMatcher(spec: HotKeySpec(modifiers: 0, keyCode: 105))
         var voice: HotKeyMatcher? = HotKeyMatcher(spec: HotKeySpec(modifiers: 0, keyCode: 107))
         _ = voice?.handle(.keyDown, keyCode: 107, flags: 0)
+        var tombstones = HotKeyManager.captureSwallowedKeyUpTombstones(
+            matcher: ptt, redoMatcher: redo, voiceEditMatcher: voice
+        )
 
         HotKeyManager.resetMatchers(matcher: &ptt, redoMatcher: &redo, voiceEditMatcher: &voice)
 
-        #expect(voice?.handle(.keyUp, keyCode: 107, flags: 0).swallow == false)
+        #expect(!HotKeyManager.consumeSwallowedKeyUpTombstone(kind: .keyUp, keyCode: 105, tombstones: &tombstones))
+        #expect(HotKeyManager.consumeSwallowedKeyUpTombstone(kind: .keyUp, keyCode: 107, tombstones: &tombstones))
+        #expect(!HotKeyManager.consumeSwallowedKeyUpTombstone(kind: .keyUp, keyCode: 107, tombstones: &tombstones))
+        #expect(voice?.handle(.keyUp, keyCode: 107, flags: 0).released == false)
+    }
+
+    @Test func swallowedKeyUpTombstonesStayBoundedAcrossRestarts() {
+        var tombstones = Set<UInt16>()
+        for keyCode in UInt16(1)...UInt16(20) {
+            HotKeyManager.mergeSwallowedKeyUpTombstones([keyCode], into: &tombstones)
+        }
+        #expect(tombstones.count <= HotKeyManager.maximumSwallowedKeyUpTombstones)
     }
 
     @Test func eventTapMainThreadContractIsExplicit() {
