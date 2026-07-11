@@ -54,3 +54,27 @@ SelfCheck PASSED (...)
 $ git diff --check
 (no output; exit 0)
 ```
+
+## Final important-finding fixes
+
+Commit `d0ea384d6fc3d59bf983e59e9e8a75822dd0f5b5` adds a shared manual-download eligibility/reservation guard and per-operation progress identity. A manual download attempted while deletion is suspended is rejected before reaching the injected downloader, and progress callbacks delivered after either terminal success or terminal failure cannot mutate the row.
+
+The focused checks were added first. RED:
+
+```text
+$ make selfcheck
+error: extra argument 'manualDownloader' in call
+make: *** [build] Error 1
+```
+
+GREEN and final verification:
+
+```text
+$ make selfcheck
+Build complete! (10.09s)
+SelfCheck: found 2 input device(s): HD Webcam C615, MacBook Pro Microphone
+SelfCheck PASSED (...)
+
+$ git diff --check
+(no output; exit 0)
+```
