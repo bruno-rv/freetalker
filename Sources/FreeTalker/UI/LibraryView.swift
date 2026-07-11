@@ -19,7 +19,11 @@ struct LibraryView: View {
         VStack(spacing: 0) {
             Picker("Library section", selection: $section) {
                 Text("Dictations").tag(Section.dictations)
-                recoveryLabel.tag(Section.recoveries)
+                if let recoveryStore = coordinator.jobLibraryStore {
+                    RecoveryPickerLabel(store: recoveryStore).tag(Section.recoveries)
+                } else {
+                    Text("Recoveries").tag(Section.recoveries)
+                }
                 Text("Imports").tag(Section.imports)
             }
             .pickerStyle(.segmented)
@@ -35,12 +39,6 @@ struct LibraryView: View {
             }
         }
         .frame(minWidth: 720, maxWidth: .infinity, minHeight: 480, maxHeight: .infinity)
-    }
-
-    private var recoveryLabel: some View {
-        let count = coordinator.jobLibraryStore.map { RecoveryPresentation.badgeCount($0.recoveryJobs) } ?? 0
-        return Text(count == 0 ? "Recoveries" : "Recoveries (\(count))")
-            .accessibilityLabel(count == 0 ? "Recoveries" : "Recoveries, \(count) needing attention")
     }
 
     private var dictationsView: some View {
@@ -143,6 +141,17 @@ struct LibraryView: View {
         } message: {
             Text(errorMessage ?? "")
         }
+    }
+}
+
+private struct RecoveryPickerLabel: View {
+    @ObservedObject var store: JobLibraryStore
+
+    var body: some View {
+        let count = RecoveryPresentation.badgeCount(store.recoveryJobs)
+        let badge = RecoveryPresentation.badgeText(count: count)
+        Text(badge.map { "Recoveries (\($0))" } ?? "Recoveries")
+            .accessibilityLabel(count == 0 ? "Recoveries" : "Recoveries, \(count) needing attention")
     }
 }
 

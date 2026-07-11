@@ -28,6 +28,18 @@ import Testing
         #expect(try await fixture.store.job(id: second.id)?.state == .ready)
     }
 
+    @Test func runnerPublishesProcessingAndTerminalChanges() async throws {
+        let fixture = try RunnerFixture()
+        let job = try await fixture.makeJob(.recovery, "changes.wav")
+        let changes = JobChangeProbe()
+        let runner = LocalJobRunner(store: fixture.store, didChange: { id in await changes.record(id) }) { _, _ in }
+
+        await runner.enqueue(job.id)
+        await runner.waitUntilIdle()
+
+        #expect(await changes.ids == [job.id, job.id])
+    }
+
     @Test func cancellationRemovesQueuedJobBeforeExecution() async throws {
         let fixture = try RunnerFixture()
         let first = try await fixture.makeJob(.recovery, "first.wav")
@@ -220,6 +232,71 @@ import Testing
         #expect(library.recoveryJobs.map(\.id) == [recovery.id])
         #expect(library.importJobs.map(\.id) == [mediaImport.id])
     }
+
+    @Test @MainActor func libraryFacadeRetryRefreshesAndEnqueues() async throws {
+        let fixture = try RunnerFixture()
+        let job = try await fixture.makeFailedRecovery()
+        let enqueued = EnqueueProbe()
+        let library = JobLibraryStore(store: fixture.store)
+        library.configureRetry { id in await enqueued.record(id) }
+        try await library.refresh()
+
+        try await library.retry(id: job.id, configuration: .init(language: "pt"))
+
+        #expect(library.recoveryJobs.first?.state == .queued)
+        #expect(await enqueued.ids == [job.id])
+        #expect(try await fixture.store.attempts(jobID: job.id).first?.configuration.language == "pt")
+    }
+
+    @Test @MainActor func libraryFacadeCaptureAndDeleteRefreshPublishedJobs() async throws {
+        let fixture = try RunnerFixture()
+        let recoveries = fixture.database.directory.appendingPathComponent("recoveries", isDirectory: true)
+        try FileManager.default.createDirectory(at: recoveries, withIntermediateDirectories: true)
+        let library = JobLibraryStore(store: fixture.store, recoveryDirectory: recoveries)
+
+        let id = try await library.preserve(samples: [0, 0.25], metadata: .init(capturedAt: Date(), failure: .init(stage: .transcribing, message: "offline")))
+        #expect(library.recoveryJobs.map(\.id) == [id])
+
+        try await library.delete(id: id)
+        #expect(library.recoveryJobs.isEmpty)
+        #expect(try await fixture.store.job(id: id) == nil)
+    }
+
+    @Test @MainActor func libraryFacadeSurfacesPlaybackStartFailure() async throws {
+        let fixture = try RunnerFixture()
+        let job = try await fixture.makeFailedRecovery()
+        let library = JobLibraryStore(store: fixture.store, playbackFactory: { _ in PlaybackStub(starts: false) })
+        try await library.refresh()
+
+        #expect(throws: RecoveryPlaybackError.couldNotStart) { try library.play(id: job.id) }
+    }
+
+    @Test @MainActor func libraryFacadeRetryAndDeleteRaceHasOneDurableWinner() async throws {
+        let fixture = try RunnerFixture()
+        let recoveries = fixture.database.directory.appendingPathComponent("recoveries", isDirectory: true)
+        try FileManager.default.createDirectory(at: recoveries, withIntermediateDirectories: true)
+        let source = recoveries.appendingPathComponent("\(UUID()).wav")
+        try Data("audio".utf8).write(to: source)
+        let job = try await fixture.makeFailedRecovery(source: source.path)
+        let secondStore = try TranscriptionJobStore(databaseURL: fixture.database.url, clock: SystemJobClock())
+        let retryLibrary = JobLibraryStore(store: fixture.store, recoveryDirectory: recoveries)
+        let deleteLibrary = JobLibraryStore(store: secondStore, recoveryDirectory: recoveries)
+
+        async let retry: Result<Void, Error> = facadeResult { try await retryLibrary.retry(id: job.id, configuration: .init(language: "pt")) }
+        async let delete: Result<Void, Error> = facadeResult { try await deleteLibrary.delete(id: job.id) }
+        let outcomes = await [retry, delete]
+        let persisted = try await fixture.store.job(id: job.id)
+
+        #expect(outcomes.count { if case .success = $0 { true } else { false } } == 1)
+        if let persisted {
+            #expect(persisted.state == .queued)
+            #expect(try await fixture.store.attempts(jobID: job.id).count == 1)
+            #expect(FileManager.default.fileExists(atPath: source.path))
+        } else {
+            #expect(try await fixture.store.attempts(jobID: job.id).isEmpty)
+            #expect(!FileManager.default.fileExists(atPath: source.path))
+        }
+    }
 }
 
 private struct RunnerFixture {
@@ -234,6 +311,34 @@ private struct RunnerFixture {
     func makeJob(_ kind: JobKind, _ reference: String) async throws -> TranscriptionJob {
         try await store.create(kind: kind, source: JobSource(reference: reference), now: Date())
     }
+
+    func makeFailedRecovery(source: String? = nil) async throws -> TranscriptionJob {
+        let job = try await makeJob(.recovery, source ?? database.directory.appendingPathComponent("\(UUID()).wav").path)
+        try await store.transition(job.id, from: .queued, to: .processing(stage: .preparing))
+        try await store.transition(job.id, from: .processing, to: .failed(.init(stage: .transcribing, message: "offline")))
+        return try #require(try await store.job(id: job.id))
+    }
+}
+
+private func facadeResult(_ operation: () async throws -> Void) async -> Result<Void, Error> {
+    do { try await operation(); return .success(()) }
+    catch { return .failure(error) }
+}
+
+private actor EnqueueProbe {
+    private(set) var ids: [UUID] = []
+    func record(_ id: UUID) { ids.append(id) }
+}
+
+private actor JobChangeProbe {
+    private(set) var ids: [UUID] = []
+    func record(_ id: UUID) { ids.append(id) }
+}
+
+private final class PlaybackStub: RecoveryAudioPlaying {
+    let starts: Bool
+    init(starts: Bool) { self.starts = starts }
+    func play() -> Bool { starts }
 }
 
 private final class TemporaryRunnerDatabase: @unchecked Sendable {

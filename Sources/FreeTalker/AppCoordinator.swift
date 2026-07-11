@@ -898,10 +898,12 @@ final class AppCoordinator: ObservableObject {
     }
 
     private func preserveFailedAudio(_ samples: [Float], failure: JobFailure) async -> Bool {
-        guard let recoveryStore else { return false }
+        guard let jobLibraryStore else { return false }
         do {
-            _ = try await RecoveryCaptureService(directory: Self.recoveryDirectory, store: recoveryStore)
-                .preserve(samples: samples, metadata: RecoveryMetadata(capturedAt: Date(), failure: failure))
+            _ = try await jobLibraryStore.preserve(
+                samples: samples,
+                metadata: RecoveryMetadata(capturedAt: Date(), failure: failure)
+            )
             return true
         } catch {
             lastError = "Failed to save recovery audio: \(error.localizedDescription)"
@@ -927,7 +929,8 @@ final class AppCoordinator: ObservableObject {
             store: recoveryStore,
             kind: .recovery,
             executorFinalizesJob: true,
-            finalizationFailure: pipeline.failFinalization
+            finalizationFailure: pipeline.failFinalization,
+            didChange: { [weak jobLibraryStore] _ in try? await jobLibraryStore?.refresh() }
         ) { job, token in
             try await pipeline.execute(jobID: job.id, configuration: nil, cancellation: token)
         }

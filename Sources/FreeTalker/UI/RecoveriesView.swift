@@ -55,6 +55,26 @@ enum RecoveryPresentation {
         case .persisting: "Saving"
         }
     }
+
+    static func stateLabel(_ state: JobState) -> String {
+        switch state {
+        case .failed: "Needs attention"
+        case .queued: "Queued"
+        case .processing(let stage): stageLabel(stage)
+        case .ready: "Recovered"
+        case .cancelled: "Cancelled"
+        }
+    }
+
+    static func stateIcon(_ state: JobState) -> String {
+        switch state {
+        case .failed: "exclamationmark.triangle"
+        case .queued: "clock"
+        case .processing: "waveform"
+        case .ready: "checkmark.circle"
+        case .cancelled: "xmark.circle"
+        }
+    }
 }
 
 struct RecoveriesView: View {
@@ -93,7 +113,7 @@ struct RecoveriesView: View {
     private func recoveryRow(_ job: TranscriptionJob) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Label(stateLabel(job.state), systemImage: stateIcon(job.state))
+                Label(RecoveryPresentation.stateLabel(job.state), systemImage: RecoveryPresentation.stateIcon(job.state))
                     .font(.headline)
                 Spacer()
                 Text(job.createdAt, style: .relative).font(.caption).foregroundStyle(.secondary)
@@ -124,12 +144,6 @@ struct RecoveriesView: View {
     }
 
     private func refresh() async { do { try await store.refresh() } catch { errorMessage = error.localizedDescription } }
-    private func stateLabel(_ state: JobState) -> String {
-        switch state { case .failed: "Needs attention"; case .queued: "Queued"; case .processing(let stage): RecoveryPresentation.stageLabel(stage); case .ready: "Recovered"; case .cancelled: "Cancelled" }
-    }
-    private func stateIcon(_ state: JobState) -> String {
-        switch state { case .failed: "exclamationmark.triangle"; case .queued: "clock"; case .processing: "waveform"; case .ready: "checkmark.circle"; case .cancelled: "xmark.circle" }
-    }
 }
 
 extension TranscriptionJob: Identifiable {}
