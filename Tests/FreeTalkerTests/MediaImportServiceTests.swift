@@ -18,24 +18,98 @@ import UniformTypeIdentifiers
         let source = URL(fileURLWithPath: "/outside/tone.wav")
         let access = BookmarkProbe(resolvedURL: source)
         let store = MediaStoreProbe()
-        let service = MediaImportService(store: store, bookmarkAccess: access, clock: { Date(timeIntervalSince1970: 42) })
+        let service = MediaImportService(store: store, bookmarkAccess: access, mediaProbe: MediaProbe(result: .success), clock: { Date(timeIntervalSince1970: 42) })
 
         let id = try await service.createJob(for: source)
 
         #expect(await store.created?.id == id)
         #expect(await store.created?.source == JobSource(reference: source.path, bookmark: Data("bookmark".utf8)))
         #expect(await access.created == [source])
+        #expect(await access.started == [source])
+        #expect(await access.stopped == [source])
     }
 
     @Test func rejectsUnsupportedTypeBeforeBookmarkOrPersistence() async {
         let access = BookmarkProbe(resolvedURL: URL(fileURLWithPath: "/tmp/a.txt"))
         let store = MediaStoreProbe()
-        let service = MediaImportService(store: store, bookmarkAccess: access)
+        let service = MediaImportService(store: store, bookmarkAccess: access, mediaProbe: MediaProbe(result: .success))
 
         await #expect(throws: MediaImportError.unsupportedType) {
             try await service.createJob(for: URL(fileURLWithPath: "/tmp/a.txt"))
         }
         #expect(await access.created.isEmpty)
+        #expect(await access.started.isEmpty)
+        #expect(await access.stopped.isEmpty)
+        #expect(await store.created == nil)
+    }
+
+    @Test func createJobRejectsDisguisedNonMediaBeforeBookmarkOrPersistence() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("not-really.wav")
+        try Data("arbitrary bytes".utf8).write(to: source)
+        let access = BookmarkProbe(resolvedURL: source)
+        let store = MediaStoreProbe()
+        let service = MediaImportService(store: store, bookmarkAccess: access)
+
+        await #expect(throws: MediaImportError.invalidMedia) {
+            try await service.createJob(for: source)
+        }
+        #expect(await access.created.isEmpty)
+        #expect(await access.started == [source])
+        #expect(await access.stopped == [source])
+        #expect(await store.created == nil)
+    }
+
+    @Test func createJobAcceptsRealMediaRenamedToAnotherAllowedExtension() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("renamed.wav")
+        try FileManager.default.copyItem(
+            at: Bundle.module.url(forResource: "two-tone", withExtension: "m4a", subdirectory: "Fixtures")!,
+            to: source
+        )
+        let access = BookmarkProbe(resolvedURL: source)
+        let store = MediaStoreProbe()
+        let service = MediaImportService(store: store, bookmarkAccess: access)
+
+        _ = try await service.createJob(for: source)
+
+        #expect(await access.created == [source])
+        #expect(await access.started == [source])
+        #expect(await access.stopped == [source])
+        #expect(await store.created != nil)
+    }
+
+    @Test func createJobRejectsSilentVideoBeforeBookmarkOrPersistence() async throws {
+        let source = Bundle.module.url(forResource: "silent-video", withExtension: "mov", subdirectory: "Fixtures")!
+        let access = BookmarkProbe(resolvedURL: source)
+        let store = MediaStoreProbe()
+        let service = MediaImportService(store: store, bookmarkAccess: access)
+
+        await #expect(throws: MediaImportError.noAudioTrack) {
+            try await service.createJob(for: source)
+        }
+        #expect(await access.created.isEmpty)
+        #expect(await access.started == [source])
+        #expect(await access.stopped == [source])
+        #expect(await store.created == nil)
+    }
+
+    @Test func injectedProbeFailurePreventsBookmarkAndJob() async {
+        let source = URL(fileURLWithPath: "/outside/tone.wav")
+        let access = BookmarkProbe(resolvedURL: source)
+        let store = MediaStoreProbe()
+        let service = MediaImportService(store: store, bookmarkAccess: access, mediaProbe: MediaProbe(result: .invalid))
+
+        await #expect(throws: MediaImportError.invalidMedia) {
+            try await service.createJob(for: source)
+        }
+        #expect(await access.created.isEmpty)
+        #expect(await access.started == [source])
+        #expect(await access.stopped == [source])
         #expect(await store.created == nil)
     }
 
@@ -88,12 +162,23 @@ import UniformTypeIdentifiers
         let output = try AVAudioFile(forReading: fixture.output)
         #expect(output.fileFormat.sampleRate == 16_000)
         #expect(output.fileFormat.channelCount == 1)
-        #expect(output.length > 0)
+        #expect(abs(output.length - 1_920) <= 1)
         let values = progress.values
         #expect(values.first == 0)
         #expect(values.last == 1)
         #expect(values == values.sorted())
         #expect(!FileManager.default.fileExists(atPath: fixture.output.appendingPathExtension("partial").path))
+    }
+
+    @Test func decoderDrainsNonIntegerResamplerTail() async throws {
+        let fixture = try MediaFixture(duration: 0.101)
+
+        try await AVAudioDecoder().decode(source: fixture.tone, destination: fixture.output, progress: { _ in }, cancellation: CancellationToken())
+
+        let output = try AVAudioFile(forReading: fixture.output)
+        let inputFrames: Double = 4_454
+        let expected = Int64((inputFrames * 16_000 / 44_100).rounded())
+        #expect(abs(output.length - expected) <= 1)
     }
 
     @Test func decoderStreamsCompressedAudioToNormalizedWave() async throws {
@@ -188,6 +273,14 @@ private actor DecodeProbe: MediaAudioDecoding {
         case .failure: throw CocoaError(.fileReadCorruptFile)
         case .cancellation: throw CancellationError()
         }
+    }
+}
+
+private struct MediaProbe: MediaAssetProbing {
+    enum Result { case success, invalid }
+    let result: Result
+    func validateAudio(at url: URL) async throws {
+        if result == .invalid { throw MediaImportError.invalidMedia }
     }
 }
 

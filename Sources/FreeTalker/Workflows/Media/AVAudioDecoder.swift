@@ -63,7 +63,7 @@ struct AVAudioDecoder: MediaAudioDecoding {
                         )
                     }
                     guard let converter, let writer else { throw MediaImportError.decodeFailed("audio converter could not be created") }
-                    try Self.convert(sourceBuffer, with: converter, writingTo: writer)
+                    _ = try Self.convert(sourceBuffer, with: converter, writingTo: writer)
                 }
                 let timestamp = CMSampleBufferGetPresentationTimeStamp(sample).seconds
                 if durationSeconds > 0, timestamp.isFinite {
@@ -75,7 +75,8 @@ struct AVAudioDecoder: MediaAudioDecoding {
             guard reader.status == .completed else {
                 throw MediaImportError.decodeFailed(reader.error?.localizedDescription ?? "reader stopped unexpectedly")
             }
-            guard writer != nil else { throw MediaImportError.decodeFailed("audio track contained no decodable samples") }
+            guard let converter, let writer else { throw MediaImportError.decodeFailed("audio track contained no decodable samples") }
+            try Self.drain(converter, writingTo: writer, cancellation: cancellation)
             if files.fileExists(atPath: destination.path) {
                 _ = try files.replaceItemAt(destination, withItemAt: partial)
             } else {
@@ -109,7 +110,8 @@ struct AVAudioDecoder: MediaAudioDecoding {
         return buffer
     }
 
-    private static func convert(_ input: AVAudioPCMBuffer, with converter: AVAudioConverter, writingTo file: AVAudioFile) throws {
+    @discardableResult
+    private static func convert(_ input: AVAudioPCMBuffer, with converter: AVAudioConverter, writingTo file: AVAudioFile) throws -> AVAudioConverterOutputStatus {
         let ratio = outputFormat.sampleRate / input.format.sampleRate
         let capacity = AVAudioFrameCount(ceil(Double(input.frameLength) * ratio)) + 32
         guard let converted = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: capacity) else {
@@ -126,6 +128,25 @@ struct AVAudioDecoder: MediaAudioDecoding {
         if let conversionError { throw conversionError }
         guard status != .error else { throw MediaImportError.decodeFailed("audio conversion failed") }
         if converted.frameLength > 0 { try file.write(from: converted) }
+        return status
+    }
+
+    private static func drain(_ converter: AVAudioConverter, writingTo file: AVAudioFile, cancellation: CancellationToken) throws {
+        while true {
+            try cancellation.checkCancellation()
+            guard let converted = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: 4_096) else {
+                throw MediaImportError.decodeFailed("converted audio buffer allocation failed")
+            }
+            var conversionError: NSError?
+            let status = converter.convert(to: converted, error: &conversionError) { _, inputStatus in
+                inputStatus.pointee = .endOfStream
+                return nil
+            }
+            if let conversionError { throw conversionError }
+            guard status != .error else { throw MediaImportError.decodeFailed("audio conversion drain failed") }
+            if converted.frameLength > 0 { try file.write(from: converted) }
+            if status == .endOfStream { return }
+        }
     }
 }
 
