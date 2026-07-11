@@ -3,8 +3,8 @@ import Foundation
 
 actor TranscriptionJobStore {
     private let connection: SQLiteJobConnection
-    private var handle: OpaquePointer { connection.handle }
-    private let clock: any JobClock
+    var handle: OpaquePointer { connection.handle }
+    let clock: any JobClock
 
     init(databaseURL: URL, clock: any JobClock) throws {
         var database: OpaquePointer?

@@ -13,8 +13,9 @@ import CSQLite
             .failed: "failed", .cancelled: "cancelled"
         ])
         #expect(Dictionary(uniqueKeysWithValues: JobStage.allCases.map { ($0, $0.rawValue) }) == [
-            .preparing: "preparing", .transcribing: "transcribing",
-            .postProcessing: "post_processing", .persisting: "persisting"
+            .preparing: "preparing", .decoding: "decoding", .transcribing: "transcribing",
+            .diarizing: "diarizing", .postProcessing: "post_processing", .persisting: "persisting",
+            .finalizing: "finalizing"
         ])
     }
 
