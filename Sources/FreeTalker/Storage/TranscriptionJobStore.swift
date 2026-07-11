@@ -46,6 +46,49 @@ actor TranscriptionJobStore {
         )
     }
 
+    func createRecovery(source: JobSource, metadata: RecoveryMetadata) throws -> TranscriptionJob {
+        let id = UUID()
+        let statement = try prepare("""
+        INSERT INTO transcription_jobs
+            (id, kind, source_reference, source_bookmark, state, progress, created_at, updated_at,
+             completed_at, failure_stage, failure_message)
+        VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?);
+        """)
+        defer { sqlite3_finalize(statement) }
+        bind(id.uuidString, to: 1, in: statement)
+        bind(JobKind.recovery.rawValue, to: 2, in: statement)
+        bind(source.reference, to: 3, in: statement)
+        bind(source.bookmark, to: 4, in: statement)
+        bind(JobState.Kind.failed.rawValue, to: 5, in: statement)
+        sqlite3_bind_double(statement, 6, metadata.capturedAt.timeIntervalSince1970)
+        sqlite3_bind_double(statement, 7, metadata.capturedAt.timeIntervalSince1970)
+        sqlite3_bind_double(statement, 8, metadata.capturedAt.timeIntervalSince1970)
+        bind(metadata.failure.stage.rawValue, to: 9, in: statement)
+        bind(metadata.failure.message, to: 10, in: statement)
+        try stepDone(statement)
+        return TranscriptionJob(
+            id: id, kind: .recovery, source: source, state: .failed(metadata.failure), progress: 0,
+            createdAt: metadata.capturedAt, updatedAt: metadata.capturedAt, startedAt: nil,
+            completedAt: metadata.capturedAt, expiresAt: nil, result: nil
+        )
+    }
+
+    func recoveryJobs() throws -> [TranscriptionJob] {
+        try jobs(kind: .recovery)
+    }
+
+    func deleteRecovery(id: UUID, expectedSourceReference: String) throws -> Bool {
+        let statement = try prepare("""
+        DELETE FROM transcription_jobs
+        WHERE id = ? AND kind = 'recovery' AND state = 'failed' AND source_reference = ?;
+        """)
+        defer { sqlite3_finalize(statement) }
+        bind(id.uuidString, to: 1, in: statement)
+        bind(expectedSourceReference, to: 2, in: statement)
+        try stepDone(statement)
+        return sqlite3_changes(handle) == 1
+    }
+
     func job(id: UUID) throws -> TranscriptionJob? {
         let statement = try prepare("""
         SELECT id, kind, source_reference, source_bookmark, state, progress,
