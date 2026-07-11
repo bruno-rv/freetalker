@@ -60,16 +60,16 @@ final class AccessibilityLocalContextProvider: LocalContextProvider {
         case .off:
             return .empty
         case .selectedText:
-            context = with(base, text: bounded(accessibility.selectedText() ?? "", limit: 8_000))
+            context = with(base, text: bounded(accessibility.selectedText(pid: identity.pid) ?? "", limit: 8_000))
         case .focusedField:
-            let field = accessibility.focusedField()
+            let field = accessibility.focusedField(pid: identity.pid)
             let text = field?.isSecure == false ? field?.text ?? "" : ""
             context = with(base, text: bounded(text, limit: 8_000))
         case .activeWindow:
-            let window = accessibility.activeWindow()
+            let window = accessibility.activeWindow(pid: identity.pid)
             context = with(base, windowTitle: window?.title, text: bounded(window?.visibleText ?? "", limit: 12_000))
         case .windowOCR:
-            let metadata = accessibility.activeWindowMetadata()
+            let metadata = accessibility.activeWindowMetadata(pid: identity.pid)
             context = with(base, windowTitle: metadata?.title)
         }
         return ContextCapture(context: context, limitation: nil)

@@ -83,3 +83,52 @@ Result: exit 0; 75 tests in 7 suites passed, the release build completed, and
 ## Concerns
 
 None.
+
+## Review follow-up: bounded cyclic traversal and PID-consistent capture
+
+### Findings resolved
+
+- Replaced recursive AX traversal with an iterative stack over a fakeable node adapter and
+  adapter-defined stable identity. A visited set prevents cycles and duplicate reads.
+- Defined exact traversal ceilings of 12,000 characters, 5,000 unique nodes, and depth 64.
+  Traversal does not request children after reaching any applicable ceiling.
+- The app-name, bundle-id, and PID snapshot is read once per provider capture. Every focused
+  element/window request receives that captured PID and the real adapter creates its AX app
+  root from that PID without another `NSWorkspace` lookup.
+- Invalid persisted context-scope strings normalize to Off and are rewritten as the canonical
+  `off` raw value during `AppSettings` initialization.
+
+### TDD evidence
+
+RED command:
+
+```text
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter 'LocalContextProviderTests|AccessibilityTreeReaderTests'
+```
+
+Result: exit 1 with expected missing PID-aware adapter and tree-reader APIs, including:
+
+```text
+error: extra argument 'pid' in call
+error: cannot find type 'AccessibilityNodeAdapting' in scope
+error: cannot find 'AccessibilityTreeReader' in scope
+```
+
+GREEN focused command:
+
+```text
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter 'LocalContextProviderTests|AccessibilityTreeReaderTests'
+```
+
+Result: exit 0; 14 tests in 2 suites passed. New tests cover a cycle, a 10,000-deep
+tree, a 10,000-child textless tree, exact node/depth/character read ceilings, app focus changing
+after the identity snapshot, and invalid persisted scope normalization.
+
+### Verification
+
+```text
+make test && DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build -c release && git diff --check
+```
+
+Result: exit 0; 81 tests in 8 suites passed, the release build completed, and
+`git diff --check` produced no output.
