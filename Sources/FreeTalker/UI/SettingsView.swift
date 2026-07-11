@@ -88,6 +88,10 @@ struct SettingsView: View {
                 .tabItem { Label("General", systemImage: "gearshape") }
             TemplatesSettingsView()
                 .tabItem { Label("Templates", systemImage: "text.badge.checkmark") }
+            if let snippetStore = AppCoordinator.shared.snippetStore {
+                SnippetsSettingsView(store: snippetStore)
+                    .tabItem { Label("Snippets", systemImage: "text.quote") }
+            }
         }
         .padding(20)
         // A SINGLE frame call with both min and max: chaining `.frame(maxWidth: .infinity, ...)`
@@ -99,6 +103,18 @@ struct SettingsView: View {
         // the Window scene, not this view), but the content stops tracking it. One call with
         // min *and* max keeps both constraints on the same flexible frame.
         .frame(minWidth: 520, maxWidth: .infinity, minHeight: 480, maxHeight: .infinity)
+    }
+}
+
+struct VoiceEditHotKeyPresentation: Equatable {
+    let label: String
+    let actionLabel: String
+
+    static func make(spec: HotKeySpec?, capturing: Bool) -> Self {
+        Self(
+            label: "Voice Edit key: \(spec?.displayLabel ?? "Unbound")",
+            actionLabel: capturing ? "Press a key or combination… (⎋ cancels)" : "Change…"
+        )
     }
 }
 
@@ -134,6 +150,9 @@ private struct GeneralSettingsView: View {
     @State private var capturingRedoHotKey = false
     @State private var redoCaptureSession: HotKeyCapture.Session?
     @State private var redoRecorderMessage: String?
+    @State private var capturingVoiceEditHotKey = false
+    @State private var voiceEditCaptureSession: HotKeyCapture.Session?
+    @State private var voiceEditRecorderMessage: String?
     @State private var inputDevices: [AudioInputDevices.Device] = []
     @State private var runningApps: [NSRunningApplication] = []
     @State private var newRuleBundleID: String?
@@ -277,6 +296,30 @@ private struct GeneralSettingsView: View {
                     .foregroundStyle(.secondary)
                 if let redoRecorderMessage {
                     Text(redoRecorderMessage)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+
+                let voiceEditPresentation = VoiceEditHotKeyPresentation.make(
+                    spec: settings.voiceEditHotKeySpec,
+                    capturing: capturingVoiceEditHotKey
+                )
+                HStack {
+                    Text(voiceEditPresentation.label)
+                    Spacer()
+                    Button("Clear") {
+                        settings.voiceEditHotKeySpec = nil
+                        voiceEditRecorderMessage = nil
+                    }
+                    .disabled(settings.voiceEditHotKeySpec == nil)
+                    Button(voiceEditPresentation.actionLabel) { beginVoiceEditCapture() }
+                        .disabled(capturingVoiceEditHotKey)
+                }
+                Text("Records an instruction for the selected text, then always shows a local preview before replacement.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let voiceEditRecorderMessage {
+                    Text(voiceEditRecorderMessage)
                         .font(.caption)
                         .foregroundStyle(.red)
                 }
@@ -678,6 +721,35 @@ private struct GeneralSettingsView: View {
             // AppCoordinator re-plumbs the tap itself on any hotKeySpec/redoHotKeySpec change
             // (see its Combine subscriptions) — no manual call needed here.
             settings.redoHotKeySpec = spec
+        }
+    }
+
+    private func beginVoiceEditCapture() {
+        capturingVoiceEditHotKey = true
+        NSApp.activate()
+        NSApp.windows.first(where: { $0.title == "Settings" })?.makeKeyAndOrderFront(nil)
+        let session = HotKeyCapture.Session()
+        voiceEditCaptureSession = session
+        session.start { spec in
+            defer {
+                capturingVoiceEditHotKey = false
+                voiceEditCaptureSession = nil
+            }
+            guard let spec else { return }
+            guard HotKeySpec.isValidRedoSpec(spec) else {
+                voiceEditRecorderMessage = "Voice Edit needs a key, not just modifiers."
+                return
+            }
+            guard HotKeySpec.validActionSpec(
+                spec,
+                pttSpec: settings.hotKeySpec,
+                otherActionSpec: settings.redoHotKeySpec
+            ) != nil else {
+                voiceEditRecorderMessage = "This conflicts with another hotkey — pick a different chord."
+                return
+            }
+            voiceEditRecorderMessage = nil
+            settings.voiceEditHotKeySpec = spec
         }
     }
 

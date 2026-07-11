@@ -1,5 +1,12 @@
 import SwiftUI
 
+enum VoiceEditPreviewAccessibility {
+    static let originalLabel = "Original selected text"
+    static let proposedLabel = "Proposed replacement text"
+    static let replaceHint = "This revalidates the original target and replaces only if it is unchanged"
+    static let copyHint = "Copies the proposed text and does not replace the selection"
+}
+
 struct VoiceEditPreviewView: View {
     @ObservedObject var coordinator: VoiceEditCoordinator
     let onDismiss: () -> Void
@@ -13,12 +20,32 @@ struct VoiceEditPreviewView: View {
                 }
             } else if let preview = coordinator.preview {
                 Text("Preview edit").font(.headline)
-                Text(preview.result).textSelection(.enabled)
+                Text("Instruction").font(.caption).foregroundStyle(.secondary)
+                Text(coordinator.instruction)
+                    .textSelection(.enabled)
+                    .accessibilityLabel("Spoken edit instruction")
+                Text("Original").font(.caption).foregroundStyle(.secondary)
+                Text(coordinator.originalText)
+                    .textSelection(.enabled)
+                    .accessibilityLabel(VoiceEditPreviewAccessibility.originalLabel)
+                Text("Proposed").font(.caption).foregroundStyle(.secondary)
+                ScrollView {
+                    Text(preview.result).frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .textSelection(.enabled)
+                .accessibilityLabel(VoiceEditPreviewAccessibility.proposedLabel)
                 HStack {
                     Button("Cancel", role: .cancel) { coordinator.cancel(); onDismiss() }
+                        .keyboardShortcut(.cancelAction)
+                        .accessibilityHint("Closes the preview without changing the selection")
                     Button("Copy") { copyResult() }
+                        .accessibilityHint(VoiceEditPreviewAccessibility.copyHint)
                     Spacer()
-                    Button("Replace") { confirm() }.keyboardShortcut(.defaultAction)
+                    Button("Replace") { confirm() }
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(!coordinator.canReplace)
+                        .accessibilityLabel("Replace original selection")
+                        .accessibilityHint(VoiceEditPreviewAccessibility.replaceHint)
                 }
             } else if coordinator.error != nil {
                 Text("The edit could not be prepared.")
@@ -28,7 +55,7 @@ struct VoiceEditPreviewView: View {
             }
         }
         .padding(20)
-        .frame(width: 440)
+        .frame(minWidth: 440, minHeight: 320)
         .alert("Voice Edit", isPresented: Binding(
             get: { coordinator.preview != nil && coordinator.errorMessage != nil },
             set: { if !$0 { coordinator.dismissError() } }

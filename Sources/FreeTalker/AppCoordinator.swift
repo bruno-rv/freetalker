@@ -3,6 +3,7 @@ import AVFoundation
 import Combine
 import Foundation
 import os
+import SwiftUI
 
 @MainActor
 final class AppCoordinator: ObservableObject {
@@ -59,6 +60,11 @@ final class AppCoordinator: ObservableObject {
     private let contextTargetSnapshotter = ContextTargetSnapshotter()
     private let selectionAccess: any SelectionAccessing = SelectionAccess()
     private(set) var pendingVoiceEditSelection: SelectionSnapshot?
+    let snippetStore: SnippetStore?
+    private var voiceEditCoordinator: VoiceEditCoordinator?
+    private var voiceEditWindow: NSWindow?
+    private var voiceEditWindowDelegate: VoiceEditWindowDelegate?
+    private var isRecordingVoiceEditInstruction = false
 
     private let hotKeyManager = HotKeyManager()
     private let audioCapture = AudioCapture()
@@ -87,6 +93,7 @@ final class AppCoordinator: ObservableObject {
         whisperEngine = WhisperKitEngine(downloadCoordinator: downloadCoordinator)
         let recoveryStore = try? Self.makeRecoveryStore()
         self.recoveryStore = recoveryStore
+        snippetStore = try? Self.makeSnippetStore()
         jobLibraryStore = recoveryStore.map { JobLibraryStore(store: $0, recoveryDirectory: Self.recoveryDirectory) }
         whisperEngine.setEventReceiver(modelStore)
         modelStore.onAutomaticSelection = { [weak whisperEngine] target in
@@ -210,11 +217,119 @@ final class AppCoordinator: ObservableObject {
     }
 
     private func handleVoiceEditHotKey() {
+        if isRecordingVoiceEditInstruction {
+            finishVoiceEditInstructionRecording()
+            return
+        }
         Self.handleVoiceEditHotKey(
             selectionAccess: selectionAccess,
             pendingSelection: &pendingVoiceEditSelection,
             flash: { hud.flash($0) }
         )
+        guard pendingVoiceEditSelection != nil else { return }
+        beginVoiceEditInstructionRecording()
+    }
+
+    private func beginVoiceEditInstructionRecording() {
+        guard !isRecording, !isProcessing else {
+            hud.flash("Finish the current recording first")
+            pendingVoiceEditSelection = nil
+            return
+        }
+        guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
+            hud.flash("Microphone not authorized — check System Settings")
+            pendingVoiceEditSelection = nil
+            return
+        }
+        do {
+            try audioCapture.start(deviceUID: AppSettings.shared.microphoneDeviceUID)
+            isRecordingVoiceEditInstruction = true
+            isRecording = true
+            hotKeyManager.isRecording = true
+            hud.show(text: "Speak the edit instruction, then press Voice Edit again")
+        } catch {
+            pendingVoiceEditSelection = nil
+            lastError = "Mic error: \(error.localizedDescription)"
+        }
+    }
+
+    private func finishVoiceEditInstructionRecording() {
+        let selection = pendingVoiceEditSelection
+        pendingVoiceEditSelection = nil
+        isRecordingVoiceEditInstruction = false
+        isRecording = false
+        hotKeyManager.isRecording = false
+        let samples = audioCapture.stop()
+        guard let selection, !samples.isEmpty else {
+            hud.flash("No voice instruction captured")
+            return
+        }
+        isProcessing = true
+        hud.show(text: "Transcribing instruction locally…")
+        Task {
+            defer { isProcessing = false }
+            do {
+                // Voice Edit is deliberately pinned to the on-device engine even when normal
+                // dictation is configured for cloud STT.
+                let transcription = try await whisperEngine.transcribe(samples: samples, forcedLanguage: nil)
+                let instruction = transcription.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !instruction.isEmpty else {
+                    hud.flash("No voice instruction recognized")
+                    return
+                }
+                presentVoiceEdit(selection: selection, instruction: instruction)
+                hud.hide()
+            } catch {
+                hud.flash("The local speech model could not transcribe the instruction")
+            }
+        }
+    }
+
+    private func presentVoiceEdit(selection: SelectionSnapshot, instruction: String) {
+        closeVoiceEditWindow(clearCoordinator: true)
+        let store = snippetStore
+        let coordinator = VoiceEditCoordinator(
+            selection: selection,
+            instruction: instruction,
+            selectionAccess: selectionAccess,
+            snippetMatcher: { trigger in
+                guard let store else { return .none }
+                return try await store.match(trigger)
+            }
+        )
+        voiceEditCoordinator = coordinator
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 420),
+            styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false
+        )
+        window.title = "Voice Edit Preview"
+        window.isReleasedWhenClosed = false
+        window.contentView = NSHostingView(rootView: VoiceEditPreviewView(coordinator: coordinator) { [weak self] in
+            self?.closeVoiceEditWindow(clearCoordinator: true)
+        })
+        let delegate = VoiceEditWindowDelegate { [weak self] in
+            self?.voiceEditCoordinator?.cancel()
+            self?.voiceEditCoordinator = nil
+            self?.voiceEditWindow = nil
+            self?.voiceEditWindowDelegate = nil
+        }
+        window.delegate = delegate
+        voiceEditWindowDelegate = delegate
+        voiceEditWindow = window
+        window.center()
+        NSApp.activate()
+        window.makeKeyAndOrderFront(nil)
+        Task { await coordinator.begin() }
+    }
+
+    private func closeVoiceEditWindow(clearCoordinator: Bool) {
+        if clearCoordinator { voiceEditCoordinator?.cancel() }
+        voiceEditWindow?.delegate = nil
+        voiceEditWindow?.close()
+        voiceEditWindow = nil
+        voiceEditWindowDelegate = nil
+        if clearCoordinator { voiceEditCoordinator = nil }
     }
 
     static func handleVoiceEditHotKey(
@@ -359,6 +474,15 @@ final class AppCoordinator: ObservableObject {
     }
 
     private func handleEscape() {
+        if isRecordingVoiceEditInstruction {
+            isRecordingVoiceEditInstruction = false
+            pendingVoiceEditSelection = nil
+            isRecording = false
+            hotKeyManager.isRecording = false
+            _ = audioCapture.stop()
+            hud.flash("Voice Edit cancelled")
+            return
+        }
         let (newState, action) = RecordingStateMachine.transition(state: recordingState, event: .esc, currentGeneration: recordingGeneration)
         recordingState = newState
         switch action {
@@ -1119,6 +1243,11 @@ final class AppCoordinator: ObservableObject {
         )
     }
 
+    private static func makeSnippetStore() throws -> SnippetStore {
+        try FileManager.default.createDirectory(at: applicationSupportDirectory, withIntermediateDirectories: true)
+        return try SnippetStore(databaseURL: applicationSupportDirectory.appendingPathComponent("jobs.db"))
+    }
+
     private func preserveFailedAudio(_ samples: [Float], failure: JobFailure) async -> Bool {
         guard let jobLibraryStore else { return false }
         do {
@@ -1298,4 +1427,15 @@ final class AppCoordinator: ObservableObject {
             hud.flash(Self.redoLastResultMessage(posted: posted))
         }
     }
+}
+
+@MainActor
+private final class VoiceEditWindowDelegate: NSObject, NSWindowDelegate {
+    private let onClose: () -> Void
+
+    init(onClose: @escaping () -> Void) {
+        self.onClose = onClose
+    }
+
+    func windowWillClose(_ notification: Notification) { onClose() }
 }

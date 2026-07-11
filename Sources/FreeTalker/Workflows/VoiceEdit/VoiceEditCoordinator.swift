@@ -116,6 +116,15 @@ final class VoiceEditCoordinator: ObservableObject {
     private var generationTask: Task<Void, Never>?
 
     var errorMessage: String? { error?.message }
+    var originalText: String { selection?.text ?? "" }
+    var canReplace: Bool {
+        switch error {
+        case .targetChanged, .selectionChanged, .secureField, .noEditableSelection, .replacementFailed:
+            false
+        case .none, .noSelection, .generationFailed, .copyFailed:
+            preview != nil
+        }
+    }
 
     init(
         selection: SelectionSnapshot?,
