@@ -1,4 +1,4 @@
-# Task 1 report: atomic recovery capture and retention
+# Task 1 report: context scope and Accessibility capture
 
 ## Status
 
@@ -6,13 +6,21 @@ DONE
 
 ## Changes
 
-- Added `RecoveryCaptureService`, which writes a UUID temporary WAV, synchronizes and closes it, renames it to its final UUID `.wav`, and then creates one failed recovery job.
-- Added rollback that removes both temporary and final files when file or job persistence fails.
-- Added `RecoveryRetentionService` with 1, 7, 30, and 90 day boundaries plus never retention.
-- Restricted cleanup to expired failed recovery jobs and exact UUID-named `.wav` direct children of the configured recovery directory.
-- Staged files before conditional database deletion so a failed or stale delete restores the source.
-- Added actor-preserving recovery store operations and persisted `AppSettings.recoveryRetention` with a seven-day default.
-- Added real temporary-directory and SQLite coverage for atomic capture, database rollback, every retention value, exact path safety, and state/kind exclusions.
+- Added persisted `LocalContextScope` values for Off, selected text, focused field,
+  active window, and window OCR. Unset or invalid persisted values resolve to Off.
+- Added immutable `Sendable` app identity, field, window, processing-context, and
+  capture-result snapshots. Only strings and the bundle identifier cross the AX boundary.
+- Added a `@MainActor` fakeable Accessibility adapter and `LocalContextProvider`.
+  `AXUIElement` values remain private stack/local implementation details of the real adapter.
+- Off returns immediately without consulting the adapter. Selected text reads only the AX
+  selection; focused field text is capped at 8,000 characters; active-window visible text is
+  capped at 12,000 characters.
+- Secure/password/protected controls yield no text, including secure descendants during active
+  window traversal.
+- Missing Accessibility permission returns app name/bundle identity only with a typed
+  `accessibilityPermissionRequired` limitation and performs no AX content read.
+- Window OCR currently captures app/window metadata only and performs no text or screenshot
+  capture; OCR remains explicitly deferred to Task 2.
 
 ## TDD evidence
 
@@ -21,16 +29,15 @@ DONE
 Command:
 
 ```text
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter RecoveryStorageTests
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter LocalContextProviderTests
 ```
 
-Result: exit 1 with the expected missing-production-type failures, including:
+Result: exit 1 with the expected missing-production API failures, including:
 
 ```text
-error: cannot find 'RecoveryRetention' in scope
-error: cannot find type 'RecoveryJobStoring' in scope
-error: cannot find 'RecoveryCaptureService' in scope
-error: cannot find 'RecoveryRetentionService' in scope
+error: cannot find type 'AccessibilityContextProviding' in scope
+error: cannot find 'AccessibilityLocalContextProvider' in scope
+error: value of type 'AppSettings' has no member 'localContextScope'
 ```
 
 ### GREEN
@@ -38,160 +45,41 @@ error: cannot find 'RecoveryRetentionService' in scope
 Focused command:
 
 ```text
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter RecoveryStorageTests
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter LocalContextProviderTests
 ```
 
-Result: exit 0; 6 tests in `RecoveryStorageTests` passed, including four parameterized retention cases.
+Result: exit 0; 8 tests in `LocalContextProviderTests` passed.
+
+Coverage includes every scope and call boundary, both character caps, secure-field rejection,
+missing-permission degradation, Off's zero-call guarantee, and default/persisted settings.
 
 ### Full verification
 
 Command:
 
 ```text
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test && DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build -c release && git diff --check
+make test && DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build -c release && git diff --check
 ```
 
-Result: exit 0; 28 tests in 4 suites passed, the release build completed, and `git diff --check` produced no output.
+Result: exit 0; 75 tests in 7 suites passed, the release build completed, and
+`git diff --check` produced no output.
 
 ## Self-review
 
-- File durability order is temporary write, `synchronize`, close, rename, then database create.
-- Recovery creation is one SQLite insert in the terminal failed state; no intermediate queued/processing row can survive.
-- Store access remains actor-isolated behind async protocol requirements; SQLite handles and statements are not exposed.
-- Cleanup eligibility requires recovery kind, failed state, and an inclusive age boundary. Never retention returns before reading or mutating the store.
-- Conditional deletion repeats kind, state, ID, and exact source reference checks at mutation time, preventing stale reads from deleting active work.
-- Path validation rejects nested paths, prefix matches, wrong extensions, and non-UUID filenames. Sibling files remain untouched.
-- A conditional database deletion failure restores the staged WAV before propagating the error.
+- The provider checks Off before app identity or permission, so it makes exactly zero adapter
+  calls.
+- App identity comes from `NSWorkspace`, not AX, and is captured before the permission gate;
+  this makes app-name-only degradation possible without querying protected UI content.
+- Each non-OCR scope has a distinct adapter method, preventing selected-text capture from
+  accidentally reading a full field or active-window content.
+- The real adapter rejects both the secure text-field role and `AXProtectedContent`, and active
+  window traversal stops at protected subtrees.
+- AX traversal applies the 12,000-character budget while walking as well as at the provider
+  output boundary, avoiding an oversized intermediate visible-text snapshot.
+- `windowOCR` does not call the active-window text path and cannot accidentally collect AX text.
+- Tests use an injected adapter and isolated `UserDefaults` suite; they do not inspect the real
+  screen or request system permission.
 
 ## Concerns
-
-None.
-
-## Review follow-up: database-first purge claims and path containment
-
-### Root cause
-
-The original retention flow read eligible rows, mutated the filesystem, and only then
-conditionally deleted the database row. A job could become retryable between the read and
-filesystem mutation, and a crash during the temporary rename protocol could leave an
-untracked staged file. Lexical standardization also did not reject a symlinked source whose
-resolved target was outside the recovery root. Capture rollback discarded a second failure
-from deleting the final WAV.
-
-### RED
-
-Command:
-
-```text
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter RecoveryStorageTests
-```
-
-Result: exit 1 with expected missing claim and compound-error APIs, including:
-
-```text
-error: cannot find type 'RecoveryPurgeClaim' in scope
-error: cannot find type 'RecoveryCaptureRollbackError' in scope
-error: value of type 'TranscriptionJobStore' has no member 'claimExpiredRecoveries'
-error: value of type 'TranscriptionJobStore' has no member 'claimedRecoveries'
-```
-
-The first GREEN attempt exposed an invalid failure fixture: macOS recursively removes a
-non-empty directory. That focused run failed 2 tests. The fixture was replaced by an injected
-remover that fails deterministically while the service still operates on real temporary files
-and SQLite.
-
-### GREEN
-
-Focused commands:
-
-```text
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter RecoveryStorageTests
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter DatabaseMigrationTests
-```
-
-Results: exit 0; 14 recovery tests (including four parameterized retention cases) and 6
-migration tests passed.
-
-### Full verification
-
-Command:
-
-```text
-make test && DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build -c release && git diff --check
-```
-
-Result: exit 0; 36 tests in 4 suites passed, the release build completed, and
-`git diff --check` produced no output.
-
-### Changes and self-review
-
-- Migration 3 persists `purge_claimed_at` and `purge_error`, with an index for launch/purge
-  reconciliation.
-- One SQLite `UPDATE ... RETURNING` atomically claims only unclaimed, expired, failed recovery
-  rows. No filesystem operation occurs before that statement completes.
-- Transitions and attempt creation reject claimed rows, so retry/local-runner activation cannot
-  race a claimed deletion.
-- Purge first reconciles persistent claims, even under `never`: an existing file is removed then
-  its row is deleted; an absent file proceeds directly to row deletion.
-- Removal failures persist a cleanup error and retain the claimed row for a later retry.
-- Cleanup deletes the exact source directly without rename staging. Conditional row deletion
-  requires ID, recovery kind, failed state, claim presence, and exact source reference.
-- Containment requires both a lexical UUID `.wav` direct child and a resolved direct child of
-  the resolved recovery root. Tests cover `..`, nesting, symlink files, and a symlink root.
-- Capture now throws `RecoveryCaptureRollbackError` containing both the persistence error and
-  final-file rollback error when both operations fail.
-- Crash reconciliation is verified after opening a new store connection against the same
-  temporary SQLite database.
-
-### Concerns
-
-None.
-
-## Final review follow-up: atomic purge-claim versus retry-attempt arbitration
-
-### RED
-
-Added a two-connection, on-disk SQLite test covering both deterministic orderings. The focused
-suite exited 1 because the store did not yet expose a distinct claimed error:
-
-```text
-error: type 'JobStoreError' has no member 'purgeClaimed'
-```
-
-### GREEN
-
-`beginAttempt` now uses one `INSERT ... SELECT` whose parent-row predicate requires
-`purge_claimed_at IS NULL`; a zero-row insert is classified as `jobNotFound`, `purgeClaimed`,
-or `invalidTransition`. Purge claiming's single `UPDATE ... RETURNING` now excludes jobs with
-an unfinished attempt. Therefore SQLite write serialization chooses exactly one winner across
-separate store actors and connections.
-
-Focused command:
-
-```text
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter RecoveryStorageTests
-```
-
-Result: exit 0; 15 recovery tests passed.
-
-Full command:
-
-```text
-make test && DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build -c release && git diff --check
-```
-
-Result: exit 0; 37 tests in 4 suites passed, the release build completed, and the diff check
-produced no output.
-
-### Self-review
-
-- Claim-first produces one persistent claim, a distinct `purgeClaimed` attempt failure, and no
-  attempt row.
-- Attempt-first produces one unfinished attempt and no purge claim.
-- Attempt numbering remains computed inside the insert statement, eliminating the prior
-  max-number/read gap as well.
-- Existing missing-job and ordinary invalid-state errors remain distinct from `purgeClaimed`.
-
-### Concerns
 
 None.
