@@ -22,6 +22,14 @@ protocol RecoveryRetryStoring: Sendable {
     func jobsNeedingSourceCleanup() async throws -> [TranscriptionJob]
 }
 
+protocol RecoveryLeaseStoring: RecoveryRetryStoring {
+    func beginOwnedAttempt(jobID: UUID, owner: UUID, configuration: AttemptConfiguration) async throws -> JobAttempt
+    func advanceOwnedStage(jobID: UUID, owner: UUID, stage: JobStage) async throws
+    func finishOwnedAttempt(jobID: UUID, owner: UUID, attemptID: Int64, result: AttemptResult) async throws
+    func completeOwnedAttemptAndJob(jobID: UUID, owner: UUID, attemptID: Int64) async throws
+    func failOwnedAttemptAndJob(jobID: UUID, owner: UUID, attemptID: Int64, failure: JobFailure) async throws
+}
+
 extension TranscriptionJobStore: RecoveryRetryStoring {}
 
 struct RecoveryRetryPipeline: Sendable {
@@ -58,24 +66,32 @@ struct RecoveryRetryPipeline: Sendable {
         if let unfinished = try await store.latestUnfinishedAttempt(jobID: jobID) {
             attempt = unfinished
         } else {
-            attempt = try await store.beginAttempt(jobID: jobID, configuration: configuration ?? AttemptConfiguration())
+            if let owner = cancellation.owner, let leased = store as? any RecoveryLeaseStoring {
+                attempt = try await leased.beginOwnedAttempt(jobID: jobID, owner: owner, configuration: configuration ?? AttemptConfiguration())
+            } else {
+                attempt = try await store.beginAttempt(jobID: jobID, configuration: configuration ?? AttemptConfiguration())
+            }
         }
         do {
             try cancellation.checkCancellation()
-            try await store.transition(jobID, from: .processing, to: .processing(stage: .transcribing))
+            if let owner = cancellation.owner, let leased = store as? any RecoveryLeaseStoring {
+                try await leased.advanceOwnedStage(jobID: jobID, owner: owner, stage: .transcribing)
+            } else { try await store.transition(jobID, from: .processing, to: .processing(stage: .transcribing)) }
             let samples = try loadSamples(URL(fileURLWithPath: job.source.reference))
             try cancellation.checkCancellation()
             _ = try await processDictation(samples, attempt.configuration)
             try cancellation.checkCancellation()
             try await cancellation.beginFinalization()
         } catch {
-            try? await store.finishAttempt(
-                attempt.id,
-                result: .failed(JobFailure(stage: errorStage(error), message: error.localizedDescription))
-            )
+            let result = AttemptResult.failed(JobFailure(stage: errorStage(error), message: error.localizedDescription))
+            if let owner = cancellation.owner, let leased = store as? any RecoveryLeaseStoring {
+                try? await leased.finishOwnedAttempt(jobID: jobID, owner: owner, attemptID: attempt.id, result: result)
+            } else { try? await store.finishAttempt(attempt.id, result: result) }
             throw error
         }
-        try await store.completeAttemptAndMarkJobReady(jobID: jobID, attemptID: attempt.id)
+        if let owner = cancellation.owner, let leased = store as? any RecoveryLeaseStoring {
+            try await leased.completeOwnedAttemptAndJob(jobID: jobID, owner: owner, attemptID: attempt.id)
+        } else { try await store.completeAttemptAndMarkJobReady(jobID: jobID, attemptID: attempt.id) }
         await cleanSource(for: job)
     }
 
@@ -84,10 +100,12 @@ struct RecoveryRetryPipeline: Sendable {
         for job in jobs { await cleanSource(for: job) }
     }
 
-    func failFinalization(jobID: UUID, error: any Error) async throws {
+    func failFinalization(jobID: UUID, owner: UUID?, error: any Error) async throws {
         guard let attempt = try await store.latestUnfinishedAttempt(jobID: jobID) else { return }
         let failure = JobFailure(stage: .persisting, message: error.localizedDescription)
-        try await store.failAttemptAndMarkJobFailed(jobID: jobID, attemptID: attempt.id, failure: failure)
+        if let owner, let leased = store as? any RecoveryLeaseStoring {
+            try await leased.failOwnedAttemptAndJob(jobID: jobID, owner: owner, attemptID: attempt.id, failure: failure)
+        } else { try await store.failAttemptAndMarkJobFailed(jobID: jobID, attemptID: attempt.id, failure: failure) }
     }
 
     private func cleanSource(for job: TranscriptionJob) async {

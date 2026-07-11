@@ -63,14 +63,17 @@ struct MediaImportPipeline: Sendable {
         guard job.kind == .mediaImport else { throw JobStoreError.jobNotFound }
         guard let owner = cancellation.owner else { throw JobStoreError.leaseLost }
         var completed = try await store.completedMediaStages(jobID: job.id)
-        let audioURL = jobsDirectory
-            .appendingPathComponent(job.id.uuidString, isDirectory: true)
-            .appendingPathComponent("audio.wav")
+        let ownedDirectory = try OwnedJobDirectory(root: jobsDirectory, jobID: job.id, create: true)
+        let audioURL = ownedDirectory.directoryURL.appendingPathComponent("audio.wav")
 
         if completed.contains(.decode) {
             let registered = try await store.isDerivedMediaRegistered(jobID: job.id, path: audioURL.path)
-            if !DecodedMediaValidator.isValid(audioURL) || !registered {
+            let existing = try? ownedDirectory.openExisting("audio.wav")
+            let valid = existing.map(ownedDirectory.isNormalizedWAV) ?? false
+            if let existing { ownedDirectory.close(existing) }
+            if !valid || !registered {
                 try await store.invalidateInvalidDecodedMedia(jobID: job.id, owner: owner)
+                try ownedDirectory.unlinkRegistered(path: audioURL.path, source: URL(fileURLWithPath: job.source.reference), fileManager: .default)
                 completed = []
             }
         }
@@ -78,22 +81,27 @@ struct MediaImportPipeline: Sendable {
         if !completed.contains(.decode) {
             try cancellation.checkCancellation()
             try await store.advanceMediaStage(jobID: job.id, owner: owner, stage: .decoding)
-            try FileManager.default.createDirectory(at: audioURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try await decoder.decode(jobID: job.id, destination: audioURL, cancellation: cancellation) { value in
+            let temporary = try ownedDirectory.createTemporaryFile()
+            defer { ownedDirectory.discard(temporary); ownedDirectory.close(temporary) }
+            try await decoder.decode(jobID: job.id, destination: temporary.url, cancellation: cancellation) { value in
                 Task { try? await store.updateMediaProgress(jobID: job.id, owner: owner, progress: 0.25 * normalized(value)) }
             }
             try cancellation.checkCancellation()
-            guard FileManager.default.fileExists(atPath: audioURL.path) else { throw MediaImportError.decodeFailed("No decoded audio was produced") }
-            guard DecodedMediaValidator.isValid(audioURL) else { throw MediaImportError.decodeFailed("Decoded audio is not normalized 16 kHz mono WAV") }
-            try await store.persistDecodedMedia(jobID: job.id, owner: owner, derivedAudioPath: audioURL.path)
+            guard ownedDirectory.isNormalizedWAV(temporary) else { throw MediaImportError.decodeFailed("Decoded audio is not normalized 16 kHz mono WAV") }
+            let promoted = try ownedDirectory.promote(temporary, to: "audio.wav")
+            try await store.persistDecodedMedia(jobID: job.id, owner: owner, derivedAudioPath: promoted.path)
             try await store.updateMediaProgress(jobID: job.id, owner: owner, progress: 0.25)
             completed.insert(.decode)
         }
 
+
+        let inferenceAudio = try ownedDirectory.openExisting("audio.wav")
+        defer { ownedDirectory.close(inferenceAudio) }
+
         if !completed.contains(.transcribe) {
             try cancellation.checkCancellation()
             try await store.advanceMediaStage(jobID: job.id, owner: owner, stage: .transcribing)
-            let segments = try await transcriber.transcribeFile(at: audioURL, language: language, model: model)
+            let segments = try await transcriber.transcribeFile(at: inferenceAudio.url, language: language, model: model)
             try cancellation.checkCancellation()
             try await store.persistTranscript(jobID: job.id, owner: owner, segments: segments)
             try await store.updateMediaProgress(jobID: job.id, owner: owner, progress: 0.5)
@@ -103,7 +111,7 @@ struct MediaImportPipeline: Sendable {
         if !completed.contains(.diarize) {
             try cancellation.checkCancellation()
             try await store.advanceMediaStage(jobID: job.id, owner: owner, stage: .diarizing)
-            let turns = try await diarizer.diarizeFile(at: audioURL) { value in
+            let turns = try await diarizer.diarizeFile(at: inferenceAudio.url) { value in
                 Task { try? await store.updateMediaProgress(jobID: job.id, owner: owner, progress: 0.5 + 0.25 * normalized(value)) }
             }
             try cancellation.checkCancellation()
@@ -115,14 +123,6 @@ struct MediaImportPipeline: Sendable {
         try await store.advanceMediaStage(jobID: job.id, owner: owner, stage: .finalizing)
         try await cancellation.beginFinalization()
         try await store.finalizeMediaImport(jobID: job.id, owner: owner)
-    }
-}
-
-private enum DecodedMediaValidator {
-    static func isValid(_ url: URL) -> Bool {
-        guard url.pathExtension.lowercased() == "wav", FileManager.default.isReadableFile(atPath: url.path),
-              let file = try? AVAudioFile(forReading: url) else { return false }
-        return file.processingFormat.channelCount == 1 && abs(file.processingFormat.sampleRate - 16_000) < 0.5
     }
 }
 

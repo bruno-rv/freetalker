@@ -60,7 +60,9 @@ extension TranscriptionJobStore {
             let file = try mediaPrepare("INSERT OR IGNORE INTO media_derived_files (job_id, path) VALUES (?, ?);")
             defer { sqlite3_finalize(file) }
             mediaBind(jobID.uuidString, 1, file); mediaBind(derivedAudioPath, 2, file); try mediaStep(file)
+            try assertLease(jobID: jobID, owner: owner)
             try insertMediaCheckpoint(jobID: jobID, stage: .decode)
+            try assertLease(jobID: jobID, owner: owner)
         }
     }
 
@@ -79,7 +81,9 @@ extension TranscriptionJobStore {
                 mediaBind(segment.text, 5, statement); try mediaStep(statement)
                 sqlite3_reset(statement); sqlite3_clear_bindings(statement)
             }
+            try assertLease(jobID: jobID, owner: owner)
             try insertMediaCheckpoint(jobID: jobID, stage: .transcribe)
+            try assertLease(jobID: jobID, owner: owner)
         }
     }
 
@@ -97,7 +101,9 @@ extension TranscriptionJobStore {
                 sqlite3_bind_double(statement, 4, turn.start); sqlite3_bind_double(statement, 5, turn.end); try mediaStep(statement)
                 sqlite3_reset(statement); sqlite3_clear_bindings(statement)
             }
+            try assertLease(jobID: jobID, owner: owner)
             try insertMediaCheckpoint(jobID: jobID, stage: .diarize)
+            try assertLease(jobID: jobID, owner: owner)
         }
     }
 
@@ -125,10 +131,11 @@ extension TranscriptionJobStore {
             UPDATE transcription_jobs SET state = 'ready', progress = 1, failure_stage = NULL,
                 failure_message = NULL, updated_at = ?, completed_at = ?,
                 lease_owner = NULL, lease_expires_at = NULL
-            WHERE id = ? AND kind = 'media_import' AND state = 'processing' AND lease_owner = ?;
+            WHERE id = ? AND kind = 'media_import' AND state = 'processing' AND lease_owner = ?
+              AND lease_expires_at > ? AND deletion_claimed_at IS NULL;
             """)
             defer { sqlite3_finalize(statement) }; let now = clock.now.timeIntervalSince1970
-            sqlite3_bind_double(statement, 1, now); sqlite3_bind_double(statement, 2, now); mediaBind(jobID.uuidString, 3, statement); mediaBind(owner.uuidString, 4, statement)
+            sqlite3_bind_double(statement, 1, now); sqlite3_bind_double(statement, 2, now); mediaBind(jobID.uuidString, 3, statement); mediaBind(owner.uuidString, 4, statement); sqlite3_bind_double(statement, 5, now)
             try mediaStep(statement); guard sqlite3_changes(handle) == 1 else { throw JobStoreError.invalidTransition }
         }
     }
@@ -141,6 +148,7 @@ extension TranscriptionJobStore {
             defer { sqlite3_finalize(checkpoints) }; mediaBind(jobID.uuidString, 1, checkpoints); try mediaStep(checkpoints)
             let files = try mediaPrepare("DELETE FROM media_derived_files WHERE job_id = ?;")
             defer { sqlite3_finalize(files) }; mediaBind(jobID.uuidString, 1, files); try mediaStep(files)
+            try assertLease(jobID: jobID, owner: owner)
         }
     }
 
@@ -159,12 +167,13 @@ extension TranscriptionJobStore {
         let deletionOwner = UUID()
         let claim = try mediaPrepare("""
         UPDATE transcription_jobs SET deletion_claimed_at = COALESCE(deletion_claimed_at, ?),
-            deletion_owner = ?, deletion_error = NULL, updated_at = ?
+            deletion_owner = ?, deletion_expires_at = ?, deletion_error = NULL, updated_at = ?
         WHERE id = ? AND kind = 'media_import' AND state IN ('ready', 'failed', 'cancelled')
-          AND lease_owner IS NULL AND (deletion_claimed_at IS NULL OR deletion_error IS NOT NULL);
+          AND lease_owner IS NULL AND (deletion_claimed_at IS NULL OR deletion_error IS NOT NULL OR deletion_expires_at <= ?);
         """)
         defer { sqlite3_finalize(claim) }; let now = clock.now.timeIntervalSince1970
-        sqlite3_bind_double(claim, 1, now); mediaBind(deletionOwner.uuidString, 2, claim); sqlite3_bind_double(claim, 3, now); mediaBind(jobID.uuidString, 4, claim)
+        sqlite3_bind_double(claim, 1, now); mediaBind(deletionOwner.uuidString, 2, claim); sqlite3_bind_double(claim, 3, now + 30)
+        sqlite3_bind_double(claim, 4, now); mediaBind(jobID.uuidString, 5, claim); sqlite3_bind_double(claim, 6, now)
         try mediaStep(claim); guard sqlite3_changes(handle) == 1 else { throw JobStoreError.invalidTransition }
         guard let current = try job(id: jobID), current.kind == .mediaImport else { throw JobStoreError.jobNotFound }
         let statement = try mediaPrepare("SELECT path FROM media_derived_files WHERE job_id = ?;")
@@ -173,37 +182,26 @@ extension TranscriptionJobStore {
         while result == SQLITE_ROW { paths.append(String(cString: sqlite3_column_text(statement, 0))); result = sqlite3_step(statement) }
         guard result == SQLITE_DONE else { throw mediaSQLError() }
         do {
-            let root = jobsDirectory.standardizedFileURL.resolvingSymlinksInPath()
-            let ownedRoot = root.appendingPathComponent(jobID.uuidString, isDirectory: true).standardizedFileURL.resolvingSymlinksInPath()
-            guard isStrictlyContained(ownedRoot, in: root) else { throw JobStoreError.corruptData("Invalid media job directory") }
-            var candidates: [URL] = []
+            let ownedDirectory = try OwnedJobDirectory(root: jobsDirectory, jobID: jobID, create: false)
             for path in paths {
-                let candidate = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
-                guard isStrictlyContained(candidate, in: ownedRoot), candidate.path != ownedRoot.path else {
-                    throw JobStoreError.corruptData("A derived file is outside its media job directory")
-                }
-                let source = URL(fileURLWithPath: current.source.reference).standardizedFileURL.resolvingSymlinksInPath()
-                guard candidate.path != source.path, !sameFile(candidate, source, fileManager: fileManager) else {
-                    throw JobStoreError.corruptData("A derived file aliases the imported source")
-                }
-                guard fileManager.fileExists(atPath: path) else { continue }
-                var isDirectory: ObjCBool = false
-                guard fileManager.fileExists(atPath: candidate.path, isDirectory: &isDirectory), !isDirectory.boolValue else {
-                    throw JobStoreError.corruptData("A media-derived path is not a file")
-                }
-                candidates.append(candidate)
+                try ownedDirectory.unlinkRegistered(path: path, source: URL(fileURLWithPath: current.source.reference), fileManager: fileManager)
             }
-            for candidate in candidates { try fileManager.removeItem(at: candidate) }
         } catch {
             let failure = try? mediaPrepare("UPDATE transcription_jobs SET deletion_error = ? WHERE id = ? AND deletion_owner = ?;")
             if let failure { mediaBind(error.localizedDescription, 1, failure); mediaBind(jobID.uuidString, 2, failure); mediaBind(deletionOwner.uuidString, 3, failure); try? mediaStep(failure); sqlite3_finalize(failure) }
             throw error
         }
-        try mediaTransaction {
-            for table in ["speaker_names", "speaker_segments", "job_attempts"] { try deleteRows(table, jobID: jobID) }
-            let delete = try mediaPrepare("DELETE FROM transcription_jobs WHERE id = ? AND kind = 'media_import' AND deletion_owner = ?;")
-            defer { sqlite3_finalize(delete) }; mediaBind(jobID.uuidString, 1, delete); mediaBind(deletionOwner.uuidString, 2, delete); try mediaStep(delete)
-            guard sqlite3_changes(handle) == 1 else { throw JobStoreError.jobNotFound }
+        do {
+            try mediaTransaction {
+                for table in ["speaker_names", "speaker_segments", "job_attempts"] { try deleteRows(table, jobID: jobID) }
+                let delete = try mediaPrepare("DELETE FROM transcription_jobs WHERE id = ? AND kind = 'media_import' AND deletion_owner = ?;")
+                defer { sqlite3_finalize(delete) }; mediaBind(jobID.uuidString, 1, delete); mediaBind(deletionOwner.uuidString, 2, delete); try mediaStep(delete)
+                guard sqlite3_changes(handle) == 1 else { throw JobStoreError.jobNotFound }
+            }
+        } catch {
+            let failure = try? mediaPrepare("UPDATE transcription_jobs SET deletion_error = ? WHERE id = ? AND deletion_owner = ?;")
+            if let failure { mediaBind(error.localizedDescription, 1, failure); mediaBind(jobID.uuidString, 2, failure); mediaBind(deletionOwner.uuidString, 3, failure); try? mediaStep(failure); sqlite3_finalize(failure) }
+            throw error
         }
     }
 
@@ -213,22 +211,6 @@ extension TranscriptionJobStore {
         guard sqlite3_step(statement) == SQLITE_ROW else { throw JobStoreError.jobNotFound }
         guard sqlite3_column_type(statement, 0) != SQLITE_NULL else { return nil }
         return String(cString: sqlite3_column_text(statement, 0))
-    }
-
-    private func isStrictlyContained(_ child: URL, in parent: URL) -> Bool {
-        let parentComponents = parent.standardizedFileURL.pathComponents
-        let childComponents = child.standardizedFileURL.pathComponents
-        return childComponents.count > parentComponents.count && childComponents.prefix(parentComponents.count).elementsEqual(parentComponents)
-    }
-
-    private func sameFile(_ first: URL, _ second: URL, fileManager: FileManager) -> Bool {
-        if let firstID = try? first.resourceValues(forKeys: [.fileResourceIdentifierKey]).fileResourceIdentifier,
-           let secondID = try? second.resourceValues(forKeys: [.fileResourceIdentifierKey]).fileResourceIdentifier,
-           String(describing: firstID) == String(describing: secondID) { return true }
-        guard let firstAttributes = try? fileManager.attributesOfItem(atPath: first.path),
-              let secondAttributes = try? fileManager.attributesOfItem(atPath: second.path) else { return false }
-        return (firstAttributes[.systemNumber] as? NSNumber) == (secondAttributes[.systemNumber] as? NSNumber)
-            && (firstAttributes[.systemFileNumber] as? NSNumber) == (secondAttributes[.systemFileNumber] as? NSNumber)
     }
 
     private func insertMediaCheckpoint(jobID: UUID, stage: MediaPipelineStage) throws {

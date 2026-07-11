@@ -1,7 +1,7 @@
 import CSQLite
 
 enum DatabaseMigrator {
-    static let latestVersion = 7
+    static let latestVersion = 8
 
     static func migrate(_ db: OpaquePointer) throws {
         try execute(db, "BEGIN IMMEDIATE;")
@@ -184,7 +184,11 @@ enum DatabaseMigrator {
     CREATE INDEX idx_transcription_jobs_deletion_claimed_at ON transcription_jobs(deletion_claimed_at);
     """
 
-    private static let migrations = [migration1, migration2, migration3, migration4, migration5, migration6, migration7]
+    private static let migration8 = """
+    ALTER TABLE transcription_jobs ADD COLUMN deletion_expires_at REAL;
+    """
+
+    private static let migrations = [migration1, migration2, migration3, migration4, migration5, migration6, migration7, migration8]
 
     private static func migrateLegacySnippetRows(_ db: OpaquePointer) throws {
         var select: OpaquePointer?

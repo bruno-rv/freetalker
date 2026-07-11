@@ -17,7 +17,10 @@ struct AVAudioDecoder: MediaAudioDecoding {
         progress: @escaping @Sendable (Double) -> Void,
         cancellation: CancellationToken
     ) async throws {
-        let partial = destination.appendingPathExtension("partial")
+        let descriptorDestination = destination.path.hasPrefix("/dev/fd/")
+        let partial = descriptorDestination
+            ? FileManager.default.temporaryDirectory.appendingPathComponent("FreeTalker-decode-\(UUID().uuidString).wav")
+            : destination.appendingPathExtension("partial")
         let files = FileManager.default
         try? files.removeItem(at: partial)
         defer { try? files.removeItem(at: partial) }
@@ -77,7 +80,19 @@ struct AVAudioDecoder: MediaAudioDecoding {
             }
             guard let converter, let writer else { throw MediaImportError.decodeFailed("audio track contained no decodable samples") }
             try Self.drain(converter, writingTo: writer, cancellation: cancellation)
-            if files.fileExists(atPath: destination.path) {
+            if descriptorDestination {
+                let input = try FileHandle(forReadingFrom: partial)
+                let output = try FileHandle(forWritingTo: destination)
+                try output.truncate(atOffset: 0)
+                while true {
+                    try cancellation.checkCancellation()
+                    let chunk = try input.read(upToCount: 1_048_576) ?? Data()
+                    if chunk.isEmpty { break }
+                    try output.write(contentsOf: chunk)
+                }
+                try output.synchronize()
+                try input.close(); try output.close()
+            } else if files.fileExists(atPath: destination.path) {
                 _ = try files.replaceItemAt(destination, withItemAt: partial)
             } else {
                 try files.moveItem(at: partial, to: destination)

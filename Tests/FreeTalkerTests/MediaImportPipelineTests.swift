@@ -1,9 +1,48 @@
 @preconcurrency import AVFoundation
+import Darwin
 import Foundation
 import Testing
 @testable import FreeTalker
 
 @Suite struct MediaImportPipelineTests {
+    @Test func productionDecoderWritesNormalizedAudioThroughPreopenedDescriptor() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString); try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let directory = try OwnedJobDirectory(root: root, jobID: UUID(), create: true); let temporary = try directory.createTemporaryFile()
+        defer { directory.discard(temporary); directory.close(temporary) }
+        let source = try #require(Bundle.module.url(forResource: "tone", withExtension: "wav", subdirectory: "Fixtures"))
+        try await AVAudioDecoder().decode(source: source, destination: temporary.url, progress: { _ in }, cancellation: CancellationToken())
+        #expect(directory.isNormalizedWAV(temporary))
+    }
+    @Test func symlinkedJobDirectoryIsRejectedBeforeDecode() async throws {
+        let fixture = try MediaPipelineFixture(); let outside = fixture.root.deletingLastPathComponent().appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let job = try await fixture.store.create(kind: .mediaImport, source: .init(reference: fixture.source.path), now: .now)
+        try FileManager.default.createSymbolicLink(at: fixture.jobDirectory(job.id), withDestinationURL: outside)
+        let decoder = PipelineDecodeProbe(); let runner = fixture.pipeline(decoder: decoder).localJobRunner(); await runner.enqueue(job.id); await runner.waitUntilIdle()
+        #expect(await decoder.calls == 0)
+        #expect(!FileManager.default.fileExists(atPath: outside.appendingPathComponent("audio.wav").path))
+    }
+
+    @Test func symlinkedDestinationCannotOverwriteOutsideFile() async throws {
+        let fixture = try MediaPipelineFixture(); let outside = fixture.root.deletingLastPathComponent().appendingPathComponent(UUID().uuidString)
+        try Data("outside".utf8).write(to: outside)
+        let job = try await fixture.store.create(kind: .mediaImport, source: .init(reference: fixture.source.path), now: .now)
+        try FileManager.default.createDirectory(at: fixture.jobDirectory(job.id), withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: fixture.audioURL(job.id), withDestinationURL: outside)
+        let runner = fixture.pipeline().localJobRunner(); await runner.enqueue(job.id); await runner.waitUntilIdle()
+        #expect(try Data(contentsOf: outside) == Data("outside".utf8))
+        #expect(try await fixture.store.job(id: job.id)?.state.kind == .failed)
+    }
+
+    @Test func directorySwapAfterTempOpenCannotRedirectDecodeOrInference() async throws {
+        let fixture = try MediaPipelineFixture(); let outside = fixture.root.deletingLastPathComponent().appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let job = try await fixture.store.create(kind: .mediaImport, source: .init(reference: fixture.source.path), now: .now)
+        let decoder = DirectorySwapDecoder(root: fixture.root, jobID: job.id, outside: outside)
+        let runner = fixture.pipeline(decoder: decoder).localJobRunner(); await runner.enqueue(job.id); await runner.waitUntilIdle()
+        #expect(!FileManager.default.fileExists(atPath: outside.appendingPathComponent("audio.wav").path))
+        #expect(try await fixture.store.job(id: job.id)?.state == .ready)
+    }
     @Test func activeLeaseIsNotStolenByAnotherRunner() async throws {
         let fixture = try MediaPipelineFixture()
         let job = try await fixture.store.create(kind: .mediaImport, source: .init(reference: fixture.source.path), now: .now)
@@ -30,8 +69,23 @@ import Testing
         #expect(try await store.recoverStaleJobs(kind: .mediaImport) == 1)
         let newOwner = UUID(); _ = try await store.claimQueuedJob(job.id, kind: .mediaImport, owner: newOwner, leaseDuration: 5)
         await #expect(throws: JobStoreError.leaseLost) { try await store.updateMediaProgress(jobID: job.id, owner: oldOwner, progress: 0.9) }
+        await #expect(throws: JobStoreError.leaseLost) { try await store.finalizeMediaImport(jobID: job.id, owner: oldOwner) }
         try await store.updateMediaProgress(jobID: job.id, owner: newOwner, progress: 0.2)
         #expect(try await store.job(id: job.id)?.progress == 0.2)
+    }
+
+    @Test func recoveryAttemptFinalizationIsFencedAcrossOwners() async throws {
+        let clock = MutableJobClock(Date(timeIntervalSince1970: 200)); let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let store = try TranscriptionJobStore(databaseURL: root.appendingPathComponent("jobs.sqlite"), clock: clock)
+        let job = try await store.create(kind: .recovery, source: .init(reference: "/recovery.wav"), now: clock.now)
+        let old = UUID(); _ = try await store.claimQueuedJob(job.id, kind: .recovery, owner: old, leaseDuration: 5)
+        let attempt = try await store.beginOwnedAttempt(jobID: job.id, owner: old, configuration: .init())
+        clock.advance(by: 6); #expect(try await store.recoverStaleJobs(kind: .recovery) == 1)
+        let new = UUID(); _ = try await store.claimQueuedJob(job.id, kind: .recovery, owner: new, leaseDuration: 5)
+        await #expect(throws: JobStoreError.leaseLost) { try await store.completeOwnedAttemptAndJob(jobID: job.id, owner: old, attemptID: attempt.id) }
+        try await store.completeOwnedAttemptAndJob(jobID: job.id, owner: new, attemptID: attempt.id)
+        #expect(try await store.job(id: job.id)?.state == .ready)
     }
 
     @Test(arguments: ["missing", "corrupt"])
@@ -152,7 +206,7 @@ import Testing
         }
 
         #expect(FileManager.default.fileExists(atPath: fixture.source.path))
-        #expect(FileManager.default.fileExists(atPath: derived.path))
+        #expect(!FileManager.default.fileExists(atPath: derived.path))
         #expect(try await fixture.store.job(id: job.id) != nil)
     }
 
@@ -224,10 +278,12 @@ import Testing
     @Test func failedDeletionClaimCanRetryAfterArtifactIsMadeSafe() async throws {
         let fixture = try MediaPipelineFixture(); let outside = fixture.root.deletingLastPathComponent().appendingPathComponent(UUID().uuidString); try Data().write(to: outside)
         let job = try await fixture.store.create(kind: .mediaImport, source: .init(reference: fixture.source.path), now: .now)
-        let artifact = fixture.audioURL(job.id); try FileManager.default.createDirectory(at: artifact.deletingLastPathComponent(), withIntermediateDirectories: true); try FileManager.default.createSymbolicLink(at: artifact, withDestinationURL: outside)
-        let owner = try await fixture.claim(job.id); try await fixture.store.persistDecodedMedia(jobID: job.id, owner: owner, derivedAudioPath: artifact.path); try await fixture.store.transitionOwned(job.id, owner: owner, to: .ready)
+        let first = fixture.jobDirectory(job.id).appendingPathComponent("a.wav"); let artifact = fixture.jobDirectory(job.id).appendingPathComponent("z.wav")
+        try FileManager.default.createDirectory(at: artifact.deletingLastPathComponent(), withIntermediateDirectories: true); try Data().write(to: first); try FileManager.default.createSymbolicLink(at: artifact, withDestinationURL: outside)
+        let owner = try await fixture.claim(job.id); try await fixture.store.persistDecodedMedia(jobID: job.id, owner: owner, derivedAudioPath: first.path); try await fixture.store.persistDecodedMedia(jobID: job.id, owner: owner, derivedAudioPath: artifact.path); try await fixture.store.transitionOwned(job.id, owner: owner, to: .ready)
         await #expect(throws: Error.self) { try await fixture.store.deleteMediaImport(jobID: job.id, jobsDirectory: fixture.root) }
         #expect(try await fixture.store.mediaDeletionError(jobID: job.id) != nil)
+        #expect(!FileManager.default.fileExists(atPath: first.path))
         try FileManager.default.removeItem(at: artifact); try Data().write(to: artifact)
         try await fixture.store.deleteMediaImport(jobID: job.id, jobsDirectory: fixture.root)
         #expect(try await fixture.store.job(id: job.id) == nil)
@@ -252,7 +308,7 @@ private struct MediaPipelineFixture {
     func jobDirectory(_ id: UUID) -> URL { root.appendingPathComponent(id.uuidString) }
     func audioURL(_ id: UUID) -> URL { jobDirectory(id).appendingPathComponent("audio.wav") }
     func claim(_ id: UUID) async throws -> UUID { let owner = UUID(); _ = try await store.claimQueuedJob(id, kind: .mediaImport, owner: owner, leaseDuration: 30); return owner }
-    func pipeline(decoder: PipelineDecodeProbe = .init(), transcriber: PipelineTranscribeProbe = .init(), diarizer: PipelineDiarizeProbe = .init()) -> MediaImportPipeline {
+    func pipeline(decoder: any MediaJobAudioDecoding = PipelineDecodeProbe(), transcriber: any TimestampedTranscribing = PipelineTranscribeProbe(), diarizer: any SpeakerDiarizing = PipelineDiarizeProbe()) -> MediaImportPipeline {
         MediaImportPipeline(store: store, jobsDirectory: root, decoder: decoder, transcriber: transcriber, diarizer: diarizer, language: nil, model: "model")
     }
 }
@@ -264,7 +320,32 @@ private actor PipelineDecodeProbe: MediaJobAudioDecoding {
     }
 }
 
+private struct DirectorySwapDecoder: MediaJobAudioDecoding {
+    let root: URL; let jobID: UUID; let outside: URL
+    func decode(jobID: UUID, destination: URL, cancellation: CancellationToken, progress: @escaping @Sendable (Double) -> Void) async throws {
+        let original = root.appendingPathComponent(jobID.uuidString); let moved = root.appendingPathComponent(jobID.uuidString + "-moved")
+        try FileManager.default.moveItem(at: original, to: moved)
+        try FileManager.default.createSymbolicLink(at: original, withDestinationURL: outside)
+        try writeValidWAV(to: destination); progress(1)
+    }
+}
+
 private func writeValidWAV(to url: URL) throws {
+    if url.path.hasPrefix("/dev/fd/") {
+        let descriptor = Darwin.open(url.path, O_WRONLY | O_NOFOLLOW)
+        guard descriptor >= 0 else { throw POSIXError(.EIO) }
+        defer { Darwin.close(descriptor) }
+        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("wav")
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        try writeValidWAV(to: temporary)
+        let data = try Data(contentsOf: temporary)
+        guard ftruncate(descriptor, 0) == 0, lseek(descriptor, 0, SEEK_SET) >= 0 else { throw POSIXError(.EIO) }
+        try data.withUnsafeBytes { bytes in
+            guard Darwin.write(descriptor, bytes.baseAddress, bytes.count) == bytes.count else { throw POSIXError(.EIO) }
+        }
+        _ = lseek(descriptor, 0, SEEK_SET)
+        return
+    }
     let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false)!
     let file = try AVAudioFile(forWriting: url, settings: format.settings)
     let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 160)!

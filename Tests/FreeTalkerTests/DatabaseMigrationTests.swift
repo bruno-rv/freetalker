@@ -57,19 +57,20 @@ import Testing
         try db.execute("""
         DROP INDEX idx_transcription_jobs_lease_expires_at;
         DROP INDEX idx_transcription_jobs_deletion_claimed_at;
+        ALTER TABLE transcription_jobs DROP COLUMN deletion_expires_at;
         ALTER TABLE transcription_jobs DROP COLUMN deletion_error;
         ALTER TABLE transcription_jobs DROP COLUMN deletion_owner;
         ALTER TABLE transcription_jobs DROP COLUMN deletion_claimed_at;
         ALTER TABLE transcription_jobs DROP COLUMN lease_expires_at;
         ALTER TABLE transcription_jobs DROP COLUMN lease_owner;
-        DELETE FROM schema_migrations WHERE version = 7;
+        DELETE FROM schema_migrations WHERE version >= 7;
         INSERT INTO transcription_jobs (id, kind, source_reference, state, created_at, updated_at) VALUES ('media-v6', 'media_import', '/source', 'queued', 1, 1);
         INSERT INTO transcript_segments (job_id, ordinal, start_time, end_time, transcript) VALUES ('media-v6', 0, 0, 1, 'kept');
         """)
         try DatabaseMigrator.migrate(db.handle)
-        #expect(try db.migrationVersions() == Array(1...7))
+        #expect(try db.migrationVersions() == Array(1...DatabaseMigrator.latestVersion))
         #expect(try db.integer("SELECT COUNT(*) FROM transcript_segments WHERE job_id = 'media-v6' AND transcript = 'kept';") == 1)
-        #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('transcription_jobs') WHERE name IN ('lease_owner','lease_expires_at','deletion_claimed_at','deletion_owner','deletion_error');") == 5)
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('transcription_jobs') WHERE name IN ('lease_owner','lease_expires_at','deletion_claimed_at','deletion_owner','deletion_error','deletion_expires_at');") == 6)
     }
 
     @Test func migratesPopulatedVersionOneDatabaseWithoutDataLoss() throws {
