@@ -1,6 +1,70 @@
 import AppKit
 import SwiftUI
 
+struct SpeechModelRowPresentation: Equatable {
+    enum Action: Equatable { case none, download, delete }
+
+    let status: String
+    let canSelect: Bool
+    let canDelete: Bool
+    let action: Action
+    let actionCaption: String?
+    let actionEnabled: Bool
+
+    @MainActor static func make(
+        state: SpeechModelStore.State,
+        selected: Bool,
+        activeDownloadVariant: String?
+    ) -> Self {
+        let unsupported = !state.supported
+        let canSelect = state.phase == .downloaded && !state.active && !unsupported
+        let canDelete = !selected && SpeechModelStore.canDelete(phase: state.phase, active: state.active)
+        let status: String
+        if state.active {
+            if unsupported {
+                status = "Active — unsupported on this Mac"
+            } else if case .notDownloaded = state.phase {
+                status = "Active — downloads on first use"
+            } else {
+                status = phaseText(state.phase, active: true)
+            }
+        } else if selected {
+            status = "Selected — pending reload"
+        } else if unsupported {
+            status = "Unsupported on this Mac"
+        } else {
+            status = phaseText(state.phase, active: false)
+        }
+
+        if canDelete {
+            return Self(status: status, canSelect: canSelect, canDelete: true,
+                        action: .delete, actionCaption: nil, actionEnabled: true)
+        }
+        if SpeechModelStore.canStartManualDownload(phase: state.phase, reserved: false),
+           !state.active, !unsupported {
+            let waiting = activeDownloadVariant != nil
+            return Self(status: status, canSelect: canSelect, canDelete: false,
+                        action: .download,
+                        actionCaption: waiting ? "waiting for current download" : nil,
+                        actionEnabled: !waiting)
+        }
+        return Self(status: status, canSelect: canSelect, canDelete: false,
+                    action: .none, actionCaption: nil, actionEnabled: false)
+    }
+
+    private static func phaseText(_ phase: SpeechModelStore.Phase, active: Bool) -> String {
+        switch phase {
+        case .notDownloaded: return "Not downloaded"
+        case .downloading(let progress): return "Downloading \(Int(progress * 100))%"
+        case .downloaded: return active ? "Active" : "Downloaded"
+        case .failed(let hint): return "Failed — \(hint)"
+        case .busy(let target):
+            let name = SpeechModelCatalog.entry(for: target)?.displayName ?? target
+            return "Loading \(name)…"
+        }
+    }
+}
+
 struct SettingsView: View {
     var body: some View {
         TabView {
@@ -25,6 +89,7 @@ struct SettingsView: View {
 private struct GeneralSettingsView: View {
     @ObservedObject private var settings = AppSettings.shared
     @ObservedObject private var coordinator = AppCoordinator.shared
+    @ObservedObject private var speechModelStore = AppCoordinator.shared.speechModelStore
     @ObservedObject private var templateStore = TemplateStore.shared
     @State private var accessibilityTrusted = Permissions.isAccessibilityTrusted()
     @State private var microphoneAuthorized = Permissions.isMicrophoneAuthorized()
@@ -60,6 +125,7 @@ private struct GeneralSettingsView: View {
     @State private var cloudSTTTestResult: String?
     @State private var cloudLLMTesting = false
     @State private var cloudLLMTestResult: String?
+    @State private var modelPendingDeletion: SpeechModelCatalogEntry?
 
     private let refreshTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
@@ -184,6 +250,21 @@ private struct GeneralSettingsView: View {
                 Text(coordinator.engineStatusText)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+
+                if settings.sttEngine == .whisperKit {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Speech model")
+                            .font(.headline)
+                        ForEach(SpeechModelCatalog.entries, id: \.id) { entry in
+                            speechModelRow(entry)
+                        }
+                    }
+                    .padding(.top, 4)
+                    .onAppear {
+                        Task { await speechModelStore.refresh() }
+                        speechModelStore.refreshRemoteSupportOnce()
+                    }
+                }
 
                 Toggle("Live preview while recording", isOn: $settings.livePreviewEnabled)
                 if settings.sttEngine == .cloud && !coordinator.whisperEngine.isLoaded {
@@ -344,6 +425,23 @@ private struct GeneralSettingsView: View {
                     .font(.caption)
             }
         }
+        .confirmationDialog(
+            "Delete \(modelPendingDeletion?.displayName ?? "speech model")?",
+            isPresented: Binding(
+                get: { modelPendingDeletion != nil },
+                set: { if !$0 { modelPendingDeletion = nil } }
+            ),
+            presenting: modelPendingDeletion
+        ) { entry in
+            Button("Delete model", role: .destructive) {
+                modelPendingDeletion = nil
+                Task { try? await speechModelStore.delete(entry.id) }
+            }
+            Button("Cancel", role: .cancel) { modelPendingDeletion = nil }
+        } message: { entry in
+            let bytes = speechModelStore.states[entry.id]?.sizeBytes ?? 0
+            Text("This removes \(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)) from local storage.")
+        }
         .formStyle(.grouped)
         .onAppear {
             inputDevices = AudioInputDevices.enumerate()
@@ -353,6 +451,62 @@ private struct GeneralSettingsView: View {
             accessibilityTrusted = Permissions.isAccessibilityTrusted()
             microphoneAuthorized = Permissions.isMicrophoneAuthorized()
             inputMonitoringAuthorized = Permissions.isInputMonitoringAuthorized()
+        }
+    }
+
+    @ViewBuilder
+    private func speechModelRow(_ entry: SpeechModelCatalogEntry) -> some View {
+        let state = speechModelStore.states[entry.id] ?? .init()
+        let selected = settings.whisperModel == entry.id
+        let presentation = SpeechModelRowPresentation.make(
+            state: state,
+            selected: selected,
+            activeDownloadVariant: speechModelStore.activeDownloadVariant
+        )
+        HStack(alignment: .center, spacing: 10) {
+            Button {
+                Task { await coordinator.selectSpeechModelFromUser(entry.id) }
+            } label: {
+                Image(systemName: state.active ? "largecircle.fill.circle" : (selected ? "circle.inset.filled" : "circle"))
+                    .accessibilityLabel(state.active ? "Active" : (selected ? "Selected" : "Select"))
+            }
+            .buttonStyle(.plain)
+            .disabled(!presentation.canSelect)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(entry.displayName)
+                Text("\(entry.approximateSize) · \(tradeoffLabel(for: entry))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text(presentation.status)
+                    .font(.caption)
+                    .foregroundStyle(state.supported || state.active ? .secondary : .tertiary)
+                if let caption = presentation.actionCaption {
+                    Text(caption).font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            switch presentation.action {
+            case .download:
+                Button("Download") { Task { await speechModelStore.download(entry.id) } }
+                    .disabled(!presentation.actionEnabled)
+            case .delete:
+                Button("Delete") { modelPendingDeletion = entry }
+            case .none:
+                if case .downloading(let progress) = state.phase {
+                    ProgressView(value: progress).frame(width: 72)
+                }
+            }
+        }
+    }
+
+    private func tradeoffLabel(for entry: SpeechModelCatalogEntry) -> String {
+        switch entry.id {
+        case "openai_whisper-tiny": "fastest"
+        case "openai_whisper-base", "openai_whisper-small": "fast and compact"
+        case "openai_whisper-medium": "balanced"
+        case "openai_whisper-large-v3_947MB": "most accurate"
+        default: "faster large-model transcription"
         }
     }
 

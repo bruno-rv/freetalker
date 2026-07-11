@@ -56,7 +56,9 @@ final class AppCoordinator: ObservableObject {
     /// pure decision SelfCheck exercises directly.
     private var oneShotLanguage: String?
 
-    let whisperEngine = WhisperKitEngine()
+    let speechModelDownloadCoordinator: SpeechModelDownloadCoordinator
+    let speechModelStore: SpeechModelStore
+    let whisperEngine: WhisperKitEngine
     let cloudSTTEngine = CloudSTTEngine()
     private let appleFMProcessor = AppleFMProcessor()
 
@@ -81,6 +83,12 @@ final class AppCoordinator: ObservableObject {
     }
 
     private init() {
+        let downloadCoordinator = SpeechModelDownloadCoordinator.shared
+        let modelStore = SpeechModelStore(coordinator: downloadCoordinator)
+        speechModelDownloadCoordinator = downloadCoordinator
+        speechModelStore = modelStore
+        whisperEngine = WhisperKitEngine(downloadCoordinator: downloadCoordinator)
+        whisperEngine.setEventReceiver(modelStore)
         // Forward engine status changes (e.g. WhisperKit download progress) so the menu bar
         // and Settings, which observe `AppCoordinator`, actually re-render live — not just
         // when the menu happens to reopen.
@@ -129,6 +137,23 @@ final class AppCoordinator: ObservableObject {
         hud.onPanelLanguage = { [weak self] code in self?.handlePanelOneShotLanguage(code) }
         hud.onPanelCycleTemplate = { [weak self] in self?.handlePanelCycleTemplate() }
         hud.onPanelLock = { [weak self] in self?.handlePillClick() }
+    }
+
+    func selectSpeechModelFromUser(_ variant: String) async {
+        await Self.routeSpeechModelSelection(
+            variant,
+            setFromUser: { AppSettings.shared.setWhisperModelFromUser($0) },
+            reload: { [whisperEngine] in await whisperEngine.reload(to: $0) }
+        )
+    }
+
+    static func routeSpeechModelSelection(
+        _ variant: String,
+        setFromUser: (String) -> Void,
+        reload: (String) async -> Void
+    ) async {
+        setFromUser(variant)
+        await reload(variant)
     }
 
     /// Single entry point that (re)creates the global hotkey event tap whenever it is dead.
