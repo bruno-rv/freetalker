@@ -17,23 +17,44 @@ enum AutomaticStyle: String, CaseIterable, Sendable {
 }
 
 struct AutomaticStyleClassifier: Sendable {
+    private static let emailBundleIDs: Set<String> = [
+        "com.apple.mail",
+        "com.microsoft.outlook",
+        "com.readdle.smartemail-macos"
+    ]
+    private static let conversationalBundleIDs: Set<String> = [
+        "com.apple.mobilesms",
+        "com.tinyspeck.slackmacgap",
+        "com.hnc.discord",
+        "com.microsoft.teams2",
+        "ru.keepcoder.telegram",
+        "net.whatsapp.whatsapp",
+        "org.whispersystems.signal-desktop"
+    ]
+    private static let technicalBundleIDs: Set<String> = [
+        "com.apple.dt.xcode",
+        "com.apple.terminal",
+        "com.googlecode.iterm2",
+        "dev.warp.warp-stable",
+        "com.microsoft.vscode",
+        "com.github.githubclient"
+    ]
+    private static let documentBundleIDs: Set<String> = [
+        "com.apple.iwork.pages",
+        "com.microsoft.word",
+        "org.libreoffice.script",
+        "com.apple.notes"
+    ]
+
     func classify(bundleID: String?, windowTitle: String?, context: String) -> AutomaticStyle {
         let bundle = bundleID?.lowercased() ?? ""
         let title = windowTitle?.lowercased() ?? ""
         let text = context.lowercased()
 
-        if containsAny(bundle, ["mail", "outlook", "airmail", "spark"]) {
-            return .email
-        }
-        if containsAny(bundle, ["messages", "slack", "discord", "teams", "telegram", "whatsapp", "signal"]) {
-            return .conversational
-        }
-        if containsAny(bundle, ["xcode", "terminal", "iterm", "warp", "visual-studio-code", "github"]) {
-            return .technical
-        }
-        if containsAny(bundle, ["pages", "word", "writer", "notes"]) {
-            return .document
-        }
+        if Self.emailBundleIDs.contains(bundle) { return .email }
+        if Self.conversationalBundleIDs.contains(bundle) { return .conversational }
+        if Self.technicalBundleIDs.contains(bundle) { return .technical }
+        if Self.documentBundleIDs.contains(bundle) { return .document }
         if containsAny(title, [".swift", ".js", ".ts", ".py", ".rs", "terminal", "console"]) ||
             containsAny(text, ["func ", "class ", "struct ", "async throws", "import ", "git "]) {
             return .technical
