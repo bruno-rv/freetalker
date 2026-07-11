@@ -79,6 +79,10 @@ actor TranscriptionJobStore {
         SET purge_claimed_at = ?, purge_error = NULL, updated_at = ?
         WHERE kind = 'recovery' AND state = 'failed' AND purge_claimed_at IS NULL
           AND created_at <= ?
+          AND NOT EXISTS (
+              SELECT 1 FROM job_attempts
+              WHERE job_id = transcription_jobs.id AND completed_at IS NULL
+          )
         RETURNING id, source_reference, purge_claimed_at, purge_error;
         """)
         defer { sqlite3_finalize(statement) }
@@ -224,27 +228,48 @@ actor TranscriptionJobStore {
     }
 
     func beginAttempt(jobID: UUID, configuration: AttemptConfiguration) throws -> JobAttempt {
-        guard try job(id: jobID) != nil else { throw JobStoreError.jobNotFound }
-        guard try !isPurgeClaimed(id: jobID) else { throw JobStoreError.invalidTransition }
-        let number = try nextAttemptNumber(jobID: jobID)
         let startedAt = clock.now
         let statement = try prepare("""
         INSERT INTO job_attempts
             (job_id, attempt_number, started_at, language, speech_model, template)
-        VALUES (?, ?, ?, ?, ?, ?);
+        SELECT ?,
+               COALESCE((SELECT MAX(attempt_number) FROM job_attempts WHERE job_id = ?), 0) + 1,
+               ?, ?, ?, ?
+        FROM transcription_jobs
+        WHERE id = ? AND purge_claimed_at IS NULL;
         """)
         defer { sqlite3_finalize(statement) }
         bind(jobID.uuidString, to: 1, in: statement)
-        sqlite3_bind_int(statement, 2, Int32(number))
+        bind(jobID.uuidString, to: 2, in: statement)
         sqlite3_bind_double(statement, 3, startedAt.timeIntervalSince1970)
         bind(configuration.language, to: 4, in: statement)
         bind(configuration.speechModel, to: 5, in: statement)
         bind(configuration.template, to: 6, in: statement)
+        bind(jobID.uuidString, to: 7, in: statement)
         try stepDone(statement)
-        return JobAttempt(
-            id: sqlite3_last_insert_rowid(handle), jobID: jobID, number: number,
-            configuration: configuration, startedAt: startedAt, completedAt: nil, result: nil
-        )
+        guard sqlite3_changes(handle) == 1 else {
+            guard try job(id: jobID) != nil else { throw JobStoreError.jobNotFound }
+            if try isPurgeClaimed(id: jobID) { throw JobStoreError.purgeClaimed }
+            throw JobStoreError.invalidTransition
+        }
+        let id = sqlite3_last_insert_rowid(handle)
+        guard let attempt = try attempt(id: id) else { throw JobStoreError.attemptNotFound }
+        return attempt
+    }
+
+    private func attempt(id: Int64) throws -> JobAttempt? {
+        let statement = try prepare("""
+        SELECT id, job_id, attempt_number, started_at, completed_at,
+               language, speech_model, template, result, failure_stage, failure_message
+        FROM job_attempts WHERE id = ?;
+        """)
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_int64(statement, 1, id)
+        switch sqlite3_step(statement) {
+        case SQLITE_ROW: return try decodeAttempt(statement)
+        case SQLITE_DONE: return nil
+        default: throw sqlError()
+        }
     }
 
     func finishAttempt(_ id: Int64, result: AttemptResult) throws {
@@ -329,14 +354,6 @@ actor TranscriptionJobStore {
              (.failed, .queued), (.cancelled, .queued): true
         default: false
         }
-    }
-
-    private func nextAttemptNumber(jobID: UUID) throws -> Int {
-        let statement = try prepare("SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM job_attempts WHERE job_id = ?;")
-        defer { sqlite3_finalize(statement) }
-        bind(jobID.uuidString, to: 1, in: statement)
-        guard sqlite3_step(statement) == SQLITE_ROW else { throw sqlError() }
-        return Int(sqlite3_column_int(statement, 0))
     }
 
     private func decodeJob(_ statement: OpaquePointer) throws -> TranscriptionJob {

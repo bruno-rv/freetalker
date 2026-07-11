@@ -127,8 +127,39 @@ import Testing
         await #expect(throws: JobStoreError.invalidTransition) {
             try await fixture.store.transition(id, from: .failed, to: .queued)
         }
-        await #expect(throws: JobStoreError.invalidTransition) {
+        await #expect(throws: JobStoreError.purgeClaimed) {
             _ = try await fixture.store.beginAttempt(jobID: id, configuration: .init())
+        }
+    }
+
+    @Test func purgeClaimAndAttemptHaveExactlyOneWinnerAcrossConnectionsInBothOrderings() async throws {
+        for claimFirst in [true, false] {
+            let temp = try TemporaryDirectory()
+            let databaseURL = temp.url.appendingPathComponent("jobs.sqlite")
+            let first = try TranscriptionJobStore(databaseURL: databaseURL, clock: SystemJobClock())
+            let second = try TranscriptionJobStore(databaseURL: databaseURL, clock: SystemJobClock())
+            let source = temp.url.appendingPathComponent("\(UUID().uuidString).wav")
+            try Data("audio".utf8).write(to: source)
+            let job = try await first.createRecovery(
+                source: .init(reference: source.path),
+                metadata: .init(
+                    capturedAt: .distantPast,
+                    failure: .init(stage: .transcribing, message: "failed")
+                )
+            )
+
+            if claimFirst {
+                #expect(try await first.claimExpiredRecoveries(cutoff: .distantFuture, claimedAt: Date()).map(\.id) == [job.id])
+                await #expect(throws: JobStoreError.purgeClaimed) {
+                    _ = try await second.beginAttempt(jobID: job.id, configuration: .init())
+                }
+                #expect(try await second.attempts(jobID: job.id).isEmpty)
+            } else {
+                let attempt = try await first.beginAttempt(jobID: job.id, configuration: .init())
+                #expect(attempt.number == 1)
+                #expect(try await second.claimExpiredRecoveries(cutoff: .distantFuture, claimedAt: Date()).isEmpty)
+                #expect(try await second.claimedRecoveries().isEmpty)
+            }
         }
     }
 

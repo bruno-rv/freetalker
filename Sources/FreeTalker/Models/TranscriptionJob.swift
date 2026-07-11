@@ -104,6 +104,7 @@ struct SystemJobClock: JobClock {
 
 enum JobStoreError: Error, Equatable {
     case invalidTransition
+    case purgeClaimed
     case jobNotFound
     case attemptNotFound
     case corruptData(String)
