@@ -3,27 +3,29 @@ import Darwin
 import Foundation
 
 final class PCMWAVFileWriter {
+    static let maximumDataBytes = UInt64(UInt32.max) - 36
     private let descriptor: Int32
     private var dataBytes: UInt64 = 0
     private var finished = false
 
-    init(descriptor: Int32) throws {
+    init(descriptor: Int32, initialDataBytes: UInt64 = 0) throws {
         self.descriptor = descriptor
+        guard initialDataBytes <= Self.maximumDataBytes, initialDataBytes % 4 == 0 else { throw Self.sizeError() }
+        dataBytes = initialDataBytes
         guard ftruncate(descriptor, 0) == 0 else { throw Self.posixError() }
         try Self.writeAll(descriptor, bytes: [UInt8](repeating: 0, count: 44))
     }
 
     func write(_ buffer: AVAudioPCMBuffer) throws {
         let byteCount = UInt64(buffer.frameLength) * 4
-        guard byteCount <= UInt64(Int.max), dataBytes + byteCount <= UInt64(UInt32.max) else {
-            throw MediaImportError.decodeFailed("decoded WAV exceeds the 4 GB PCM WAV limit")
-        }
+        let (newSize, overflow) = dataBytes.addingReportingOverflow(byteCount)
+        guard byteCount <= UInt64(Int.max), !overflow, newSize <= Self.maximumDataBytes, newSize % 4 == 0 else { throw Self.sizeError() }
         let audioBuffer = buffer.audioBufferList.pointee.mBuffers
         guard let data = audioBuffer.mData, UInt64(audioBuffer.mDataByteSize) >= byteCount else {
             throw MediaImportError.decodeFailed("converted PCM buffer is incomplete")
         }
         try Self.writeAll(descriptor, pointer: data, count: Int(byteCount))
-        dataBytes += byteCount
+        dataBytes = newSize
     }
 
     func finish() throws {
@@ -66,4 +68,5 @@ final class PCMWAVFileWriter {
     }
 
     private static func posixError() -> POSIXError { POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+    private static func sizeError() -> MediaImportError { .decodeFailed("decoded WAV exceeds the block-aligned 4 GB PCM WAV limit") }
 }

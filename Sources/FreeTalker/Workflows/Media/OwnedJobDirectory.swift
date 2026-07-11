@@ -112,4 +112,21 @@ final class OwnedJobDirectory: @unchecked Sendable {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
     }
+
+    func removeInvalidArtifact(_ basename: String, source: URL) throws {
+        try revalidateIdentity()
+        var info = stat()
+        if fstatat(directoryDescriptor, basename, &info, AT_SYMLINK_NOFOLLOW) != 0 {
+            if errno == ENOENT { return }
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        guard (info.st_mode & S_IFMT) != S_IFDIR else { throw JobStoreError.corruptData("Invalid artifact is a directory") }
+        var sourceInfo = stat()
+        if (info.st_mode & S_IFMT) == S_IFREG,
+           stat(source.standardizedFileURL.resolvingSymlinksInPath().path, &sourceInfo) == 0,
+           info.st_dev == sourceInfo.st_dev, info.st_ino == sourceInfo.st_ino {
+            throw JobStoreError.corruptData("Invalid artifact aliases the imported source")
+        }
+        guard unlinkat(directoryDescriptor, basename, 0) == 0 || errno == ENOENT else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+    }
 }
