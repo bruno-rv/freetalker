@@ -579,7 +579,8 @@ struct CloudLLMSettingsSnapshot {
             let scheme = components.scheme?.lowercased(),
             scheme == "http" || scheme == "https",
             let host = components.host?.lowercased(),
-            !host.isEmpty
+            !host.isEmpty,
+            Self.hasValidPortSyntax(in: trimmedBaseURL, components: components)
         else {
             return .invalidConfiguration
         }
@@ -595,6 +596,16 @@ struct CloudLLMSettingsSnapshot {
             return .eligible(apiKey: nil)
         }
         return .missingAPIKey
+    }
+
+    private static func hasValidPortSyntax(in url: String, components: URLComponents) -> Bool {
+        guard let schemeEnd = url.range(of: "://") else { return false }
+        let remainder = url[schemeEnd.upperBound...]
+        let authorityEnd = remainder.firstIndex { "/?#".contains($0) } ?? remainder.endIndex
+        let authority = remainder[..<authorityEnd]
+        guard !authority.hasSuffix(":") else { return false }
+        guard let port = components.port else { return true }
+        return (1...65_535).contains(port)
     }
 }
 

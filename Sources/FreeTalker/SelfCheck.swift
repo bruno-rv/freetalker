@@ -1544,10 +1544,22 @@ enum SelfCheck {
 
         for loopbackURL in [
             "http://localhost:11434/v1",
+            "http://localhost:80/v1",
+            "http://localhost/v1",
             "http://127.0.0.1:11434/v1",
             "http://[::1]:11434/v1",
         ] where !AppCoordinator.isCloudLLMConfigured(snapshot: openAICompatible(baseURL: loopbackURL, key: "   ")) {
             failures.append("isCloudLLMConfigured: expected empty-key local OpenAI-compatible URL to be eligible: \(loopbackURL)")
+        }
+
+        for invalidPortURL in [
+            "http://localhost:/v1",
+            "http://localhost:0/v1",
+            "http://localhost:65536/v1",
+            "http://localhost:99999/v1",
+            "http://localhost:not-a-port/v1",
+        ] where AppCoordinator.isCloudLLMConfigured(snapshot: openAICompatible(baseURL: invalidPortURL, key: nil)) {
+            failures.append("isCloudLLMConfigured: expected malformed or out-of-range port to be ineligible: \(invalidPortURL)")
         }
 
         for remoteURL in ["http://example.com/v1", "https://example.com/v1"]
