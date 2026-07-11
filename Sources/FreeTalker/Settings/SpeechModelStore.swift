@@ -11,6 +11,26 @@ actor SpeechModelDownloadCoordinator {
 
     static let shared = SpeechModelDownloadCoordinator()
     private(set) var activeVariant: String?
+    private var activityObservers: [UUID: AsyncStream<String?>.Continuation] = [:]
+
+    func activityStream() -> AsyncStream<String?> {
+        let id = UUID()
+        return AsyncStream { continuation in
+            activityObservers[id] = continuation
+            continuation.yield(activeVariant)
+            continuation.onTermination = { _ in
+                Task { await self.removeActivityObserver(id) }
+            }
+        }
+    }
+
+    private func removeActivityObserver(_ id: UUID) {
+        activityObservers.removeValue(forKey: id)
+    }
+
+    private func publishActivity() {
+        for observer in activityObservers.values { observer.yield(activeVariant) }
+    }
 
     func download(
         variant: String,
@@ -19,7 +39,11 @@ actor SpeechModelDownloadCoordinator {
     ) async throws -> URL {
         guard let activeVariant else {
             self.activeVariant = variant
-            defer { self.activeVariant = nil }
+            publishActivity()
+            defer {
+                self.activeVariant = nil
+                publishActivity()
+            }
             return try await downloader(variant, progress)
         }
         throw Error.busy(activeVariant: activeVariant)
@@ -81,22 +105,44 @@ final class SpeechModelStore: ObservableObject, SpeechModelEngineEventReceiving 
     private let baseURL: URL
     private let coordinator: SpeechModelDownloadCoordinator
     private let settings: AppSettings
+    private let deleteOperation: @Sendable (String, URL) async throws -> Void
+    private let remoteSupportFetcher: @Sendable () async -> Set<String>
+    private let remoteSupportTimeout: Duration
     private var remoteRefreshStarted = false
+    private var coordinatorActivityTask: Task<Void, Never>?
+    private var deletingVariants: Set<String> = []
 
     init(
         baseURL: URL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0],
         coordinator: SpeechModelDownloadCoordinator = .shared,
-        settings: AppSettings = .shared
+        settings: AppSettings = .shared,
+        fallbackSupport: Set<String>? = nil,
+        remoteSupportTimeout: Duration = .seconds(5),
+        remoteSupportFetcher: @escaping @Sendable () async -> Set<String> = {
+            Set((await WhisperKit.recommendedRemoteModels()).supported)
+        },
+        deleteOperation: @escaping @Sendable (String, URL) async throws -> Void = {
+            let variant = $0
+            let baseURL = $1
+            try await Task.detached {
+                try SpeechModelStore.deleteVariantDirectory(variant, baseURL: baseURL)
+            }.value
+        }
     ) {
         self.baseURL = baseURL
         self.coordinator = coordinator
         self.settings = settings
-        let fallback = Set(WhisperKit.recommendedModels().supported.compactMap { SpeechModelCatalog.entry(for: $0)?.id })
+        self.deleteOperation = deleteOperation
+        self.remoteSupportFetcher = remoteSupportFetcher
+        self.remoteSupportTimeout = remoteSupportTimeout
+        let rawFallback = fallbackSupport ?? Set(WhisperKit.recommendedModels().supported)
+        let fallback = Set(rawFallback.compactMap { SpeechModelCatalog.entry(for: $0)?.id })
         supportedVariants = fallback
         states = Dictionary(uniqueKeysWithValues: SpeechModelCatalog.entries.map {
             ($0.id, State(active: $0.id == settings.whisperModel, supported: fallback.contains($0.id)))
         })
         applyAutomaticDefaultIfNeeded()
+        Task { await connectCoordinatorActivity() }
     }
 
     nonisolated static func repositoryRoot(baseURL: URL) -> URL {
@@ -143,7 +189,7 @@ final class SpeechModelStore: ObservableObject, SpeechModelEngineEventReceiving 
 
     nonisolated static func deleteVariantDirectory(_ variant: String, baseURL: URL) throws {
         let target = variantDirectory(for: variant, baseURL: baseURL)
-        guard target == variantDirectory(for: variant, baseURL: baseURL), isSafeVariantDirectory(target, baseURL: baseURL) else {
+        guard isSafeVariantDirectory(target, baseURL: baseURL) else {
             throw CocoaError(.fileWriteInvalidFileName)
         }
         try FileManager.default.removeItem(at: target)
@@ -155,6 +201,22 @@ final class SpeechModelStore: ObservableObject, SpeechModelEngineEventReceiving 
         return false
     }
 
+    static func merging(inspection: Inspection, into state: State) -> State {
+        switch state.phase {
+        case .failed, .downloading, .busy:
+            return state
+        case .notDownloaded, .downloaded:
+            var result = state
+            result.phase = inspection.downloaded ? .downloaded : .notDownloaded
+            result.sizeBytes = inspection.sizeBytes
+            return result
+        }
+    }
+
+    static func shouldApplyAutomaticDefault(chosenByUser: Bool, current: String, supported: Set<String>) -> Bool {
+        !chosenByUser && !supported.isEmpty && !supported.contains(current)
+    }
+
     func refresh() async {
         let baseURL = self.baseURL
         let inspections = await Task.detached {
@@ -163,18 +225,23 @@ final class SpeechModelStore: ObservableObject, SpeechModelEngineEventReceiving 
             })
         }.value
         for entry in SpeechModelCatalog.entries {
-            guard let inspection = inspections[entry.id], var state = states[entry.id] else { continue }
-            if case .downloading = state.phase { continue }
-            if case .busy = state.phase { continue }
-            state.phase = inspection.downloaded ? .downloaded : .notDownloaded
-            state.sizeBytes = inspection.sizeBytes
-            states[entry.id] = state
+            guard let inspection = inspections[entry.id], let state = states[entry.id] else { continue }
+            states[entry.id] = Self.merging(inspection: inspection, into: state)
         }
+    }
+
+    func connectCoordinatorActivity() async {
+        guard coordinatorActivityTask == nil else { return }
+        let stream = await coordinator.activityStream()
+        coordinatorActivityTask = Task { @MainActor [weak self] in
+            for await active in stream { self?.activeDownloadVariant = active }
+        }
+        await Task.yield()
     }
 
     func download(_ variant: String) async {
         guard states[variant] != nil else { return }
-        activeDownloadVariant = variant
+        await connectCoordinatorActivity()
         states[variant]?.phase = .downloading(0)
         do {
             _ = try await coordinator.download(variant: variant, downloadBase: baseURL) { progress in
@@ -185,29 +252,42 @@ final class SpeechModelStore: ObservableObject, SpeechModelEngineEventReceiving 
         } catch {
             states[variant]?.phase = .failed(error.localizedDescription)
         }
-        activeDownloadVariant = nil
+        if case .failed = states[variant]?.phase {
+            // Keep the visible failure while refresh updates any cached filesystem metadata.
+        } else {
+            states[variant]?.phase = .notDownloaded
+        }
         await refresh()
     }
 
     func delete(_ variant: String) async throws {
         guard let state = states[variant], Self.canDelete(phase: state.phase, active: state.active) else { return }
+        deletingVariants.insert(variant)
+        states[variant]?.phase = .busy(reloadTarget: variant)
         let baseURL = self.baseURL
-        try await Task.detached { try Self.deleteVariantDirectory(variant, baseURL: baseURL) }.value
-        await refresh()
+        do {
+            try await deleteOperation(variant, baseURL)
+            deletingVariants.remove(variant)
+            states[variant]?.phase = .notDownloaded
+            await refresh()
+        } catch {
+            deletingVariants.remove(variant)
+            states[variant] = state
+            await refresh()
+            throw error
+        }
     }
 
     func receiveEngineEvent(_ event: SpeechModelEngineEvent, for variant: String) {
         guard states[variant] != nil else { return }
+        guard !deletingVariants.contains(variant) else { return }
         switch event {
         case .downloading(let progress):
-            activeDownloadVariant = variant
             states[variant]?.phase = .downloading(progress)
         case .busy(let target): states[variant]?.phase = .busy(reloadTarget: target)
         case .downloaded:
-            if activeDownloadVariant == variant { activeDownloadVariant = nil }
             states[variant]?.phase = .downloaded
         case .failed(let hint):
-            if activeDownloadVariant == variant { activeDownloadVariant = nil }
             states[variant]?.phase = .failed(hint)
         }
     }
@@ -216,31 +296,50 @@ final class SpeechModelStore: ObservableObject, SpeechModelEngineEventReceiving 
         guard !remoteRefreshStarted else { return }
         remoteRefreshStarted = true
         Task {
-            let remote = await withTaskGroup(of: Set<String>?.self) { group in
-                group.addTask {
-                    let support = await WhisperKit.recommendedRemoteModels()
-                    return Set(support.supported.compactMap { SpeechModelCatalog.entry(for: $0)?.id })
-                }
-                group.addTask {
-                    try? await Task.sleep(for: .seconds(5))
-                    return nil
-                }
-                let result = await group.next() ?? nil
-                group.cancelAll()
-                return result
-            }
+            let fetcher = remoteSupportFetcher
+            let remote = await Self.firstResult(within: remoteSupportTimeout, operation: fetcher)
             guard let remote else { return }
-            supportedVariants = remote
-            for id in states.keys { states[id]?.supported = remote.contains(id) }
+            let catalogRemote = Set(remote.compactMap { SpeechModelCatalog.entry(for: $0)?.id })
+            supportedVariants = catalogRemote
+            for id in states.keys { states[id]?.supported = catalogRemote.contains(id) }
             applyAutomaticDefaultIfNeeded()
         }
     }
 
+    nonisolated static func firstResult<Value: Sendable>(
+        within timeout: Duration,
+        operation: @escaping @Sendable () async -> Value
+    ) async -> Value? {
+        await withCheckedContinuation { continuation in
+            let gate = FirstResultGate(continuation)
+            Task { await gate.resume(operation()) }
+            Task {
+                try? await Task.sleep(for: timeout)
+                await gate.resume(nil)
+            }
+        }
+    }
+
     private func applyAutomaticDefaultIfNeeded() {
-        guard !supportedVariants.isEmpty,
-              !settings.whisperModelChosen,
-              !supportedVariants.contains(settings.whisperModel) else { return }
+        guard Self.shouldApplyAutomaticDefault(
+            chosenByUser: settings.whisperModelChosen,
+            current: settings.whisperModel,
+            supported: supportedVariants
+        ) else { return }
         settings.applyAutomaticWhisperModel(SpeechModelCatalog.bestSupported(in: supportedVariants))
         for id in states.keys { states[id]?.active = id == settings.whisperModel }
+    }
+}
+
+private actor FirstResultGate<Value: Sendable> {
+    private var continuation: CheckedContinuation<Value?, Never>?
+
+    init(_ continuation: CheckedContinuation<Value?, Never>) {
+        self.continuation = continuation
+    }
+
+    func resume(_ value: Value?) {
+        continuation?.resume(returning: value)
+        continuation = nil
     }
 }
