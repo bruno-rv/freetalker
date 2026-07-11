@@ -473,6 +473,15 @@ enum SelfCheck {
         if entries.contains(where: { $0.displayName.isEmpty || $0.approximateSize.isEmpty }) {
             failures.append("speech catalog: missing display metadata")
         }
+        if entries.contains(where: {
+            $0.quickTip.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || !$0.quickTip.contains($0.id)
+        }) {
+            failures.append("speech catalog: quick tip missing content or exact searchable id")
+        }
+        if Set(entries.map(\.quickTip)).count != entries.count {
+            failures.append("speech catalog: quick tips are not model-specific")
+        }
         if Set(SpeechModelCatalog.preferenceOrder) != Set(expectedIDs) || SpeechModelCatalog.preferenceOrder.count != entries.count {
             failures.append("speech catalog: preference order does not cover every entry exactly once")
         }
