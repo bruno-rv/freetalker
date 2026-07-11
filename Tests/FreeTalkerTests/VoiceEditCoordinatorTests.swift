@@ -59,6 +59,24 @@ import Testing
         coordinator.cancel()
         #expect(coordinator.preview == nil)
         #expect(coordinator.instruction.isEmpty)
+        #expect(!coordinator.hasSensitiveContent)
+    }
+
+    @Test func cancelInvalidatesSuspendedGenerationAndClearsSensitiveState() async {
+        let editor = SuspendingLocalEditService()
+        let coordinator = makeCoordinator(editor: editor)
+        let task = Task { await coordinator.begin() }
+        await editor.waitUntilRequested()
+
+        #expect(coordinator.hasSensitiveContent)
+        coordinator.cancel()
+        editor.resume(returning: "late result")
+        await task.value
+
+        #expect(coordinator.preview == nil)
+        #expect(coordinator.snippetChoices.isEmpty)
+        #expect(coordinator.error == nil)
+        #expect(!coordinator.hasSensitiveContent)
     }
 
     @Test func confirmUsesSelectionAccessAndStaleConfirmationPerformsNoWrite() async throws {
@@ -67,8 +85,34 @@ import Testing
         await coordinator.begin()
 
         #expect(throws: SelectionAccessError.selectionChanged) { try coordinator.confirm() }
-        #expect(access.successfulWrites == 0)
+        #expect(access.mutations.isEmpty)
         #expect(coordinator.preview?.result == "edited")
+        #expect(coordinator.error == .selectionChanged)
+        #expect(coordinator.errorMessage?.contains("selected text changed") == true)
+    }
+
+    @Test(arguments: [
+        (SelectionAccessError.targetChanged, VoiceEditCoordinatorError.targetChanged, "target field changed"),
+        (.selectionChanged, .selectionChanged, "selected text changed"),
+        (.secureField, .secureField, "secure fields"),
+        (.noEditableSelection, .noEditableSelection, "editable selection"),
+        (.replacementFailed, .replacementFailed, "rejected the replacement")
+    ])
+    func knownConfirmationErrorsAreMappedAccessibly(
+        _ accessError: SelectionAccessError,
+        _ expected: VoiceEditCoordinatorError,
+        _ messageFragment: String
+    ) async {
+        let access = StubCoordinatorSelectionAccess(replaceError: accessError)
+        let coordinator = makeCoordinator(access: access)
+        await coordinator.begin()
+
+        #expect(throws: accessError) { try coordinator.confirm() }
+
+        #expect(coordinator.error == expected)
+        #expect(coordinator.errorMessage?.contains(messageFragment) == true)
+        #expect(coordinator.preview?.result == "edited")
+        #expect(access.mutations.isEmpty)
     }
 
     @Test func successfulConfirmReplacesExactlyOnceAndClearsMemory() async throws {
@@ -81,6 +125,7 @@ import Testing
         #expect(access.replacements == ["edited"])
         #expect(coordinator.preview == nil)
         #expect(coordinator.instruction.isEmpty)
+        #expect(!coordinator.hasSensitiveContent)
     }
 
     @Test func copyOccursOnlyOnExplicitAction() async {
@@ -89,10 +134,27 @@ import Testing
         await coordinator.begin()
         #expect(copied.isEmpty)
 
-        coordinator.copyResult()
+        try? coordinator.copyResult()
 
         #expect(copied == ["edited"])
         #expect(coordinator.preview == nil)
+        #expect(!coordinator.hasSensitiveContent)
+    }
+
+    @Test func failedCopyPreservesPreviewAndSensitiveStateForRetry() async {
+        let coordinator = makeCoordinator(copy: { _ in throw TestError.failed })
+        await coordinator.begin()
+
+        #expect(throws: TestError.failed) { try coordinator.copyResult() }
+
+        #expect(coordinator.preview?.result == "edited")
+        #expect(coordinator.hasSensitiveContent)
+        #expect(coordinator.error == .copyFailed)
+        #expect(coordinator.errorMessage?.contains("clipboard") == true)
+        coordinator.dismissError()
+        #expect(coordinator.error == nil)
+        #expect(coordinator.preview?.result == "edited")
+        #expect(coordinator.hasSensitiveContent)
     }
 
     @Test func localGenerationFailureIsExposedWithoutPreviewOrCopy() async {
@@ -105,15 +167,16 @@ import Testing
         #expect(coordinator.preview == nil)
         #expect(coordinator.error == .generationFailed)
         #expect(copied.isEmpty)
+        #expect(!coordinator.hasSensitiveContent)
     }
 
     private func makeCoordinator(
         selection: SelectionSnapshot? = Self.snapshot(),
         instruction: String = "make concise",
         access: StubCoordinatorSelectionAccess = StubCoordinatorSelectionAccess(),
-        editor: StubLocalEditService = StubLocalEditService(result: .success("edited")),
+        editor: any LocalEditServicing = StubLocalEditService(result: .success("edited")),
         matcher: @escaping @Sendable (String) async throws -> SnippetMatch = { _ in .none },
-        copy: @escaping (String) -> Void = { _ in }
+        copy: @escaping (String) throws -> Void = { _ in }
     ) -> VoiceEditCoordinator {
         VoiceEditCoordinator(
             selection: selection, instruction: instruction, selectionAccess: access,
@@ -139,15 +202,38 @@ private enum TestError: Error { case failed }
 
 @MainActor
 private final class StubCoordinatorSelectionAccess: SelectionAccessing {
-    var replacements: [String] = []
-    var successfulWrites = 0
+    var mutations: [String] = []
+    var replacements: [String] { mutations }
     let replaceError: Error?
     init(replaceError: Error? = nil) { self.replaceError = replaceError }
     func capture() throws -> SelectionSnapshot { throw SelectionAccessError.noEditableSelection }
     func replace(_ snapshot: SelectionSnapshot, with text: String) throws {
-        replacements.append(text)
         if let replaceError { throw replaceError }
-        successfulWrites += 1
+        mutations.append(text)
+    }
+}
+
+@MainActor
+private final class SuspendingLocalEditService: LocalEditServicing {
+    private var requestContinuation: CheckedContinuation<Void, Never>?
+    private var responseContinuation: CheckedContinuation<String, Never>?
+    private var requested = false
+
+    func edit(selectedText: String, instruction: String) async throws -> String {
+        requested = true
+        requestContinuation?.resume()
+        requestContinuation = nil
+        return await withCheckedContinuation { responseContinuation = $0 }
+    }
+
+    func waitUntilRequested() async {
+        if requested { return }
+        await withCheckedContinuation { requestContinuation = $0 }
+    }
+
+    func resume(returning result: String) {
+        responseContinuation?.resume(returning: result)
+        responseContinuation = nil
     }
 }
 
