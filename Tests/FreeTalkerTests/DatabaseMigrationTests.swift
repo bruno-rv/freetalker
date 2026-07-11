@@ -38,6 +38,60 @@ import Testing
         #expect(try db.integer("SELECT COUNT(*) FROM job_attempts WHERE id = 77;") == 0)
     }
 
+    @Test func versionEightUpgradeDiscardsOrphanAttemptsAndPreservesValidAttemptsAndTriggers() throws {
+        let db = try TemporaryDatabase()
+        try DatabaseMigrator.migrate(db.handle)
+        try db.execute("""
+        PRAGMA foreign_keys = OFF;
+        CREATE TABLE attempts_v8 AS SELECT * FROM job_attempts;
+        DROP TABLE job_attempts;
+        ALTER TABLE attempts_v8 RENAME TO job_attempts;
+        CREATE INDEX idx_job_attempts_job_id ON job_attempts(job_id);
+        CREATE TABLE job_attempt_triggers (attempt_id INTEGER NOT NULL, trigger TEXT NOT NULL, PRIMARY KEY(attempt_id, trigger));
+        DELETE FROM schema_migrations WHERE version = 9;
+        INSERT INTO transcription_jobs (id, kind, source_reference, state, created_at, updated_at) VALUES ('valid-job', 'recovery', '/audio', 'failed', 1, 2);
+        INSERT INTO job_attempts (id, job_id, attempt_number, started_at, completed_at, failure_stage, failure_message, language, speech_model, template, result)
+          VALUES (41, 'valid-job', 3, 10, 20, 'transcribing', 'kept failure', 'pt', 'small', 'clean', 'failed');
+        INSERT INTO job_attempts (id, job_id, attempt_number, started_at, language, speech_model, template, result)
+          VALUES (42, 'missing-job', 1, 30, 'en', 'large', 'raw', 'failed');
+        INSERT INTO job_attempt_triggers VALUES (41, 'valid-trigger'), (42, 'orphan-trigger');
+        """)
+
+        try DatabaseMigrator.migrate(db.handle)
+
+        #expect(try db.string("SELECT id || '|' || job_id || '|' || attempt_number || '|' || started_at || '|' || completed_at || '|' || failure_stage || '|' || failure_message || '|' || language || '|' || speech_model || '|' || template || '|' || result FROM job_attempts WHERE id = 41;") == "41|valid-job|3|10.0|20.0|transcribing|kept failure|pt|small|clean|failed")
+        #expect(try db.integer("SELECT COUNT(*) FROM job_attempts WHERE id = 42;") == 0)
+        #expect(try db.integer("SELECT COUNT(*) FROM job_attempt_triggers WHERE attempt_id = 41 AND trigger = 'valid-trigger';") == 1)
+        #expect(try db.integer("SELECT COUNT(*) FROM job_attempt_triggers WHERE attempt_id = 42;") == 0)
+        try db.execute("PRAGMA foreign_keys = ON; DELETE FROM transcription_jobs WHERE id = 'valid-job';")
+        #expect(try db.integer("SELECT COUNT(*) FROM job_attempts WHERE id = 41;") == 0)
+        #expect(try db.integer("SELECT COUNT(*) FROM job_attempt_triggers WHERE attempt_id = 41;") == 0)
+    }
+
+    @Test func versionNineFailureRollsBackAttemptsTriggersAndLedger() throws {
+        let db = try TemporaryDatabase()
+        try DatabaseMigrator.migrate(db.handle)
+        try db.execute("""
+        PRAGMA foreign_keys = OFF;
+        CREATE TABLE attempts_v8 AS SELECT * FROM job_attempts;
+        DROP TABLE job_attempts;
+        ALTER TABLE attempts_v8 RENAME TO job_attempts;
+        CREATE INDEX idx_job_attempts_job_id ON job_attempts(job_id);
+        CREATE TABLE job_attempt_triggers (attempt_id INTEGER NOT NULL, trigger TEXT NOT NULL, PRIMARY KEY(attempt_id, trigger));
+        CREATE TABLE legacy_job_attempts (collision INTEGER);
+        DELETE FROM schema_migrations WHERE version = 9;
+        INSERT INTO job_attempts (id, job_id, attempt_number, started_at) VALUES (88, 'orphan', 1, 1);
+        INSERT INTO job_attempt_triggers VALUES (88, 'kept-on-rollback');
+        """)
+
+        #expect(throws: DatabaseError.self) { try DatabaseMigrator.migrate(db.handle) }
+
+        #expect(try db.migrationVersions() == Array(1...8))
+        #expect(try db.integer("SELECT COUNT(*) FROM job_attempts WHERE id = 88;") == 1)
+        #expect(try db.integer("SELECT COUNT(*) FROM job_attempt_triggers WHERE attempt_id = 88 AND trigger = 'kept-on-rollback';") == 1)
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('legacy_job_attempts') WHERE name = 'collision';") == 1)
+    }
+
     @Test func migratingLatestSchemaAgainMakesNoChanges() throws {
         let db = try TemporaryDatabase()
         try DatabaseMigrator.migrate(db.handle)
