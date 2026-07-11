@@ -45,7 +45,9 @@ struct TimelineJoiner: Sendable {
             }
         }
 
-        let durations = Dictionary(grouping: intervals, by: \.speakerID).mapValues(unionDuration)
+        let durations = Dictionary(grouping: intervals, by: \.speakerID).mapValues {
+            quantizedMilliseconds(unionDuration($0))
+        }
         guard let greatest = durations.values.max() else { return nil }
         let winners = durations.filter { $0.value == greatest }.map(\.key)
         return winners.count == 1 ? winners[0] : nil
@@ -70,6 +72,13 @@ struct TimelineJoiner: Sendable {
             }
         }
         return duration + current.end - current.start
+    }
+
+    /// Timeline attribution uses the pipeline's millisecond timestamp resolution.
+    private func quantizedMilliseconds(_ duration: TimeInterval) -> Int {
+        let scaled = duration * 1_000
+        guard scaled.isFinite, scaled < Double(Int.max) else { return Int.max }
+        return Int(scaled.rounded())
     }
 }
 

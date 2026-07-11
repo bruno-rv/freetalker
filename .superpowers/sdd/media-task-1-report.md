@@ -42,7 +42,7 @@ make app
 git diff --check
 ```
 
-All commands exited 0. The final `make test` passed 186 tests in 18 suites. `make app`
+All commands exited 0. The final `make test` passed 188 tests in 18 suites. `make app`
 completed the release build, bundle assembly, and ad-hoc signing. `git diff --check`
 produced no output.
 
@@ -51,6 +51,9 @@ produced no output.
 - Added sequential equal/unequal speaker-transition tests and concurrent equal/unequal
   speech tests. Sequential attribution uses the unique greatest union duration; exact
   ties and any positive-duration concurrency across distinct speakers remain ambiguous.
+- Speaker union durations are ranked as saturated integer milliseconds, matching the
+  pipeline/export timestamp resolution. Mathematically equal fragmented and contiguous
+  durations now tie deterministically; a one-millisecond advantage remains decisive.
 - Added strict join validation for transcript and speaker intervals: both endpoints
   must be finite, start must be nonnegative, and end must be greater than start.
   Invalid transcript segments remain in the result but are unattributed. Export cue
@@ -62,7 +65,7 @@ produced no output.
   conversion. Huge finite timestamps saturate without trapping and near-ceiling cues
   remain valid and monotonic.
 - Review-focused RED cycles recorded the expected ambiguity/escaping failures and the
-  prior fatal huge-timestamp conversion trap. The final focused GREEN passed 17 tests
+  prior fatal huge-timestamp conversion trap. The final focused GREEN passed 19 tests
   in `TimelineAndExportTests`.
 
 ## Dependency note
