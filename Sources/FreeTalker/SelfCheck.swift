@@ -1532,6 +1532,60 @@ enum SelfCheck {
             failures.append("isCloudLLMConfigured: expected a blank base URL to fall back to on-device")
         }
 
+        func openAICompatible(baseURL: String, key: String?) -> CloudLLMSettingsSnapshot {
+            CloudLLMSettingsSnapshot(
+                provider: .openAICompatible,
+                baseURL: baseURL,
+                model: "llama3.2",
+                key: key,
+                vocabulary: []
+            )
+        }
+
+        for loopbackURL in [
+            "http://localhost:11434/v1",
+            "http://127.0.0.1:11434/v1",
+            "http://[::1]:11434/v1",
+        ] where !AppCoordinator.isCloudLLMConfigured(snapshot: openAICompatible(baseURL: loopbackURL, key: "   ")) {
+            failures.append("isCloudLLMConfigured: expected empty-key local OpenAI-compatible URL to be eligible: \(loopbackURL)")
+        }
+
+        for remoteURL in ["http://example.com/v1", "https://example.com/v1"]
+        where AppCoordinator.isCloudLLMConfigured(snapshot: openAICompatible(baseURL: remoteURL, key: nil)) {
+            failures.append("isCloudLLMConfigured: expected empty-key remote URL to be ineligible: \(remoteURL)")
+        }
+
+        for malformedURL in ["not a URL", "http://", "://localhost:11434/v1"]
+        where AppCoordinator.isCloudLLMConfigured(snapshot: openAICompatible(baseURL: malformedURL, key: "sk-test")) {
+            failures.append("isCloudLLMConfigured: expected malformed URL to be ineligible: \(malformedURL)")
+        }
+
+        if !AppCoordinator.isCloudLLMConfigured(snapshot: openAICompatible(baseURL: "http://localhost:11434/v1", key: "local-key")) {
+            failures.append("isCloudLLMConfigured: expected supplied local key to remain eligible")
+        }
+        let localAnthropicWithoutKey = CloudLLMSettingsSnapshot(
+            provider: .anthropic,
+            baseURL: "http://localhost:11434/v1",
+            model: "claude-local",
+            key: nil,
+            vocabulary: []
+        )
+        if AppCoordinator.isCloudLLMConfigured(snapshot: localAnthropicWithoutKey) {
+            failures.append("isCloudLLMConfigured: expected localhost exception not to affect Anthropic")
+        }
+
+        let emptyKeyHeaders = CloudLLMProcessor.openAICompatibleHeaders(apiKey: nil)
+        if emptyKeyHeaders["Authorization"] != nil {
+            failures.append("openAICompatibleHeaders: expected Authorization to be omitted without a key")
+        }
+        if emptyKeyHeaders["Content-Type"] != "application/json" {
+            failures.append("openAICompatibleHeaders: expected JSON content type without a key")
+        }
+        let suppliedKeyHeaders = CloudLLMProcessor.openAICompatibleHeaders(apiKey: "local-key")
+        if suppliedKeyHeaders["Authorization"] != "Bearer local-key" {
+            failures.append("openAICompatibleHeaders: expected supplied local key to retain bearer authorization")
+        }
+
         // Legacy templates.json with the removed `useCloud` key must still decode — synthesized
         // Codable ignores unknown keys once the property is gone from the struct.
         let legacyJSON = Data("""

@@ -351,7 +351,7 @@ private struct GeneralSettingsView: View {
                             .foregroundStyle(cloudLLMTestResult.hasSuffix("Connected ✓") ? .green : .red)
                     }
                 }
-                Text("Used for all templates whenever provider, model, and API key are configured. Clear the key to go back to on-device processing.")
+                Text("Used for all templates whenever provider, model, and required API key are configured. OpenAI-compatible loopback HTTP endpoints can be used without a key.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

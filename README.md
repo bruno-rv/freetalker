@@ -151,8 +151,9 @@ app, or logged.
   provider, base URL, and model. Supported providers are OpenAI-compatible endpoints
   (including [Ollama cloud](https://ollama.com/v1)) and Anthropic. Once a provider has a key,
   endpoint, and model all set, cloud post-processing runs automatically for every Dictation —
-  it isn't chosen per Template. Leave any of the three unset and FreeTalker falls back to the
-  on-device Apple model.
+  it isn't chosen per Template. A key is optional only for an OpenAI-compatible loopback HTTP
+  endpoint (`localhost`, `127.0.0.1`, or `::1`); other endpoints and providers still require
+  one. Leave any required field unset and FreeTalker falls back to the on-device Apple model.
 
 Both sections have a **Test connection** button, enabled once the required fields are filled
 in. It sends a single request and reports a fixed status hint — "Connected ✓", an HTTP failure
@@ -161,7 +162,7 @@ response body or the key itself.
 
 For fully local LLM post-processing, run Ollama Desktop and use the existing
 OpenAI-compatible BYOK provider with `http://localhost:11434/v1`. Ollama's local endpoint
-doesn't require an API key.
+doesn't require an API key; FreeTalker omits the Authorization header when the key is empty.
 
 ![Settings](docs/settings.png)
 *Settings → General: permissions status, hotkey, hands-free auto-stop, microphone, engine

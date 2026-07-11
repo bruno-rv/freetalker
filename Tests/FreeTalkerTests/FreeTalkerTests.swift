@@ -63,7 +63,7 @@ struct FreeTalkerTests {
             engineName: fakeEngine.name,
             template: template,
             processor: PassthroughPostProcessor(),
-            insert: { _ in true },
+            insert: { _, _ in true },
             record: recordToTempDB
         )
         #expect(!resultA.refined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -77,7 +77,7 @@ struct FreeTalkerTests {
             engineName: fakeEngine.name,
             template: template,
             processor: EmptyPostProcessor(),
-            insert: { _ in true },
+            insert: { _, _ in true },
             record: recordToTempDB
         )
         #expect(resultB.refined == resultB.transcript)
