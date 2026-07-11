@@ -1,8 +1,10 @@
+@preconcurrency import AVFoundation
 import Foundation
 import UniformTypeIdentifiers
 
 enum MediaImportError: LocalizedError, Equatable {
     case unsupportedType
+    case invalidMedia
     case missingBookmark
     case staleBookmark
     case securityScopeDenied
@@ -13,12 +15,35 @@ enum MediaImportError: LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .unsupportedType: "Choose a WAV, M4A, MP3, MP4, or MOV file."
+        case .invalidMedia: "The selected file is not readable local audio or video media."
         case .missingBookmark: "The imported file no longer has a saved access bookmark."
         case .staleBookmark: "The imported file's saved access is stale. Choose the file again."
         case .securityScopeDenied: "FreeTalker could not access the imported file."
         case .jobNotFound: "The media import job no longer exists."
         case .noAudioTrack: "The selected video does not contain an audio track."
         case .decodeFailed(let message): "The media audio could not be decoded: \(message)"
+        }
+    }
+}
+
+protocol MediaAssetProbing: Sendable {
+    func validateAudio(at url: URL) async throws
+}
+
+struct AVMediaAssetProbe: MediaAssetProbing {
+    func validateAudio(at url: URL) async throws {
+        let asset = AVURLAsset(url: url)
+        do {
+            async let readable = asset.load(.isReadable)
+            async let playable = asset.load(.isPlayable)
+            guard try await readable, try await playable else { throw MediaImportError.invalidMedia }
+            guard !(try await asset.loadTracks(withMediaType: .audio)).isEmpty else {
+                throw MediaImportError.noAudioTrack
+            }
+        } catch let error as MediaImportError {
+            throw error
+        } catch {
+            throw MediaImportError.invalidMedia
         }
     }
 }
@@ -76,6 +101,7 @@ struct MediaImportService: Sendable {
 
     private let store: any MediaImportJobStoring
     private let bookmarkAccess: any SecurityScopedBookmarkAccessing
+    private let mediaProbe: any MediaAssetProbing
     private let decoder: any MediaAudioDecoding
     private let clock: @Sendable () -> Date
 
@@ -83,11 +109,13 @@ struct MediaImportService: Sendable {
         store: any MediaImportJobStoring,
         bookmarkAccess: any SecurityScopedBookmarkAccessing = FoundationSecurityScopedBookmarkAccess(),
         decoder: any MediaAudioDecoding = AVAudioDecoder(),
+        mediaProbe: any MediaAssetProbing = AVMediaAssetProbe(),
         clock: @escaping @Sendable () -> Date = Date.init
     ) {
         self.store = store
         self.bookmarkAccess = bookmarkAccess
         self.decoder = decoder
+        self.mediaProbe = mediaProbe
         self.clock = clock
     }
 
@@ -99,7 +127,16 @@ struct MediaImportService: Sendable {
 
     func createJob(for sourceURL: URL) async throws -> UUID {
         guard Self.isSupported(sourceURL) else { throw MediaImportError.unsupportedType }
-        let bookmark = try await bookmarkAccess.createBookmark(for: sourceURL)
+        guard await bookmarkAccess.startAccessing(sourceURL) else { throw MediaImportError.securityScopeDenied }
+        let bookmark: Data
+        do {
+            try await mediaProbe.validateAudio(at: sourceURL)
+            bookmark = try await bookmarkAccess.createBookmark(for: sourceURL)
+            await bookmarkAccess.stopAccessing(sourceURL)
+        } catch {
+            await bookmarkAccess.stopAccessing(sourceURL)
+            throw error
+        }
         let source = JobSource(reference: sourceURL.path, bookmark: bookmark)
         return try await store.create(kind: .mediaImport, source: source, now: clock()).id
     }
