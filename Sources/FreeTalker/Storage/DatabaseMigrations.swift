@@ -1,7 +1,7 @@
 import CSQLite
 
 enum DatabaseMigrator {
-    static let latestVersion = 3
+    static let latestVersion = 4
 
     static func migrate(_ db: OpaquePointer) throws {
         try execute(db, "BEGIN IMMEDIATE;")
@@ -105,7 +105,14 @@ enum DatabaseMigrator {
         ON transcription_jobs (purge_claimed_at);
     """
 
-    private static let migrations = [migration1, migration2, migration3]
+    private static let migration4 = """
+    ALTER TABLE transcription_jobs ADD COLUMN needs_source_cleanup INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE transcription_jobs ADD COLUMN source_cleanup_error TEXT;
+    CREATE INDEX idx_transcription_jobs_needs_source_cleanup
+        ON transcription_jobs (needs_source_cleanup);
+    """
+
+    private static let migrations = [migration1, migration2, migration3, migration4]
 
     private static func appliedVersions(_ db: OpaquePointer) throws -> [Int] {
         var statement: OpaquePointer?

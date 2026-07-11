@@ -64,4 +64,59 @@ Result: exit 0; 42 tests in 5 suites passed, the release build completed, and `g
 
 ## Concerns
 
-- Launch resumes persisted queued recoveries with default attempt configuration. A later retry UI can pass explicit overrides directly to `RecoveryRetryPipeline`; no override-selection UI is part of this task.
+None at initial implementation; subsequent review findings are addressed below.
+
+## Review follow-up: durable restart, finalization arbitration, and cleanup ledger
+
+### Root causes
+
+- Restart constructed a default configuration and unconditionally appended an attempt, so an
+  interrupted override was lost and the audit log gained a second attempt.
+- Pipeline-owned ready completion occurred before the runner entered its finalizing phase,
+  leaving an await-sized cancellation race.
+- Attempt success and job readiness were two independent writes.
+- An unscoped runner discovered media-import rows.
+- Source deletion failure was caught as if processing failed, despite the Dictation and job
+  already being committed successfully.
+
+### RED
+
+Focused command:
+
+```text
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter 'RecoveryRetryTests|LocalJobRunnerTests|TranscriptionJobStoreTests|DatabaseMigrationTests'
+```
+
+Result: exit 1 with expected missing APIs and metadata, including
+`latestUnfinishedAttempt`, `completeAttemptAndMarkJobReady`, `needsSourceCleanup`,
+optional retry configuration, and the runner `kind` scope.
+
+### Changes
+
+- Migration 4 adds `needs_source_cleanup` and `source_cleanup_error`, including a populated
+  version-3 upgrade regression.
+- Restart reads the latest unfinished attempt and reuses its exact persisted language/model/
+  template configuration, even when a conflicting override is supplied. No new attempt is
+  created.
+- `CancellationToken.beginFinalization()` calls back into the runner actor. Token cancellation
+  check and the `executing` to `finalizing` phase flip occur in one actor turn before any
+  completion await. Cancellation before it wins; cancellation after it returns `tooLate`.
+- `completeAttemptAndMarkJobReady` commits attempt success, ready state, and cleanup-needed
+  metadata in one `BEGIN IMMEDIATE` transaction; any failed predicate rolls back both writes.
+- Recovery launch and resume are scoped to `.recovery`, and wrong-kind enqueue is ignored.
+- Cleanup happens only after the atomic ready commit. Failure keeps the ready/succeeded state,
+  retains the WAV, and records an explicit cleanup error. Launch retries cleanup; success removes
+  the exact owned UUID WAV and clears both metadata fields.
+
+### Verification
+
+```text
+make test && DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build -c release && git diff --check
+```
+
+Result: exit 0; 50 tests in 5 suites passed, the release build completed, and the diff check
+produced no output.
+
+### Concerns
+
+None.

@@ -42,7 +42,7 @@ actor TranscriptionJobStore {
         return TranscriptionJob(
             id: id, kind: kind, source: source, state: .queued, progress: 0,
             createdAt: now, updatedAt: now, startedAt: nil, completedAt: nil,
-            expiresAt: nil, result: nil
+            expiresAt: nil, result: nil, needsSourceCleanup: false, sourceCleanupError: nil
         )
     }
 
@@ -69,7 +69,8 @@ actor TranscriptionJobStore {
         return TranscriptionJob(
             id: id, kind: .recovery, source: source, state: .failed(metadata.failure), progress: 0,
             createdAt: metadata.capturedAt, updatedAt: metadata.capturedAt, startedAt: nil,
-            completedAt: metadata.capturedAt, expiresAt: nil, result: nil
+            completedAt: metadata.capturedAt, expiresAt: nil, result: nil,
+            needsSourceCleanup: false, sourceCleanupError: nil
         )
     }
 
@@ -157,7 +158,7 @@ actor TranscriptionJobStore {
         let statement = try prepare("""
         SELECT id, kind, source_reference, source_bookmark, state, progress,
                created_at, updated_at, started_at, completed_at, expires_at,
-               failure_stage, failure_message, result
+               failure_stage, failure_message, result, needs_source_cleanup, source_cleanup_error
         FROM transcription_jobs WHERE id = ?;
         """)
         defer { sqlite3_finalize(statement) }
@@ -175,7 +176,7 @@ actor TranscriptionJobStore {
             statement = try prepare("""
             SELECT id, kind, source_reference, source_bookmark, state, progress,
                    created_at, updated_at, started_at, completed_at, expires_at,
-                   failure_stage, failure_message, result
+                   failure_stage, failure_message, result, needs_source_cleanup, source_cleanup_error
             FROM transcription_jobs WHERE kind = ? ORDER BY created_at, id;
             """)
             bind(kind.rawValue, to: 1, in: statement)
@@ -183,7 +184,7 @@ actor TranscriptionJobStore {
             statement = try prepare("""
             SELECT id, kind, source_reference, source_bookmark, state, progress,
                    created_at, updated_at, started_at, completed_at, expires_at,
-                   failure_stage, failure_message, result
+                   failure_stage, failure_message, result, needs_source_cleanup, source_cleanup_error
             FROM transcription_jobs ORDER BY created_at, id;
             """)
         }
@@ -288,6 +289,105 @@ actor TranscriptionJobStore {
         guard sqlite3_changes(handle) == 1 else { throw JobStoreError.attemptNotFound }
     }
 
+    func latestUnfinishedAttempt(jobID: UUID) throws -> JobAttempt? {
+        let statement = try prepare("""
+        SELECT id, job_id, attempt_number, started_at, completed_at,
+               language, speech_model, template, result, failure_stage, failure_message
+        FROM job_attempts
+        WHERE job_id = ? AND completed_at IS NULL
+        ORDER BY attempt_number DESC LIMIT 1;
+        """)
+        defer { sqlite3_finalize(statement) }
+        bind(jobID.uuidString, to: 1, in: statement)
+        switch sqlite3_step(statement) {
+        case SQLITE_ROW: return try decodeAttempt(statement)
+        case SQLITE_DONE: return nil
+        default: throw sqlError()
+        }
+    }
+
+    func completeAttemptAndMarkJobReady(jobID: UUID, attemptID: Int64) throws {
+        try execute("BEGIN IMMEDIATE;")
+        do {
+            do {
+                let attempt = try prepare("""
+                UPDATE job_attempts
+                SET completed_at = ?, result = 'succeeded', failure_stage = NULL, failure_message = NULL
+                WHERE id = ? AND job_id = ? AND completed_at IS NULL;
+                """)
+                defer { sqlite3_finalize(attempt) }
+                sqlite3_bind_double(attempt, 1, clock.now.timeIntervalSince1970)
+                sqlite3_bind_int64(attempt, 2, attemptID)
+                bind(jobID.uuidString, to: 3, in: attempt)
+                try stepDone(attempt)
+                guard sqlite3_changes(handle) == 1 else { throw JobStoreError.attemptNotFound }
+            }
+            do {
+                let job = try prepare("""
+                UPDATE transcription_jobs
+                SET state = 'ready', failure_stage = NULL, failure_message = NULL,
+                    updated_at = ?, completed_at = ?, needs_source_cleanup = 1,
+                    source_cleanup_error = NULL
+                WHERE id = ? AND kind = 'recovery' AND state = 'processing'
+                  AND purge_claimed_at IS NULL;
+                """)
+                defer { sqlite3_finalize(job) }
+                sqlite3_bind_double(job, 1, clock.now.timeIntervalSince1970)
+                sqlite3_bind_double(job, 2, clock.now.timeIntervalSince1970)
+                bind(jobID.uuidString, to: 3, in: job)
+                try stepDone(job)
+                guard sqlite3_changes(handle) == 1 else { throw JobStoreError.invalidTransition }
+            }
+            try execute("COMMIT;")
+        } catch {
+            try? execute("ROLLBACK;")
+            throw error
+        }
+    }
+
+    func recordSourceCleanupError(jobID: UUID, message: String) throws {
+        let statement = try prepare("""
+        UPDATE transcription_jobs SET needs_source_cleanup = 1, source_cleanup_error = ?
+        WHERE id = ? AND kind = 'recovery' AND state = 'ready';
+        """)
+        defer { sqlite3_finalize(statement) }
+        bind(message, to: 1, in: statement)
+        bind(jobID.uuidString, to: 2, in: statement)
+        try stepDone(statement)
+        guard sqlite3_changes(handle) == 1 else { throw JobStoreError.invalidTransition }
+    }
+
+    func completeSourceCleanup(jobID: UUID) throws {
+        let statement = try prepare("""
+        UPDATE transcription_jobs SET needs_source_cleanup = 0, source_cleanup_error = NULL
+        WHERE id = ? AND kind = 'recovery' AND state = 'ready' AND needs_source_cleanup = 1;
+        """)
+        defer { sqlite3_finalize(statement) }
+        bind(jobID.uuidString, to: 1, in: statement)
+        try stepDone(statement)
+        guard sqlite3_changes(handle) == 1 else { throw JobStoreError.invalidTransition }
+    }
+
+    func jobsNeedingSourceCleanup() throws -> [TranscriptionJob] {
+        let statement = try prepare("""
+        SELECT id, kind, source_reference, source_bookmark, state, progress,
+               created_at, updated_at, started_at, completed_at, expires_at,
+               failure_stage, failure_message, result, needs_source_cleanup, source_cleanup_error
+        FROM transcription_jobs
+        WHERE kind = 'recovery' AND state = 'ready' AND needs_source_cleanup = 1
+        ORDER BY updated_at, id;
+        """)
+        defer { sqlite3_finalize(statement) }
+        var jobs: [TranscriptionJob] = []
+        var result = sqlite3_step(statement)
+        while result == SQLITE_ROW {
+            jobs.append(try decodeJob(statement))
+            result = sqlite3_step(statement)
+        }
+        guard result == SQLITE_DONE else { throw sqlError() }
+        return jobs
+    }
+
     func attempts(jobID: UUID) throws -> [JobAttempt] {
         let statement = try prepare("""
         SELECT id, job_id, attempt_number, started_at, completed_at,
@@ -306,13 +406,24 @@ actor TranscriptionJobStore {
         return values
     }
 
-    func recoverInterruptedJobs() throws -> Int {
-        let statement = try prepare("""
-        UPDATE transcription_jobs
-        SET state = 'queued', failure_stage = NULL, failure_message = NULL,
-            updated_at = ?, completed_at = NULL
-        WHERE state = 'processing';
-        """)
+    func recoverInterruptedJobs(kind: JobKind? = nil) throws -> Int {
+        let statement: OpaquePointer
+        if let kind {
+            statement = try prepare("""
+            UPDATE transcription_jobs
+            SET state = 'queued', failure_stage = NULL, failure_message = NULL,
+                updated_at = ?, completed_at = NULL
+            WHERE state = 'processing' AND kind = ?;
+            """)
+            bind(kind.rawValue, to: 2, in: statement)
+        } else {
+            statement = try prepare("""
+            UPDATE transcription_jobs
+            SET state = 'queued', failure_stage = NULL, failure_message = NULL,
+                updated_at = ?, completed_at = NULL
+            WHERE state = 'processing';
+            """)
+        }
         defer { sqlite3_finalize(statement) }
         sqlite3_bind_double(statement, 1, clock.now.timeIntervalSince1970)
         try stepDone(statement)
@@ -382,7 +493,9 @@ actor TranscriptionJobStore {
             state: state, progress: sqlite3_column_double(statement, 5),
             createdAt: date(statement, 6)!, updatedAt: date(statement, 7)!,
             startedAt: date(statement, 8), completedAt: date(statement, 9),
-            expiresAt: date(statement, 10), result: optionalText(statement, 13)
+            expiresAt: date(statement, 10), result: optionalText(statement, 13),
+            needsSourceCleanup: sqlite3_column_int(statement, 14) == 1,
+            sourceCleanupError: optionalText(statement, 15)
         )
     }
 
@@ -423,6 +536,15 @@ actor TranscriptionJobStore {
 
     private func stepDone(_ statement: OpaquePointer) throws {
         guard sqlite3_step(statement) == SQLITE_DONE else { throw sqlError() }
+    }
+
+    private func execute(_ sql: String) throws {
+        var message: UnsafeMutablePointer<CChar>?
+        guard sqlite3_exec(handle, sql, nil, nil, &message) == SQLITE_OK else {
+            let detail = message.map { String(cString: $0) } ?? String(cString: sqlite3_errmsg(handle))
+            sqlite3_free(message)
+            throw DatabaseError.sqlFailed(detail)
+        }
     }
 
     private func sqlError() -> DatabaseError {

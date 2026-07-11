@@ -909,6 +909,7 @@ final class AppCoordinator: ObservableObject {
     func launchRecoveryWorkflows() async {
         guard let recoveryStore else { return }
         let pipeline = RecoveryRetryPipeline(
+            directory: Self.recoveryDirectory,
             store: recoveryStore,
             processDictation: { [weak self] samples, configuration in
                 guard let self else { throw CancellationError() }
@@ -919,11 +920,12 @@ final class AppCoordinator: ObservableObject {
                 return .transcribing
             }
         )
-        let runner = LocalJobRunner(store: recoveryStore, executorFinalizesJob: true) { job, token in
-            try await pipeline.execute(jobID: job.id, configuration: AttemptConfiguration(), cancellation: token)
+        let runner = LocalJobRunner(store: recoveryStore, kind: .recovery, executorFinalizesJob: true) { job, token in
+            try await pipeline.execute(jobID: job.id, configuration: nil, cancellation: token)
         }
         recoveryRunner = runner
-        _ = try? await recoveryStore.recoverInterruptedJobs()
+        await pipeline.retryPendingSourceCleanup()
+        _ = try? await recoveryStore.recoverInterruptedJobs(kind: .recovery)
         _ = try? await RecoveryRetentionService(directory: Self.recoveryDirectory, store: recoveryStore)
             .purgeExpired(now: Date(), retention: AppSettings.shared.recoveryRetention)
         await runner.resumeQueuedJobs()
