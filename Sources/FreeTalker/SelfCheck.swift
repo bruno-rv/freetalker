@@ -2624,6 +2624,36 @@ enum SelfCheck {
     @MainActor
     private static func speechModelManagementChecks() async -> [String] {
         var failures: [String] = []
+        let progressGuard = ModelLoadProgressGuard()
+        let activeProgress = progressGuard.begin(variant: "delayed-active")
+        let activeRelease = OneShotSignal()
+        var activeVisible = "loading"
+        let delayedActiveProgress = Task { @MainActor in
+            await activeRelease.wait()
+            if progressGuard.isCurrent(activeProgress) { activeVisible = "downloading" }
+        }
+        progressGuard.finish(activeProgress)
+        activeVisible = "Ready — Delayed Active"
+        await activeRelease.fire()
+        await delayedActiveProgress.value
+        if activeVisible != "Ready — Delayed Active" {
+            failures.append("speech model engine: delayed progress regressed terminal active/Ready")
+        }
+
+        let failedProgress = progressGuard.begin(variant: "delayed-failure")
+        let failureRelease = OneShotSignal()
+        var failureVisible = "loading"
+        let delayedFailureProgress = Task { @MainActor in
+            await failureRelease.wait()
+            if progressGuard.isCurrent(failedProgress) { failureVisible = "downloading" }
+        }
+        progressGuard.finish(failedProgress)
+        failureVisible = "Failed to load Delayed Failure"
+        await failureRelease.fire()
+        await delayedFailureProgress.value
+        if failureVisible != "Failed to load Delayed Failure" {
+            failures.append("speech model engine: delayed progress regressed terminal failure")
+        }
         let controller = ModelReloadController<String>()
         let probe = ProductionReloadProbe(setting: "old")
         let loader: ModelReloadController<String>.Loader = { try await probe.load($0) }

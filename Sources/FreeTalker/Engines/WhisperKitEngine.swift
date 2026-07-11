@@ -137,6 +137,35 @@ final class GuardedKitState<Kit>: @unchecked Sendable {
     }
 }
 
+final class ModelLoadProgressGuard: @unchecked Sendable {
+    struct Attempt: Sendable, Equatable {
+        let id: UUID
+        let variant: String
+    }
+
+    private let attempts = OSAllocatedUnfairLock(initialState: [String: UUID]())
+
+    func begin(variant: String) -> Attempt {
+        let attempt = Attempt(id: UUID(), variant: variant)
+        attempts.withLock { $0[variant] = attempt.id }
+        return attempt
+    }
+
+    func isCurrent(_ attempt: Attempt) -> Bool {
+        attempts.withLock { $0[attempt.variant] == attempt.id }
+    }
+
+    func finish(_ attempt: Attempt) {
+        attempts.withLock {
+            if $0[attempt.variant] == attempt.id { $0.removeValue(forKey: attempt.variant) }
+        }
+    }
+
+    func finishCurrent(variant: String) {
+        _ = attempts.withLock { $0.removeValue(forKey: variant) }
+    }
+}
+
 final class ModelReloadController<Kit>: @unchecked Sendable {
     private final class ResultBox: @unchecked Sendable { var kit: Kit? }
     typealias Loader = @Sendable (String) async throws -> Kit
@@ -217,6 +246,7 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
     private let modelController = ModelReloadController<WhisperKit>()
     private let gate = SerialGate()
     private let downloadCoordinator: SpeechModelDownloadCoordinator
+    private let progressGuard = ModelLoadProgressGuard()
     @MainActor private weak var eventReceiver: (any SpeechModelEngineEventReceiving)?
 
     /// Whether the model has already been loaded (preloaded at launch, or lazily by an earlier
@@ -264,7 +294,7 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
             // `Void`, not the loaded instance.
             try await gate.run { _ = try await self.loadedKit() }
         } catch {
-            await setStatus("Preload failed: \(error.localizedDescription)")
+            // `loadedKit` publishes the model-named terminal failure status/event.
         }
     }
 
@@ -465,13 +495,7 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
                     }
                 }
             },
-            loader: { variant in
-                do { return try await self.loadModel(variant: variant) }
-                catch {
-                    await self.setStatus("Failed to load \(Self.displayName(for: variant)): \(error.localizedDescription)")
-                    throw error
-                }
-            },
+            loader: { try await self.loadModel(variant: $0) },
             event: { await self.emit($0, for: $1) },
             didInstall: { _ in await self.setReadyStatus() }
         )
@@ -479,9 +503,10 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
 
     private func loadModel(variant: String) async throws -> WhisperKit {
         let displayName = Self.displayName(for: variant)
+        let attempt = progressGuard.begin(variant: variant)
         await setStatus("Checking for \(displayName)…")
         let folder = try await downloadCoordinator.download(variant: variant) { [weak self] progress in
-            Task { await self?.reportDownloadProgress(progress, variant: variant, displayName: displayName) }
+            Task { @MainActor in self?.reportDownloadProgress(progress, attempt: attempt, displayName: displayName) }
         }
         await setStatus("Loading \(displayName)…")
         let config = WhisperKitConfig(modelFolder: folder.path, verbose: false, logLevel: .none, load: true, download: false)
@@ -489,13 +514,26 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
         return kit
     }
 
-    private func reportDownloadProgress(_ progress: Double, variant: String, displayName: String) async {
-        await emit(.downloading(progress: progress), for: variant)
-        await setStatus("Downloading \(displayName)… \(Int(progress * 100))%")
+    @MainActor
+    private func reportDownloadProgress(_ progress: Double, attempt: ModelLoadProgressGuard.Attempt, displayName: String) {
+        guard progressGuard.isCurrent(attempt) else { return }
+        eventReceiver?.receiveEngineEvent(.downloading(progress: progress), for: attempt.variant)
+        statusText = "Downloading \(displayName)… \(Int(progress * 100))%"
     }
 
     private func emit(_ event: SpeechModelEngineEvent, for variant: String) async {
-        await MainActor.run { eventReceiver?.receiveEngineEvent(event, for: variant) }
+        await MainActor.run {
+            switch event {
+            case .active:
+                progressGuard.finishCurrent(variant: variant)
+            case .failed(let hint):
+                progressGuard.finishCurrent(variant: variant)
+                statusText = "Failed to load \(Self.displayName(for: variant)): \(hint)"
+            default:
+                break
+            }
+            eventReceiver?.receiveEngineEvent(event, for: variant)
+        }
     }
 
     private func setReadyStatus() async {
