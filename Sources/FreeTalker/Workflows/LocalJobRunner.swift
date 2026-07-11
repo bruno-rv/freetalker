@@ -49,7 +49,7 @@ final class CancellationToken: @unchecked Sendable {
 
 actor LocalJobRunner {
     typealias Executor = @Sendable (TranscriptionJob, CancellationToken) async throws -> Void
-    typealias FinalizationFailure = @Sendable (UUID, any Error) async throws -> Void
+    typealias FinalizationFailure = @Sendable (UUID, UUID?, any Error) async throws -> Void
     typealias DidChange = @Sendable (UUID) async -> Void
 
     enum CancellationOutcome: Sendable, Equatable {
@@ -223,7 +223,7 @@ actor LocalJobRunner {
             return
         case .processing(let stage):
             if let finalizationFailure {
-                try? await finalizationFailure(id, error)
+                try? await finalizationFailure(id, current?.token.owner, error)
                 if let refreshed = try? await store.job(id: id),
                    refreshed.state.kind != .processing {
                     return
