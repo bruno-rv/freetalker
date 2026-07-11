@@ -4,7 +4,8 @@ import Foundation
 import IOKit.hid
 import os
 
-final class HotKeyManager: @unchecked Sendable {
+@MainActor
+final class HotKeyManager {
     /// Fired with the originating `CGEvent`'s timestamp, converted to seconds since boot (see
     /// `handle(type:event:)`) — NOT the wall-clock time the callback happens to run at. Capture-
     /// start latency (the `Task { @MainActor in ... }` hop, or contention on the main run loop)
@@ -43,7 +44,11 @@ final class HotKeyManager: @unchecked Sendable {
     private static let logger = Logger(subsystem: "com.bruno.freetalker", category: "hotkey")
 
     /// Esc virtual keycode (kVK_Escape).
-    static let escapeKeyCode: UInt16 = 53
+    nonisolated static let escapeKeyCode: UInt16 = 53
+
+    nonisolated static func eventTapThreadIsValid() -> Bool {
+        Thread.isMainThread
+    }
 
     nonisolated static func shouldSwallowEscape(keyCode: UInt16, isRecording: Bool) -> Bool {
         keyCode == escapeKeyCode && isRecording
@@ -59,7 +64,7 @@ final class HotKeyManager: @unchecked Sendable {
         var swallow = false
     }
 
-    static func dispatch(
+    nonisolated static func dispatch(
         kind: KeyEventKind,
         keyCode: UInt16,
         flags: UInt64,
@@ -78,6 +83,16 @@ final class HotKeyManager: @unchecked Sendable {
             voiceEditEngaged: voiceEditOutcome?.engaged == true,
             swallow: outcome.swallow || redoOutcome?.swallow == true || voiceEditOutcome?.swallow == true
         )
+    }
+
+    nonisolated static func resetMatchers(
+        matcher: inout HotKeyMatcher,
+        redoMatcher: inout HotKeyMatcher?,
+        voiceEditMatcher: inout HotKeyMatcher?
+    ) {
+        matcher = HotKeyMatcher(spec: matcher.spec)
+        redoMatcher = redoMatcher.map { HotKeyMatcher(spec: $0.spec) }
+        voiceEditMatcher = voiceEditMatcher.map { HotKeyMatcher(spec: $0.spec) }
     }
 
     @MainActor
@@ -130,16 +145,27 @@ final class HotKeyManager: @unchecked Sendable {
             callback: { _, type, event, refcon in
                 guard let refcon else { return Unmanaged.passUnretained(event) }
                 let manager = Unmanaged<HotKeyManager>.fromOpaque(refcon).takeUnretainedValue()
-                // The system disables event taps after a timeout or suspicious input (and
-                // across sleep/wake); without re-enabling, push-to-talk would silently die
-                // after working fine initially.
-                if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-                    if let tap = manager.eventTap {
-                        CGEvent.tapEnable(tap: tap, enable: true)
+                // This tap's run-loop source is installed exclusively on the main run loop
+                // below. Assert that contract before entering MainActor isolation synchronously;
+                // event swallowing and voice-selection capture cannot be deferred.
+                precondition(HotKeyManager.eventTapThreadIsValid(), "HotKeyManager event tap must run on the main thread")
+                let eventAddress = UInt(bitPattern: Unmanaged.passUnretained(event).toOpaque())
+                let resultAddress: UInt = MainActor.assumeIsolated {
+                    let eventPointer = UnsafeMutableRawPointer(bitPattern: eventAddress)!
+                    let isolatedEvent = Unmanaged<CGEvent>.fromOpaque(eventPointer).takeUnretainedValue()
+                    // The system disables event taps after a timeout or suspicious input (and
+                    // across sleep/wake); without re-enabling, push-to-talk would silently die.
+                    if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                        if let tap = manager.eventTap {
+                            CGEvent.tapEnable(tap: tap, enable: true)
+                        }
+                        return eventAddress
                     }
-                    return Unmanaged.passUnretained(event)
+                    return manager.handle(type: type, event: isolatedEvent)
+                        .map { UInt(bitPattern: $0.toOpaque()) } ?? 0
                 }
-                return manager.handle(type: type, event: event)
+                guard let resultPointer = UnsafeMutableRawPointer(bitPattern: resultAddress) else { return nil }
+                return Unmanaged<CGEvent>.fromOpaque(resultPointer)
             },
             userInfo: refcon
         ) else {
@@ -165,6 +191,7 @@ final class HotKeyManager: @unchecked Sendable {
         }
         eventTap = nil
         runLoopSource = nil
+        Self.resetMatchers(matcher: &matcher, redoMatcher: &redoMatcher, voiceEditMatcher: &voiceEditMatcher)
     }
 
     /// Runs on the main thread (the tap's run-loop source is on the main run loop), so
@@ -209,13 +236,11 @@ final class HotKeyManager: @unchecked Sendable {
             Task { @MainActor in self.onRedoKeyDown?(eventSeconds) }
         }
         if outcome.voiceEditEngaged {
-            MainActor.assumeIsolated {
-                Self.deliverVoiceEditIfNeeded(
-                    outcome: outcome,
-                    eventSeconds: eventSeconds,
-                    action: self.onVoiceEditKeyDown
-                )
-            }
+            Self.deliverVoiceEditIfNeeded(
+                outcome: outcome,
+                eventSeconds: eventSeconds,
+                action: onVoiceEditKeyDown
+            )
         }
         return outcome.swallow ? nil : Unmanaged.passUnretained(event)
     }

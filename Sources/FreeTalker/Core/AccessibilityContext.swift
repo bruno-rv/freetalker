@@ -133,7 +133,7 @@ struct AXNodeIdentity: Hashable {
 }
 
 @MainActor
-final class SystemAccessibilityNodeAdapter: AccessibilityNodeAdapting {
+final class SystemAccessibilityNodeAdapter: AccessibilityNodeAdapting, SelectionAccessibilityAdapting {
     typealias Node = AXUIElement
     typealias Identity = AXNodeIdentity
 
@@ -212,6 +212,21 @@ final class SystemAccessibilityNodeAdapter: AccessibilityNodeAdapting {
         var range = CFRange()
         guard AXValueGetValue(axValue, .cfRange, &range) else { return nil }
         return NSRange(location: range.location, length: range.length)
+    }
+
+    func selectedText(of element: AXUIElement) -> String? {
+        stringAttribute(kAXSelectedTextAttribute, from: element)
+    }
+
+    func elementsEqual(_ lhs: AXUIElement?, _ rhs: AXUIElement?) -> Bool {
+        guard let lhs, let rhs else { return lhs == nil && rhs == nil }
+        return CFEqual(lhs, rhs)
+    }
+
+    func setSelectedTextRange(of element: AXUIElement, to range: NSRange) -> Bool {
+        var cfRange = CFRange(location: range.location, length: range.length)
+        guard let value = AXValueCreate(.cfRange, &cfRange) else { return false }
+        return AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, value) == .success
     }
 
     func replaceSelectedText(of element: AXUIElement, with text: String) -> Bool {

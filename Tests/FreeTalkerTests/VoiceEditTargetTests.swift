@@ -1,4 +1,5 @@
 import CoreGraphics
+import ApplicationServices
 import Foundation
 import Testing
 @testable import FreeTalker
@@ -72,6 +73,126 @@ import Testing
         #expect(called)
     }
 
+    @Test func productionVoiceEditWiringCapturesPendingSelection() throws {
+        let manager = HotKeyManager()
+        let access = StubSelectionAccess(result: .success(Self.snapshot(text: "draft")))
+        var pending: SelectionSnapshot?
+        var messages: [String] = []
+        AppCoordinator.configureVoiceEditHotKey(manager: manager) {
+            AppCoordinator.handleVoiceEditHotKey(
+                selectionAccess: access,
+                pendingSelection: &pending,
+                flash: { messages.append($0) }
+            )
+        }
+
+        manager.onVoiceEditKeyDown?(1)
+
+        #expect(pending?.text == "draft")
+        #expect(messages.isEmpty)
+    }
+
+    @Test(arguments: [
+        (SelectionAccessError.noEditableSelection, "Select editable text first"),
+        (.secureField, "Voice Edit is unavailable in secure fields")
+    ])
+    func productionVoiceEditWiringSurfacesTypedCaptureErrors(_ error: SelectionAccessError, _ message: String) {
+        let access = StubSelectionAccess(result: .failure(error))
+        var pending: SelectionSnapshot?
+        var messages: [String] = []
+
+        AppCoordinator.handleVoiceEditHotKey(
+            selectionAccess: access,
+            pendingSelection: &pending,
+            flash: { messages.append($0) }
+        )
+
+        #expect(pending == nil)
+        #expect(messages == [message])
+    }
+
+    @Test func captureRejectsDriftAtEveryRangeAndTextReadBoundary() {
+        for changedRead in 0..<4 {
+            let adapter = ScriptedSelectionAdapter(reads: Self.driftingReads(changedRead: changedRead))
+            let access = Self.access(adapter: adapter)
+            #expect(throws: SelectionAccessError.selectionChanged) { try access.capture() }
+            #expect(adapter.replacements.isEmpty)
+        }
+    }
+
+    @Test func captureRejectsElementOrWindowIdentityDrift() {
+        for driftWindow in [false, true] {
+            let adapter = ScriptedSelectionAdapter(reads: Self.stableReads)
+            let changed = driftWindow
+                ? Self.target(window: AXUIElementCreateApplication(99))
+                : Self.target(element: AXUIElementCreateApplication(99))
+            let access = Self.access(adapter: adapter, targets: [Self.target(), changed])
+            #expect(throws: SelectionAccessError.targetChanged) { try access.capture() }
+            #expect(adapter.replacements.isEmpty)
+        }
+    }
+
+    @Test func replaceRejectsDriftAtEveryReadBoundaryWithoutSettingText() throws {
+        for changedRead in 0..<8 {
+            var reads = Self.stableReads + Self.stableReads
+            reads[changedRead] = changedRead.isMultiple(of: 2)
+                ? .range(NSRange(location: 0, length: 4))
+                : .text("drift")
+            let adapter = ScriptedSelectionAdapter(reads: reads)
+            let access = Self.access(adapter: adapter, targetCount: 4)
+            let snapshot = Self.snapshot(text: "draft")
+
+            #expect(throws: SelectionAccessError.selectionChanged) {
+                try access.replace(snapshot, with: "replacement")
+            }
+            #expect(adapter.replacements.isEmpty)
+        }
+    }
+
+    @Test func replaceReassertsRangeAndRevalidatesImmediatelyBeforeSettingText() throws {
+        let adapter = ScriptedSelectionAdapter(reads: Self.stableReads + Self.stableReads)
+        let access = Self.access(adapter: adapter, targetCount: 4)
+
+        try access.replace(Self.snapshot(text: "draft"), with: "replacement")
+
+        #expect(adapter.rangesSet == [NSRange(location: 0, length: 5)])
+        #expect(adapter.replacements == ["replacement"])
+    }
+
+    @Test func replaceRejectsIdentityDriftAtEveryTargetReadBoundaryWithoutSettingText() {
+        for driftWindow in [false, true] {
+            for changedRead in 0..<4 {
+                var targets = Array(repeating: Self.target(), count: 4)
+                let changedIdentity = AXUIElementCreateApplication(pid_t(100 + changedRead))
+                targets[changedRead] = driftWindow
+                    ? Self.target(window: changedIdentity)
+                    : Self.target(element: changedIdentity)
+                let adapter = ScriptedSelectionAdapter(reads: Self.stableReads + Self.stableReads)
+                let access = Self.access(adapter: adapter, targets: targets)
+
+                #expect(throws: SelectionAccessError.targetChanged) {
+                    try access.replace(Self.snapshot(text: "draft"), with: "replacement")
+                }
+                #expect(adapter.replacements.isEmpty)
+            }
+        }
+    }
+
+    @Test func stoppingResetsSwallowedKeyState() {
+        var ptt = HotKeyMatcher(spec: .default)
+        var redo: HotKeyMatcher? = HotKeyMatcher(spec: HotKeySpec(modifiers: 0, keyCode: 105))
+        var voice: HotKeyMatcher? = HotKeyMatcher(spec: HotKeySpec(modifiers: 0, keyCode: 107))
+        _ = voice?.handle(.keyDown, keyCode: 107, flags: 0)
+
+        HotKeyManager.resetMatchers(matcher: &ptt, redoMatcher: &redo, voiceEditMatcher: &voice)
+
+        #expect(voice?.handle(.keyUp, keyCode: 107, flags: 0).swallow == false)
+    }
+
+    @Test func eventTapMainThreadContractIsExplicit() {
+        #expect(HotKeyManager.eventTapThreadIsValid())
+    }
+
     @Test func threeHotkeysRejectEveryCollision() {
         let ptt = HotKeySpec.default
         let redo = HotKeySpec(modifiers: 0, keyCode: 105)
@@ -95,5 +216,84 @@ import Testing
         settings?.redoHotKeySpec = voice
         #expect(settings?.redoHotKeySpec == nil)
         #expect(settings?.voiceEditHotKeySpec == voice)
+    }
+
+    private static let stableReads: [ScriptedSelectionAdapter.Read] = [
+        .range(NSRange(location: 0, length: 5)), .text("draft"),
+        .range(NSRange(location: 0, length: 5)), .text("draft")
+    ]
+
+    private static func driftingReads(changedRead: Int) -> [ScriptedSelectionAdapter.Read] {
+        var reads = stableReads
+        reads[changedRead] = changedRead.isMultiple(of: 2)
+            ? .range(NSRange(location: 1, length: 5))
+            : .text("drift")
+        return reads
+    }
+
+    private static let element = AXUIElementCreateSystemWide()
+    private static let window = AXUIElementCreateSystemWide()
+
+    private static func target(element: AXUIElement = element, window: AXUIElement = window) -> InsertionTarget {
+        InsertionTarget(bundleID: "test.app", pid: 7, focusedElement: element, window: window)
+    }
+
+    private static func snapshot(text: String) -> SelectionSnapshot {
+        SelectionSnapshot(
+            target: target(), range: NSRange(location: 0, length: text.utf16.count),
+            text: text, fingerprint: SelectionSnapshot.fingerprint(for: text)
+        )
+    }
+
+    private static func access(
+        adapter: ScriptedSelectionAdapter,
+        targets: [InsertionTarget]? = nil,
+        targetCount: Int = 2
+    ) -> SelectionAccess {
+        var queue = targets ?? Array(repeating: target(), count: targetCount)
+        return SelectionAccess(adapter: adapter, targetProvider: { queue.removeFirst() })
+    }
+}
+
+@MainActor
+private final class StubSelectionAccess: SelectionAccessing {
+    let result: Result<SelectionSnapshot, Error>
+    init(result: Result<SelectionSnapshot, Error>) { self.result = result }
+    func capture() throws -> SelectionSnapshot { try result.get() }
+    func replace(_ snapshot: SelectionSnapshot, with text: String) throws {}
+}
+
+@MainActor
+private final class ScriptedSelectionAdapter: SelectionAccessibilityAdapting {
+    enum Read {
+        case range(NSRange)
+        case text(String)
+    }
+
+    var reads: [Read]
+    var rangesSet: [NSRange] = []
+    var replacements: [String] = []
+    init(reads: [Read]) { self.reads = reads }
+    func isSecure(_ element: AXUIElement) -> Bool { false }
+    func isEditable(_ element: AXUIElement) -> Bool { true }
+    func elementsEqual(_ lhs: AXUIElement?, _ rhs: AXUIElement?) -> Bool {
+        guard let lhs, let rhs else { return lhs == nil && rhs == nil }
+        return CFEqual(lhs, rhs)
+    }
+    func selectedTextRange(of element: AXUIElement) -> NSRange? {
+        guard case let .range(value) = reads.removeFirst() else { Issue.record("Expected range read"); return nil }
+        return value
+    }
+    func selectedText(of element: AXUIElement) -> String? {
+        guard case let .text(value) = reads.removeFirst() else { Issue.record("Expected text read"); return nil }
+        return value
+    }
+    func setSelectedTextRange(of element: AXUIElement, to range: NSRange) -> Bool {
+        rangesSet.append(range)
+        return true
+    }
+    func replaceSelectedText(of element: AXUIElement, with text: String) -> Bool {
+        replacements.append(text)
+        return true
     }
 }
