@@ -349,6 +349,16 @@ private struct GeneralSettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
+            Section("Media imports") {
+                Picker("Keep imported transcripts", selection: $settings.mediaImportRetention) {
+                    ForEach(MediaImportRetention.allCases, id: \.rawValue) { value in
+                        Text(value.days.map { "\($0) day\($0 == 1 ? "" : "s")" } ?? "Until I delete them").tag(value)
+                    }
+                }
+                Text("Defaults to 7 days. Imported media, derived audio, transcripts, and speaker data stay on this Mac; the original source is never changed or deleted.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
             Section("Microphone") {
                 Picker("Input device", selection: $settings.microphoneDeviceUID) {
                     Text("System default").tag(nil as String?)

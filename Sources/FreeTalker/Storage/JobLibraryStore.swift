@@ -22,6 +22,10 @@ final class JobLibraryStore: ObservableObject {
     private let store: TranscriptionJobStore
     private let recoveryDirectory: URL
     private var enqueueRecovery: (@Sendable (UUID) async -> Void)?
+    private var enqueueImport: (@Sendable (UUID) async -> Void)?
+    private var cancelImport: (@Sendable (UUID) async -> LocalJobRunner.CancellationOutcome)?
+    private var importService: MediaImportService?
+    private var importsDirectory: URL?
     private let playbackFactory: (URL) throws -> any RecoveryAudioPlaying
     private var player: (any RecoveryAudioPlaying)?
 
@@ -37,6 +41,64 @@ final class JobLibraryStore: ObservableObject {
 
     func configureRetry(_ enqueue: @escaping @Sendable (UUID) async -> Void) {
         enqueueRecovery = enqueue
+    }
+
+    func configureImports(
+        service: MediaImportService,
+        directory: URL,
+        enqueue: @escaping @Sendable (UUID) async -> Void,
+        cancel: @escaping @Sendable (UUID) async -> LocalJobRunner.CancellationOutcome
+    ) {
+        importService = service
+        importsDirectory = directory
+        enqueueImport = enqueue
+        cancelImport = cancel
+    }
+
+    func importMedia(_ url: URL) async throws {
+        guard let importService else { throw MediaImportError.invalidMedia }
+        let id = try await importService.createJob(for: url)
+        try await refresh()
+        await enqueueImport?(id)
+    }
+
+    func retryImport(id: UUID) async throws {
+        try await store.queueMediaImportRetry(jobID: id)
+        try await refresh()
+        await enqueueImport?(id)
+    }
+
+    func cancelImport(id: UUID) async throws {
+        guard let cancelImport else { throw JobStoreError.invalidTransition }
+        let outcome = await cancelImport(id)
+        if outcome == .notRunning, let job = try await store.job(id: id), job.state == .queued {
+            try await store.transition(id, from: .queued, to: .cancelled)
+        }
+        try await refresh()
+    }
+
+    func deleteImport(id: UUID) async throws {
+        guard let importsDirectory else { throw JobStoreError.invalidTransition }
+        try await store.deleteMediaImport(jobID: id, jobsDirectory: importsDirectory)
+        try await refresh()
+    }
+
+    func importDetail(id: UUID) async throws -> MediaImportDetail {
+        guard let job = try await store.job(id: id), job.kind == .mediaImport else { throw JobStoreError.jobNotFound }
+        let transcript = try await store.transcriptSegments(jobID: id)
+        let turns = try await store.speakerTurns(jobID: id)
+        return MediaImportDetail(
+            job: job,
+            transcript: transcript,
+            turns: turns,
+            names: try await store.speakerNames(jobID: id),
+            completedStages: try await store.completedMediaStages(jobID: id)
+        )
+    }
+
+    func renameSpeaker(jobID: UUID, speakerID: String, name: String) async throws {
+        try await store.replaceSpeakerName(jobID: jobID, speakerID: speakerID, name: name)
+        objectWillChange.send()
     }
 
     func refresh() async throws {
