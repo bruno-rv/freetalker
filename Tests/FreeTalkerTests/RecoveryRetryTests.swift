@@ -157,7 +157,8 @@ import Testing
             directory: fixture.directory,
             store: retryStore,
             loadSamples: { _ in [0.1] },
-            processDictation: RetryProbe().process
+            processDictation: RetryProbe().process,
+            errorStage: { _ in .transcribing }
         )
         let runner = LocalJobRunner(
             store: fixture.store,

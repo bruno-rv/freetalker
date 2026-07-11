@@ -144,3 +144,14 @@ default runner ready-transition failure. Neither leaves indefinite processing st
 
 Focused `RecoveryRetryTests|LocalJobRunnerTests` verification passed 22 tests. Full
 `make test` passed 52 tests in 5 suites; the release build and `git diff --check` also exited 0.
+
+## Final classification follow-up
+
+Recovery finalization now classifies `completeAttemptAndMarkJobReady` failures as
+`.persisting` unconditionally. The general error-stage mapper remains limited to transcription
+and processing failures. A regression injects a ready-transaction database failure while
+configuring the pipeline's general mapper to return `.transcribing`; both the job and unfinished
+attempt are nevertheless persisted with `.persisting`.
+
+Focused `RecoveryRetryTests` passed 10 tests. Full `make test` passed 52 tests in 5 suites; the
+release build and `git diff --check` exited 0.
