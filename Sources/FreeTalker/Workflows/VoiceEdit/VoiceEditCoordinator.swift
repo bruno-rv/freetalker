@@ -38,6 +38,65 @@ enum VoiceEditCoordinatorError: Error, Equatable {
 
 enum VoiceEditClipboardError: Error { case writeFailed }
 
+struct VoiceEditPasteboardItem: Equatable {
+    let values: [NSPasteboard.PasteboardType: Data]
+}
+
+@MainActor
+protocol VoiceEditPasteboardAdapting {
+    func snapshot() -> [VoiceEditPasteboardItem]
+    func write(_ text: String) throws -> Bool
+    func restore(_ items: [VoiceEditPasteboardItem])
+}
+
+@MainActor
+enum VoiceEditClipboard {
+    static func copy(
+        _ text: String,
+        pasteboard: any VoiceEditPasteboardAdapting = SystemVoiceEditPasteboard()
+    ) throws {
+        let previous = pasteboard.snapshot()
+        let succeeded: Bool
+        do {
+            succeeded = try pasteboard.write(text)
+        } catch {
+            pasteboard.restore(previous)
+            throw error
+        }
+        guard succeeded else {
+            pasteboard.restore(previous)
+            throw VoiceEditClipboardError.writeFailed
+        }
+    }
+}
+
+@MainActor
+private struct SystemVoiceEditPasteboard: VoiceEditPasteboardAdapting {
+    private let pasteboard = NSPasteboard.general
+
+    func snapshot() -> [VoiceEditPasteboardItem] {
+        pasteboard.pasteboardItems?.map { item in
+            VoiceEditPasteboardItem(values: Dictionary(uniqueKeysWithValues: item.types.compactMap {
+                type in item.data(forType: type).map { (type, $0) }
+            }))
+        } ?? []
+    }
+
+    func write(_ text: String) throws -> Bool {
+        pasteboard.writeObjects([text as NSString])
+    }
+
+    func restore(_ items: [VoiceEditPasteboardItem]) {
+        pasteboard.clearContents()
+        let objects = items.map { stored -> NSPasteboardItem in
+            let item = NSPasteboardItem()
+            for (type, data) in stored.values { item.setData(data, forType: type) }
+            return item
+        }
+        if !objects.isEmpty { pasteboard.writeObjects(objects) }
+    }
+}
+
 @MainActor
 final class VoiceEditCoordinator: ObservableObject {
     typealias SnippetMatcher = @Sendable (String) async throws -> SnippetMatch
@@ -54,6 +113,7 @@ final class VoiceEditCoordinator: ObservableObject {
     private let editService: any LocalEditServicing
     private let copy: (String) throws -> Void
     private var operationID: UUID?
+    private var generationTask: Task<Void, Never>?
 
     var errorMessage: String? { error?.message }
 
@@ -63,11 +123,7 @@ final class VoiceEditCoordinator: ObservableObject {
         selectionAccess: any SelectionAccessing,
         snippetMatcher: @escaping SnippetMatcher,
         editService: any LocalEditServicing = LocalEditService(),
-        copy: @escaping (String) throws -> Void = { text in
-            guard NSPasteboard.general.writeObjects([text as NSString]) else {
-                throw VoiceEditClipboardError.writeFailed
-            }
-        }
+        copy: @escaping (String) throws -> Void = { try VoiceEditClipboard.copy($0) }
     ) {
         self.selection = selection
         self.instruction = instruction
@@ -79,12 +135,31 @@ final class VoiceEditCoordinator: ObservableObject {
     }
 
     func begin() async {
+        generationTask?.cancel()
         let operationID = UUID()
         self.operationID = operationID
         preview = nil
         snippetChoices = []
         error = nil
-        guard let selection else {
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.generate(operationID: operationID)
+        }
+        generationTask = task
+        await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+        if Task.isCancelled, self.operationID == operationID {
+            clearMemory()
+            return
+        }
+        if self.operationID == operationID { generationTask = nil }
+    }
+
+    private func generate(operationID: UUID) async {
+        guard selection != nil else {
             finish(error: .noSelection)
             return
         }
@@ -97,14 +172,15 @@ final class VoiceEditCoordinator: ObservableObject {
             case .ambiguous(let snippets):
                 snippetChoices = snippets
             case .none:
+                guard let selectedText = self.selection?.text else { return }
                 let result = try await editService.edit(
-                    selectedText: selection.text, instruction: instruction
+                    selectedText: selectedText, instruction: instruction
                 )
                 guard self.operationID == operationID, !Task.isCancelled else { return }
                 setPreview(result, source: .localModel)
             }
         } catch {
-            guard self.operationID == operationID, !Task.isCancelled else { return }
+            guard !(error is CancellationError), self.operationID == operationID, !Task.isCancelled else { return }
             finish(error: .generationFailed)
         }
     }
@@ -144,12 +220,15 @@ final class VoiceEditCoordinator: ObservableObject {
     private func setPreview(_ result: String, source: VoiceEditPreview.Source) {
         preview = VoiceEditPreview(result: result, source: source)
         operationID = nil
+        generationTask = nil
     }
 
     private func clearMemory() {
         preview = nil
         snippetChoices = []
         error = nil
+        generationTask?.cancel()
+        generationTask = nil
         operationID = nil
         selection = nil
         instruction = ""
