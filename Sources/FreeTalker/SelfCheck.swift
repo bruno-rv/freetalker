@@ -60,6 +60,37 @@ private actor ProductionReloadProbe {
     func resetEvents() { events = []; installed = [] }
 }
 
+private actor RapidReloadProbe {
+    var setting = "A"
+    private(set) var attempts: [String: Int] = [:]
+    private(set) var lifecycles: [String] = []
+    private(set) var statuses: [String] = []
+    let aStarted = OneShotSignal()
+    let releaseA = OneShotSignal()
+
+    func load(_ variant: String, lifecycle: String) async throws -> String {
+        attempts[variant, default: 0] += 1
+        if variant == "A" {
+            await aStarted.fire()
+            await releaseA.wait()
+            return "A-kit"
+        }
+        statuses.append("\(lifecycle):B-progress")
+        throw FakeReloadError.failed
+    }
+
+    func begin(_ variant: String) -> String {
+        lifecycles.append(variant)
+        return "lifecycle-\(variant)"
+    }
+
+    func setSetting(_ value: String) { setting = value }
+
+    func revert(failed: String, previous: String) {
+        if setting == failed { setting = previous }
+    }
+}
+
 /// No-op `PostProcessor` for the pipeline contract check below — returns the transcript
 /// unchanged so the check exercises the capture-to-transcript-to-Library-row contract without
 /// depending on Apple Intelligence or a cloud LLM. See Round 1 Codex finding 14.
@@ -2964,6 +2995,46 @@ enum SelfCheck {
         let maximumActiveLoads = await probe.maximumActiveLoads
         if controller.state.snapshot().kit != "fifth-kit" || maximumActiveLoads != 1 {
             failures.append("speech model engine controller: production reload seam was not serialized/latest-wins")
+        }
+
+        let rapidController = ModelReloadController<String>()
+        rapidController.state.installIfEmpty(kit: "old-kit", variant: "old")
+        let rapid = RapidReloadProbe()
+        let a = Task {
+            await rapidController.reloadWithLifecycle(
+                currentSetting: { await rapid.setting },
+                revertSetting: { await rapid.revert(failed: $0, previous: $1) },
+                beginAttempt: { await rapid.begin($0) },
+                loader: { try await rapid.load($0, lifecycle: $1) },
+                event: { _, _, _ in },
+                didInstall: { _ in },
+                finishAttempt: { _ in }
+            )
+        }
+        await rapid.aStarted.wait()
+        await rapid.setSetting("B")
+        let b = Task {
+            await rapidController.reloadWithLifecycle(
+                currentSetting: { await rapid.setting },
+                revertSetting: { await rapid.revert(failed: $0, previous: $1) },
+                beginAttempt: { await rapid.begin($0) },
+                loader: { try await rapid.load($0, lifecycle: $1) },
+                event: { _, _, _ in },
+                didInstall: { _ in },
+                finishAttempt: { _ in }
+            )
+        }
+        await rapid.releaseA.fire()
+        await a.value
+        await b.value
+        let rapidAttempts = await rapid.attempts
+        let rapidLifecycles = await rapid.lifecycles
+        let rapidStatuses = await rapid.statuses
+        let rapidSetting = await rapid.setting
+        if rapidAttempts["A"] != 1 || rapidAttempts["B"] != 1
+            || rapidLifecycles != ["A", "B"] || rapidStatuses != ["lifecycle-B:B-progress"]
+            || rapidSetting != "A" || rapidController.state.snapshot().variant != "A" {
+            failures.append("speech model engine controller: rapid A→B owner/failed-B retry lifecycle mismatch")
         }
         if WhisperKitEngine.shouldReload(loadedVariant: nil, requestedVariant: "new")
             || WhisperKitEngine.shouldReload(loadedVariant: "same", requestedVariant: "same")
