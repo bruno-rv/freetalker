@@ -13,35 +13,49 @@ struct PurgeResult: Sendable, Equatable {
 }
 
 struct RecoveryRetentionService: Sendable {
-    private let directory: URL
+    private let lexicalDirectory: URL
+    private let resolvedDirectory: URL
     private let store: any RecoveryJobStoring
+    private let fileRemover: any RecoveryFileRemoving
 
-    init(directory: URL, store: any RecoveryJobStoring) {
-        self.directory = directory.standardizedFileURL
+    init(
+        directory: URL,
+        store: any RecoveryJobStoring,
+        fileRemover: any RecoveryFileRemoving = SystemRecoveryFileRemover()
+    ) {
+        lexicalDirectory = directory.standardizedFileURL
+        resolvedDirectory = directory.standardizedFileURL.resolvingSymlinksInPath()
         self.store = store
+        self.fileRemover = fileRemover
     }
 
     func purgeExpired(now: Date, retention: RecoveryRetention) async throws -> PurgeResult {
-        guard retention != .never else { return PurgeResult(deletedJobIDs: []) }
-        let cutoff = now.addingTimeInterval(-Double(retention.rawValue) * 86_400)
-        let candidates = try await store.recoveryJobs().filter {
-            $0.kind == .recovery && $0.state.kind == .failed && $0.createdAt <= cutoff
+        var claims = try await store.claimedRecoveries()
+        if retention != .never {
+            let cutoff = now.addingTimeInterval(-Double(retention.rawValue) * 86_400)
+            claims += try await store.claimExpiredRecoveries(cutoff: cutoff, claimedAt: now)
         }
         var deleted: [UUID] = []
-        for job in candidates {
-            guard let sourceURL = ownedSourceURL(job.source.reference) else { continue }
-            let stagedURL = directory.appendingPathComponent(".purge-\(UUID().uuidString).tmp")
-            let exists = FileManager.default.fileExists(atPath: sourceURL.path)
-            if exists { try FileManager.default.moveItem(at: sourceURL, to: stagedURL) }
+        for claim in claims {
+            guard let sourceURL = ownedSourceURL(claim.sourceReference) else {
+                try await store.recordPurgeError(
+                    id: claim.id,
+                    message: "Recovery source is outside the owned directory"
+                )
+                continue
+            }
             do {
-                if try await store.deleteRecovery(id: job.id, expectedSourceReference: job.source.reference) {
-                    if exists { try FileManager.default.removeItem(at: stagedURL) }
-                    deleted.append(job.id)
-                } else if exists {
-                    try FileManager.default.moveItem(at: stagedURL, to: sourceURL)
+                if FileManager.default.fileExists(atPath: sourceURL.path) {
+                    try fileRemover.removeItem(at: sourceURL)
+                }
+                if try await store.deleteClaimedRecovery(
+                    id: claim.id,
+                    expectedSourceReference: claim.sourceReference
+                ) {
+                    deleted.append(claim.id)
                 }
             } catch {
-                if exists { try? FileManager.default.moveItem(at: stagedURL, to: sourceURL) }
+                try await store.recordPurgeError(id: claim.id, message: String(describing: error))
                 throw error
             }
         }
@@ -50,9 +64,11 @@ struct RecoveryRetentionService: Sendable {
 
     private func ownedSourceURL(_ reference: String) -> URL? {
         let source = URL(fileURLWithPath: reference).standardizedFileURL
-        guard source.deletingLastPathComponent() == directory,
+        guard source.deletingLastPathComponent() == lexicalDirectory,
               source.pathExtension == "wav",
               UUID(uuidString: source.deletingPathExtension().lastPathComponent) != nil else { return nil }
+        let resolvedSource = source.resolvingSymlinksInPath()
+        guard resolvedSource.deletingLastPathComponent() == resolvedDirectory else { return nil }
         return source
     }
 }

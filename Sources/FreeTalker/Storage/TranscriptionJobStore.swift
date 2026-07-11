@@ -73,20 +73,80 @@ actor TranscriptionJobStore {
         )
     }
 
-    func recoveryJobs() throws -> [TranscriptionJob] {
-        try jobs(kind: .recovery)
+    func claimExpiredRecoveries(cutoff: Date, claimedAt: Date) throws -> [RecoveryPurgeClaim] {
+        let statement = try prepare("""
+        UPDATE transcription_jobs
+        SET purge_claimed_at = ?, purge_error = NULL, updated_at = ?
+        WHERE kind = 'recovery' AND state = 'failed' AND purge_claimed_at IS NULL
+          AND created_at <= ?
+        RETURNING id, source_reference, purge_claimed_at, purge_error;
+        """)
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_double(statement, 1, claimedAt.timeIntervalSince1970)
+        sqlite3_bind_double(statement, 2, claimedAt.timeIntervalSince1970)
+        sqlite3_bind_double(statement, 3, cutoff.timeIntervalSince1970)
+        return try decodeClaims(statement)
     }
 
-    func deleteRecovery(id: UUID, expectedSourceReference: String) throws -> Bool {
+    func claimedRecoveries() throws -> [RecoveryPurgeClaim] {
+        let statement = try prepare("""
+        SELECT id, source_reference, purge_claimed_at, purge_error
+        FROM transcription_jobs
+        WHERE kind = 'recovery' AND state = 'failed' AND purge_claimed_at IS NOT NULL
+        ORDER BY purge_claimed_at, id;
+        """)
+        defer { sqlite3_finalize(statement) }
+        return try decodeClaims(statement)
+    }
+
+    func recordPurgeError(id: UUID, message: String) throws {
+        let statement = try prepare("""
+        UPDATE transcription_jobs SET purge_error = ?
+        WHERE id = ? AND kind = 'recovery' AND state = 'failed' AND purge_claimed_at IS NOT NULL;
+        """)
+        defer { sqlite3_finalize(statement) }
+        bind(message, to: 1, in: statement)
+        bind(id.uuidString, to: 2, in: statement)
+        try stepDone(statement)
+        guard sqlite3_changes(handle) == 1 else { throw JobStoreError.invalidTransition }
+    }
+
+    func deleteClaimedRecovery(id: UUID, expectedSourceReference: String) throws -> Bool {
         let statement = try prepare("""
         DELETE FROM transcription_jobs
-        WHERE id = ? AND kind = 'recovery' AND state = 'failed' AND source_reference = ?;
+        WHERE id = ? AND kind = 'recovery' AND state = 'failed'
+          AND purge_claimed_at IS NOT NULL AND source_reference = ?;
         """)
         defer { sqlite3_finalize(statement) }
         bind(id.uuidString, to: 1, in: statement)
         bind(expectedSourceReference, to: 2, in: statement)
         try stepDone(statement)
         return sqlite3_changes(handle) == 1
+    }
+
+    private func isPurgeClaimed(id: UUID) throws -> Bool {
+        let statement = try prepare("SELECT purge_claimed_at IS NOT NULL FROM transcription_jobs WHERE id = ?;")
+        defer { sqlite3_finalize(statement) }
+        bind(id.uuidString, to: 1, in: statement)
+        guard sqlite3_step(statement) == SQLITE_ROW else { throw JobStoreError.jobNotFound }
+        return sqlite3_column_int(statement, 0) == 1
+    }
+
+    private func decodeClaims(_ statement: OpaquePointer) throws -> [RecoveryPurgeClaim] {
+        var claims: [RecoveryPurgeClaim] = []
+        var result = sqlite3_step(statement)
+        while result == SQLITE_ROW {
+            guard let id = UUID(uuidString: text(statement, 0)), let claimedAt = date(statement, 2) else {
+                throw JobStoreError.corruptData("Invalid recovery purge claim")
+            }
+            claims.append(RecoveryPurgeClaim(
+                id: id, sourceReference: text(statement, 1), claimedAt: claimedAt,
+                cleanupError: optionalText(statement, 3)
+            ))
+            result = sqlite3_step(statement)
+        }
+        guard result == SQLITE_DONE else { throw sqlError() }
+        return claims
     }
 
     func job(id: UUID) throws -> TranscriptionJob? {
@@ -142,7 +202,7 @@ actor TranscriptionJobStore {
         SET state = ?, failure_stage = ?, failure_message = ?, updated_at = ?,
             started_at = CASE WHEN ? = 'processing' THEN COALESCE(started_at, ?) ELSE started_at END,
             completed_at = CASE WHEN ? IN ('ready', 'failed', 'cancelled') THEN ? ELSE NULL END
-        WHERE id = ? AND state = ?;
+        WHERE id = ? AND state = ? AND purge_claimed_at IS NULL;
         """)
         defer { sqlite3_finalize(statement) }
         let failure = state.failure
@@ -165,6 +225,7 @@ actor TranscriptionJobStore {
 
     func beginAttempt(jobID: UUID, configuration: AttemptConfiguration) throws -> JobAttempt {
         guard try job(id: jobID) != nil else { throw JobStoreError.jobNotFound }
+        guard try !isPurgeClaimed(id: jobID) else { throw JobStoreError.invalidTransition }
         let number = try nextAttemptNumber(jobID: jobID)
         let startedAt = clock.now
         let statement = try prepare("""
