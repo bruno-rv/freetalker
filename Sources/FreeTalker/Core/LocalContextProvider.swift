@@ -16,6 +16,7 @@ struct LocalProcessingContext: Equatable, Sendable {
 
 enum ContextCaptureLimitation: Equatable, Sendable {
     case accessibilityPermissionRequired
+    case screenRecordingPermissionRequired
 }
 
 struct ContextCapture: Equatable, Sendable {

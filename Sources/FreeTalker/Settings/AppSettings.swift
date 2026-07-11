@@ -126,6 +126,10 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(localContextScope.rawValue, forKey: Keys.localContextScope) }
     }
 
+    @Published var automaticStyleEnabled: Bool {
+        didSet { defaults.set(automaticStyleEnabled, forKey: Keys.automaticStyleEnabled) }
+    }
+
     @Published var handsFreeMaxMinutes: Int {
         didSet {
             let clamped = Self.clampHandsFreeMaxMinutes(handsFreeMaxMinutes)
@@ -409,6 +413,7 @@ final class AppSettings: ObservableObject {
         static let activeTemplateID = "activeTemplateID"
         static let recoveryRetention = "recoveryRetention"
         static let localContextScope = "localContextScope"
+        static let automaticStyleEnabled = "automaticStyleEnabled"
         static let handsFreeMaxMinutes = "handsFreeMaxMinutes"
         static let appRules = "appRules"
         static let languagePin = "languagePin"
@@ -470,6 +475,7 @@ final class AppSettings: ObservableObject {
         recoveryRetention = RecoveryRetention(rawValue: defaults.object(forKey: Keys.recoveryRetention) as? Int ?? 7) ?? .sevenDays
         let storedLocalContextScope = defaults.string(forKey: Keys.localContextScope)
         localContextScope = storedLocalContextScope.flatMap(LocalContextScope.init(rawValue:)) ?? .off
+        automaticStyleEnabled = defaults.bool(forKey: Keys.automaticStyleEnabled)
         if let storedLocalContextScope, LocalContextScope(rawValue: storedLocalContextScope) == nil {
             defaults.set(LocalContextScope.off.rawValue, forKey: Keys.localContextScope)
         }

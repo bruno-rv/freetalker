@@ -53,6 +53,9 @@ final class AppCoordinator: ObservableObject {
     let whisperEngine: WhisperKitEngine
     let cloudSTTEngine = CloudSTTEngine()
     private let appleFMProcessor = AppleFMProcessor()
+    private let localContextProvider: any LocalContextProvider = AccessibilityLocalContextProvider()
+    private let screenshotService: any ActiveWindowScreenshotCapturing = ActiveWindowScreenshotService()
+    private let ocrService: any VisionOCRServicing = VisionOCRService()
 
     private let hotKeyManager = HotKeyManager()
     private let audioCapture = AudioCapture()
@@ -484,12 +487,23 @@ final class AppCoordinator: ObservableObject {
             cap = 0
         }
         let activeTemplateName = TemplateStore.shared.template(id: AppSettings.shared.activeTemplateID)?.name ?? "Template"
+        let contextScope = AppSettings.shared.localContextScope
+        let contextPermissionHint: String?
+        if contextScope == .windowOCR, !Permissions.isScreenRecordingAuthorized() {
+            contextPermissionHint = "Screen Recording permission required"
+        } else if contextScope != .off, !Permissions.isAccessibilityTrusted() {
+            contextPermissionHint = "Accessibility permission required"
+        } else {
+            contextPermissionHint = nil
+        }
         let state = HUDController.RecordingPanelState(
             isLocked: isLocked,
             elapsed: elapsed,
             cap: cap,
             previewText: lastLivePreviewText.map { HUDController.tailTruncate($0, maxCharacters: 60) },
             activeTemplateName: activeTemplateName,
+            localContextScopeName: contextScope.displayName,
+            localContextPermissionHint: contextPermissionHint,
             oneShotLanguage: oneShotLanguage
         )
         hud.showRecordingPanel(state)
@@ -552,12 +566,28 @@ final class AppCoordinator: ObservableObject {
         let bundleID = frontmostApp?.bundleIdentifier
         let appName = frontmostApp?.localizedName
         let insertionTarget = preSnapshotted?.target ?? Insertion.snapshotTarget(app: frontmostApp)
-        let (template, ruleFired) = Self.resolveTemplate(
-            bundleID: bundleID,
-            rules: AppSettings.shared.appRules,
-            templates: TemplateStore.shared.templates,
-            activeTemplateID: AppSettings.shared.activeTemplateID
+        let contextScope = AppSettings.shared.localContextScope
+        let capturedContext = Self.captureApprovedContext(scope: contextScope, provider: localContextProvider)
+        let contextCapture = contextScope == .off
+            ? ContextCapture(
+                context: LocalProcessingContext(
+                    appName: appName,
+                    bundleID: bundleID,
+                    windowTitle: nil,
+                    text: ""
+                ),
+                limitation: nil
+            )
+            : capturedContext
+        let captureTarget = ActiveWindowCaptureTarget(
+            processID: frontmostApp?.processIdentifier ?? 0,
+            windowTitle: contextCapture.context.windowTitle
         )
+        let templates = TemplateStore.shared.templates
+        let appRules = AppSettings.shared.appRules
+        let activeTemplateID = AppSettings.shared.activeTemplateID
+        let automaticStyleEnabled = AppSettings.shared.automaticStyleEnabled
+        let processor = resolveActiveProcessor()
         let forcedLanguage = Self.resolveLanguage(
             oneShot: capturedOneShotLanguage,
             bundleID: bundleID,
@@ -565,9 +595,66 @@ final class AppCoordinator: ObservableObject {
             pin: AppSettings.shared.languagePin
         )
 
-        hud.show(text: ruleFired ? "Processing… (\(template.name))" : "Processing…")
+        hud.show(text: Self.contextPermissionHint(for: contextCapture.limitation) ?? "Processing…")
 
-        Task { await runPipeline(samples: samples, engine: engine, engineName: engineName, template: template, appName: appName, target: insertionTarget, forcedLanguage: forcedLanguage, skipPostProcessing: skipPostProcessing) }
+        Task {
+            let resolvedCapture = await resolveWindowOCR(
+                scope: contextScope,
+                capture: contextCapture,
+                target: captureTarget
+            )
+            if let hint = Self.contextPermissionHint(for: resolvedCapture.limitation) {
+                hud.show(text: hint)
+            }
+            let resolved = Self.resolveContextAwareTemplate(
+                automaticStyleEnabled: automaticStyleEnabled,
+                capture: resolvedCapture,
+                rules: appRules,
+                templates: templates,
+                activeTemplateID: activeTemplateID
+            )
+            await runPipeline(
+                samples: samples,
+                engine: engine,
+                engineName: engineName,
+                template: resolved.template,
+                appName: appName,
+                target: insertionTarget,
+                forcedLanguage: forcedLanguage,
+                skipPostProcessing: skipPostProcessing,
+                processor: processor,
+                localContext: Self.localContextForProcessor(
+                    isCloudConfigured: !(processor is AppleFMProcessor),
+                    capture: resolvedCapture
+                )
+            )
+        }
+    }
+
+    private func resolveWindowOCR(
+        scope: LocalContextScope,
+        capture: ContextCapture,
+        target: ActiveWindowCaptureTarget
+    ) async -> ContextCapture {
+        guard scope == .windowOCR, capture.limitation == nil else { return capture }
+        do {
+            var image: CGImage? = try await screenshotService.capture(target: target)
+            let text = try await ocrService.recognizeText(in: image!)
+            image = nil
+            return ContextCapture(
+                context: LocalProcessingContext(
+                    appName: capture.context.appName,
+                    bundleID: capture.context.bundleID,
+                    windowTitle: capture.context.windowTitle,
+                    text: text
+                ),
+                limitation: nil
+            )
+        } catch ActiveWindowScreenshotError.permissionRequired {
+            return ContextCapture(context: capture.context, limitation: .screenRecordingPermissionRequired)
+        } catch {
+            return capture
+        }
     }
 
     private func cancelRecording() {
@@ -604,6 +691,59 @@ final class AppCoordinator: ObservableObject {
             return (fallback, false)
         }
         return (matched, true)
+    }
+
+    static func captureApprovedContext(
+        scope: LocalContextScope,
+        provider: any LocalContextProvider
+    ) -> ContextCapture {
+        guard scope != .off else { return .empty }
+        return provider.capture(scope: scope)
+    }
+
+    nonisolated static func localContextForProcessor(
+        isCloudConfigured: Bool,
+        capture: ContextCapture
+    ) -> LocalProcessingContext? {
+        isCloudConfigured ? nil : capture.context
+    }
+
+    nonisolated static func contextPermissionHint(for limitation: ContextCaptureLimitation?) -> String? {
+        switch limitation {
+        case .accessibilityPermissionRequired:
+            "Accessibility permission required for Local context"
+        case .screenRecordingPermissionRequired:
+            "Screen Recording permission required for Window + local OCR"
+        case nil:
+            nil
+        }
+    }
+
+    nonisolated static func resolveContextAwareTemplate(
+        automaticStyleEnabled: Bool,
+        capture: ContextCapture,
+        rules: [String: String],
+        templates: [Template],
+        activeTemplateID: String
+    ) -> (template: Template, ruleFired: Bool) {
+        let manual = resolveTemplate(
+            bundleID: capture.context.bundleID,
+            rules: rules,
+            templates: templates,
+            activeTemplateID: activeTemplateID
+        )
+        guard !manual.ruleFired, automaticStyleEnabled else { return manual }
+        return (
+            AutomaticStyleClassifier().resolveTemplate(
+                bundleID: capture.context.bundleID,
+                windowTitle: capture.context.windowTitle,
+                context: capture.context.text,
+                rules: rules,
+                templates: templates,
+                activeTemplateID: activeTemplateID
+            ),
+            false
+        )
     }
 
     nonisolated static func resolveLanguage(
@@ -763,11 +903,11 @@ final class AppCoordinator: ObservableObject {
         updateRecordingPanel()
     }
 
-    private func runPipeline(samples: [Float], engine: any TranscriptionEngine, engineName: String, template: Template, appName: String?, target: InsertionTarget?, forcedLanguage: String?, skipPostProcessing: Bool) async {
+    private func runPipeline(samples: [Float], engine: any TranscriptionEngine, engineName: String, template: Template, appName: String?, target: InsertionTarget?, forcedLanguage: String?, skipPostProcessing: Bool, processor: (any PostProcessor)? = nil, localContext: LocalProcessingContext? = nil) async {
         defer { isProcessing = false }
 
         do {
-            let result = try await processDictation(samples: samples, engine: engine, engineName: engineName, template: template, appName: appName, target: target, forcedLanguage: forcedLanguage, skipPostProcessing: skipPostProcessing)
+            let result = try await processDictation(samples: samples, engine: engine, engineName: engineName, template: template, appName: appName, target: target, forcedLanguage: forcedLanguage, skipPostProcessing: skipPostProcessing, processor: processor, localContext: localContext)
             if let fallbackReason = result.fallbackReason {
                 logPostProcessingFallback(fallbackReason)
             }
@@ -833,6 +973,7 @@ final class AppCoordinator: ObservableObject {
         forcedLanguage: String? = nil,
         skipPostProcessing: Bool = false,
         processor: (any PostProcessor)? = nil,
+        localContext: LocalProcessingContext? = nil,
         insert: (String, InsertionTarget?) -> Bool = { Insertion.insert($0, target: $1) },
         record: (_ language: String, _ template: String, _ transcript: String, _ refined: String, _ engine: String) throws -> Void = { language, template, transcript, refined, engine in
             try LibraryStore.shared.record(language: language, template: template, transcript: transcript, refined: refined, engine: engine)
@@ -852,7 +993,17 @@ final class AppCoordinator: ObservableObject {
         } else {
             let activeProcessor: any PostProcessor = processor ?? resolveActiveProcessor()
             do {
-                let processed = try await activeProcessor.process(transcript: transcription.text, template: template, appName: appName)
+                let processed: String
+                if let localProcessor = activeProcessor as? AppleFMProcessor, let localContext {
+                    processed = try await localProcessor.process(
+                        transcript: transcription.text,
+                        template: template,
+                        appName: appName,
+                        context: localContext
+                    )
+                } else {
+                    processed = try await activeProcessor.process(transcript: transcription.text, template: template, appName: appName)
+                }
                 let trimmed = processed.trimmingCharacters(in: .whitespacesAndNewlines)
                 // Never lose the user's words — fall back to the raw transcript if post-processing
                 // returns empty output without throwing. See Round 1 Codex finding 3.
