@@ -324,6 +324,18 @@ enum SelfCheck {
         if pending.status != "Selected — pending reload" || !pending.canSelect || pending.canDelete {
             failures.append("speech model row: pending selection presentation mismatch")
         }
+        let pendingBusy = SpeechModelRowPresentation.make(
+            state: .init(
+                phase: .busy(reloadTarget: "openai_whisper-small"),
+                active: false,
+                supported: true
+            ),
+            selected: true,
+            activeDownloadVariant: nil
+        )
+        if pendingBusy.status != "Selected — pending reload · Loading Whisper Small…" {
+            failures.append("speech model row: selected busy target hid loading state")
+        }
         let firstLaunch = SpeechModelRowPresentation.make(
             state: .init(phase: .notDownloaded, active: true, supported: true),
             selected: true,
@@ -355,6 +367,52 @@ enum SelfCheck {
         )
         if failed.status != "Failed — network" || failed.canSelect {
             failures.append("speech model row: failed revert visibility mismatch")
+        }
+        if SpeechModelRowPresentation.radioAccessibilityLabel(
+            displayName: "Whisper Small",
+            active: false,
+            selected: true
+        ) != "Whisper Small, selected — pending reload" {
+            failures.append("speech model row: radio accessibility label omitted model/state")
+        }
+        if SpeechModelDeleteFailure.message(modelName: "Whisper Small", hint: "denied")
+            != "Couldn't delete Whisper Small: denied" {
+            failures.append("speech model deletion: accessible failure text mismatch")
+        }
+
+        let savedModel = AppSettings.shared.whisperModel
+        let savedChosen = AppSettings.shared.whisperModelChosen
+        defer {
+            AppSettings.shared.applyAutomaticWhisperModel(savedModel)
+            AppSettings.shared.whisperModelChosen = savedChosen
+        }
+        AppSettings.shared.whisperModelChosen = false
+        AppSettings.shared.applyAutomaticWhisperModel(SpeechModelCatalog.defaultID)
+        let automaticTarget = "openai_whisper-small"
+        let automaticReloaded = OneShotSignal()
+        let automaticStore = SpeechModelStore(
+            coordinator: SpeechModelDownloadCoordinator(),
+            settings: AppSettings.shared,
+            fallbackSupport: [SpeechModelCatalog.defaultID],
+            remoteSupportFetcher: { [automaticTarget] in [automaticTarget] }
+        )
+        automaticStore.onAutomaticSelection = { target in
+            if target == automaticTarget { Task { await automaticReloaded.fire() } }
+        }
+        automaticStore.refreshRemoteSupportOnce()
+        await automaticReloaded.wait()
+        if AppSettings.shared.whisperModel != automaticTarget
+            || automaticStore.states[automaticTarget]?.active == true {
+            failures.append("speech model lifecycle: automatic correction skipped reload or claimed active before install")
+        }
+        var automaticLifecycle: [String] = []
+        await AppCoordinator.routeAutomaticSpeechModelSelection(
+            automaticTarget,
+            preload: { automaticLifecycle.append("preload") },
+            reload: { automaticLifecycle.append("reload:\($0)") }
+        )
+        if automaticLifecycle != ["preload", "reload:\(automaticTarget)"] {
+            failures.append("speech model lifecycle: automatic correction did not converge after preload")
         }
 
         let app = AppCoordinator.shared

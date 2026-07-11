@@ -29,7 +29,11 @@ struct SpeechModelRowPresentation: Equatable {
                 status = phaseText(state.phase, active: true)
             }
         } else if selected {
-            status = "Selected — pending reload"
+            if case .busy = state.phase {
+                status = "Selected — pending reload · \(phaseText(state.phase, active: false))"
+            } else {
+                status = "Selected — pending reload"
+            }
         } else if unsupported {
             status = "Unsupported on this Mac"
         } else {
@@ -62,6 +66,18 @@ struct SpeechModelRowPresentation: Equatable {
             let name = SpeechModelCatalog.entry(for: target)?.displayName ?? target
             return "Loading \(name)…"
         }
+    }
+
+    static func radioAccessibilityLabel(displayName: String, active: Bool, selected: Bool) -> String {
+        if active { return "\(displayName), active" }
+        if selected { return "\(displayName), selected — pending reload" }
+        return "\(displayName), not selected"
+    }
+}
+
+enum SpeechModelDeleteFailure {
+    static func message(modelName: String, hint: String) -> String {
+        "Couldn't delete \(modelName): \(hint)"
     }
 }
 
@@ -126,6 +142,7 @@ private struct GeneralSettingsView: View {
     @State private var cloudLLMTesting = false
     @State private var cloudLLMTestResult: String?
     @State private var modelPendingDeletion: SpeechModelCatalogEntry?
+    @State private var modelDeleteError: String?
 
     private let refreshTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
@@ -435,12 +452,32 @@ private struct GeneralSettingsView: View {
         ) { entry in
             Button("Delete model", role: .destructive) {
                 modelPendingDeletion = nil
-                Task { try? await speechModelStore.delete(entry.id) }
+                Task {
+                    do {
+                        try await speechModelStore.delete(entry.id)
+                    } catch {
+                        modelDeleteError = SpeechModelDeleteFailure.message(
+                            modelName: entry.displayName,
+                            hint: error.localizedDescription
+                        )
+                    }
+                }
             }
             Button("Cancel", role: .cancel) { modelPendingDeletion = nil }
         } message: { entry in
             let bytes = speechModelStore.states[entry.id]?.sizeBytes ?? 0
             Text("This removes \(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)) from local storage.")
+        }
+        .alert(
+            "Model deletion failed",
+            isPresented: Binding(
+                get: { modelDeleteError != nil },
+                set: { if !$0 { modelDeleteError = nil } }
+            )
+        ) {
+            Button("OK") { modelDeleteError = nil }
+        } message: {
+            Text(modelDeleteError ?? "The model couldn't be deleted.")
         }
         .formStyle(.grouped)
         .onAppear {
@@ -468,7 +505,16 @@ private struct GeneralSettingsView: View {
                 Task { await coordinator.selectSpeechModelFromUser(entry.id) }
             } label: {
                 Image(systemName: state.active ? "largecircle.fill.circle" : (selected ? "circle.inset.filled" : "circle"))
-                    .accessibilityLabel(state.active ? "Active" : (selected ? "Selected" : "Select"))
+                    .accessibilityLabel(SpeechModelRowPresentation.radioAccessibilityLabel(
+                        displayName: entry.displayName,
+                        active: state.active,
+                        selected: selected
+                    ))
+                    .accessibilityValue(SpeechModelRowPresentation.radioAccessibilityLabel(
+                        displayName: entry.displayName,
+                        active: state.active,
+                        selected: selected
+                    ))
             }
             .buttonStyle(.plain)
             .disabled(!presentation.canSelect)

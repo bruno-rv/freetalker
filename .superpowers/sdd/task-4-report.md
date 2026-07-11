@@ -37,3 +37,26 @@ Delete.
 - Settings never assigns `settings.whisperModel` directly.
 - No second model store, engine, or download coordinator is created for the app run.
 - No local LLM runtime code or dependency was added.
+
+## Review follow-up
+
+### RED
+
+Focused SelfCheck additions first failed because the row presentation had no combined
+selected/busy state, no model-specific accessibility label, no surfaced delete failure, and
+the store exposed no automatic-selection lifecycle callback. A second RED check referenced
+the missing automatic preload-then-reload route needed to converge even when an older preload
+was already in flight.
+
+### GREEN
+
+- A selected reload target now retains **Selected — pending reload** while also naming its
+  current **Loading** state.
+- Remote support correction updates the non-user setting, clears presumptive active flags,
+  and notifies `AppCoordinator`; the coordinator waits for any preload and then reloads the
+  corrected target, so the engine's `.active` event remains the only post-correction activation.
+- The radio's VoiceOver label and value include the catalog display name and selection state.
+- Delete errors are no longer discarded; Settings presents an accessible alert with the model
+  name and localized failure hint.
+
+Fresh follow-up verification: `make selfcheck` passed and `git diff --check` passed.

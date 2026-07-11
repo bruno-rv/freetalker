@@ -102,6 +102,7 @@ final class SpeechModelStore: ObservableObject, SpeechModelEngineEventReceiving 
     @Published private(set) var states: [String: State]
     @Published private(set) var activeDownloadVariant: String?
     @Published private(set) var supportedVariants: Set<String>
+    var onAutomaticSelection: ((String) -> Void)?
 
     private let baseURL: URL
     private let coordinator: SpeechModelDownloadCoordinator
@@ -366,8 +367,10 @@ final class SpeechModelStore: ObservableObject, SpeechModelEngineEventReceiving 
             current: settings.whisperModel,
             supported: supportedVariants
         ) else { return }
-        settings.applyAutomaticWhisperModel(SpeechModelCatalog.bestSupported(in: supportedVariants))
-        for id in states.keys { states[id]?.active = id == settings.whisperModel }
+        let target = SpeechModelCatalog.bestSupported(in: supportedVariants)
+        settings.applyAutomaticWhisperModel(target)
+        for id in states.keys { states[id]?.active = false }
+        onAutomaticSelection?(target)
     }
 }
 
