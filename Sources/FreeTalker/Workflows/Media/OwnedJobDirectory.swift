@@ -129,4 +129,28 @@ final class OwnedJobDirectory: @unchecked Sendable {
         }
         guard unlinkat(directoryDescriptor, basename, 0) == 0 || errno == ENOENT else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
     }
+
+    func removeCrashArtifactsAndDirectory(source: URL) throws {
+        try revalidateIdentity()
+        let duplicate = dup(directoryDescriptor)
+        guard duplicate >= 0, let stream = fdopendir(duplicate) else {
+            if duplicate >= 0 { Darwin.close(duplicate) }
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        defer { closedir(stream) }
+        while let entry = readdir(stream) {
+            let name = withUnsafePointer(to: entry.pointee.d_name) {
+                $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXNAMLEN) + 1) { String(cString: $0) }
+            }
+            guard name != ".", name != ".." else { continue }
+            let isStaging = name.hasPrefix(".decode-") && name.hasSuffix(".wav") &&
+                UUID(uuidString: String(name.dropFirst(8).dropLast(4))) != nil
+            guard name == "audio.wav" || isStaging else { continue }
+            try removeInvalidArtifact(name, source: source)
+        }
+        try revalidateIdentity()
+        guard unlinkat(rootDescriptor, jobName, AT_REMOVEDIR) == 0 || errno == ENOENT else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+    }
 }

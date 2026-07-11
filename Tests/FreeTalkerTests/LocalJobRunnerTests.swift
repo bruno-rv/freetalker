@@ -246,6 +246,28 @@ import Testing
         #expect(await probe.started == [follower.id])
     }
 
+    @Test func quickRelaunchRechecksAtLeaseExpiryAndResumesExactlyOnce() async throws {
+        let database = try TemporaryRunnerDatabase()
+        let clock = RunnerMutableClock(Date(timeIntervalSince1970: 100))
+        let store = try TranscriptionJobStore(databaseURL: database.url, clock: clock)
+        let job = try await store.create(kind: .recovery, source: .init(reference: "recovery.wav"), now: clock.now)
+        _ = try await store.claimQueuedJob(job.id, kind: .recovery, owner: UUID(), leaseDuration: 5)
+        let sleeper = LeaseSleeperProbe()
+        let executor = SuspendedExecutorProbe()
+        let runner = LocalJobRunner(store: store, kind: .recovery, leaseSleeper: sleeper.sleep, executor: executor.execute)
+
+        await runner.resumeQueuedJobs()
+        await sleeper.waitUntilScheduled()
+        #expect(await sleeper.delays == [5])
+        clock.advance(by: 6)
+        await sleeper.release()
+        await executor.waitUntilStarted(job.id)
+        #expect(await executor.started == [job.id])
+        await executor.resume(job.id)
+        await runner.waitUntilIdle()
+        #expect(try await store.job(id: job.id)?.state == .ready)
+    }
+
     @Test @MainActor func libraryFacadeRefreshesKindSpecificArrays() async throws {
         let fixture = try RunnerFixture()
         let recovery = try await fixture.makeJob(.recovery, "recovery.wav")
@@ -379,6 +401,25 @@ private actor EnqueueProbe {
 private actor JobChangeProbe {
     private(set) var ids: [UUID] = []
     func record(_ id: UUID) { ids.append(id) }
+}
+
+private final class RunnerMutableClock: JobClock, @unchecked Sendable {
+    private let lock: NSLock
+    private var value: Date
+    init(_ value: Date) { self.value = value; lock = NSLock() }
+    var now: Date { lock.withLock { value } }
+    func advance(by seconds: TimeInterval) { lock.withLock { value = value.addingTimeInterval(seconds) } }
+}
+
+private actor LeaseSleeperProbe {
+    private(set) var delays: [TimeInterval] = []
+    private var continuation: CheckedContinuation<Void, Never>?
+    func sleep(_ delay: TimeInterval) async {
+        delays.append(delay)
+        await withCheckedContinuation { continuation = $0 }
+    }
+    func waitUntilScheduled() async { while continuation == nil { await Task.yield() } }
+    func release() { continuation?.resume(); continuation = nil }
 }
 
 private final class PlaybackStub: RecoveryAudioPlaying {

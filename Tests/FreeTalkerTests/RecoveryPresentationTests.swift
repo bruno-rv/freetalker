@@ -3,6 +3,11 @@ import Testing
 @testable import FreeTalker
 
 @Suite struct RecoveryPresentationTests {
+    @Test @MainActor func retentionSettingChangePurgesImmediately() async {
+        let probe = RecoveryRetentionChangeProbe()
+        await AppCoordinator.routeRecoveryRetentionChange(.thirtyDays) { await probe.record($0) }
+        #expect(await probe.values == [.thirtyDays])
+    }
     private let now = Date(timeIntervalSince1970: 1_000_000)
 
     @Test func badgeCountsOnlyRecoveriesNeedingAttention() {
@@ -68,4 +73,9 @@ import Testing
             needsSourceCleanup: false, sourceCleanupError: nil
         )
     }
+}
+
+private actor RecoveryRetentionChangeProbe {
+    private(set) var values: [RecoveryRetention] = []
+    func record(_ value: RecoveryRetention) { values.append(value) }
 }

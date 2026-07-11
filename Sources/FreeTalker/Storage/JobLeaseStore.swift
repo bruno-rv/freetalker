@@ -2,6 +2,15 @@ import CSQLite
 import Foundation
 
 extension TranscriptionJobStore: LeasedTranscriptionJobStoring {
+    func delayUntilNextLeaseExpiry(kind: JobKind? = nil) throws -> TimeInterval? {
+        let statement = try leasePrepare("SELECT MIN(lease_expires_at) FROM transcription_jobs WHERE state = 'processing' AND lease_expires_at IS NOT NULL AND (? IS NULL OR kind = ?);")
+        defer { sqlite3_finalize(statement) }
+        if let kind { leaseBind(kind.rawValue, 1, statement); leaseBind(kind.rawValue, 2, statement) }
+        else { sqlite3_bind_null(statement, 1); sqlite3_bind_null(statement, 2) }
+        guard sqlite3_step(statement) == SQLITE_ROW else { throw DatabaseError.sqlFailed(String(cString: sqlite3_errmsg(handle))) }
+        guard sqlite3_column_type(statement, 0) != SQLITE_NULL else { return nil }
+        return max(0, sqlite3_column_double(statement, 0) - clock.now.timeIntervalSince1970)
+    }
     func claimQueuedJob(_ id: UUID, kind: JobKind?, owner: UUID, leaseDuration: TimeInterval) throws -> TranscriptionJob {
         let statement = try leasePrepare("""
         UPDATE transcription_jobs
@@ -69,3 +78,5 @@ extension TranscriptionJobStore: LeasedTranscriptionJobStoring {
     private func leaseStep(_ statement: OpaquePointer) throws { guard sqlite3_step(statement) == SQLITE_DONE else { throw DatabaseError.sqlFailed(String(cString: sqlite3_errmsg(handle))) } }
     private func leaseBind(_ value: String, _ index: Int32, _ statement: OpaquePointer) { sqlite3_bind_text(statement, index, value, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self)) }
 }
+
+extension TranscriptionJobStore: LeaseExpirySchedulingStore {}

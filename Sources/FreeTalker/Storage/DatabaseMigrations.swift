@@ -1,7 +1,7 @@
 import CSQLite
 
 enum DatabaseMigrator {
-    static let latestVersion = 8
+    static let latestVersion = 9
 
     static func migrate(_ db: OpaquePointer) throws {
         try execute(db, "BEGIN IMMEDIATE;")
@@ -188,7 +188,38 @@ enum DatabaseMigrator {
     ALTER TABLE transcription_jobs ADD COLUMN deletion_expires_at REAL;
     """
 
-    private static let migrations = [migration1, migration2, migration3, migration4, migration5, migration6, migration7, migration8]
+    private static let migration9 = """
+    CREATE TABLE IF NOT EXISTS job_attempts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, attempt_number INTEGER NOT NULL,
+        started_at REAL NOT NULL, completed_at REAL, failure_stage TEXT, failure_message TEXT,
+        language TEXT, speech_model TEXT, template TEXT, result TEXT
+    );
+    ALTER TABLE job_attempts RENAME TO legacy_job_attempts;
+    CREATE TABLE job_attempts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id TEXT NOT NULL,
+        attempt_number INTEGER NOT NULL,
+        started_at REAL NOT NULL,
+        completed_at REAL,
+        failure_stage TEXT,
+        failure_message TEXT,
+        language TEXT,
+        speech_model TEXT,
+        template TEXT,
+        result TEXT,
+        FOREIGN KEY (job_id) REFERENCES transcription_jobs(id) ON DELETE CASCADE
+    );
+    INSERT INTO job_attempts
+        (id, job_id, attempt_number, started_at, completed_at, failure_stage, failure_message,
+         language, speech_model, template, result)
+    SELECT id, job_id, attempt_number, started_at, completed_at, failure_stage, failure_message,
+           language, speech_model, template, result
+    FROM legacy_job_attempts;
+    DROP TABLE legacy_job_attempts;
+    CREATE INDEX idx_job_attempts_job_id ON job_attempts(job_id);
+    """
+
+    private static let migrations = [migration1, migration2, migration3, migration4, migration5, migration6, migration7, migration8, migration9]
 
     private static func migrateLegacySnippetRows(_ db: OpaquePointer) throws {
         var select: OpaquePointer?

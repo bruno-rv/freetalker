@@ -3,6 +3,20 @@ import Testing
 @testable import FreeTalker
 
 @Suite struct RecoveryRetryTests {
+    @Test func recoveryLocalProcessorUsesExactLocalModelAndNoCloudBoundary() async throws {
+        let local = RecoveryLocalTranscriberProbe()
+        let cloudSTT = CloudBoundaryProbe()
+        let cloudLLM = CloudBoundaryProbe()
+        let output = try await RecoveryLocalProcessor(transcriber: local).process(
+            samples: [0.1],
+            configuration: .init(language: "pt", speechModel: "requested-small", template: "ignored"),
+            defaultModel: "global-large"
+        )
+        #expect(output.text == "local transcript")
+        #expect(await local.requests == ["pt|requested-small"])
+        #expect(await cloudSTT.calls == 0)
+        #expect(await cloudLLM.calls == 0)
+    }
     @Test func oneRetryCreatesOneAttemptAndUsesOverrides() async throws {
         let fixture = try await RetryFixture()
         let configuration = AttemptConfiguration(language: "pt", speechModel: "small", template: "email")
@@ -179,6 +193,19 @@ import Testing
             JobFailure(stage: .persisting, message: "database")
         ))
     }
+}
+
+private actor RecoveryLocalTranscriberProbe: RecoveryLocalTranscribing {
+    private(set) var requests: [String] = []
+    func transcribe(samples: [Float], forcedLanguage: String?, exactModel: String) async throws -> TranscriptionOutput {
+        requests.append("\(forcedLanguage ?? "auto")|\(exactModel)")
+        return .init(text: "local transcript", language: forcedLanguage ?? "en")
+    }
+}
+
+private actor CloudBoundaryProbe {
+    private(set) var calls = 0
+    func call() { calls += 1 }
 }
 
 private enum RetryTestError: Error, LocalizedError {

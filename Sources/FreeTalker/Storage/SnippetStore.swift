@@ -7,6 +7,7 @@ actor SnippetStore {
     private let transactionDidBegin: @Sendable () -> Void
 
     init(databaseURL: URL, transactionDidBegin: @escaping @Sendable () -> Void = {}) throws {
+        try DatabasePrivacy.prepare(url: databaseURL)
         var database: OpaquePointer?
         guard sqlite3_open(databaseURL.path, &database) == SQLITE_OK, let database else {
             let message = database.map { String(cString: sqlite3_errmsg($0)) } ?? "Could not open database"
@@ -15,6 +16,7 @@ actor SnippetStore {
         }
         sqlite3_busy_timeout(database, 5_000)
         do {
+            try DatabasePrivacy.secureOpenedDatabase(database, url: databaseURL)
             try Self.execute(database, "PRAGMA foreign_keys=ON;")
             try DatabaseMigrator.migrate(database)
             guard try Self.foreignKeysEnabled(database) else {

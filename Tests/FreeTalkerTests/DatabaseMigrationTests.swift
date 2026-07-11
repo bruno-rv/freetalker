@@ -22,7 +22,20 @@ import Testing
             "idx_transcription_jobs_lease_expires_at", "idx_transcription_jobs_deletion_claimed_at"
         ])
         #expect(try db.integer("SELECT COUNT(*) FROM pragma_foreign_key_list('snippet_triggers') WHERE \"table\" = 'snippets' AND \"from\" = 'snippet_id' AND on_delete = 'CASCADE';") == 1)
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_foreign_key_list('job_attempts') WHERE \"table\" = 'transcription_jobs' AND \"from\" = 'job_id' AND on_delete = 'CASCADE';") == 1)
         #expect(try db.migrationVersions() == Array(1...DatabaseMigrator.latestVersion))
+    }
+
+    @Test func deletingJobCascadesRecoveryAttempts() throws {
+        let db = try TemporaryDatabase()
+        try DatabaseMigrator.migrate(db.handle)
+        try db.execute("PRAGMA foreign_keys = ON;")
+        try db.execute("""
+        INSERT INTO transcription_jobs (id, kind, source_reference, state, created_at, updated_at) VALUES ('recovery', 'recovery', '/audio', 'failed', 1, 1);
+        INSERT INTO job_attempts (id, job_id, attempt_number, started_at, language, speech_model, template) VALUES (77, 'recovery', 1, 1, 'pt', 'small', 'clean');
+        DELETE FROM transcription_jobs WHERE id = 'recovery';
+        """)
+        #expect(try db.integer("SELECT COUNT(*) FROM job_attempts WHERE id = 77;") == 0)
     }
 
     @Test func migratingLatestSchemaAgainMakesNoChanges() throws {
