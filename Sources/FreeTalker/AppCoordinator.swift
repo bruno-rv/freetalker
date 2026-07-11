@@ -91,9 +91,13 @@ final class AppCoordinator: ObservableObject {
         whisperEngine.setEventReceiver(modelStore)
         modelStore.onAutomaticSelection = { [weak whisperEngine] target in
             guard let whisperEngine else { return }
+            let kitLoaded = whisperEngine.isLoaded
+            let localEngineSelected = AppSettings.shared.sttEngine == .whisperKit
             Task {
                 await Self.routeAutomaticSpeechModelSelection(
                     target,
+                    kitLoaded: kitLoaded,
+                    localEngineSelected: localEngineSelected,
                     preload: { await whisperEngine.preload() },
                     reload: { await whisperEngine.reload(to: $0) }
                 )
@@ -168,11 +172,17 @@ final class AppCoordinator: ObservableObject {
 
     static func routeAutomaticSpeechModelSelection(
         _ variant: String,
+        kitLoaded: Bool,
+        localEngineSelected: Bool,
         preload: () async -> Void,
         reload: (String) async -> Void
     ) async {
-        await preload()
-        await reload(variant)
+        if kitLoaded {
+            await reload(variant)
+        } else if localEngineSelected {
+            await preload()
+            await reload(variant)
+        }
     }
 
     /// Single entry point that (re)creates the global hotkey event tap whenever it is dead.

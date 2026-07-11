@@ -147,7 +147,7 @@ final class SpeechModelStore: ObservableObject, SpeechModelEngineEventReceiving 
         states = Dictionary(uniqueKeysWithValues: SpeechModelCatalog.entries.map {
             ($0.id, State(active: $0.id == settings.whisperModel, supported: fallback.contains($0.id)))
         })
-        applyAutomaticDefaultIfNeeded()
+        applyAutomaticDefaultIfNeeded(markCorrectedActive: true, notifyLifecycle: false)
         Task { await connectCoordinatorActivity() }
     }
 
@@ -343,7 +343,7 @@ final class SpeechModelStore: ObservableObject, SpeechModelEngineEventReceiving 
             let catalogRemote = Set(remote.compactMap { SpeechModelCatalog.entry(for: $0)?.id })
             supportedVariants = catalogRemote
             for id in states.keys { states[id]?.supported = catalogRemote.contains(id) }
-            applyAutomaticDefaultIfNeeded()
+            applyAutomaticDefaultIfNeeded(markCorrectedActive: false, notifyLifecycle: true)
         }
     }
 
@@ -361,7 +361,7 @@ final class SpeechModelStore: ObservableObject, SpeechModelEngineEventReceiving 
         }
     }
 
-    private func applyAutomaticDefaultIfNeeded() {
+    private func applyAutomaticDefaultIfNeeded(markCorrectedActive: Bool, notifyLifecycle: Bool) {
         guard Self.shouldApplyAutomaticDefault(
             chosenByUser: settings.whisperModelChosen,
             current: settings.whisperModel,
@@ -369,8 +369,8 @@ final class SpeechModelStore: ObservableObject, SpeechModelEngineEventReceiving 
         ) else { return }
         let target = SpeechModelCatalog.bestSupported(in: supportedVariants)
         settings.applyAutomaticWhisperModel(target)
-        for id in states.keys { states[id]?.active = false }
-        onAutomaticSelection?(target)
+        for id in states.keys { states[id]?.active = markCorrectedActive && id == target }
+        if notifyLifecycle { onAutomaticSelection?(target) }
     }
 }
 

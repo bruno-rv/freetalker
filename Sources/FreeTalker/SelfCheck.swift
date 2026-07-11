@@ -389,6 +389,16 @@ enum SelfCheck {
         AppSettings.shared.whisperModelChosen = false
         AppSettings.shared.applyAutomaticWhisperModel(SpeechModelCatalog.defaultID)
         let automaticTarget = "openai_whisper-small"
+        let initialFallbackStore = SpeechModelStore(
+            coordinator: SpeechModelDownloadCoordinator(),
+            settings: AppSettings.shared,
+            fallbackSupport: [automaticTarget]
+        )
+        if AppSettings.shared.whisperModel != automaticTarget
+            || initialFallbackStore.states[automaticTarget]?.active != true {
+            failures.append("speech model lifecycle: initial fallback correction was not first-launch active")
+        }
+        AppSettings.shared.applyAutomaticWhisperModel(SpeechModelCatalog.defaultID)
         let automaticReloaded = OneShotSignal()
         let automaticStore = SpeechModelStore(
             coordinator: SpeechModelDownloadCoordinator(),
@@ -405,14 +415,38 @@ enum SelfCheck {
             || automaticStore.states[automaticTarget]?.active == true {
             failures.append("speech model lifecycle: automatic correction skipped reload or claimed active before install")
         }
-        var automaticLifecycle: [String] = []
+        var loadedLifecycle: [String] = []
         await AppCoordinator.routeAutomaticSpeechModelSelection(
             automaticTarget,
-            preload: { automaticLifecycle.append("preload") },
-            reload: { automaticLifecycle.append("reload:\($0)") }
+            kitLoaded: true,
+            localEngineSelected: true,
+            preload: { loadedLifecycle.append("preload") },
+            reload: { loadedLifecycle.append("reload:\($0)") }
         )
-        if automaticLifecycle != ["preload", "reload:\(automaticTarget)"] {
-            failures.append("speech model lifecycle: automatic correction did not converge after preload")
+        if loadedLifecycle != ["reload:\(automaticTarget)"] {
+            failures.append("speech model lifecycle: loaded kit did not reload directly")
+        }
+        var localUnloadedLifecycle: [String] = []
+        await AppCoordinator.routeAutomaticSpeechModelSelection(
+            automaticTarget,
+            kitLoaded: false,
+            localEngineSelected: true,
+            preload: { localUnloadedLifecycle.append("preload") },
+            reload: { localUnloadedLifecycle.append("reload:\($0)") }
+        )
+        if localUnloadedLifecycle != ["preload", "reload:\(automaticTarget)"] {
+            failures.append("speech model lifecycle: local unloaded correction did not preload and converge")
+        }
+        var cloudUnloadedLifecycle: [String] = []
+        await AppCoordinator.routeAutomaticSpeechModelSelection(
+            automaticTarget,
+            kitLoaded: false,
+            localEngineSelected: false,
+            preload: { cloudUnloadedLifecycle.append("preload") },
+            reload: { cloudUnloadedLifecycle.append("reload:\($0)") }
+        )
+        if !cloudUnloadedLifecycle.isEmpty {
+            failures.append("speech model lifecycle: cloud selection triggered a local model download")
         }
 
         let app = AppCoordinator.shared
