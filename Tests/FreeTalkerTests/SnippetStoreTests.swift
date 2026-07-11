@@ -186,6 +186,7 @@ private func createLegacyDatabase(at url: URL, triggers: [String]) throws {
     let sql = """
     CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at REAL NOT NULL DEFAULT (unixepoch()));
     INSERT INTO schema_migrations(version) VALUES (1),(2),(3),(4);
+    CREATE TABLE transcription_jobs (id TEXT PRIMARY KEY);
     CREATE TABLE snippets (id TEXT PRIMARY KEY, trigger TEXT NOT NULL UNIQUE, replacement TEXT NOT NULL, created_at REAL NOT NULL, updated_at REAL NOT NULL);
     """ + triggers.enumerated().map {
         "INSERT INTO snippets VALUES ('\($0.offset)', '\($0.element)', 'value \($0.offset)', 100, 100);"

@@ -7,12 +7,20 @@ protocol TranscriptionJobStoring: Sendable {
     func recoverInterruptedJobs(kind: JobKind?) async throws -> Int
 }
 
+protocol LeasedTranscriptionJobStoring: TranscriptionJobStoring {
+    func claimQueuedJob(_ id: UUID, kind: JobKind?, owner: UUID, leaseDuration: TimeInterval) async throws -> TranscriptionJob
+    func renewLease(_ id: UUID, owner: UUID, leaseDuration: TimeInterval) async throws
+    func transitionOwned(_ id: UUID, owner: UUID, to state: JobState) async throws
+    func recoverStaleJobs(kind: JobKind?) async throws -> Int
+}
+
 extension TranscriptionJobStore: TranscriptionJobStoring {}
 
 final class CancellationToken: @unchecked Sendable {
     private let lock = NSLock()
     private var isCancelled = false
     private var finalization: (@Sendable () async throws -> Void)?
+    private var leaseOwner: UUID?
 
     func cancel() {
         lock.lock()
@@ -29,6 +37,9 @@ final class CancellationToken: @unchecked Sendable {
     func installFinalization(_ operation: @escaping @Sendable () async throws -> Void) {
         lock.withLock { finalization = operation }
     }
+
+    func installLeaseOwner(_ owner: UUID) { lock.withLock { leaseOwner = owner } }
+    var owner: UUID? { lock.withLock { leaseOwner } }
 
     func beginFinalization() async throws {
         let operation = lock.withLock { finalization }
@@ -64,6 +75,7 @@ actor LocalJobRunner {
     private let kind: JobKind?
     private let finalizationFailure: FinalizationFailure?
     private let didChange: DidChange?
+    private let leaseDuration: TimeInterval
     private var queue: [UUID] = []
     private var worker: Task<Void, Never>?
     private var current: CurrentExecution?
@@ -74,6 +86,7 @@ actor LocalJobRunner {
         executorFinalizesJob: Bool = false,
         finalizationFailure: FinalizationFailure? = nil,
         didChange: DidChange? = nil,
+        leaseDuration: TimeInterval = 30,
         executor: @escaping Executor
     ) {
         self.store = store
@@ -81,6 +94,7 @@ actor LocalJobRunner {
         self.executorFinalizesJob = executorFinalizesJob
         self.finalizationFailure = finalizationFailure
         self.didChange = didChange
+        self.leaseDuration = leaseDuration
         self.executor = executor
     }
 
@@ -109,7 +123,11 @@ actor LocalJobRunner {
 
     func resumeQueuedJobs() async {
         if worker == nil, current == nil {
-            _ = try? await store.recoverInterruptedJobs(kind: kind)
+            if let leased = store as? any LeasedTranscriptionJobStoring {
+                _ = try? await leased.recoverStaleJobs(kind: kind)
+            } else {
+                _ = try? await store.recoverInterruptedJobs(kind: kind)
+            }
         }
         guard let jobs = try? await store.jobs(kind: kind) else { return }
         for job in jobs where job.state == .queued {
@@ -133,6 +151,7 @@ actor LocalJobRunner {
         while !queue.isEmpty {
             let id = queue.removeFirst()
             let token = CancellationToken()
+            token.installLeaseOwner(UUID())
             token.installFinalization { [weak self, weak token] in
                 guard let self, let token else { throw CancellationError() }
                 try await self.beginFinalization(id: id, token: token)
@@ -149,11 +168,28 @@ actor LocalJobRunner {
               kind == nil || job.kind == kind else { return }
 
         do {
-            try await store.transition(id, from: .queued, to: .processing(stage: .preparing))
+            if let leased = store as? any LeasedTranscriptionJobStoring, let owner = token.owner {
+                _ = try await leased.claimQueuedJob(id, kind: kind, owner: owner, leaseDuration: leaseDuration)
+            } else {
+                try await store.transition(id, from: .queued, to: .processing(stage: .preparing))
+            }
         } catch {
             return
         }
         await didChange?(id)
+
+        let heartbeat: Task<Void, Never>? = if let leased = store as? any LeasedTranscriptionJobStoring,
+                                               let owner = token.owner {
+            Task {
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .seconds(max(0.25, leaseDuration / 3)))
+                    guard !Task.isCancelled else { return }
+                    do { try await leased.renewLease(id, owner: owner, leaseDuration: leaseDuration) }
+                    catch { token.cancel(); return }
+                }
+            }
+        } else { nil }
+        defer { heartbeat?.cancel() }
 
         do {
             try token.checkCancellation()
@@ -161,10 +197,10 @@ actor LocalJobRunner {
             try await executor(currentJob, token)
             if !executorFinalizesJob { try await token.beginFinalization() }
             if !executorFinalizesJob {
-                try await store.transition(id, from: .processing, to: .ready)
+                try await transitionTerminal(id, token: token, state: .ready)
             }
         } catch is CancellationError {
-            try? await store.transition(id, from: .processing, to: .cancelled)
+            try? await transitionTerminal(id, token: token, state: .cancelled)
         } catch {
             if current?.phase == .finalizing {
                 await handleFinalizationFailure(id: id, error: error)
@@ -173,7 +209,7 @@ actor LocalJobRunner {
             }
             let stage = try? await store.job(id: id)?.state.processingStage
             let failure = JobFailure(stage: stage ?? .preparing, message: error.localizedDescription)
-            try? await store.transition(id, from: .processing, to: .failed(failure))
+            try? await transitionTerminal(id, token: token, state: .failed(failure))
         }
         await didChange?(id)
     }
@@ -194,7 +230,19 @@ actor LocalJobRunner {
                 }
             }
             let failure = JobFailure(stage: stage, message: error.localizedDescription)
-            try? await store.transition(id, from: .processing, to: .failed(failure))
+            if let leased = store as? any LeasedTranscriptionJobStoring, let owner = current?.token.owner {
+                try? await leased.transitionOwned(id, owner: owner, to: .failed(failure))
+            } else {
+                try? await store.transition(id, from: .processing, to: .failed(failure))
+            }
+        }
+    }
+
+    private func transitionTerminal(_ id: UUID, token: CancellationToken, state: JobState) async throws {
+        if let leased = store as? any LeasedTranscriptionJobStoring, let owner = token.owner {
+            try await leased.transitionOwned(id, owner: owner, to: state)
+        } else {
+            try await store.transition(id, from: .processing, to: state)
         }
     }
 
