@@ -321,7 +321,7 @@ enum SelfCheck {
             selected: true,
             activeDownloadVariant: nil
         )
-        if pending.status != "Selected — pending reload" || !pending.canSelect || pending.canDelete {
+        if pending.status != "Selected — pending reload" || pending.canSelect || pending.canDelete {
             failures.append("speech model row: pending selection presentation mismatch")
         }
         let pendingBusy = SpeechModelRowPresentation.make(
@@ -481,6 +481,10 @@ enum SelfCheck {
         }
         if Set(entries.map(\.quickTip)).count != entries.count {
             failures.append("speech catalog: quick tips are not model-specific")
+        }
+        if entries.contains(where: { $0.compactTradeoff.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
+            || Set(entries.map(\.compactTradeoff)).count < 4 {
+            failures.append("speech catalog: compact tradeoff metadata missing or insufficiently specific")
         }
         if Set(SpeechModelCatalog.preferenceOrder) != Set(expectedIDs) || SpeechModelCatalog.preferenceOrder.count != entries.count {
             failures.append("speech catalog: preference order does not cover every entry exactly once")
@@ -2972,13 +2976,49 @@ enum SelfCheck {
             failures.append("speech model engine: failed reload settings revert mismatch")
         }
 
+        let status = EngineStatusComposer(initial: "Ready — Old")
+        let reload = status.beginReload("Checking for New…")
+        async let staleDetect: Void = status.setOperation("Detecting language…")
+        async let staleTranscribe: Void = status.setOperation("Transcribing…")
+        _ = await (staleDetect, staleTranscribe)
+        if status.rendered != "Checking for New…" {
+            failures.append("speech model engine: old-kit operation status overrode reload lifecycle")
+        }
+        status.setReload("Loading New…", token: reload)
+        status.setOperation("Ready — Old")
+        if status.rendered != "Loading New…" {
+            failures.append("speech model engine: old-kit Ready overrode loading reload target")
+        }
+        status.finishReload("Ready — New", token: reload)
+        if status.rendered != "Ready — New" {
+            failures.append("speech model engine: successful reload terminal status was not exposed")
+        }
+        let failedReload = status.beginReload("Checking for Broken…")
+        status.setOperation("Ready — Old")
+        status.setReloadFailure("Failed to load Broken", token: failedReload)
+        status.finishReload("Ready — Old", token: failedReload)
+        if status.rendered != "Failed to load Broken" {
+            failures.append("speech model engine: failed reload terminal status was not exposed")
+        }
+
         let guarded = GuardedKitState<String>()
         if guarded.isLoaded || guarded.snapshot().variant != nil {
             failures.append("speech model engine: initial guarded state was loaded")
         }
         guarded.installIfEmpty(kit: "old-kit", variant: "old")
-        let captured = guarded.snapshot().kit
+        let capturedSignal = OneShotSignal()
+        let resumeCapture = OneShotSignal()
+        let operation = Task {
+            try await guarded.withCapturedKit { kit in
+                await capturedSignal.fire()
+                await resumeCapture.wait()
+                return kit
+            }
+        }
+        await capturedSignal.wait()
         guarded.swap(kit: "new-kit", variant: "new")
+        await resumeCapture.fire()
+        let captured = try? await operation.value
         if !guarded.isLoaded || guarded.snapshot().kit != "new-kit"
             || guarded.snapshot().variant != "new" || captured != "old-kit" {
             failures.append("speech model engine: guarded load/swap or transcription capture mismatch")

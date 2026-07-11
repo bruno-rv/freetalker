@@ -17,7 +17,7 @@ struct SpeechModelRowPresentation: Equatable {
         activeDownloadVariant: String?
     ) -> Self {
         let unsupported = !state.supported
-        let canSelect = state.phase == .downloaded && !state.active && !unsupported
+        let canSelect = state.phase == .downloaded && !state.active && !selected && !unsupported
         let canDelete = !selected && SpeechModelStore.canDelete(phase: state.phase, active: state.active)
         let status: String
         if state.active {
@@ -521,7 +521,7 @@ private struct GeneralSettingsView: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(entry.displayName)
-                Text("\(entry.approximateSize) · \(tradeoffLabel(for: entry))")
+                Text("\(entry.approximateSize) · \(entry.compactTradeoff)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Text(presentation.status)
@@ -546,16 +546,6 @@ private struct GeneralSettingsView: View {
         }
         .help(entry.quickTip)
         .accessibilityHint(entry.quickTip)
-    }
-
-    private func tradeoffLabel(for entry: SpeechModelCatalogEntry) -> String {
-        switch entry.id {
-        case "openai_whisper-tiny": "fastest"
-        case "openai_whisper-base", "openai_whisper-small": "fast and compact"
-        case "openai_whisper-medium": "balanced"
-        case "openai_whisper-large-v3_947MB": "most accurate"
-        default: "faster large-model transcription"
-        }
     }
 
     /// Running, user-facing (`.regular` activation policy — excludes menu-bar-only/background
