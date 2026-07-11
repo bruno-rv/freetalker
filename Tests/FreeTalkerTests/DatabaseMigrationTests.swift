@@ -10,13 +10,15 @@ import Testing
 
         #expect(try db.tableNames() == [
             "transcription_jobs", "job_attempts", "speaker_segments",
-            "speaker_names", "snippets", "snippet_triggers", "schema_migrations"
+            "speaker_names", "snippets", "snippet_triggers", "schema_migrations",
+            "media_job_stages", "transcript_segments", "speaker_turns", "media_derived_files"
         ])
         #expect(try db.indexNames() == [
             "idx_transcription_jobs_state_expires_at",
             "idx_transcription_jobs_purge_claimed_at",
             "idx_transcription_jobs_needs_source_cleanup",
-            "idx_job_attempts_job_id", "idx_snippet_triggers_normalized_unique"
+            "idx_job_attempts_job_id", "idx_snippet_triggers_normalized_unique",
+            "idx_transcript_segments_job_id", "idx_speaker_turns_job_id"
         ])
         #expect(try db.integer("SELECT COUNT(*) FROM pragma_foreign_key_list('snippet_triggers') WHERE \"table\" = 'snippets' AND \"from\" = 'snippet_id' AND on_delete = 'CASCADE';") == 1)
         #expect(try db.migrationVersions() == Array(1...DatabaseMigrator.latestVersion))
@@ -114,6 +116,27 @@ import Testing
         #expect(try db.migrationVersions() == [1, 2, 3, 4])
         #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('snippets') WHERE name = 'trigger';") == 1)
         #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('snippets') WHERE name = 'name';") == 0)
+    }
+
+    @Test func rollsBackVersionSixMediaUpgradeAndLedgerWhenTableCreationFails() throws {
+        let db = try TemporaryDatabase()
+        try DatabaseMigrator.migrate(db.handle)
+        try db.execute("""
+        DROP INDEX idx_transcript_segments_job_id;
+        DROP INDEX idx_speaker_turns_job_id;
+        DROP TABLE media_job_stages;
+        DROP TABLE transcript_segments;
+        DROP TABLE speaker_turns;
+        DROP TABLE media_derived_files;
+        DELETE FROM schema_migrations WHERE version = 6;
+        CREATE TABLE transcript_segments (collision INTEGER);
+        """)
+
+        #expect(throws: DatabaseError.self) { try DatabaseMigrator.migrate(db.handle) }
+
+        #expect(try db.migrationVersions() == [1, 2, 3, 4, 5])
+        #expect(try db.tableNames().contains("media_job_stages") == false)
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('transcript_segments') WHERE name = 'collision';") == 1)
     }
 
     @Test func rejectsSchemaVersionNewerThanMigrator() throws {

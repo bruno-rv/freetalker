@@ -1,7 +1,7 @@
 import CSQLite
 
 enum DatabaseMigrator {
-    static let latestVersion = 5
+    static let latestVersion = 6
 
     static func migrate(_ db: OpaquePointer) throws {
         try execute(db, "BEGIN IMMEDIATE;")
@@ -136,7 +136,45 @@ enum DatabaseMigrator {
         SELECT id, trigger, replacement, created_at, updated_at FROM legacy_snippets;
     """
 
-    private static let migrations = [migration1, migration2, migration3, migration4, migration5]
+    private static let migration6 = """
+    CREATE TABLE media_job_stages (
+        job_id TEXT NOT NULL,
+        stage TEXT NOT NULL,
+        completed_at REAL NOT NULL,
+        PRIMARY KEY (job_id, stage),
+        FOREIGN KEY (job_id) REFERENCES transcription_jobs(id) ON DELETE CASCADE
+    );
+    CREATE TABLE transcript_segments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id TEXT NOT NULL,
+        ordinal INTEGER NOT NULL,
+        start_time REAL NOT NULL,
+        end_time REAL NOT NULL,
+        transcript TEXT NOT NULL,
+        FOREIGN KEY (job_id) REFERENCES transcription_jobs(id) ON DELETE CASCADE,
+        UNIQUE (job_id, ordinal)
+    );
+    CREATE TABLE speaker_turns (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id TEXT NOT NULL,
+        ordinal INTEGER NOT NULL,
+        speaker_id TEXT NOT NULL,
+        start_time REAL NOT NULL,
+        end_time REAL NOT NULL,
+        FOREIGN KEY (job_id) REFERENCES transcription_jobs(id) ON DELETE CASCADE,
+        UNIQUE (job_id, ordinal)
+    );
+    CREATE TABLE media_derived_files (
+        job_id TEXT NOT NULL,
+        path TEXT NOT NULL,
+        PRIMARY KEY (job_id, path),
+        FOREIGN KEY (job_id) REFERENCES transcription_jobs(id) ON DELETE CASCADE
+    );
+    CREATE INDEX idx_transcript_segments_job_id ON transcript_segments(job_id, ordinal);
+    CREATE INDEX idx_speaker_turns_job_id ON speaker_turns(job_id, ordinal);
+    """
+
+    private static let migrations = [migration1, migration2, migration3, migration4, migration5, migration6]
 
     private static func migrateLegacySnippetRows(_ db: OpaquePointer) throws {
         var select: OpaquePointer?

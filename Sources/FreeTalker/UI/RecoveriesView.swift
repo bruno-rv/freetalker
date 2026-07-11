@@ -50,9 +50,12 @@ enum RecoveryPresentation {
     static func stageLabel(_ stage: JobStage) -> String {
         switch stage {
         case .preparing: "Preparing"
+        case .decoding: "Decoding"
         case .transcribing: "Transcribing"
+        case .diarizing: "Separating speakers"
         case .postProcessing: "Post-processing"
         case .persisting: "Saving"
+        case .finalizing: "Finalizing"
         }
     }
 

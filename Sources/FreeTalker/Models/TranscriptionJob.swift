@@ -7,9 +7,12 @@ enum JobKind: String, CaseIterable, Sendable, Equatable {
 
 enum JobStage: String, CaseIterable, Sendable, Equatable {
     case preparing = "preparing"
+    case decoding = "decoding"
     case transcribing = "transcribing"
+    case diarizing = "diarizing"
     case postProcessing = "post_processing"
     case persisting = "persisting"
+    case finalizing = "finalizing"
 }
 
 struct JobFailure: Sendable, Equatable {
