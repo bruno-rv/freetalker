@@ -3,10 +3,13 @@ BUNDLE := $(APP_NAME).app
 CONFIG := release
 BIN := .build/$(CONFIG)/$(APP_NAME)
 
-.PHONY: build app run clean
+.PHONY: build test app run clean
 
 build:
 	swift build -c $(CONFIG)
+
+test:
+	swift test
 
 # Assembles FreeTalker.app from the built executable — no .xcodeproj available (CLT only),
 # see README.md.
