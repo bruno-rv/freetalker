@@ -107,12 +107,7 @@ struct MediaImportPipeline: Sendable {
             guard ownedDirectory.isNormalizedWAV(temporary) else { throw MediaImportError.decodeFailed("Decoded audio is not normalized 16 kHz mono WAV") }
             let promoted = try ownedDirectory.promote(temporary, to: "audio.wav")
             try ownedDirectory.revalidateIdentity()
-            do {
-                try await store.persistDecodedMedia(jobID: job.id, owner: owner, derivedAudioPath: promoted.path)
-            } catch {
-                try? ownedDirectory.removeInvalidArtifact("audio.wav", source: URL(fileURLWithPath: job.source.reference))
-                throw error
-            }
+            try await store.persistDecodedMedia(jobID: job.id, owner: owner, derivedAudioPath: promoted.path)
             try await store.updateMediaProgress(jobID: job.id, owner: owner, progress: 0.25)
             completed.insert(.decode)
         }
