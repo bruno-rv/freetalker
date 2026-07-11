@@ -60,3 +60,24 @@ was already in flight.
   name and localized failure hint.
 
 Fresh follow-up verification: `make selfcheck` passed and `git diff --check` passed.
+
+## Lifecycle review follow-up
+
+### RED
+
+Focused SelfCheck calls first failed because automatic lifecycle routing had no loaded/local
+engine inputs. The initialization check also documented the semantic regression: the shared
+automatic-default helper cleared active state for both synchronous fallback correction and
+later remote correction.
+
+### GREEN
+
+- Synchronous fallback correction now marks its corrected desired row active, preserving the
+  first-launch **Active — downloads on first use** presentation.
+- Remote support correction clears presumptive active state and waits for the engine's install
+  event before marking the corrected target active.
+- Lifecycle routing now reloads an already-loaded local kit, preloads then convergence-checks
+  an unloaded kit only when WhisperKit is selected, and performs no local model work while
+  Cloud STT remains selected.
+
+Fresh lifecycle follow-up verification: `make selfcheck` passed and `git diff --check` passed.
