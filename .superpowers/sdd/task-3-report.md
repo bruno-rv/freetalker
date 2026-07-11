@@ -25,4 +25,24 @@ Verification evidence is recorded in the commit/handoff command output: `make se
 - Scope is limited to `WhisperKitEngine.swift`, `SelfCheck.swift`, and this required report.
 - No direct `WhisperKit.download` remains in the engine.
 - No production network/model download is exercised by SelfCheck.
-- The existing event interface lacks a distinct `active` event; successful swaps instead publish model-specific Ready status, while Task 4's lifecycle wiring can update store active identity from settings/reload completion.
+- Task 4 still owns lifecycle wiring of the engine event receiver and selection-triggered reload calls.
+
+## Findings follow-up
+
+### RED
+
+The follow-up began by referencing the required production reload seam and active/install event from SelfCheck. `make selfcheck` failed before implementation with:
+
+- `cannot find 'ModelReloadController' in scope`
+- `type 'SpeechModelEngineEvent' has no member 'active'`
+
+### GREEN
+
+- `ModelReloadController` is now the production seam used by both initial engine load and `reload(to:)`; offline fakes exercise the same guarded install, serialization, failure, revert, event, and convergence code as production.
+- The controller keeps the prior kit on candidate failure, conditionally reverts only the still-current failed setting, and continues to a newer third selection.
+- Target state remains nondeletable from `.busy`, through `.downloading`, until terminal `.active` or `.failed`; `.downloaded` is no longer emitted before candidate construction.
+- `.active` is emitted immediately after guarded install/swap. `SpeechModelStore` atomically clears the prior active flag, activates the installed variant, and marks it downloaded.
+- Ready status is published only by the post-install callback, after guarded state contains the installed kit and variant.
+- Offline checks cover initial busy→active ordering, failure preservation/revert, third-selection non-clobber and convergence, absence of premature downloaded events, captured old-kit identity, active store alignment, and maximum one concurrent candidate load.
+
+Fresh final verification: `make selfcheck` passed and `git diff --check` passed.
