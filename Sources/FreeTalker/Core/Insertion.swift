@@ -19,8 +19,6 @@ struct InsertionTarget {
     let window: AXUIElement?
 }
 
-/// Inserts the Refined Output at the cursor of the frontmost app via the pasteboard +
-/// synthetic ⌘V, restoring the previous pasteboard contents afterward. See PLAN.md step 6.
 enum Insertion {
     /// Compares a snapshotted focused element/window against what's focused now. `.unavailable`
     /// covers both "no snapshot was taken at all" and "the snapshot app was AX-opaque, so
@@ -119,41 +117,6 @@ enum Insertion {
         return posted
     }
 
-    /// Pure paste-target-drift decision, split out so SelfCheck can drive it with synthetic
-    /// identity data.
-    ///
-    /// `hasTarget` is the *only* switch for the permissive "nothing to compare against" path:
-    /// `false` means no snapshot was taken at all (e.g. `AppCoordinator.reprocess`, which has no
-    /// frontmost-app snapshot for a historical re-process) → `true`, preserving the pre-fix
-    /// behavior of always pasting; `pidMatch`/`elementComparison`/bundle ids are irrelevant here
-    /// and never evaluated. This must NOT be conflated with "a snapshot was taken but its bundle
-    /// id happened to be nil" (`app.bundleIdentifier == nil`, which some apps report) — that case
-    /// has `hasTarget == true` and still goes through the full pid + element gate below. See
-    /// Round 3 Codex finding: nil-bundleID snapshot bypassing the drift gate.
-    ///
-    /// When `hasTarget` is `true`, bundle id is checked first:
-    /// - Both non-nil → must be equal, else `false` (the user switched apps).
-    /// - `snapshotBundleID == nil`, `currentBundleID` anything → bundle id carries no information
-    ///   (it was unknown at snapshot time), so this doesn't contradict identity on its own; the
-    ///   decision falls through entirely to `pidMatch`/`elementComparison`.
-    /// - `snapshotBundleID != nil`, `currentBundleID == nil` → `false`. We *did* know the
-    ///   intended target and now can't identify what's frontmost, which is exactly the "can't
-    ///   confirm it's safe" situation this check exists to catch — stranding the text on the
-    ///   pasteboard (recoverable via manual paste) beats pasting into an unidentifiable target.
-    ///
-    /// Once bundle id doesn't contradict, `pidMatch` (default `true`, i.e. "no pid info to
-    /// contradict") must also hold — bundle id alone doesn't distinguish two windows of the same
-    /// app if macOS ever reuses/aliases identifiers oddly, and a pid mismatch is an unambiguous
-    /// signal something changed. `elementComparison` then refines *within* the same process:
-    /// - `.match` / `.unavailable` → paste allowed (`.unavailable` covers both "no snapshot" and
-    ///   "snapshot app was AX-opaque, neither element nor window were obtainable" — falls back to
-    ///   bundle+pid identity, same as the pre-fix behavior, plus the existing editability probe
-    ///   called separately after this gate).
-    ///   // ponytail: bundle+pid-only fallback for AX-opaque apps + upgrade path: none currently
-    ///   available — AX element/window identity is the only public surface finer than bundle id,
-    ///   so an app that denies AX queries entirely has no stronger signal to fall back to.
-    /// - `.mismatch` → the focused element (or window) changed within the same app/process since
-    ///   the snapshot — e.g. a different Slack channel or Mail draft — so the paste is skipped.
     nonisolated static func shouldSynthesizePaste(
         hasTarget: Bool,
         snapshotBundleID: String?,

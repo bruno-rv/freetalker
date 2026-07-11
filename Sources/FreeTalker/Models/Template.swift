@@ -1,14 +1,10 @@
 import Foundation
 
-/// A user-editable instruction set that transforms a Transcript into a Refined Output.
-/// See CONTEXT.md: "Template", "Disfluency", "Self-correction".
 struct Template: Identifiable, Equatable, Codable {
     var id: String
     var name: String
     var prompt: String
 
-    /// Appended to every built-in Template's v4 prompt — see CONTEXT.md "Spoken Command" and
-    /// PLAN.md Feature 1. Identical text across all four built-ins.
     static let spokenCommandsSection = "This transcript may also contain Spoken Commands: English phrases spoken as instructions rather than words to transcribe, no matter what language the rest of the transcript is in (including Portuguese). Interpret them instead of transcribing the command words: \"new paragraph\" starts a new paragraph; \"new line\" breaks to a new line; \"quote\" ... \"unquote\" wraps the enclosed words in quotation marks; \"bullet point\" starts a bulleted list item; \"numbered list\" starts a numbered list item; \"all caps\" ... \"end caps\" uppercases the enclosed words; \"scratch that\" removes the most recent sentence or clause the speaker said immediately before the command. Phrases used descriptively rather than as instructions (for example, \"I added a new paragraph about pricing\") must be transcribed literally, exactly as spoken. When in doubt whether something is a command, transcribe it literally."
 
     static let builtIns: [Template] = [
@@ -36,9 +32,6 @@ struct Template: Identifiable, Equatable, Codable {
 
     static let defaultID = "clean-dictation"
 
-    /// Prior default prompts for each built-in Template id, kept verbatim so `upgradingBuiltIns`
-    /// can recognize "never edited" and safely upgrade to the current default. Each future
-    /// prompt revision appends its predecessor here rather than replacing it. See PLAN.md step 7.
     static let legacyPrompts: [String: [String]] = [
         "clean-dictation": [
             """
@@ -78,14 +71,6 @@ struct Template: Identifiable, Equatable, Codable {
         ]
     ]
 
-    /// Pure upgrade-if-unedited migration: for each element whose `id` is a built-in id and
-    /// whose whitespace-trimmed `prompt` matches one of that built-in's `legacyPrompts` (also
-    /// trimmed), replaces the prompt with the current built-in default. `name` is untouched.
-    /// Idempotent — a second pass over the result reports `changed == false`, since an
-    /// already-current prompt matches neither a legacy prompt nor the "differs from current"
-    /// guard. Deliberately does NOT add back a built-in the caller's `templates` doesn't contain
-    /// (a deleted built-in stays deleted — user intent, not a bug) and never touches a
-    /// semantically-edited prompt. See PLAN.md step 7, Round 1 Codex finding 8 (rejected).
     static func upgradingBuiltIns(_ templates: [Template]) -> (templates: [Template], changed: Bool) {
         let currentPromptByID = Dictionary(uniqueKeysWithValues: builtIns.map { ($0.id, $0.prompt) })
         var changed = false

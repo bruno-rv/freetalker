@@ -4,9 +4,6 @@ import Combine
 import Foundation
 import os
 
-/// Central orchestrator: wires push-to-talk, capture, transcription, post-processing,
-/// insertion, and Library recording into one pipeline. Also the source of truth for menu bar
-/// status text. See PLAN.md "Approach" steps 2–6.
 @MainActor
 final class AppCoordinator: ObservableObject {
     static let shared = AppCoordinator()
@@ -49,11 +46,6 @@ final class AppCoordinator: ObservableObject {
     private var lockedCapSeconds: TimeInterval?
     /// Ticks the HUD's elapsed/cap display roughly once a second while `locked`.
     private var lockedHUDTimer: Timer?
-    /// Recording Panel one-shot language choice (CONTEXT.md "Language Pin", PLAN.md step 12):
-    /// beats the app rule AND the pin, but only for the in-flight Dictation. Set/cleared only
-    /// through `Self.nextOneShotLanguage` (see below) so every touch point — set, tap-again-
-    /// clears, and the three clear sites (stop, cancel, new recording) — goes through the same
-    /// pure decision SelfCheck exercises directly.
     private var oneShotLanguage: String?
 
     let speechModelDownloadCoordinator: SpeechModelDownloadCoordinator
@@ -68,10 +60,6 @@ final class AppCoordinator: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private var permissionPollTimer: Timer?
 
-    // ponytail: debug artifact for the live-mic silence investigation — always cheap (one
-    // WAV write per dictation), kept permanently rather than behind a debug flag since it's
-    // the fastest way to confirm what the mic tap actually delivered without asking the user
-    // to reproduce anything. See CONTEXT.md.
     private static let logger = Logger(subsystem: "com.bruno.freetalker", category: "capture")
 
     var activeSTTEngine: any TranscriptionEngine {
@@ -108,22 +96,6 @@ final class AppCoordinator: ObservableObject {
         // when the menu happens to reopen.
         whisperEngine.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }.store(in: &cancellables)
         cloudSTTEngine.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }.store(in: &cancellables)
-        // Central hotkey re-plumb (Round 1 Codex finding 6): every call site that changes
-        // `AppSettings.shared.hotKeySpec`/`redoHotKeySpec` used to have to remember to also call
-        // `restartHotKeyListening()` itself (SettingsView's Change…/Clear buttons did, three
-        // times over) — a direct assignment from anywhere else would silently leave the event
-        // tap's matchers stale. Subscribing here instead makes AppCoordinator itself the one
-        // place either setting's change re-plumbs the tap, so no call site needs to remember to;
-        // the matching manual calls in SettingsView are removed. `dropFirst()` skips the initial
-        // replay each `@Published` projected publisher sends on subscribe.
-        //
-        // Not exercised by SelfCheck: like `ensureHotKeyListening()`/`hotKeyManager.start()`
-        // elsewhere in this file, the callback attempts a real `CGEventTap` creation —
-        // SelfCheck never triggers that (see `hotKeyChecks()`/`redoLastChecks()`, which only
-        // drive the pure `HotKeyMatcher`/`HotKeySpec` decision logic), so no check assigns to
-        // `AppSettings.shared.hotKeySpec`/`redoHotKeySpec` directly; doing so would fire this
-        // subscription against `AppCoordinator.shared`, which is already live by the time
-        // SelfCheck runs (see the pipeline contract check above).
         AppSettings.shared.$hotKeySpec
             .dropFirst()
             .receive(on: DispatchQueue.main)
@@ -143,8 +115,6 @@ final class AppCoordinator: ObservableObject {
         // Amendment B3: clicking the HUD pill locks an in-progress PTT recording or stops a
         // locked one — wired once, not per-`ensureHotKeyListening()` call.
         hud.onPillClick = { [weak self] in self?.handlePillClick() }
-        // Recording Panel (Feature 3): each control's own callback, wired once — see
-        // PLAN.md step 9/10.
         hud.onPanelCancel = { [weak self] in self?.handlePanelCancel() }
         hud.onPanelDone = { [weak self] in self?.handlePanelDone() }
         hud.onPanelRaw = { [weak self] in self?.handlePanelRaw() }
@@ -326,10 +296,6 @@ final class AppCoordinator: ObservableObject {
         }
     }
 
-    /// Esc while recording (either mode) cancels — the event tap only forwards Esc here while
-    /// actually recording (see `HotKeyManager.shouldSwallowEscape`), so this fires only when
-    /// `recordingState != .idle` in practice; routed through the state machine regardless, for a
-    /// single source of truth. See PLAN.md Amendment B1.
     private func handleEscape() {
         let (newState, action) = RecordingStateMachine.transition(state: recordingState, event: .esc, currentGeneration: recordingGeneration)
         recordingState = newState
@@ -341,20 +307,6 @@ final class AppCoordinator: ObservableObject {
         }
     }
 
-    // MARK: - Recording Panel (Feature 3)
-    //
-    // Every panel button that can stop/lock/cancel the recording routes through
-    // `RecordingStateMachine.transition` from the CURRENT state, via the pure
-    // `recordingEvent(for:)` mapping below — so a stale/double click (the state already back at
-    // idle by the time it's handled) always resolves to `.none` from the same table
-    // `handsFreeChecks`/`panelActionRoutingChecks` cover, rather than a bespoke per-button guard.
-    // See PLAN.md step 9/10.
-
-    /// Which `RecordingEvent` a Recording Panel button press maps to — the routing table
-    /// SelfCheck drives directly against `RecordingStateMachine.transition`. EN/PT and the
-    /// template-cycle button aren't lifecycle transitions (they don't stop/lock/cancel a
-    /// recording) — they're metadata toggles gated on "a recording is in progress", handled by
-    /// their own methods below rather than through this table.
     enum PanelButton: Equatable {
         case cancel
         case done
@@ -370,24 +322,15 @@ final class AppCoordinator: ObservableObject {
         }
     }
 
-    /// ✕ Cancel — same esc/cancel path as pressing Esc while recording. See PLAN.md step 9.
     private func handlePanelCancel() { handleEscape() }
 
-    /// 🔒 Lock — visible only in `pttRecording` (PLAN.md step 9); the only panel control mapped
-    /// to `pillClick`, reusing `handlePillClick`'s existing pre-snapshot + enterLocked path.
     private func handlePanelLock() { handlePillClick() }
 
     /// ✓ Done — stop+transcribe with post-processing.
     private func handlePanelDone() { handlePanelFinish(skipPostProcessing: false) }
 
-    /// "Raw" — stop+transcribe verbatim (Post-Processor never invoked). See PLAN.md step 11.
     private func handlePanelRaw() { handlePanelFinish(skipPostProcessing: true) }
 
-    /// Shared Done/Raw implementation (PLAN.md step 10): Done/Raw CANNOT reuse `pillClick` —
-    /// from `pttRecording`, `pillClick` LOCKS rather than stopping — so this routes `.panelFinish`
-    /// instead, with the same pre-snapshot discipline as `handlePillClick` (InsertionTarget
-    /// captured BEFORE the state-machine transition and its side effects, for the same
-    /// paste-target-drift reason).
     private func handlePanelFinish(skipPostProcessing: Bool) {
         let preSnapshottedFrontmostApp = NSWorkspace.shared.frontmostApplication
         let preSnapshottedTarget = Insertion.snapshotTarget(app: preSnapshottedFrontmostApp)
@@ -401,12 +344,6 @@ final class AppCoordinator: ObservableObject {
         }
     }
 
-    /// Pure decision for what `oneShotLanguage` should become after each lifecycle event PLAN.md
-    /// step 12 names: a panel EN/PT tap sets/toggles it (tapping the already-active choice clears
-    /// it back to standing behavior); a stop (`stopAndTranscribe`, every terminal path including
-    /// the empty-samples early return), a cancel, or a new recording starting all clear it back
-    /// to nil. Every real touch point below calls this — not a re-derived mirror — so SelfCheck's
-    /// coverage is of the actual production decision.
     enum OneShotLanguageEvent: Equatable {
         case panelLanguageTap(String)
         case clear
@@ -419,9 +356,6 @@ final class AppCoordinator: ObservableObject {
         }
     }
 
-    /// EN | PT one-shot buttons (PLAN.md step 9): sets/clears `oneShotLanguage` for the IN-FLIGHT
-    /// Dictation only. Gated on "a recording is in progress" — a stale press after the recording
-    /// already ended must not set state for a future, unrelated Dictation.
     private func handlePanelOneShotLanguage(_ code: String) {
         guard recordingState != .idle else { return }
         oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .panelLanguageTap(code))
@@ -437,9 +371,6 @@ final class AppCoordinator: ObservableObject {
         return templateIDsInOrder[(index + 1) % templateIDsInOrder.count]
     }
 
-    /// Template-cycle button (PLAN.md step 9): advances the GLOBAL Active Template through the
-    /// store's order — not a one-shot; the stop-time template resolution read makes it apply
-    /// naturally to the in-flight Dictation. Gated the same way as the language buttons.
     private func handlePanelCycleTemplate() {
         guard recordingState != .idle else { return }
         guard let next = Self.nextTemplateID(current: AppSettings.shared.activeTemplateID, templateIDsInOrder: TemplateStore.shared.templates.map(\.id)) else { return }
@@ -466,8 +397,6 @@ final class AppCoordinator: ObservableObject {
     /// capture-start failure, so the caller never commits the state transition for a recording
     /// that never actually started.
     private func beginCapture() -> Bool {
-        // Reset for the new Dictation (PLAN.md step 12) — a one-shot choice never leaks across
-        // recordings.
         oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .clear)
         let micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
         Self.logger.log("key down: micAuthorizationStatus=\(micStatus.rawValue, privacy: .public)")
@@ -578,18 +507,10 @@ final class AppCoordinator: ObservableObject {
     /// button) rides straight through to `processDictation` — the raw flag is pipeline config,
     /// not lifecycle, so it isn't part of the state machine.
     private func stopAndTranscribe(preSnapshotted: (app: NSRunningApplication?, target: InsertionTarget?)? = nil, skipPostProcessing: Bool = false) {
-        // Consumed into the forced-language snapshot below, before the pipeline `Task` starts;
-        // cleared on EVERY terminal path of this function via `defer` (including the
-        // empty-samples early return just below) so a one-shot choice never leaks into the next
-        // Dictation. See PLAN.md step 12.
         let capturedOneShotLanguage = oneShotLanguage
         defer { oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .clear) }
 
         invalidateCapTimer()
-        // Cancel the preview loop immediately, before anything else — the final pipeline below
-        // owns the buffer from here on. See PLAN 3 "Partial loop": "Key release: cancel loop
-        // immediately, ignore any in-flight partial result, run existing final pipeline
-        // untouched."
         stopLivePreview()
         let samples = audioCapture.stop()
 
@@ -631,10 +552,6 @@ final class AppCoordinator: ObservableObject {
             templates: TemplateStore.shared.templates,
             activeTemplateID: AppSettings.shared.activeTemplateID
         )
-        // Language Pin resolution (CONTEXT.md "Language Pin"): resolved here, at stop time,
-        // using the same already-snapshotted `bundleID` template resolution just used — passed
-        // as a parameter through the pipeline, never re-read from AppSettings mid-transcribe. See
-        // PLAN.md step 4/12.
         let forcedLanguage = Self.resolveLanguage(
             oneShot: capturedOneShotLanguage,
             bundleID: bundleID,
@@ -647,9 +564,6 @@ final class AppCoordinator: ObservableObject {
         Task { await runPipeline(samples: samples, engine: engine, engineName: engineName, template: template, appName: appName, target: insertionTarget, forcedLanguage: forcedLanguage, skipPostProcessing: skipPostProcessing) }
     }
 
-    /// Terminal `cancelRecording` action (B1a) — the production call site, wired to the real
-    /// audio/HUD/timer objects. See `performCancelRecording` for the pure, injectable version
-    /// SelfCheck exercises.
     private func cancelRecording() {
         oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .clear)
         Self.performCancelRecording(
@@ -660,12 +574,6 @@ final class AppCoordinator: ObservableObject {
         )
     }
 
-    /// Pure execution of the `cancelRecording` side-effect set (B1a): stop audio capture, cancel
-    /// the live preview loop, invalidate the cap timer, and clear/flash the HUD — in that order,
-    /// discarding whatever `stopCapture` returns. Deliberately does NOT call transcribe/insert/
-    /// record — no transcription, no Library entry, no failed-audio save. Exposed as a `static`
-    /// so SelfCheck can assert exactly this side-effect set fires, via injected hooks, without a
-    /// live `AppCoordinator`/real audio/HUD/timers. See PLAN.md Amendment B1a.
     nonisolated static func performCancelRecording(
         stopCapture: () -> Void,
         cancelLivePreview: () -> Void,
@@ -678,12 +586,6 @@ final class AppCoordinator: ObservableObject {
         clearHUD()
     }
 
-    /// Pure resolution of which Template a dictation should use: a rule mapping the snapshotted
-    /// app's bundle id wins; a missing bundle id, no matching rule, or a rule pointing at a
-    /// template id that no longer exists (deleted after the rule was created) all fall back to
-    /// the Active Template — never crashes. `templates`/`activeTemplateID` are passed in (rather
-    /// than read from the singletons directly) so this stays a pure function SelfCheck can drive
-    /// with synthetic inputs. See PLAN 2 "Template resolution".
     nonisolated static func resolveTemplate(
         bundleID: String?,
         rules: [String: String],
@@ -698,13 +600,6 @@ final class AppCoordinator: ObservableObject {
         return (matched, true)
     }
 
-    /// Pure Language Pin resolution (CONTEXT.md "Language Pin"): returns nil for auto-detect, or
-    /// a forced "en"/"pt" code. Precedence: one-shot (panel) > app rule > pin > auto. Each
-    /// candidate is normalized INDEPENDENTLY (`AppSettings.normalizeLanguageCode`: trim/lowercase,
-    /// must be "en"/"pt") — an invalid candidate falls through to the next rather than blocking a
-    /// valid one further down the chain (an invalid one-shot never blocks a valid rule/pin; an
-    /// invalid rule never blocks a valid pin). A nil `bundleID` skips the app-rule step entirely.
-    /// See PLAN.md step 4.
     nonisolated static func resolveLanguage(
         oneShot: String?,
         bundleID: String?,
@@ -722,13 +617,6 @@ final class AppCoordinator: ObservableObject {
         return AppSettings.normalizeLanguageCode(pin)
     }
 
-    /// Pure global routing rule (Amendment A1, replacing the removed per-Template
-    /// `Template.useCloud` toggle): the Cloud Post-Processor is used for every Template — never
-    /// selected per Template — iff the shared snapshot eligibility rule accepts the URL, model,
-    /// and credentials. An empty key is accepted only for an OpenAI-compatible loopback HTTP
-    /// endpoint; any other incomplete or invalid config falls back to `AppleFMProcessor`. Takes the same
-    /// `CloudLLMSettingsSnapshot` passed into `CloudLLMProcessor.process`, so the routing decision
-    /// and the request it drives can never disagree. See PLAN.md Amendment A.
     nonisolated static func isCloudLLMConfigured(snapshot: CloudLLMSettingsSnapshot) -> Bool {
         snapshot.eligibility.isEligible
     }
@@ -753,13 +641,7 @@ final class AppCoordinator: ObservableObject {
         return Self.isCloudLLMConfigured(snapshot: snapshot) ? CloudLLMProcessor(snapshot: snapshot) : appleFMProcessor
     }
 
-    // MARK: - Live preview (PLAN 3)
-
-    /// Seconds between re-transcription ticks of the growing recording buffer. Periodic
-    /// re-transcription (not WhisperKit's streaming API) — see PLAN 3 "Design".
     private static let livePreviewTickInterval: TimeInterval = 1.5
-    /// 1s of 16kHz mono audio — a tick on anything shorter is mostly silence/noise and wastes a
-    /// WhisperKit pass. See PLAN 3 "Partial loop".
     private static let livePreviewMinSamples = 16_000
     /// Constant-cost preview bound (Codex round-3 finding: early-stop is best-effort only —
     /// WhisperKit 0.18.0's pre-decode stages (logmel, encoder CoreML calls) aren't interruptible
@@ -780,29 +662,14 @@ final class AppCoordinator: ObservableObject {
     private var livePreviewInFlight = false
     private var lastLivePreviewText: String?
 
-    /// Pure gating for a single tick: whether it's even worth taking a buffer snapshot and
-    /// running a WhisperKit pass right now. No timers/audio/async — SelfCheck drives this
-    /// directly. See PLAN 3 "Partial loop": skip if not recording, skip if a partial is already
-    /// in flight (single in-flight gate, no backlog), skip if the buffer is still short.
     nonisolated static func shouldRunLivePreviewTick(isRecording: Bool, isPartialInFlight: Bool, sampleCount: Int, minSamples: Int) -> Bool {
         isRecording && !isPartialInFlight && sampleCount >= minSamples
     }
 
-    /// Pure gating for whether a completed partial's text should actually reach the HUD: the
-    /// recording must still be in progress AND still be the same one the tick was started for
-    /// (generation match) — a fast keyUp→keyDown re-press bumps the generation, so a late result
-    /// from the previous recording can't land on top of the new one even though `isRecording` is
-    /// true again. See PLAN 3 "Failure modes to avoid".
     nonisolated static func shouldAcceptLivePreviewResult(isRecording: Bool, resultGeneration: Int, currentGeneration: Int) -> Bool {
         isRecording && resultGeneration == currentGeneration
     }
 
-    /// Whether live preview should run at all for the current settings. Preview only ever
-    /// transcribes with the local WhisperKit engine (never per-chunk cloud uploads — cost/
-    /// latency/privacy, see PLAN 3 "Settings"): if WhisperKit itself is the active engine,
-    /// preview is enabled by the toggle alone; if Cloud STT is the active engine, preview only
-    /// runs when WhisperKit already happens to be loaded (never triggers a fresh load just for a
-    /// tick).
     nonisolated static func isLivePreviewEnabled(settingEnabled: Bool, sttEngine: STTEngineKind, whisperKitLoaded: Bool) -> Bool {
         guard settingEnabled else { return false }
         return sttEngine == .whisperKit || whisperKitLoaded
@@ -882,9 +749,6 @@ final class AppCoordinator: ObservableObject {
         guard Self.shouldAcceptLivePreviewResult(isRecording: isRecording, resultGeneration: generation, currentGeneration: livePreviewGeneration) else { return }
 
         let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Empty partial leaves whatever the HUD already shows (e.g. "Recording…", or a device
-        // fallback note) untouched, and only update when the text actually changed — avoids
-        // flashing/resizing the pill every tick. See PLAN 3 "Failure modes to avoid".
         guard !text.isEmpty, text != lastLivePreviewText else { return }
         lastLivePreviewText = text
         // Recording Panel (Feature 3): the preview text is embedded inside the panel's own row
@@ -901,17 +765,6 @@ final class AppCoordinator: ObservableObject {
             if let fallbackReason = result.fallbackReason {
                 logPostProcessingFallback(fallbackReason)
             }
-            // The manual-paste notice is the actionable signal that the user's words are on the
-            // clipboard, not inserted — it must never be silently clobbered by the (less urgent)
-            // post-processing fallback notice. Neither must it silently clobber the fallback
-            // notice the other way: when BOTH conditions hold, a single-condition message would
-            // drop half the story (either "why is this the raw transcript" or "why do I need to
-            // paste manually"), so that case gets its own combined message instead of falling
-            // through the two single-condition branches below. Busy state otherwise hides
-            // immediately on success; nothing terminal to show the user. See Round 2 Codex
-            // finding 6, PLAN.md step 8. Raw dictations (Feature 3, `skipPostProcessing`) never
-            // have a fallback reason (the Post-Processor is never invoked) — their own terminal
-            // message ("Pasted (raw)") only applies on the success path.
             if !result.posted, result.fallbackReason != nil {
                 hud.flash("Post-processing failed — raw transcript copied, paste manually (check API key/model in Settings)")
             } else if !result.posted {
@@ -940,19 +793,11 @@ final class AppCoordinator: ObservableObject {
         case recordFailed(Error)
     }
 
-    /// Why post-processing fell back to the raw transcript — a thrown error, or output that
-    /// came back empty/whitespace-only without throwing. Reported (logged + surfaced) by the two
-    /// call sites (`runPipeline`, `reprocess`) rather than inside `processDictation` itself, so
-    /// SelfCheck's pipeline contract check (which calls `processDictation` directly with a fake
-    /// processor) never triggers a real HUD panel. See PLAN.md step 8, Round 2/3 Codex findings.
     enum PostProcessingFallbackReason {
         case error(Error)
         case emptyOutput
     }
 
-    /// Redacted diagnostic log for a post-processing fallback — provider label and HTTP status
-    /// only, never a response body. Shared by both silent-fallback sites. See PLAN.md step 8,
-    /// Round 2 Codex finding 5.
     private func logPostProcessingFallback(_ reason: PostProcessingFallbackReason) {
         switch reason {
         case .error(let error):
@@ -966,18 +811,11 @@ final class AppCoordinator: ObservableObject {
         }
     }
 
-    /// Logs + shows the non-blocking HUD notice for a post-processing fallback. Used by
-    /// `reprocess`, which (unlike `runPipeline`) has no separate "posted vs. not posted" HUD
-    /// state to preserve. See PLAN.md step 8.
     private func reportPostProcessingFallback(_ reason: PostProcessingFallbackReason) {
         logPostProcessingFallback(reason)
         hud.flash("Cloud post-processing failed — used raw transcript (check API key/model in Settings)")
     }
 
-    /// Core transcribe → post-process (with empty-refined fallback) → insert → record pipeline,
-    /// extracted from `runPipeline` so it can be exercised with a fake engine/processor and
-    /// without posting real CGEvents (`insert`) or touching the real Library database
-    /// (`record`) in tests/SelfCheck. See Round 2 Codex finding 8.
     @discardableResult
     func processDictation(
         samples: [Float],
@@ -987,13 +825,9 @@ final class AppCoordinator: ObservableObject {
         appName: String? = nil,
         target: InsertionTarget? = nil,
         forcedLanguage: String? = nil,
-        // Raw path (CONTEXT.md/PLAN.md step 11): skips the Post-Processor entirely — refined IS
-        // the transcript verbatim — and records the reserved "Raw Transcript" Library row name.
         skipPostProcessing: Bool = false,
         processor: (any PostProcessor)? = nil,
         insert: (String, InsertionTarget?) -> Bool = { Insertion.insert($0, target: $1) },
-        // ponytail: closure default (not a protocol/factory) keeps SelfCheck hermetic to a temp
-        // DB instead of writing test rows into the user's real Library on every run.
         record: (_ language: String, _ template: String, _ transcript: String, _ refined: String, _ engine: String) throws -> Void = { language, template, transcript, refined, engine in
             try LibraryStore.shared.record(language: language, template: template, transcript: transcript, refined: refined, engine: engine)
         }
@@ -1007,10 +841,6 @@ final class AppCoordinator: ObservableObject {
         var fallbackReason: PostProcessingFallbackReason?
         let recordedTemplateName: String
         if skipPostProcessing {
-            // Raw path: the Post-Processor is never invoked — the Library row records the
-            // reserved sentinel name instead of the resolved Template's, so raw rows are
-            // distinguishable from ordinary post-processing-fallback rows (which keep their real
-            // template name). See PLAN.md step 11.
             refined = transcription.text
             recordedTemplateName = TemplateStore.rawTranscriptTemplateName
         } else {
@@ -1027,7 +857,6 @@ final class AppCoordinator: ObservableObject {
                     refined = trimmed
                 }
             } catch {
-                // Never lose the user's words — fall back to the raw transcript. See PLAN.md step 4.
                 refined = transcription.text
                 fallbackReason = .error(error)
             }
@@ -1088,9 +917,6 @@ final class AppCoordinator: ObservableObject {
         }
     }
 
-    /// Re-runs post-processing (only) on an existing Library entry's transcript with a
-    /// different Template, inserting the result and appending a new Library row.
-    /// See CONTEXT.md: "Re-process".
     func reprocess(dictation: Dictation, with template: Template) async {
         let processor: PostProcessor = resolveActiveProcessor()
         let refined: String
@@ -1111,12 +937,6 @@ final class AppCoordinator: ObservableObject {
             fallbackReason = .error(error)
         }
         Insertion.insert(refined)
-        // Re-check the source row still exists immediately before persisting — a Delete
-        // (single-row or Delete All) may have removed it while the LLM call above was in
-        // flight. The result is still inserted at the cursor (already happened above); only the
-        // Library write is skipped, so a derived row never points at a source the user just
-        // deleted. `nil` (database unavailable) is not treated as "deleted" — the record() call
-        // below still runs and surfaces its own error the normal way. See PLAN.md step 5.
         if LibraryStore.shared.exists(id: dictation.id) == false {
             return
         }
@@ -1133,17 +953,11 @@ final class AppCoordinator: ObservableObject {
             hud.flash("Library save failed")
             return
         }
-        // A Library-save failure above takes priority (a data-loss-adjacent error the user must
-        // see right now) — the fallback notice is only reported once the record succeeded, so it
-        // can't be silently overwritten by "Library save failed". See PLAN.md step 8.
         if let fallbackReason {
             reportPostProcessingFallback(fallbackReason)
         }
     }
 
-    /// Outcome of `redoLast()`'s guard + Library lookup — pure so SelfCheck can drive the full
-    /// truth table (active/idle, DB error, empty Library, happy path) without a real
-    /// HotKeyManager, Database, or Insertion side effect. See PLAN.md step 10.
     enum RedoLastAction: Equatable {
         /// `isRecording` or `isProcessing` was true — redo is silently ignored while active.
         case ignored
@@ -1175,9 +989,6 @@ final class AppCoordinator: ObservableObject {
         posted ? "Redone" : "Copied — paste manually"
     }
 
-    /// Fires from `HotKeyManager.onRedoKeyDown` (Redo Last hotkey, CONTEXT.md "Redo Last"):
-    /// re-inserts the newest Library entry's Refined Output at the cursor. Never records or
-    /// re-processes — same permissive (no target) insert path `reprocess` uses above.
     func redoLast() {
         // Skip the Database lookup entirely while active — `redoLastAction` ignores
         // `fetchResult` in that branch anyway, so `.success(nil)` here is just a placeholder.

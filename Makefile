@@ -3,7 +3,7 @@ BUNDLE := $(APP_NAME).app
 CONFIG := release
 BIN := .build/$(CONFIG)/$(APP_NAME)
 
-.PHONY: build app run test clean selfcheck
+.PHONY: build app run clean
 
 build:
 	swift build -c $(CONFIG)
@@ -26,17 +26,6 @@ app: build
 
 run: app
 	open $(BUNDLE)
-
-# Runs the FTS/template-seeding check without relying on the (broken, CLT-only) XCTest/
-# swift-testing runtime — see SelfCheck.swift and README "Running tests".
-selfcheck: build
-	$(BIN) --self-check
-
-# `swift test` compiles Tests/FreeTalkerTests but cannot execute in this CLT-only environment
-# (Testing.framework's runtime dylibs aren't shipped outside Xcode). Kept for parity with a
-# full Xcode toolchain; use `make selfcheck` for a guaranteed-runnable check today.
-test:
-	swift build --build-tests -Xswiftc -F -Xswiftc /Library/Developer/CommandLineTools/Library/Developer/Frameworks
 
 clean:
 	rm -rf .build $(BUNDLE)

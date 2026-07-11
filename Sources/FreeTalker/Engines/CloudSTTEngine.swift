@@ -9,10 +9,6 @@ final class CloudSTTEngine: ObservableObject, TranscriptionEngine, @unchecked Se
 
     enum CloudSTTError: LocalizedError {
         case missingAPIKey
-        /// HTTP status + a classified hint only — the raw response body is never carried into
-        /// the error description, logged, or otherwise surfaced. Same redaction contract as
-        /// `CloudLLMProcessor.CloudLLMError.badResponse` / `ConnectionTestOutcome`. See PLAN.md
-        /// step 5.
         case badResponse(status: Int, hint: String)
 
         var errorDescription: String? {
@@ -68,9 +64,6 @@ final class CloudSTTEngine: ObservableObject, TranscriptionEngine, @unchecked Se
             let language: String?
         }
         let decoded = try JSONDecoder().decode(TranscriptionResponse.self, from: data)
-        // Forced language always wins over whatever the server reports — never let `?? "en"`
-        // silently record English for a forced-PT dictation when the server omits/ignores the
-        // field. See PLAN.md step 5.
         let language = forcedLanguage ?? decoded.language ?? "en"
         return TranscriptionOutput(text: decoded.text, language: language)
     }
@@ -109,9 +102,6 @@ final class CloudSTTEngine: ObservableObject, TranscriptionEngine, @unchecked Se
         append("Content-Disposition: form-data; name=\"model\"\r\n\r\n")
         append("whisper-1\r\n")
 
-        // Language Pin (CONTEXT.md): only sent when a language is actually forced — an
-        // OpenAI-compatible field; a provider that rejects/ignores it surfaces through the
-        // existing HTTP status mapping, no special casing. See PLAN.md step 5.
         if let forcedLanguage {
             append("--\(boundary)\r\n")
             append("Content-Disposition: form-data; name=\"language\"\r\n\r\n")

@@ -81,14 +81,6 @@ struct HotKeySpec: Codable, Equatable {
         return symbols.isEmpty ? "None" : symbols
     }
 
-    // MARK: - Redo Last recorder constraints (PLAN.md step 9)
-    //
-    // Pure so both the PTT and Redo-last key recorders (SettingsView) and SelfCheck can share
-    // and exercise them without any capture session. See CONTEXT.md "Redo Last".
-
-    /// A valid Redo Last spec must end in a real key: unlike PTT, redo needs an unambiguous
-    /// keyDown to fire on, so a modifier-only chord (which `HotKeyCapture` otherwise allows) is
-    /// rejected by the redo recorder.
     static func isValidRedoSpec(_ spec: HotKeySpec) -> Bool {
         spec.keyCode != nil
     }
@@ -115,15 +107,6 @@ struct HotKeySpec: Codable, Equatable {
         return redoGeneric & pttGeneric == pttGeneric
     }
 
-    /// Full recorder-level validity check for a candidate Redo Last spec against the currently
-    /// bound PTT spec: must end in a real key (`isValidRedoSpec`), must not collide with the PTT
-    /// spec, and must not be shadow-engaged before its own keyDown by holding the PTT spec's
-    /// modifiers. Returns the candidate unchanged when valid, nil otherwise. Used both by the
-    /// interactive recorders (SettingsView, which give per-reason rejection messages) and by
-    /// `AppSettings` to re-validate a persisted/hand-edited pair on load and whenever either spec
-    /// changes — a hand-edited default, or a PTT change that lands outside the recorder, must
-    /// never let an invalid pair (modifier-only, side-normalized collision, or prefix-shadow vs.
-    /// PTT) persist. See PLAN.md step 9, Round 1 Codex finding 10.
     static func validRedoSpec(_ candidate: HotKeySpec, pttSpec: HotKeySpec) -> HotKeySpec? {
         guard isValidRedoSpec(candidate), !collides(candidate, pttSpec), !redoShadowsHeldPTT(pttSpec: pttSpec, redoSpec: candidate) else {
             return nil
@@ -152,8 +135,6 @@ struct HotKeySpec: Codable, Equatable {
     ]
 }
 
-/// Event kinds the matcher cares about — a tiny mirror of CGEventType so SelfCheck can drive
-/// the state machine with synthetic events, no CGEvents or permissions needed.
 enum KeyEventKind {
     case flagsChanged
     case keyDown

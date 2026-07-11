@@ -1,10 +1,5 @@
 import Foundation
 
-/// Status-code → user-facing outcome mapping shared by the Cloud STT and Cloud LLM "Test
-/// connection" buttons in Settings. Pure and side-effect free: never inspects a response body,
-/// header, or the API key — the security requirement is that the UI can only ever show a
-/// provider label plus one of these fixed outcomes, never anything read off the wire. See
-/// SelfCheck's `connectionTestChecks` for mutation-tested coverage of every branch.
 enum ConnectionTestOutcome: Equatable {
     case success
     case httpStatus(Int)

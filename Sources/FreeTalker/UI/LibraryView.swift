@@ -91,8 +91,6 @@ struct LibraryView: View {
             titleVisibility: .visible
         ) {
             Button("Delete All", role: .destructive) {
-                // Re-checked here (not just via `.disabled` above) because a global hotkey can
-                // start a dictation while this dialog sits open. See PLAN.md step 4.
                 guard !coordinator.isRecording, !coordinator.isProcessing else {
                     errorMessage = "Can't delete — a dictation is in progress. Try again once it finishes."
                     return

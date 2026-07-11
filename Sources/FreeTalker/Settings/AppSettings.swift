@@ -48,11 +48,6 @@ final class AppSettings: ObservableObject {
         }
     }
 
-    /// The optional Redo Last hotkey (CONTEXT.md "Redo Last"): nil = unbound = dormant, the
-    /// default. Persisted as JSON in UserDefaults like `hotKeySpec` above, but — since nil is a
-    /// meaningful, common state here, unlike `hotKeySpec` which is never unbound — persisting nil
-    /// removes the key rather than writing null/absent JSON, so a stale spec never lingers once
-    /// the user clears it. See PLAN.md step 7.
     @Published var redoHotKeySpec: HotKeySpec? {
         didSet {
             // Re-validate against the current PTT spec on every assignment, not just the ones
@@ -100,17 +95,10 @@ final class AppSettings: ObservableObject {
         whisperModel = SpeechModelCatalog.normalize(model)
     }
 
-    /// Whether the HUD shows a live rolling transcript while push-to-talk is held. Default ON.
-    /// See PLAN 3 "Settings" — `AppCoordinator.isLivePreviewEnabled` combines this with the
-    /// active engine/loaded-model state to decide whether preview actually runs.
     @Published var livePreviewEnabled: Bool {
         didSet { defaults.set(livePreviewEnabled, forKey: Keys.livePreviewEnabled) }
     }
 
-    /// On every change, `cloudLLMBaseURL`/`cloudLLMModel` are re-resolved against the new
-    /// provider's known default via `resolveProviderDefaults` — a value that's empty or equals
-    /// another provider's known default is swapped for this provider's; a value the user
-    /// actually customized is left untouched. See PLAN.md step 2.
     @Published var llmProvider: LLMProviderKind {
         didSet {
             defaults.set(llmProvider.rawValue, forKey: Keys.llmProvider)
@@ -130,12 +118,6 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(activeTemplateID, forKey: Keys.activeTemplateID) }
     }
 
-    /// Auto-stop cap for a `locked` (hands-free) recording, in minutes — clamped to [1, 60] both
-    /// here (on persist) and in `init` (on read), so a stale/out-of-range stored value or a
-    /// direct programmatic set can never reach a recording unclamped. Swift does not re-invoke
-    /// `didSet` for an assignment made from inside the same observer (same reasoning as
-    /// `vocabularyText` above), so the clamped branch persists the clamped value explicitly.
-    /// Held (PTT) recordings are unbounded, unaffected. See PLAN.md Amendment B2.
     @Published var handsFreeMaxMinutes: Int {
         didSet {
             let clamped = Self.clampHandsFreeMaxMinutes(handsFreeMaxMinutes)
@@ -148,24 +130,14 @@ final class AppSettings: ObservableObject {
         }
     }
 
-    /// Pure [1, 60]-minute clamp for `handsFreeMaxMinutes`. SelfCheck-tested directly.
     nonisolated static func clampHandsFreeMaxMinutes(_ minutes: Int) -> Int {
         min(max(minutes, 1), 60)
     }
 
-    /// Per-app template rules: bundle identifier -> template id. `[String: String]` is a
-    /// property-list type UserDefaults stores natively — no JSON encoding needed (unlike
-    /// `hotKeySpec` above, which isn't). Consulted by `AppCoordinator.resolveTemplate`; a rule
-    /// whose template id no longer exists is not cleaned up here — resolution falls back to the
-    /// Active Template instead. See PLAN "App Rules".
     @Published var appRules: [String: String] {
         didSet { defaults.set(appRules, forKey: Keys.appRules) }
     }
 
-    /// Persistent Language Pin (CONTEXT.md/menu bar "Language" section): forces the Transcript
-    /// language absent a more specific override (an app rule, or the panel's one-shot choice).
-    /// "auto" | "en" | "pt" — any other assigned/persisted value falls back to "auto". See
-    /// PLAN.md step 3.
     @Published var languagePin: String {
         didSet {
             let normalized = Self.normalizeLanguagePin(languagePin)
@@ -178,10 +150,6 @@ final class AppSettings: ObservableObject {
         }
     }
 
-    /// Per-app language rules: bundle identifier -> "en"/"pt", same plist-dict pattern as
-    /// `appRules`. An entry whose value isn't a valid language code is dropped on set/load — see
-    /// `sanitizedLanguageRules`. Consulted by `AppCoordinator.resolveLanguage`. See PLAN.md
-    /// step 3/7.
     @Published var appLanguageRules: [String: String] {
         didSet {
             let sanitized = Self.sanitizedLanguageRules(appLanguageRules)
@@ -194,12 +162,6 @@ final class AppSettings: ObservableObject {
         }
     }
 
-    /// Normalizes a single language CANDIDATE (a one-shot choice, an app rule value, or the pin)
-    /// for `AppCoordinator.resolveLanguage`'s precedence chain: trims/lowercases, and accepts
-    /// only "en"/"pt" — anything else (including "auto", empty, garbage) is invalid and returns
-    /// nil so the caller falls through to the next candidate. Also used to sanitize
-    /// `appLanguageRules` entries (whose valid domain is the same: "en"/"pt", never "auto" — a
-    /// rule is either present forcing a language, or simply absent). See PLAN.md step 4.
     nonisolated static func normalizeLanguageCode(_ raw: String) -> String? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return ["en", "pt"].contains(trimmed) ? trimmed : nil
@@ -219,9 +181,6 @@ final class AppSettings: ObservableObject {
         raw.compactMapValues { normalizeLanguageCode($0) }
     }
 
-    /// One row of the Settings "App Rules" list — a UI-level join over `appRules`' and
-    /// `appLanguageRules`' keys (PLAN.md step 7); storage stays the two separate dicts. A row can
-    /// be template-only, language-only, or both.
     struct AppRuleRow: Identifiable, Equatable {
         let bundleID: String
         let templateID: String?
@@ -229,8 +188,6 @@ final class AppSettings: ObservableObject {
         var id: String { bundleID }
     }
 
-    /// Pure join producing the unified App Rules row list, sorted by bundle id for a stable
-    /// display order. See PLAN.md step 7.
     nonisolated static func unifiedAppRuleRows(appRules: [String: String], appLanguageRules: [String: String]) -> [AppRuleRow] {
         let allBundleIDs = Set(appRules.keys).union(appLanguageRules.keys)
         return allBundleIDs.sorted().map { bundleID in
@@ -238,9 +195,6 @@ final class AppSettings: ObservableObject {
         }
     }
 
-    /// Pure removal for a unified App Rules row: clears the bundle id from BOTH dicts, never
-    /// leaving an invisible stale language override behind once the row appears gone (or vice
-    /// versa). See PLAN.md step 7.
     nonisolated static func removingAppRule(bundleID: String, appRules: [String: String], appLanguageRules: [String: String]) -> (appRules: [String: String], appLanguageRules: [String: String]) {
         var rules = appRules
         var languageRules = appLanguageRules
@@ -406,22 +360,12 @@ final class AppSettings: ObservableObject {
         boundedVocabulary(raw).kept
     }
 
-    /// Known base URL / model per provider — the single source of truth `resolveProviderDefaults`
-    /// swaps values against. `openAICompatible` has no known default: it's an arbitrary,
-    /// user-supplied endpoint. See PLAN.md step 2.
     nonisolated static let knownProviderDefaults: [LLMProviderKind: LLMProviderDefault] = [
         .anthropic: LLMProviderDefault(baseURL: "https://api.anthropic.com/v1", model: "claude-sonnet-4-5"),
         .ollama: LLMProviderDefault(baseURL: "https://ollama.com/v1", model: "gpt-oss:120b"),
         .openAICompatible: LLMProviderDefault(baseURL: nil, model: nil)
     ]
 
-    /// Swaps `baseURL`/`model` to `provider`'s known default when each (whitespace-trimmed)
-    /// value is empty, or verbatim-equals a known default belonging to a *different* provider —
-    /// a value the user actually customized (matches no known default) is never touched. When
-    /// `provider` itself has no known default (`openAICompatible`), a swap clears the field to
-    /// "" instead. Idempotent: re-applying to already-resolved values is a no-op. All matching
-    /// operates on trimmed values, and the result is the trimmed strings — see PLAN.md step 2,
-    /// Round 2/3 Codex findings (defaulting on init too; whitespace variants bypassing matching).
     nonisolated static func resolveProviderDefaults(provider: LLMProviderKind, baseURL: String, model: String) -> (baseURL: String, model: String) {
         let current = knownProviderDefaults[provider] ?? LLMProviderDefault(baseURL: nil, model: nil)
         let allBaseURLs = Set(knownProviderDefaults.values.compactMap(\.baseURL))
@@ -554,12 +498,6 @@ final class AppSettings: ObservableObject {
     }
 }
 
-/// Snapshot of the settings `CloudLLMProcessor` needs, taken in one MainActor hop
-/// (`AppSettings.cloudLLMSnapshot`) so provider, base URL, model, key, and vocabulary can never
-/// observe a mid-update mix — e.g. a provider switch landing between separate `await` reads.
-/// Captured by `AppCoordinator` at processor-selection time and passed into
-/// `CloudLLMProcessor.process` — the processor itself never re-reads `AppSettings`/Keychain.
-/// See PLAN.md step 4, Round 1 Codex finding 5; Amendment A1/A2.
 struct CloudLLMSettingsSnapshot {
     let provider: LLMProviderKind
     let baseURL: String

@@ -2,8 +2,6 @@ import AudioToolbox
 @preconcurrency import AVFoundation
 import Foundation
 
-/// Captures microphone audio while push-to-talk is held, converting to 16 kHz mono Float32
-/// samples as required by WhisperKit. Batch capture only (PLAN.md: no streaming in v1).
 final class AudioCapture {
     private let engine = AVAudioEngine()
     private var converter: AVAudioConverter?
@@ -51,18 +49,12 @@ final class AudioCapture {
         isCapturing = true
     }
 
-    /// Thread-safe copy of the samples accumulated so far, without stopping capture. Used by
-    /// the live preview loop to periodically re-transcribe the growing buffer. See PLAN 3.
     func snapshot() -> [Float] {
         samplesLock.lock()
         defer { samplesLock.unlock() }
         return samples
     }
 
-    /// Pure tail-window slice: the most recent `maxSamples` samples of `samples`, or all of
-    /// `samples` unchanged if it's already at or under `maxSamples`. Extracted so SelfCheck can
-    /// verify the suffix logic without audio hardware; `snapshotSuffix` is the only production
-    /// caller, and it always invokes this while already holding `samplesLock`.
     nonisolated static func boundedSuffix(_ samples: [Float], maxSamples: Int) -> [Float] {
         Array(samples.suffix(maxSamples))
     }

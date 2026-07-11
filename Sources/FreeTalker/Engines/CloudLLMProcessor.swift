@@ -1,16 +1,5 @@
 import Foundation
 
-/// BYOK cloud post-processing. One generic implementation covering the two supported wire
-/// formats — Anthropic's Messages API and OpenAI-compatible chat completions — behind a provider
-/// enum, per PLAN.md step 4 ("one generic implementation with provider enum"). `.ollama` reuses
-/// the OpenAI-compatible shape: verified empirically (unauthenticated `POST
-/// https://ollama.com/v1/chat/completions` -> 401, not 404 — the endpoint exists and is
-/// auth-gated). See PLAN.md step 1.
-///
-/// Holds a `CloudLLMSettingsSnapshot` captured by `AppCoordinator` on MainActor at
-/// processor-selection time — `process` never reads `AppSettings` or the Keychain itself, so the
-/// routing decision (`AppCoordinator.isCloudLLMConfigured`) and the request it drives always see
-/// the same provider/base URL/model/key. See PLAN.md Amendment A1/A2, Codex round-5 finding 4.
 struct CloudLLMProcessor: PostProcessor {
     let snapshot: CloudLLMSettingsSnapshot
 
@@ -29,9 +18,6 @@ struct CloudLLMProcessor: PostProcessor {
     enum CloudLLMError: LocalizedError {
         case missingAPIKey(provider: String)
         case missingConfiguration(provider: String)
-        /// Status code + provider label only — the response body is never carried into the
-        /// error description, logged, or otherwise surfaced. See PLAN.md step 8, Round 2 Codex
-        /// finding 5.
         case badResponse(provider: String, status: Int)
 
         var errorDescription: String? {

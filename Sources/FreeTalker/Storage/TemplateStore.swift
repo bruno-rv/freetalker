@@ -1,15 +1,9 @@
 import Foundation
 
-/// Templates are simple editable records — a JSON file is simpler than a DB table + CRUD SQL
-/// for this (PLAN.md step 5 explicitly allows "SQLite or JSON, pick simpler").
 @MainActor
 final class TemplateStore: ObservableObject {
     static let shared = TemplateStore()
 
-    /// Reserved display name for Raw-path Library rows (CONTEXT.md/PLAN.md step 11) — NOT a
-    /// real, storable Template. `upsert` rejects creating/renaming a Template to this name
-    /// (case-insensitive, trimmed); `init` renames any pre-existing user template already using
-    /// it, so the sentinel is unambiguous from the very first launch after this upgrade.
     nonisolated static let rawTranscriptTemplateName = "Raw Transcript"
 
     enum TemplateStoreError: LocalizedError {
@@ -42,14 +36,7 @@ final class TemplateStore: ObservableObject {
             didSeed = true
         }
 
-        // Upgrade-if-unedited migration (PLAN.md step 7): a never-edited built-in prompt is
-        // upgraded to the current default; an edited one, or a built-in the user deleted, is
-        // left alone. Only rewrite the file when something actually changed, so an unchanged
-        // `templates.json` isn't rewritten on every launch.
         let (upgraded, changed) = Template.upgradingBuiltIns(loadedTemplates)
-        // Reserved-name migration (PLAN.md step 11): a template that predates the "Raw
-        // Transcript" sentinel and happens to already be named that is renamed once, on load, so
-        // the sentinel is unambiguous going forward.
         let (renamed, renameChanged) = Self.renamingReservedNameCollisions(upgraded)
         templates = renamed
         if didSeed || changed || renameChanged {
@@ -61,8 +48,6 @@ final class TemplateStore: ObservableObject {
         templates.first { $0.id == id }
     }
 
-    /// Throws `TemplateStoreError.reservedName` (case-insensitive, trimmed) rather than creating
-    /// or renaming a Template to the reserved "Raw Transcript" sentinel. See PLAN.md step 11.
     func upsert(_ template: Template) throws {
         guard !Self.isReservedTemplateName(template.name) else {
             throw TemplateStoreError.reservedName
@@ -80,16 +65,10 @@ final class TemplateStore: ObservableObject {
         save()
     }
 
-    /// Pure "is this the reserved Raw Transcript sentinel" check (trimmed, case-insensitive) —
-    /// extracted so SelfCheck can exercise the rejection rule without touching the real
-    /// singleton's file-backed storage. `upsert` uses this same function. See PLAN.md step 11.
     nonisolated static func isReservedTemplateName(_ name: String) -> Bool {
         name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == rawTranscriptTemplateName.lowercased()
     }
 
-    /// Renames any template whose name collides with the reserved sentinel (case-insensitive,
-    /// trimmed) to "Raw Transcript (Template)" — pure so SelfCheck can drive it directly. See
-    /// PLAN.md step 11.
     nonisolated static func renamingReservedNameCollisions(_ templates: [Template]) -> (templates: [Template], changed: Bool) {
         var changed = false
         let renamed = templates.map { template -> Template in
