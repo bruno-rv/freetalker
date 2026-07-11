@@ -9,7 +9,7 @@ import Testing
             .init(windowID: 10, processID: 41),
             .init(windowID: 20, processID: 41)
         ])
-        let service = ActiveWindowScreenshotService(authorization: { .authorized }, backend: backend)
+        let service = ActiveWindowScreenshotService(authorization: { .granted }, backend: backend)
 
         _ = try await service.capture(target: .init(appName: nil, bundleID: nil, processID: 41, windowID: 20, windowTitle: nil))
 
@@ -18,7 +18,7 @@ import Testing
 
     @Test func targetSwitchBeforeShareableContentResponseDoesNotFallback() async {
         let backend = FakeScreenshotBackend(windows: [.init(windowID: 99, processID: 41)])
-        let service = ActiveWindowScreenshotService(authorization: { .authorized }, backend: backend)
+        let service = ActiveWindowScreenshotService(authorization: { .granted }, backend: backend)
 
         await #expect(throws: ActiveWindowScreenshotError.targetUnavailable) {
             _ = try await service.capture(target: .init(appName: nil, bundleID: nil, processID: 41, windowID: 20, windowTitle: "same"))
@@ -26,17 +26,15 @@ import Testing
         #expect(backend.capturedIDs.isEmpty)
     }
 
-    @Test(arguments: [ScreenRecordingAuthorization.notDetermined, .denied])
-    func permissionStatesStayTyped(_ authorization: ScreenRecordingAuthorization) async {
-        let service = ActiveWindowScreenshotService(authorization: { authorization }, backend: FakeScreenshotBackend(windows: []))
-        let expected: ActiveWindowScreenshotError = authorization == .denied ? .permissionDenied : .permissionNotDetermined
-        await #expect(throws: expected) {
+    @Test func notGrantedStaysTyped() async {
+        let service = ActiveWindowScreenshotService(authorization: { .notGranted }, backend: FakeScreenshotBackend(windows: []))
+        await #expect(throws: ActiveWindowScreenshotError.permissionNotGranted) {
             _ = try await service.capture(target: .init(appName: nil, bundleID: nil, processID: 41, windowID: 20, windowTitle: nil))
         }
     }
 
     @Test func missingSnapshottedWindowIDIsTargetUnavailable() async {
-        let service = ActiveWindowScreenshotService(authorization: { .authorized }, backend: FakeScreenshotBackend(windows: []))
+        let service = ActiveWindowScreenshotService(authorization: { .granted }, backend: FakeScreenshotBackend(windows: []))
         await #expect(throws: ActiveWindowScreenshotError.targetUnavailable) {
             _ = try await service.capture(target: .init(appName: nil, bundleID: nil, processID: 41, windowID: nil, windowTitle: nil))
         }
@@ -44,7 +42,7 @@ import Testing
 
     @Test func shareableContentFailureStaysTyped() async {
         let backend = FakeScreenshotBackend(windows: [], failListing: true)
-        let service = ActiveWindowScreenshotService(authorization: { .authorized }, backend: backend)
+        let service = ActiveWindowScreenshotService(authorization: { .granted }, backend: backend)
         await #expect(throws: ActiveWindowScreenshotError.captureFailed) {
             _ = try await service.capture(target: .init(appName: nil, bundleID: nil, processID: 41, windowID: 20, windowTitle: nil))
         }

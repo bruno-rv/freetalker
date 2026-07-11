@@ -9,7 +9,6 @@ import IOKit.hid
 /// capture, and Input Monitoring is requested implicitly by the system the first time the
 /// event tap is created. See Round 1 Codex finding 9.
 enum Permissions {
-    private static let screenRecordingRequestedKey = "screenRecordingPermissionRequested"
     static func isAccessibilityTrusted() -> Bool {
         AXIsProcessTrusted()
     }
@@ -51,19 +50,19 @@ enum Permissions {
         IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted
     }
 
-    static func isScreenRecordingAuthorized() -> Bool {
-        CGPreflightScreenCaptureAccess()
-    }
-
-    static func screenRecordingAuthorization() -> ScreenRecordingAuthorization {
-        if CGPreflightScreenCaptureAccess() { return .authorized }
-        return UserDefaults.standard.bool(forKey: screenRecordingRequestedKey) ? .denied : .notDetermined
+    static func screenRecordingAuthorization(
+        preflight: () -> Bool = { CGPreflightScreenCaptureAccess() }
+    ) -> ScreenRecordingAuthorization {
+        preflight() ? .granted : .notGranted
     }
 
     @discardableResult
-    static func requestScreenRecording() -> Bool {
-        UserDefaults.standard.set(true, forKey: screenRecordingRequestedKey)
-        return CGRequestScreenCaptureAccess()
+    static func requestScreenRecording(
+        request: () -> Bool = { CGRequestScreenCaptureAccess() },
+        preflight: () -> Bool = { CGPreflightScreenCaptureAccess() }
+    ) -> ScreenRecordingAuthorization {
+        _ = request()
+        return screenRecordingAuthorization(preflight: preflight)
     }
 
     static func openScreenRecordingSettings() {
