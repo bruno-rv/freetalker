@@ -544,6 +544,8 @@ private struct GeneralSettingsView: View {
                 }
             }
         }
+        .help(entry.quickTip)
+        .accessibilityHint(entry.quickTip)
     }
 
     private func tradeoffLabel(for entry: SpeechModelCatalogEntry) -> String {

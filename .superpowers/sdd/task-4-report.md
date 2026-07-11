@@ -81,3 +81,21 @@ later remote correction.
   Cloud STT remains selected.
 
 Fresh lifecycle follow-up verification: `make selfcheck` passed and `git diff --check` passed.
+
+## Model hover-tip addendum
+
+### RED
+
+Catalog invariants first failed to compile because `SpeechModelCatalogEntry` had no
+`quickTip` metadata. The first UI compile then confirmed this SDK does not expose a SwiftUI
+`accessibilityHelp` modifier.
+
+### GREEN
+
+- Every catalog entry now owns a concise, distinct quick tip covering its specific
+  speed/accuracy/resource tradeoff, best-fit use case, and exact searchable model ID.
+- Every complete Settings row uses the same catalog text for native macOS hover help and an
+  equivalent VoiceOver accessibility hint. No tooltip content is duplicated in the view.
+- SelfCheck requires non-empty, distinct tips and verifies that each includes its exact ID.
+
+Fresh addendum verification: `make selfcheck` passed and `git diff --check` passed.
