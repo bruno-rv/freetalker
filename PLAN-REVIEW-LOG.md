@@ -68,3 +68,17 @@ No material remaining findings. VERDICT: APPROVED.
 
 ## Resolution
 Converged in 4 rounds (14 + 5 + 4 + 0 findings; all 23 accepted, none rejected). Plan locked; parallel build dispatched.
+
+# Code Review Log (post-merge, main @ f9fa0b7)
+
+## Code Round 1 — Codex (thread 019f4d56-a993-7b42-9471-45bbdf85eafc, gpt-5.5)
+1 finding, VERDICT: REVISE: App Rules Add merged non-nil halves instead of replacing the row — stale template override survives a language-only re-add.
+
+### Claude's response
+ACCEPTED: pure AppSettings.applyingAppRule replaces the whole row (nil half removes that dict's entry); UI routes through it; selfcheck + mutation-tested. Commit 507a0e6.
+
+## Code Round 2 — Codex
+No new findings. VERDICT: APPROVED.
+
+## Resolution
+Code converged in 2 rounds (1 finding, accepted+fixed). (Ops note: round 2 first attempts failed on a bad thread-ID extraction of mine — resume with empty ID hangs; lesson saved to memory.)
