@@ -6,29 +6,9 @@ struct FreeTalkerApp: App {
     @ObservedObject private var coordinator = AppCoordinator.shared
 
     init() {
-        if CommandLine.arguments.contains("--self-check") {
-            SelfCheck.runAndExit()
-        }
-        // ponytail: debug harness for manual/CI runtime verification of the real WhisperKit
-        // pipeline; see DebugTranscribe.swift.
-        if let flagIndex = CommandLine.arguments.firstIndex(of: "--transcribe"),
-           CommandLine.arguments.indices.contains(flagIndex + 1) {
-            DebugTranscribe.runAndExit(path: CommandLine.arguments[flagIndex + 1])
-        }
-        // ponytail: debug harness for exercising the live-mic AVAudioEngine path (as opposed to
-        // --transcribe, which loads a file); see DebugRecordTest.swift and CONTEXT.md live-mic
-        // silence investigation.
-        if let flagIndex = CommandLine.arguments.firstIndex(of: "--record-test") {
-            let seconds = CommandLine.arguments.indices.contains(flagIndex + 1)
-                ? Double(CommandLine.arguments[flagIndex + 1]) ?? 4
-                : 4
-            DebugRecordTest.runAndExit(seconds: seconds)
-        }
         // One-time migration of the legacy shared BYOK LLM Keychain item into the active
-        // provider's scoped account (PLAN.md step 3). Deliberately placed here rather than in
-        // `AppSettings.init` so it never runs under `--self-check`, which exits above before
-        // reaching this line — SelfCheck exercises the pure migration logic separately, against
-        // an in-memory fake `SecretStore` (see SelfCheck.swift), never the real Keychain.
+        // provider's scoped account. Deliberately placed here rather than in `AppSettings.init`
+        // so it runs once during app startup against the real Keychain.
         CloudLLMKeyMigration.migrateIfNeeded(provider: AppSettings.shared.llmProvider, store: KeychainSecretStore())
         // Triggers the system Accessibility prompt on first launch if not already granted
         // (a no-op, no dialog, if already trusted or already declined once).
@@ -91,9 +71,8 @@ private struct MenuBarContentView: View {
 
             Divider()
 
-            // Language Pin (CONTEXT.md): persistent Auto/English/Portuguese toggle forcing
-            // Transcript language, absent a more specific override (an app rule, or the panel's
-            // one-shot choice). See PLAN.md step 6.
+            // Persistent Auto/English/Portuguese toggle forcing Transcript language, absent a
+            // more specific override (an app rule, or the panel's one-shot choice).
             ForEach(Self.languagePinOptions, id: \.code) { option in
                 Button {
                     settings.languagePin = option.code

@@ -2,21 +2,6 @@ import Foundation
 import WhisperKit
 import os
 
-/// Serializes async operations so at most one runs at a time. Shared between the live preview
-/// loop's periodic partial transcriptions and the final full-buffer transcription so WhisperKit
-/// never runs two `transcribe`/`detectLangauge` calls concurrently — a bare `actor` isn't
-/// enough here, since reentrancy at an `await` inside an actor method lets a second caller's
-/// operation start before the first finishes; this keeps an explicit FIFO wait queue instead.
-/// See PLAN 3 "Concurrency rules".
-///
-/// Cancellation-aware (Codex finding, live-preview streaming PLAN): a waiter's `Task` can be
-/// cancelled while it's still queued — the live preview loop's `keyUp` cancellation is the
-/// concrete case, see `AppCoordinator.stopLivePreview`. Without this, a cancelled preview tick
-/// queued behind another `run` (preload, or the final transcription itself) would still run a
-/// full WhisperKit pass before the *next* caller (the real final transcription) ever got the
-/// gate — user-visible delay at the exact moment latency matters most. Waiters are tracked by
-/// `UUID` (not a bare array of continuations) so a cancelled one can be located and removed from
-/// the queue individually rather than only ever being resumable in FIFO order.
 actor SerialGate {
     private var isBusy = false
     private var waiters: [UUID: CheckedContinuation<Void, Error>] = [:]
@@ -343,11 +328,6 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
     private let status = EngineStatusComposer(initial: "Not loaded")
     @MainActor private weak var eventReceiver: (any SpeechModelEngineEventReceiving)?
 
-    /// Whether the model has already been loaded (preloaded at launch, or lazily by an earlier
-    /// call). Read by the live preview availability check — see PLAN 3 "Settings": when Cloud
-    /// STT is the active engine, preview must never trigger a fresh multi-hundred-MB local model
-    /// load just to satisfy a tick; it only runs if WhisperKit already happens to be loaded.
-    /// This stays a cheap synchronous property for its SwiftUI and AppCoordinator call sites.
     var isLoaded: Bool { modelController.state.isLoaded }
 
     init(downloadCoordinator: SpeechModelDownloadCoordinator = .shared) {
@@ -378,52 +358,14 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
     /// (already visible in the menu bar) rather than thrown — nothing here is user-initiated.
     func preload() async {
         do {
-            // Routed through `gate` too — otherwise a live preview tick firing mid-launch-load
-            // (PLAN 3: preview starts as soon as a recording begins, independent of whether
-            // preload has finished) could call `loadedKit()` a second time concurrently with
-            // this one, racing two coordinator-backed download/load calls against the same cache.
-            // See PLAN 3 "Concurrency rules".
-            // Discards inside the closure (not `_ = gate.run { ... }`) — `WhisperKit` itself
-            // isn't `Sendable`, so the gate's `T: Sendable` result type must be inferred as
-            // `Void`, not the loaded instance.
             try await gate.run { _ = try await self.loadedKit() }
         } catch {
             // `loadedKit` publishes the model-named terminal failure status/event.
         }
     }
 
-    // ponytail: supported languages are hardcoded to {en, pt} per PLAN.md/CONTEXT.md (the app
-    // only targets English and Brazilian Portuguese). Upgrade path: source this set from a
-    // Settings-configurable language list once more languages are supported.
     private static let supportedLanguages = ["en", "pt"]
 
-    /// Public entry point — routes through `gate` so this never overlaps another `transcribe`
-    /// call (partial preview or final), then does the actual work in `performTranscribe`. See
-    /// PLAN 3 "Concurrency rules".
-    ///
-    /// `allowEarlyCancel` (preview-only, default `false`): when `true`, an in-flight decode
-    /// *may* abort as soon as the calling `Task` is cancelled — even after it has already
-    /// acquired `gate` and started decoding — via a per-token early-stop `TranscriptionCallback`
-    /// (fires once per generated token; see `performTranscribe`). This is opportunistic, not a
-    /// bound: WhisperKit 0.18.0's pre-decode stages (logmel, encoder CoreML calls) aren't
-    /// interruptible, and the callback itself fires from a low-priority detached `Task`, so a
-    /// cancellation can be delayed arbitrarily (Codex round-3 finding). The actual hard bound on
-    /// a preview tick's worst-case runtime comes from the caller feeding a constant-size window
-    /// instead of the whole growing recording (`AudioCapture.snapshotSuffix`) plus this flag
-    /// also selecting reduced `DecodingOptions` below (temperature-fallback retries disabled) —
-    /// together those cap one tick's cost independent of cancellation ever landing at all. When
-    /// it does land in time, `keyUp`'s `livePreviewTask.cancel()` (`AppCoordinator.stopLivePreview`)
-    /// still shaves off whatever's left of that bounded pass. See Round 2 Codex finding:
-    /// final-path priority.
-    ///
-    /// Never pass `true` for the final transcription — the plan invariant is that the final path
-    /// always runs to completion, uninterrupted. `TranscriptionEngine`'s protocol requirement
-    /// (`transcribe(samples:forcedLanguage:)`, no `allowEarlyCancel`) is satisfied by the overload
-    /// just below, which hardcodes `false` — so every call reached through the protocol (i.e. the final
-    /// pipeline, which only ever holds an `any TranscriptionEngine`) is final-path behavior by
-    /// construction, and can never behave differently than before this fix. Swift's protocol
-    /// witness matching doesn't accept a defaulted extra parameter as satisfying a stricter
-    /// requirement, which is why this is two overloads rather than one method with a default.
     func transcribe(samples: [Float], forcedLanguage: String?, allowEarlyCancel: Bool) async throws -> TranscriptionOutput {
         guard allowEarlyCancel else {
             return try await gate.run { [self] in try await performTranscribe(samples: samples, forcedLanguage: forcedLanguage, cancelFlag: nil) }
@@ -480,9 +422,6 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
         do {
             let language: String
             if let forcedLanguage {
-                // Language Pin (CONTEXT.md): the caller already resolved this to "en"/"pt" (one-
-                // shot > app rule > pin) — skip auto-detect entirely and decode directly in that
-                // language. See PLAN.md step 5.
                 language = forcedLanguage
             } else {
                 await setStatus("Detecting language…")
@@ -552,9 +491,6 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
 
             await setReadyStatus()
             let text = results.map(\.text).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
-            // When forced, the recorded language is always the forced code — never whatever
-            // WhisperKit's decode result happens to report — mirroring CloudSTTEngine's contract.
-            // See PLAN.md step 5.
             return TranscriptionOutput(text: text, language: forcedLanguage ?? results.first?.language ?? language)
         } catch {
             await setReadyStatus()

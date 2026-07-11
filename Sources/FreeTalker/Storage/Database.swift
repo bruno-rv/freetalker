@@ -24,8 +24,6 @@ final class Database {
             throw DatabaseError.openFailed(message)
         }
         try exec("PRAGMA journal_mode=WAL;")
-        // Deletion is a privacy feature, not just a row removal: secure_delete zeroes deleted
-        // page content instead of leaving it recoverable in free pages. See PLAN.md step 1.
         try exec("PRAGMA secure_delete=ON;")
         try createSchema()
     }
@@ -46,8 +44,7 @@ final class Database {
             engine TEXT NOT NULL,
             -- SQLite foreign keys stay OFF permanently in this app (never
             -- `PRAGMA foreign_keys=ON`) — a dangling source_id after the source row is deleted
-            -- is intended provenance behavior, not corruption. See PLAN.md step 1, CONTEXT.md
-            -- "Re-process".
+            -- is intended provenance behavior, not corruption.
             source_id INTEGER REFERENCES dictations(id)
         );
         """)
@@ -98,14 +95,6 @@ final class Database {
         return sqlite3_last_insert_rowid(handle)
     }
 
-    // MARK: - Deletes
-
-    /// Deletes one Dictation row — the committed step, alone. The `dictations_ad` AFTER DELETE
-    /// trigger keeps `dictations_fts` in sync — no FTS code needed here. Deliberately does NOT
-    /// also checkpoint (see `checkpointTruncate`, called as a separate step by
-    /// `LibraryStore.delete(id:)`) — splitting them means a checkpoint failure can never be
-    /// confused with "the row wasn't deleted": once this returns, the row is already gone. See
-    /// PLAN.md step 1, Round 2 Codex finding 2.
     func deleteRow(id: Int64) throws {
         let stmt = try prepare("DELETE FROM dictations WHERE id = ?;")
         defer { sqlite3_finalize(stmt) }
@@ -115,34 +104,15 @@ final class Database {
         }
     }
 
-    /// Clears the entire Library — the committed step, alone. Deliberately does NOT also VACUUM
-    /// or checkpoint (see `vacuumAndCheckpoint`, called as a separate step by
-    /// `LibraryStore.deleteAll()`) — splitting them lets a caller tell "rows are gone, only the
-    /// privacy housekeeping failed" apart from "nothing was deleted at all", so a
-    /// VACUUM/checkpoint-only failure never masks that the row deletion itself already
-    /// succeeded (and committed — SQLite autocommits a bare DELETE). See PLAN.md step 1, Round 1
-    /// Codex finding 4, Round 2 Codex finding 1.
     func deleteAllRows() throws {
         try exec("DELETE FROM dictations;")
     }
 
-    /// Privacy-grade cleanup run after a row deletion has already committed: `VACUUM` reclaims
-    /// (and, with `secure_delete` on, overwrites) freed pages so cleared text doesn't linger
-    /// there, then `checkpointTruncate()` verifies the WAL doesn't still hold the deleted page
-    /// image either. Deliberately kept as a step separate from `deleteRow`/`deleteAllRows` (see
-    /// their doc comments) so a failure here is never mistaken for "the delete itself failed".
-    /// See PLAN.md step 1, Round 2 Codex finding 1.
     func vacuumAndCheckpoint() throws {
         try exec("VACUUM;")
         try checkpointTruncate()
     }
 
-    /// Whether a Dictation row with this id still exists — used by `AppCoordinator.reprocess` to
-    /// detect a source row deleted mid-flight (e.g. by Delete All while an LLM call was in
-    /// flight). A definitive answer only: a genuine SQLite error (busy/corrupt/etc., classified
-    /// as `.other` below) throws rather than being coerced to `false` — `LibraryStore.exists(id:)`
-    /// turns that throw into `nil` ("unknown"), which `reprocess`'s fail-open check treats
-    /// differently from a confirmed-deleted row. See PLAN.md step 5, Round 1 Codex finding 3.
     func dictationExists(id: Int64) throws -> Bool {
         let stmt = try prepare("SELECT 1 FROM dictations WHERE id = ? LIMIT 1;")
         defer { sqlite3_finalize(stmt) }
@@ -154,16 +124,6 @@ final class Database {
         }
     }
 
-    /// Three-way classification of a `sqlite3_step` result: `.row` (more data), `.done` (clean
-    /// EOF/success), or `.other` (anything else — `SQLITE_BUSY`, `SQLITE_ERROR`, etc.). Shared by
-    /// `readAll`'s scan-loop-end check and `dictationExists`'s existence check, so neither
-    /// mistakes a genuine SQLite error for a normal "no more rows"/"row not found" outcome — the
-    /// bug both Round 1 Codex findings 2/3 caught (any non-`SQLITE_ROW` step silently read as
-    /// EOF/false instead of a failure). Pure `Int32 -> StepOutcome`, exercised directly by
-    /// SelfCheck with real SQLite result codes: deterministically forcing a genuine mid-scan
-    /// `SQLITE_BUSY`/`SQLITE_ERROR` from Swift would require faults WAL mode is specifically
-    /// designed to avoid (a concurrent reader never blocks on a writer), so the decision this fix
-    /// hinges on is tested directly instead of via fault injection.
     enum StepOutcome: Equatable { case row, done, other }
 
     static func classifyStep(_ result: Int32) -> StepOutcome {
@@ -174,13 +134,6 @@ final class Database {
         }
     }
 
-    /// Runs `PRAGMA wal_checkpoint(TRUNCATE)` as a prepared statement and checks the result
-    /// row's busy column (first column) — SQLite reports checkpoint-busy via the result row, not
-    /// an exec error, so a plain `exec(...)` would silently ignore a failed truncate. Called
-    /// after `deleteRow`/`deleteAllRows` (the latter via `vacuumAndCheckpoint`) complete their
-    /// row mutation — kept as a separate throwing step so `LibraryStore.delete(id:)` /
-    /// `deleteAll()` can tell a checkpoint-only failure apart from a row-deletion failure. See
-    /// PLAN.md step 1, Round 1 Codex finding 4, Round 2 Codex findings 1/2.
     func checkpointTruncate() throws {
         let stmt = try prepare("PRAGMA wal_checkpoint(TRUNCATE);")
         defer { sqlite3_finalize(stmt) }
@@ -205,8 +158,6 @@ final class Database {
         return Int(sqlite3_column_int64(stmt, 0))
     }
 
-    /// Reads back `PRAGMA secure_delete` (0/1) — exercised by SelfCheck to confirm the on-open
-    /// pragma in `init` actually took effect.
     func secureDeleteStatus() throws -> Int32 {
         let stmt = try prepare("PRAGMA secure_delete;")
         defer { sqlite3_finalize(stmt) }
@@ -227,11 +178,6 @@ final class Database {
         return try readAll(stmt)
     }
 
-    /// The most recently inserted Dictation, or nil if the Library is empty. `id` (not `ts`) is
-    /// the monotonic tiebreaker on equal timestamps — shared reasoning with `allDictations()`'s
-    /// ordering. Used by the Redo Last hotkey (`AppCoordinator.redoLast()` via `LibraryStore`) to
-    /// fetch straight from the DB, immune to the Library window's search-text filter. See
-    /// CONTEXT.md "Redo Last".
     func latestDictation() throws -> Dictation? {
         let sql = "SELECT id, ts, language, template, transcript, refined, engine, source_id FROM dictations ORDER BY id DESC LIMIT 1;"
         let stmt = try prepare(sql)

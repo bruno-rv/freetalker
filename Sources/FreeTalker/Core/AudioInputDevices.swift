@@ -1,14 +1,6 @@
 import CoreAudio
 import Foundation
 
-/// Enumerates CoreAudio input devices for the Settings microphone picker, and resolves a
-/// persisted device UID back to a live AudioDeviceID.
-///
-/// UIDs (not AudioDeviceIDs) are what gets persisted in AppSettings: AudioDeviceID values are
-/// only stable for the current boot/connection session and can be reassigned across reboots or
-/// disconnect/reconnect cycles, while kAudioDevicePropertyDeviceUID is stable per physical/
-/// virtual device. See PLAN incident: closing the MacBook lid makes the built-in mic (system
-/// default) deliver pure zeros, and the user needs to pin "HD Webcam C615" explicitly.
 enum AudioInputDevices {
     struct Device: Identifiable, Equatable {
         let id: AudioDeviceID

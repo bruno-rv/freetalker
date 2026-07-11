@@ -1,34 +1,17 @@
 import Foundation
 
-/// Hands-free recording states (Amendment B): tapping the hotkey (quick key-down/key-up) starts
-/// a recording that keeps going after release — `locked` — until the user taps/clicks again,
-/// presses Esc, or the duration cap fires. Holding the hotkey past `RecordingStateMachine.
-/// tapThreshold` is the classic push-to-talk gesture, unchanged: release stops and transcribes.
-///
-/// `locked`'s `ignoreNextKeyUp` handles one specific case: clicking the HUD pill locks an
-/// *in-progress* PTT recording while the hotkey is still physically held down — the inevitable
-/// key release that follows must be a no-op (it already happened, semantically, at the click).
-/// It is not load-bearing for `locked`'s general `keyUp -> no-op` transition below, which holds
-/// unconditionally either way; it exists so that one specific keyUp is consumed/reset rather than
-/// lingering indefinitely. See PLAN.md Amendment B1/B3/B6.
 enum RecordingState: Equatable {
     case idle
     case pttRecording
     case locked(ignoreNextKeyUp: Bool)
 }
 
-/// Inputs the state machine reacts to. `elapsed` (seconds since key-down) and `generation`
-/// (the recording session a cap-timer fire belongs to) are the only event payloads. See
-/// PLAN.md Amendment B6.
 enum RecordingEvent: Equatable {
     case keyDown
     case keyUp(elapsed: TimeInterval)
     case pillClick
     case esc
     case capReached(generation: Int)
-    /// Recording Panel "Done"/"Raw" (Feature 3): unlike `pillClick`, which LOCKS an in-progress
-    /// `pttRecording` rather than stopping it, this stops immediately from either recording
-    /// state. See PLAN.md step 10.
     case panelFinish
 }
 
@@ -47,17 +30,9 @@ enum RecordingAction: Equatable {
     case cancel
 }
 
-/// Pure push-to-talk / hands-free state machine (Amendment B). No audio, timers, or CGEvents —
-/// SelfCheck drives the full transition table directly. See PLAN.md Amendment B6.
 enum RecordingStateMachine {
-    /// A key-up before this many seconds since key-down is a "tap" (enters `locked`); at or
-    /// beyond it is a held push-to-talk (stop on release). See PLAN.md Amendment B1.
     static let tapThreshold: TimeInterval = 0.4
 
-    /// `currentGeneration` is consulted only for `capReached` — every other event ignores it. A
-    /// `capReached` whose `generation` doesn't match the live recording's is a stale timer fire
-    /// (superseded by a newer recording) and is always a no-op, in any state. See PLAN.md
-    /// Amendment B2.
     static func transition(state: RecordingState, event: RecordingEvent, currentGeneration: Int) -> (state: RecordingState, action: RecordingAction) {
         switch (state, event) {
         case (.idle, .keyDown):

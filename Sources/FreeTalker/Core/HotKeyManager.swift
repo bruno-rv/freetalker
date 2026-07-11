@@ -4,12 +4,6 @@ import Foundation
 import IOKit.hid
 import os
 
-/// Global push-to-talk key listener via CGEventTap. Requires Accessibility (and Input
-/// Monitoring) permission — see Permissions.swift.
-///
-/// Supports modifier-only hotkeys (single key or chord, e.g. Right ⌥ or ⌃⌥) and
-/// modifiers+key combos (e.g. ⌘⇧D, or a bare F13). Matching lives in HotKeyMatcher
-/// (HotKeySpec.swift), a pure state machine exercised by SelfCheck.
 final class HotKeyManager: @unchecked Sendable {
     /// Fired with the originating `CGEvent`'s timestamp, converted to seconds since boot (see
     /// `handle(type:event:)`) — NOT the wall-clock time the callback happens to run at. Capture-
@@ -22,9 +16,6 @@ final class HotKeyManager: @unchecked Sendable {
     /// Fired when Esc is swallowed while recording (Amendment B1) — the pure decision itself is
     /// `shouldSwallowEscape` below.
     var onEscape: (@MainActor () -> Void)?
-    /// Fires once per Redo Last chord press (autorepeat ignored, release never fires) — see
-    /// `redoMatcher` below and CONTEXT.md "Redo Last". nil (unbound) when `start(spec:redoSpec:)`
-    /// is passed a nil `redoSpec`.
     var onRedoKeyDown: (@MainActor (TimeInterval) -> Void)?
 
     /// True while a hands-free recording is in progress (ptt or locked) — mirrored synchronously
@@ -38,9 +29,6 @@ final class HotKeyManager: @unchecked Sendable {
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var matcher = HotKeyMatcher(spec: .default)
-    /// Second matcher fed from the SAME event tap as `matcher` (no second CGEventTap — one tap,
-    /// two independent state machines) — nil when Redo Last is unbound. See PLAN.md step 8,
-    /// CONTEXT.md "Redo Last".
     private var redoMatcher: HotKeyMatcher?
     /// Mirrors `HotKeyMatcher.keyIsSwallowed` for Esc: true between a swallowed Esc keyDown and
     /// its keyUp, so the keyUp is swallowed too even if `isRecording` has already flipped false
@@ -52,9 +40,6 @@ final class HotKeyManager: @unchecked Sendable {
     /// Esc virtual keycode (kVK_Escape).
     static let escapeKeyCode: UInt16 = 53
 
-    /// Pure swallow/pass decision for Esc (Amendment B1): swallowed only while a hands-free
-    /// recording is in progress; idle passes it through untouched. SelfCheck drives this
-    /// directly.
     nonisolated static func shouldSwallowEscape(keyCode: UInt16, isRecording: Bool) -> Bool {
         keyCode == escapeKeyCode && isRecording
     }
@@ -68,14 +53,6 @@ final class HotKeyManager: @unchecked Sendable {
         var swallow = false
     }
 
-    /// Feeds one synthetic event to both matchers and combines their outcomes into the single
-    /// decision `handle(type:event:)` needs: which callbacks to fire, and whether to swallow the
-    /// event. This is the entire "two matchers, one tap" dispatch logic, factored out of
-    /// `handle(type:event:)` (a thin CGEvent-to-primitive adapter around it) so SelfCheck can
-    /// drive the exact production decision with synthetic `(kind, keyCode, flags, isAutorepeat)`
-    /// tuples and two `HotKeyMatcher` instances, instead of re-deriving its own combine-two-
-    /// matchers loop that could silently drift from what the real tap callback does. See Round 1
-    /// Codex finding 7.
     static func dispatch(
         kind: KeyEventKind,
         keyCode: UInt16,
@@ -85,11 +62,6 @@ final class HotKeyManager: @unchecked Sendable {
         redoMatcher: inout HotKeyMatcher?
     ) -> DispatchOutcome {
         let outcome = matcher.handle(kind, keyCode: keyCode, flags: flags, isAutorepeat: isAutorepeat)
-        // Same event, fed to the second (Redo Last) matcher — keyUp/flagsChanged included so its
-        // internal isEngaged/key-swallow state resets on release, even though only `.engaged`
-        // below ever invokes a callback. PTT's `matcher` above is completely unaffected: this
-        // matcher is a separate state machine, never consulted by `matcher.handle`. See PLAN.md
-        // step 8.
         let redoOutcome = redoMatcher?.handle(kind, keyCode: keyCode, flags: flags, isAutorepeat: isAutorepeat)
         return DispatchOutcome(
             pttEngaged: outcome.engaged,

@@ -5,8 +5,7 @@
 System-wide push-to-talk dictation for macOS. Hold a hotkey (default **Right-⌥**), speak,
 release — the transcript is refined by the Active Template and inserted at your cursor. Tap
 the same key instead of holding it for hands-free recording. Local Whisper transcription and
-on-device Apple post-processing by default; cloud engines are optional and BYOK-only. See
-`PLAN.md` for the full spec and `CONTEXT.md` for terminology.
+on-device Apple post-processing by default; cloud engines are optional and BYOK-only.
 
 ## Requirements
 
@@ -164,27 +163,16 @@ For fully local LLM post-processing, run Ollama Desktop and use the existing
 OpenAI-compatible BYOK provider with `http://localhost:11434/v1`. Ollama's local endpoint
 doesn't require an API key; FreeTalker omits the Authorization header when the key is empty.
 
-![Settings](docs/settings.png)
-*Settings → General: permissions status, hotkey, hands-free auto-stop, microphone, engine
-selection, and cloud post-processing.*
+![FreeTalker General settings with permissions, recording controls, microphone, and transcription engine options](docs/settings-general.png)
+*Settings → General: configure permissions, recording controls, microphone input, and the
+transcription engine.*
 
-## Running tests
+![FreeTalker Templates settings with the Refined Message prompt editor](docs/settings-templates.png)
+*Settings → Templates: choose a template and edit its post-processing prompt.*
 
-```sh
-make selfcheck
-```
-
-This runs the same two checks the spec calls for — FTS search round-trip and template
-seeding — via `SelfCheck.swift`, invoked as `FreeTalker --self-check` (no test framework).
-
-**Why not plain `swift test`:** `Tests/FreeTalkerTests/FreeTalkerTests.swift` is a real
-swift-testing test target and compiles cleanly (`make test` proves this — it runs
-`swift build --build-tests`). But *running* it fails in this Command Line Tools-only
-environment: `swift test` needs `Testing.framework`'s runtime, whose supporting dylibs
-(e.g. `lib_TestingInterop.dylib`) are only shipped inside Xcode.app, not with the standalone
-CLT SDK. This is an environment limitation, not a code issue — installing Xcode would make
-`swift test` work with the exact same test file. `make selfcheck` is the guaranteed-runnable
-substitute for today's environment.
+![FreeTalker recording panel showing elapsed time, raw mode, language, and template controls](docs/recording-panel.png)
+*Recording panel: monitor elapsed time and control raw mode, language, and the active
+template without leaving your current app.*
 
 ## Manual end-to-end checklist
 
@@ -211,15 +199,3 @@ substitute for today's environment.
    Library row's `engine` reflects it. Then unplug network / clear the key and confirm
    post-processing failure falls back to the raw transcript being pasted (never silently
    drops the dictation).
-
-## Known deviations / ponytail shortcuts
-
-- **Push-to-talk hotkey is modifier-keys only** (⌥/⌃/⌘/⇧, left or right), identified via the
-  device-dependent `NX_DEVICE*KEYMASK` bits on `flagsChanged` events. A non-modifier key (e.g.
-  F13) would need a second `keyDown`/`keyUp` CGEventTap — not needed for the spec'd default
-  (Right-⌥) or realistic alternatives. See `HotKeyManager.swift`.
-- **Templates are a JSON file**, not a SQLite table — PLAN.md explicitly allows either,
-  JSON is simpler for a handful of CRUD records. See `TemplateStore.swift`.
-- **`swift test` cannot run** in this CLT-only environment (see "Running tests" above);
-  `make selfcheck` is the working substitute. The test target still compiles and documents
-  intent for a full-Xcode environment.

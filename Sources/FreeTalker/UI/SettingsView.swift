@@ -117,8 +117,6 @@ private struct GeneralSettingsView: View {
     @State private var hotKeyRecorderMessage: String?
     @State private var capturingRedoHotKey = false
     @State private var redoCaptureSession: HotKeyCapture.Session?
-    /// Set when a captured Redo Last spec is refused (modifier-only, collides with, or is
-    /// shadowed by, the PTT key). See PLAN.md step 9.
     @State private var redoRecorderMessage: String?
     @State private var inputDevices: [AudioInputDevices.Device] = []
     @State private var runningApps: [NSRunningApplication] = []
@@ -322,10 +320,6 @@ private struct GeneralSettingsView: View {
                     Text("OpenAI-compatible").tag(LLMProviderKind.openAICompatible)
                 }
                 .onChange(of: settings.llmProvider) { _, newProvider in
-                    // The API key field is Keychain-backed (not part of `AppSettings`), so it
-                    // has to be reloaded explicitly for the newly selected provider's scoped
-                    // account — otherwise it would keep showing the previous provider's key.
-                    // See PLAN.md step 5.
                     cloudLLMKey = Keychain.get(account: Keychain.Account.cloudLLMKey(for: newProvider)) ?? ""
                     cloudLLMKeyError = false
                 }
@@ -373,18 +367,11 @@ private struct GeneralSettingsView: View {
                 Text("Automatically use a specific Template and/or force a Transcript language when dictating into a chosen app, instead of the Active Template / Language Pin.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                // Unified row: a UI-level join over appRules/appLanguageRules' keys — a row can
-                // be template-only, language-only, or both; storage stays the two dicts. See
-                // PLAN.md step 7.
                 ForEach(AppSettings.unifiedAppRuleRows(appRules: settings.appRules, appLanguageRules: settings.appLanguageRules)) { row in
                     HStack {
                         Text(displayName(forBundleID: row.bundleID))
                         Spacer()
                         if let templateID = row.templateID {
-                            // A stale template id (deleted after the rule was created) still
-                            // displays, distinctly, while the row's language half (if any) keeps
-                            // working independently — resolution already falls back for stale
-                            // template ids. See PLAN.md step 7.
                             Text(templateStore.template(id: templateID)?.name ?? "(deleted template)")
                                 .foregroundStyle(.secondary)
                         }
@@ -396,8 +383,6 @@ private struct GeneralSettingsView: View {
                                 .background(Color.secondary.opacity(0.15), in: Capsule())
                         }
                         Button {
-                            // Removing a row clears the bundle id from BOTH dicts — never leaves
-                            // an invisible stale language override behind. See PLAN.md step 7.
                             let updated = AppSettings.removingAppRule(bundleID: row.bundleID, appRules: settings.appRules, appLanguageRules: settings.appLanguageRules)
                             settings.appRules = updated.appRules
                             settings.appLanguageRules = updated.appLanguageRules
@@ -424,10 +409,6 @@ private struct GeneralSettingsView: View {
                         Text("Portuguese").tag("pt" as String?)
                     }
                     Button("Add") {
-                        // Requires an app plus at least one of template/language. Replaces the
-                        // bundle id's whole row — a nil half clears that dict's existing entry
-                        // rather than leaving a stale override active. See PLAN.md step 7 and
-                        // AppSettings.applyingAppRule.
                         guard let newRuleBundleID, newRuleTemplateID != nil || newRuleLanguage != nil else { return }
                         let updated = AppSettings.applyingAppRule(bundleID: newRuleBundleID, templateID: newRuleTemplateID, language: newRuleLanguage, appRules: settings.appRules, appLanguageRules: settings.appLanguageRules)
                         settings.appRules = updated.appRules
@@ -548,8 +529,6 @@ private struct GeneralSettingsView: View {
         .accessibilityHint(entry.quickTip)
     }
 
-    /// Running, user-facing (`.regular` activation policy — excludes menu-bar-only/background
-    /// agents) apps, sorted by name, for the App Rules "App" picker. See PLAN 2 "Settings UI".
     private static func enumerateRunningApps() -> [NSRunningApplication] {
         NSWorkspace.shared.runningApplications
             .filter { $0.activationPolicy == .regular && $0.bundleIdentifier != nil }
@@ -563,8 +542,6 @@ private struct GeneralSettingsView: View {
         runningApps.first(where: { $0.bundleIdentifier == bundleID })?.localizedName ?? bundleID
     }
 
-    /// Shown as the Base URL/Model fields' placeholder for the active provider, when it has a
-    /// known default — nil (no placeholder) for `openAICompatible`. See PLAN.md step 5.
     private var providerDefaultBaseURL: String? { AppSettings.knownProviderDefaults[settings.llmProvider]?.baseURL }
     private var providerDefaultModel: String? { AppSettings.knownProviderDefaults[settings.llmProvider]?.model }
 
@@ -584,8 +561,6 @@ private struct GeneralSettingsView: View {
                 captureSession = nil
             }
             guard let spec else { return } // Escape cancelled the capture.
-            // Refuse a PTT reassignment that would newly shadow the bound Redo Last key (PLAN.md
-            // step 9, "both directions") — or collide with it outright.
             if let redo = settings.redoHotKeySpec {
                 if HotKeySpec.collides(spec, redo) {
                     hotKeyRecorderMessage = "Same as the Redo-last key — pick a different chord."
@@ -603,10 +578,6 @@ private struct GeneralSettingsView: View {
         }
     }
 
-    /// Captures a spec for the optional Redo Last key, applying the recorder-level constraints
-    /// from PLAN.md step 9 before accepting it: must end in a real key (not modifier-only), must
-    /// not collide with the PTT key, and must not be shadow-engaged by holding the PTT key's
-    /// modifiers en route to it. See CONTEXT.md "Redo Last".
     private func beginRedoCapture() {
         capturingRedoHotKey = true
         NSApp.activate()
@@ -640,7 +611,7 @@ private struct GeneralSettingsView: View {
 
     /// "Test connection" for the Cloud STT (BYOK) section. Snapshots the base URL/key into
     /// locals before the `await` so a mid-flight edit to the fields can't retroactively change
-    /// what's being tested. `ConnectionTestOutcome.message` is the only thing ever assigned to
+    /// the connection target. `ConnectionTestOutcome.message` is the only thing ever assigned to
     /// `cloudSTTTestResult` — never the thrown error's description, which could carry a response
     /// body. See Task 3 security requirement.
     private func testCloudSTTConnection() {
@@ -665,7 +636,7 @@ private struct GeneralSettingsView: View {
     /// discipline as `testCloudSTTConnection`, via `AppSettings.cloudLLMSnapshot` — the same
     /// snapshot type `CloudLLMProcessor.process` (the real dictation path) and
     /// `AppCoordinator.isCloudLLMConfigured` (this button's `.disabled` gate) both use, so all
-    /// three can never disagree about what's being tested. See CloudLLMSettingsSnapshot's doc
+    /// three can never disagree about the connection target. See CloudLLMSettingsSnapshot's doc
     /// comment.
     private func testCloudLLMConnection() {
         cloudLLMTesting = true
@@ -741,9 +712,6 @@ private struct TemplateEditor: View {
     @State var template: Template
     @ObservedObject private var store = TemplateStore.shared
     @ObservedObject private var settings = AppSettings.shared
-    /// Inline feedback when `store.upsert` rejects the reserved "Raw Transcript" name (PLAN.md
-    /// step 11) — the typed name stays visible in the field either way; only the store write is
-    /// refused.
     @State private var nameError: String?
 
     var body: some View {
