@@ -141,6 +141,25 @@ and are supplied only to Apple's on-device Foundation Model. Screenshot bytes ar
 immediately after local OCR. Local context is never persisted, logged, or included in cloud/BYOK
 post-processing requests; when cloud post-processing is configured, FreeTalker omits it entirely.
 
+### Voice Edit and snippets
+
+Assign a **Voice Edit key** in Settings → General, select editable text, and press the key. Speak
+the instruction, then press the key again. Voice Edit transcribes the instruction with the local
+WhisperKit engine, resolves any exact snippet trigger from the on-device snippet database, and
+uses Apple's on-device Foundation Model when generation is needed. It always shows a preview of
+the original and proposed text; nothing is replaced until you explicitly confirm. If the app,
+field, selection, or selected text changed, replacement is refused and Copy remains available.
+
+Create, edit, rename, or delete reusable snippets under Settings → Snippets. Put one trigger phrase
+per line. Matching ignores case, surrounding punctuation, and repeated whitespace, while duplicate
+normalized triggers are rejected. Ambiguous snippets migrated from older versions require an
+explicit choice in the preview and can be resolved by editing their trigger phrases in Settings.
+Snippet renames update the persisted record used by future matches.
+
+Selected text, spoken instructions, and previews stay in memory and are never sent to a cloud service,
+saved to Library, or logged. Snippet names, triggers, and expansions are stored only in
+FreeTalker's local SQLite database.
+
 ### Custom vocabulary
 
 Settings → Templates → **Vocabulary** takes a list of names, jargon, or acronyms your dictation
