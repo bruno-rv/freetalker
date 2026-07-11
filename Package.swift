@@ -8,7 +8,8 @@ let package = Package(
         .executable(name: "FreeTalker", targets: ["FreeTalker"])
     ],
     dependencies: [
-        .package(url: "https://github.com/argmaxinc/WhisperKit", from: "0.9.0")
+        .package(url: "https://github.com/argmaxinc/WhisperKit", from: "0.9.0"),
+        .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.12.4")
     ],
     targets: [
         .systemLibrary(name: "CSQLite", pkgConfig: nil),
@@ -16,6 +17,7 @@ let package = Package(
             name: "FreeTalker",
             dependencies: [
                 .product(name: "WhisperKit", package: "WhisperKit"),
+                .product(name: "FluidAudio", package: "FluidAudio"),
                 "CSQLite"
             ]
         ),
