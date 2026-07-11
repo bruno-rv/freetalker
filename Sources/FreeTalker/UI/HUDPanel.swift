@@ -120,7 +120,7 @@ final class HUDController {
             // overrides canBecomeKey/canBecomeMain to false so accepting mouse events here never
             // steals focus from the frontmost app.
             panel.ignoresMouseEvents = false
-            panel.collectionBehavior = [.canJoinAllSpaces, .stationary]
+            panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
             self.panel = panel
         }
 
