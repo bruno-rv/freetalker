@@ -120,6 +120,64 @@ import Testing
         #expect(try await fixture.store.job(id: job.id)?.state == .ready)
     }
 
+    @Test func cancellationDuringInitialReadPreventsExecutorStart() async throws {
+        let fixture = try RunnerFixture()
+        let job = try await fixture.makeJob(.recovery, "claimed.wav")
+        let store = SuspendedInitialReadStore(base: fixture.store, suspendedID: job.id)
+        let probe = SuspendedExecutorProbe()
+        let runner = LocalJobRunner(store: store, executor: probe.execute)
+
+        await runner.enqueue(job.id)
+        await store.waitUntilInitialReadStarts()
+        let outcome = await runner.cancel(job.id)
+        await store.resumeInitialRead()
+        await runner.waitUntilIdle()
+
+        #expect(outcome == .accepted)
+        #expect(await probe.started.isEmpty)
+        #expect(try await fixture.store.job(id: job.id)?.state == .cancelled)
+    }
+
+    @Test func claimedJobIgnoresDuplicateEnqueueAndResumeDiscovery() async throws {
+        let fixture = try RunnerFixture()
+        let first = try await fixture.makeJob(.recovery, "first.wav")
+        let second = try await fixture.makeJob(.mediaImport, "second.wav")
+        let store = SuspendedInitialReadStore(base: fixture.store, suspendedID: first.id)
+        let probe = SuspendedExecutorProbe()
+        let runner = LocalJobRunner(store: store, executor: probe.execute)
+
+        await runner.enqueue(first.id)
+        await store.waitUntilInitialReadStarts()
+        await runner.enqueue(first.id)
+        await runner.resumeQueuedJobs()
+        await store.resumeInitialRead()
+
+        await probe.waitUntilStarted(first.id)
+        await probe.resume(first.id)
+        await probe.waitUntilStarted(second.id)
+        await probe.resume(second.id)
+        await runner.waitUntilIdle()
+
+        #expect(await probe.started == [first.id, second.id])
+        // Initial validation plus the intentional fresh read after entering processing.
+        #expect(await store.readCount(for: first.id) == 2)
+    }
+
+    @Test func missingClaimIsReleasedAndDrainContinues() async throws {
+        let fixture = try RunnerFixture()
+        let follower = try await fixture.makeJob(.recovery, "follower.wav")
+        let probe = SuspendedExecutorProbe()
+        let runner = LocalJobRunner(store: fixture.store, executor: probe.execute)
+
+        await runner.enqueue(UUID())
+        await runner.enqueue(follower.id)
+        await probe.waitUntilStarted(follower.id)
+        await probe.resume(follower.id)
+        await runner.waitUntilIdle()
+
+        #expect(await probe.started == [follower.id])
+    }
+
     @Test @MainActor func libraryFacadeRefreshesKindSpecificArrays() async throws {
         let fixture = try RunnerFixture()
         let recovery = try await fixture.makeJob(.recovery, "recovery.wav")
@@ -220,5 +278,54 @@ private actor SuspendedReadyTransitionStore: TranscriptionJobStoring {
     func resumeReadyTransition() {
         readyContinuation?.resume()
         readyContinuation = nil
+    }
+}
+
+private actor SuspendedInitialReadStore: TranscriptionJobStoring {
+    private let base: TranscriptionJobStore
+    private let suspendedID: UUID
+    private var didSuspend = false
+    private var readStarted = false
+    private var readContinuation: CheckedContinuation<Void, Never>?
+    private var readCounts: [UUID: Int] = [:]
+
+    init(base: TranscriptionJobStore, suspendedID: UUID) {
+        self.base = base
+        self.suspendedID = suspendedID
+    }
+
+    func job(id: UUID) async throws -> TranscriptionJob? {
+        readCounts[id, default: 0] += 1
+        if id == suspendedID, !didSuspend {
+            didSuspend = true
+            readStarted = true
+            await withCheckedContinuation { readContinuation = $0 }
+        }
+        return try await base.job(id: id)
+    }
+
+    func jobs(kind: JobKind?) async throws -> [TranscriptionJob] {
+        try await base.jobs(kind: kind)
+    }
+
+    func recoverInterruptedJobs() async throws -> Int {
+        try await base.recoverInterruptedJobs()
+    }
+
+    func transition(_ id: UUID, from: JobState.Kind, to state: JobState) async throws {
+        try await base.transition(id, from: from, to: state)
+    }
+
+    func waitUntilInitialReadStarts() async {
+        while !readStarted { await Task.yield() }
+    }
+
+    func resumeInitialRead() {
+        readContinuation?.resume()
+        readContinuation = nil
+    }
+
+    func readCount(for id: UUID) -> Int {
+        readCounts[id, default: 0]
     }
 }

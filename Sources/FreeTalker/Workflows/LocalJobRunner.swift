@@ -104,17 +104,16 @@ actor LocalJobRunner {
     private func drainQueue() async {
         while !queue.isEmpty {
             let id = queue.removeFirst()
-            await execute(id)
+            let token = CancellationToken()
+            current = CurrentExecution(id: id, token: token, phase: .executing)
+            await execute(id, token: token)
+            current = nil
         }
         worker = nil
     }
 
-    private func execute(_ id: UUID) async {
+    private func execute(_ id: UUID, token: CancellationToken) async {
         guard let job = try? await store.job(id: id), job.state == .queued else { return }
-
-        let token = CancellationToken()
-        current = CurrentExecution(id: id, token: token, phase: .executing)
-        defer { current = nil }
 
         do {
             try await store.transition(id, from: .queued, to: .processing(stage: .preparing))
