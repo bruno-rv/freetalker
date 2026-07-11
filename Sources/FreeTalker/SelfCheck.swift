@@ -1,6 +1,7 @@
 import CoreGraphics
 import CSQLite
 import Foundation
+import os
 
 /// Runnable without any test framework. This CLT-only environment (no Xcode.app) has no
 /// working XCTest/swift-testing *runtime* — `Tests/FreeTalkerTests` compiles fine (proves the
@@ -21,6 +22,29 @@ struct FakeTranscriptionEngine: TranscriptionEngine {
     func transcribe(samples: [Float], forcedLanguage: String?) async throws -> TranscriptionOutput {
         TranscriptionOutput(text: cannedText, language: forcedLanguage ?? "en")
     }
+}
+
+private final class ReloadSerializationProbe: @unchecked Sendable {
+    private struct State { var active = 0; var maximum = 0; var completed: [String] = []; var latest: String? }
+    private let state = OSAllocatedUnfairLock(initialState: State())
+    private let gate = SerialGate()
+
+    func run(requested: String) async {
+        state.withLock { $0.latest = requested }
+        try? await gate.run {
+            self.state.withLock { value in
+                value.active += 1
+                value.maximum = max(value.maximum, value.active)
+            }
+            await Task.yield()
+            self.state.withLock { value in
+                value.active -= 1
+                if let latest = value.latest, value.completed.last != latest { value.completed.append(latest) }
+            }
+        }
+    }
+
+    var result: (Int, [String]) { state.withLock { ($0.maximum, $0.completed) } }
 }
 
 /// No-op `PostProcessor` for the pipeline contract check below — returns the transcript
@@ -2587,6 +2611,42 @@ enum SelfCheck {
     @MainActor
     private static func speechModelManagementChecks() async -> [String] {
         var failures: [String] = []
+        if WhisperKitEngine.shouldReload(loadedVariant: nil, requestedVariant: "new")
+            || WhisperKitEngine.shouldReload(loadedVariant: "same", requestedVariant: "same")
+            || !WhisperKitEngine.shouldReload(loadedVariant: "old", requestedVariant: "new") {
+            failures.append("speech model engine: reload decision mismatch")
+        }
+        if WhisperKitEngine.failedReloadRevert(setting: "new", failedRequested: "new", loadedVariant: "old") != "old"
+            || WhisperKitEngine.failedReloadRevert(setting: "third", failedRequested: "new", loadedVariant: "old") != nil
+            || WhisperKitEngine.failedReloadRevert(setting: "new", failedRequested: "new", loadedVariant: nil) != nil {
+            failures.append("speech model engine: failed reload settings revert mismatch")
+        }
+
+        let guarded = GuardedKitState<String>()
+        if guarded.isLoaded || guarded.snapshot().variant != nil {
+            failures.append("speech model engine: initial guarded state was loaded")
+        }
+        guarded.installIfEmpty(kit: "old-kit", variant: "old")
+        let captured = guarded.snapshot().kit
+        guarded.swap(kit: "new-kit", variant: "new")
+        if !guarded.isLoaded || guarded.snapshot().kit != "new-kit"
+            || guarded.snapshot().variant != "new" || captured != "old-kit" {
+            failures.append("speech model engine: guarded load/swap or transcription capture mismatch")
+        }
+        // A failed candidate load performs no swap, preserving the old identity.
+        if guarded.snapshot().kit != "new-kit" {
+            failures.append("speech model engine: failed reload did not preserve kit")
+        }
+
+        let serialized = ReloadSerializationProbe()
+        let second = Task { await serialized.run(requested: "second") }
+        await Task.yield()
+        await serialized.run(requested: "third")
+        await second.value
+        let serializedResult = serialized.result
+        if serializedResult.0 != 1 || serializedResult.1.last != "third" {
+            failures.append("speech model engine: reloads were not serialized/superseded")
+        }
         let fm = FileManager.default
         let base = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? fm.removeItem(at: base) }

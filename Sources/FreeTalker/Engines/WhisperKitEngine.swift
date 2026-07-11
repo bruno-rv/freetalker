@@ -102,43 +102,80 @@ actor SerialGate {
 /// The class itself is nonisolated (`transcribe` does CPU-heavy work that must not tie up the
 /// main actor); only `statusText` is main-actor-isolated since it feeds SwiftUI directly.
 /// `@unchecked Sendable` is safe here because the only mutable state that matters for Sendable
-/// purposes, `whisperKit`, is fully gate-confined: it is written only inside `loadedKit()` and
-/// read only inside `loadedKit()`/`performTranscribe()`, and every call site that can reach
-/// those two methods (`transcribe`, `preload`) does so exclusively through `gate.run`, which
-/// serializes them so at most one is ever "inside" at a time. `whisperKit` itself carries no
-/// `nonisolated(unsafe)` annotation and is never touched from outside that gated path — in
-/// particular, `isLoaded` (below) does not read it. Load state that genuinely does need a cheap
-/// synchronous cross-context read is published separately via `loadedFlag`, a lock-guarded
-/// `Bool` that's actually safe to read/write concurrently (unlike a bare strong-ref read/write,
-/// which is not atomic under Swift concurrency — see prior Codex finding this replaces).
+/// purposes is held by `GuardedKitState`: kit identity and loaded variant are read and swapped
+/// under one lock. The transcription gate still serializes WhisperKit inference, while reloads
+/// construct a candidate outside that gate and perform only the final atomic state swap.
+final class GuardedKitState<Kit>: @unchecked Sendable {
+    private final class KitBox: @unchecked Sendable {
+        let value: Kit
+        init(_ value: Kit) { self.value = value }
+    }
+    struct Snapshot: @unchecked Sendable {
+        let kit: Kit?
+        let variant: String?
+    }
+
+    private struct State: @unchecked Sendable {
+        var kit: KitBox?
+        var variant: String?
+    }
+
+    private let lock = OSAllocatedUnfairLock(initialState: State())
+
+    var isLoaded: Bool { lock.withLock { $0.kit != nil } }
+    func snapshot() -> Snapshot { lock.withLock { Snapshot(kit: $0.kit?.value, variant: $0.variant) } }
+    func installIfEmpty(kit: Kit, variant: String) {
+        let box = KitBox(kit)
+        lock.withLock { state in
+            guard state.kit == nil else { return }
+            state = State(kit: box, variant: variant)
+        }
+    }
+    func swap(kit: Kit, variant: String) {
+        let box = KitBox(kit)
+        lock.withLock { $0 = State(kit: box, variant: variant) }
+    }
+}
+
 final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked Sendable {
-    let name = "WhisperKit (large-v3-turbo)"
+    let name = "WhisperKit"
     @MainActor @Published private(set) var statusText: String = "Not loaded"
 
-    // Exact HF repo folder name for the large-v3-turbo CoreML export — avoids ambiguous
-    // glob matches against sibling variants (distil/turbo/dated) in the model repo.
-    private static let modelVariant = "large-v3_turbo_954MB"
-
-    private var whisperKit: WhisperKit?
+    private let kitState = GuardedKitState<WhisperKit>()
     private let gate = SerialGate()
-
-    /// Set to `true` inside `loadedKit()`, exactly once, right after the gated load completes —
-    /// never reset to `false` (no unload path exists). `OSAllocatedUnfairLock` (macOS 13+;
-    /// deployment target is macOS 26, see Package.swift) gives a genuinely thread-safe
-    /// synchronous read/write, unlike the `nonisolated(unsafe)` strong-ref read this replaces:
-    /// a class reference read racing a gated write is undefined behavior under Swift
-    /// concurrency, not just imprecise — `Bool` reads/writes under a lock are well-defined.
-    private let loadedFlag = OSAllocatedUnfairLock(initialState: false)
+    private let reloadGate = SerialGate()
+    private let downloadCoordinator: SpeechModelDownloadCoordinator
+    @MainActor private weak var eventReceiver: (any SpeechModelEngineEventReceiving)?
 
     /// Whether the model has already been loaded (preloaded at launch, or lazily by an earlier
     /// call). Read by the live preview availability check — see PLAN 3 "Settings": when Cloud
     /// STT is the active engine, preview must never trigger a fresh multi-hundred-MB local model
     /// load just to satisfy a tick; it only runs if WhisperKit already happens to be loaded.
-    /// Reads `loadedFlag`, not `whisperKit` — this stays a cheap synchronous property (its call
-    /// sites are a SwiftUI view body and a non-async AppCoordinator method, neither of which can
-    /// await a gated read without much larger ripple) while keeping `whisperKit` itself fully
-    /// gate-confined.
-    var isLoaded: Bool { loadedFlag.withLock { $0 } }
+    /// This stays a cheap synchronous property for its SwiftUI and AppCoordinator call sites.
+    var isLoaded: Bool { kitState.isLoaded }
+
+    init(downloadCoordinator: SpeechModelDownloadCoordinator = .shared) {
+        self.downloadCoordinator = downloadCoordinator
+    }
+
+    @MainActor
+    func setEventReceiver(_ receiver: (any SpeechModelEngineEventReceiving)?) {
+        eventReceiver = receiver
+    }
+
+    nonisolated static func shouldReload(loadedVariant: String?, requestedVariant: String?) -> Bool {
+        guard let loadedVariant, let requestedVariant else { return false }
+        return loadedVariant != requestedVariant
+    }
+
+    nonisolated static func failedReloadRevert(
+        setting: String,
+        failedRequested: String,
+        loadedVariant: String?
+    ) -> String? {
+        guard setting == failedRequested else { return nil }
+        return loadedVariant
+    }
 
     /// Warms up the model outside the hot path (e.g. at app launch) so the first real
     /// dictation doesn't pay the load/download cost. Errors are swallowed into `statusText`
@@ -148,7 +185,7 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
             // Routed through `gate` too — otherwise a live preview tick firing mid-launch-load
             // (PLAN 3: preview starts as soon as a recording begins, independent of whether
             // preload has finished) could call `loadedKit()` a second time concurrently with
-            // this one, racing two `WhisperKit.download`/load calls against the same cache dir.
+            // this one, racing two coordinator-backed download/load calls against the same cache.
             // See PLAN 3 "Concurrency rules".
             // Discards inside the closure (not `_ = gate.run { ... }`) — `WhisperKit` itself
             // isn't `Sendable`, so the gate's `T: Sendable` result type must be inferred as
@@ -241,7 +278,7 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
     }
 
     private func performTranscribe(samples: [Float], forcedLanguage: String?, cancelFlag: OSAllocatedUnfairLock<Bool>?) async throws -> TranscriptionOutput {
-        let kit = try await loadedKit()
+        let kit = try await kitForTranscription()
         try checkPreviewCancellation(cancelFlag)
 
         do {
@@ -313,43 +350,103 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
             // partial text rather than throwing, so cancellation has to be checked explicitly
             // here rather than inferred from a caught error.
             if let cancelFlag, Self.shouldDiscardPreviewResult(cancelled: cancelFlag.withLock({ $0 })) {
-                await setStatus("Ready")
+                await setReadyStatus()
                 throw CancellationError()
             }
 
-            await setStatus("Ready")
+            await setReadyStatus()
             let text = results.map(\.text).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
             // When forced, the recorded language is always the forced code — never whatever
             // WhisperKit's decode result happens to report — mirroring CloudSTTEngine's contract.
             // See PLAN.md step 5.
             return TranscriptionOutput(text: text, language: forcedLanguage ?? results.first?.language ?? language)
         } catch {
-            await setStatus("Ready")
+            await setReadyStatus()
             throw error
         }
     }
 
-    // ponytail: no single-flight guard for concurrent loads — AppCoordinator already
-    // serializes calls via its isRecording/isProcessing state, so re-entry can't happen.
+    private func kitForTranscription() async throws -> WhisperKit {
+        if let kit = kitState.snapshot().kit { return kit }
+        return try await loadedKit()
+    }
+
     private func loadedKit() async throws -> WhisperKit {
-        if let whisperKit { return whisperKit }
-        let kit = try await loadModel()
-        whisperKit = kit
-        loadedFlag.withLock { $0 = true }
+        if let kit = kitState.snapshot().kit { return kit }
+        let variant = await AppSettings.shared.whisperModel
+        await emit(.busy(reloadTarget: variant), for: variant)
+        do {
+            let kit = try await loadModel(variant: variant)
+            kitState.installIfEmpty(kit: kit, variant: variant)
+            return kitState.snapshot().kit ?? kit
+        } catch {
+            await emit(.failed(hint: error.localizedDescription), for: variant)
+            throw error
+        }
+    }
+
+    func reload(to requested: String) async {
+        try? await reloadGate.run { [self] in
+            var target: String? = requested
+            while let requestedVariant = target {
+                let loadedVariant = kitState.snapshot().variant
+                guard Self.shouldReload(loadedVariant: loadedVariant, requestedVariant: requestedVariant) else { return }
+                await emit(.busy(reloadTarget: requestedVariant), for: requestedVariant)
+                do {
+                    let candidate = try await loadModel(variant: requestedVariant)
+                    kitState.swap(kit: candidate, variant: requestedVariant)
+                    await setReadyStatus()
+                } catch {
+                    await emit(.failed(hint: error.localizedDescription), for: requestedVariant)
+                    await setStatus("Failed to load \(Self.displayName(for: requestedVariant)): \(error.localizedDescription)")
+                    if let revert = Self.failedReloadRevert(
+                        setting: await AppSettings.shared.whisperModel,
+                        failedRequested: requestedVariant,
+                        loadedVariant: loadedVariant
+                    ) {
+                        await MainActor.run {
+                            if AppSettings.shared.whisperModel == requestedVariant {
+                                AppSettings.shared.applyAutomaticWhisperModel(revert)
+                            }
+                        }
+                    }
+                }
+                let current = await AppSettings.shared.whisperModel
+                target = current == kitState.snapshot().variant ? nil : current
+            }
+        }
+    }
+
+    private func loadModel(variant: String) async throws -> WhisperKit {
+        let displayName = Self.displayName(for: variant)
+        await setStatus("Checking for \(displayName)…")
+        let folder = try await downloadCoordinator.download(variant: variant) { [weak self] progress in
+            Task { await self?.reportDownloadProgress(progress, variant: variant, displayName: displayName) }
+        }
+        await emit(.downloaded, for: variant)
+        await setStatus("Loading \(displayName)…")
+        let config = WhisperKitConfig(modelFolder: folder.path, verbose: false, logLevel: .none, load: true, download: false)
+        let kit = try await WhisperKit(config)
+        await setStatus("Ready — \(displayName)")
         return kit
     }
 
-    private func loadModel() async throws -> WhisperKit {
-        await setStatus("Checking for model…")
-        let folder = try await WhisperKit.download(variant: Self.modelVariant) { [weak self] progress in
-            let percent = Int(progress.fractionCompleted * 100)
-            Task { @MainActor in self?.statusText = "Downloading model… \(percent)%" }
-        }
-        await setStatus("Loading model…")
-        let config = WhisperKitConfig(modelFolder: folder.path, verbose: false, logLevel: .none, load: true, download: false)
-        let kit = try await WhisperKit(config)
-        await setStatus("Ready")
-        return kit
+    private func reportDownloadProgress(_ progress: Double, variant: String, displayName: String) async {
+        await emit(.downloading(progress: progress), for: variant)
+        await setStatus("Downloading \(displayName)… \(Int(progress * 100))%")
+    }
+
+    private func emit(_ event: SpeechModelEngineEvent, for variant: String) async {
+        await MainActor.run { eventReceiver?.receiveEngineEvent(event, for: variant) }
+    }
+
+    private func setReadyStatus() async {
+        let variant = kitState.snapshot().variant
+        await setStatus(variant.map { "Ready — \(Self.displayName(for: $0))" } ?? "Not loaded")
+    }
+
+    private static func displayName(for variant: String) -> String {
+        SpeechModelCatalog.entry(for: variant)?.displayName ?? variant
     }
 
     @MainActor
