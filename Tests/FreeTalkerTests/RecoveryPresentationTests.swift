@@ -38,6 +38,13 @@ import Testing
         #expect(RecoveryPresentation.retryState(for: .processing(stage: .postProcessing)) == .processing("Post-processing"))
     }
 
+    @Test func rowStateLabelsAndIconsCoverEveryState() {
+        #expect(RecoveryPresentation.stateLabel(.failed(.init(stage: .transcribing, message: "x"))) == "Needs attention")
+        #expect(RecoveryPresentation.stateIcon(.failed(.init(stage: .transcribing, message: "x"))) == "exclamationmark.triangle")
+        #expect(RecoveryPresentation.stateLabel(.processing(stage: .postProcessing)) == "Post-processing")
+        #expect(RecoveryPresentation.stateIcon(.ready) == "checkmark.circle")
+    }
+
     @Test func deleteConfirmationNamesIrreversibleLocalAudioRemoval() {
         #expect(RecoveryPresentation.deleteConfirmation == "Permanently delete this recovery and its saved audio? This cannot be undone.")
     }

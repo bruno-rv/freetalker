@@ -277,6 +277,60 @@ actor TranscriptionJobStore {
         return attempt
     }
 
+    func queueRecoveryRetry(jobID: UUID, configuration: AttemptConfiguration) throws -> JobAttempt {
+        try execute("BEGIN IMMEDIATE;")
+        do {
+            let startedAt = clock.now
+            let insert = try prepare("""
+            INSERT INTO job_attempts
+                (job_id, attempt_number, started_at, language, speech_model, template)
+            SELECT ?,
+                   COALESCE((SELECT MAX(attempt_number) FROM job_attempts WHERE job_id = ?), 0) + 1,
+                   ?, ?, ?, ?
+            FROM transcription_jobs
+            WHERE id = ? AND kind = 'recovery' AND state = 'failed'
+              AND purge_claimed_at IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM job_attempts
+                  WHERE job_id = transcription_jobs.id AND completed_at IS NULL
+              );
+            """)
+            defer { sqlite3_finalize(insert) }
+            bind(jobID.uuidString, to: 1, in: insert)
+            bind(jobID.uuidString, to: 2, in: insert)
+            sqlite3_bind_double(insert, 3, startedAt.timeIntervalSince1970)
+            bind(configuration.language, to: 4, in: insert)
+            bind(configuration.speechModel, to: 5, in: insert)
+            bind(configuration.template, to: 6, in: insert)
+            bind(jobID.uuidString, to: 7, in: insert)
+            try stepDone(insert)
+            guard sqlite3_changes(handle) == 1 else {
+                guard try job(id: jobID) != nil else { throw JobStoreError.jobNotFound }
+                if try isPurgeClaimed(id: jobID) { throw JobStoreError.purgeClaimed }
+                throw JobStoreError.invalidTransition
+            }
+            let attemptID = sqlite3_last_insert_rowid(handle)
+
+            let update = try prepare("""
+            UPDATE transcription_jobs
+            SET state = 'queued', failure_stage = NULL, failure_message = NULL,
+                updated_at = ?, completed_at = NULL
+            WHERE id = ? AND kind = 'recovery' AND state = 'failed' AND purge_claimed_at IS NULL;
+            """)
+            defer { sqlite3_finalize(update) }
+            sqlite3_bind_double(update, 1, startedAt.timeIntervalSince1970)
+            bind(jobID.uuidString, to: 2, in: update)
+            try stepDone(update)
+            guard sqlite3_changes(handle) == 1 else { throw JobStoreError.invalidTransition }
+            guard let queuedAttempt = try attempt(id: attemptID) else { throw JobStoreError.attemptNotFound }
+            try execute("COMMIT;")
+            return queuedAttempt
+        } catch {
+            try? execute("ROLLBACK;")
+            throw error
+        }
+    }
+
     private func attempt(id: Int64) throws -> JobAttempt? {
         let statement = try prepare("""
         SELECT id, job_id, attempt_number, started_at, completed_at,

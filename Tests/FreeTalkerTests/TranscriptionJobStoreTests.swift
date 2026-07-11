@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import CSQLite
 @testable import FreeTalker
 
 @Suite struct TranscriptionJobStoreTests {
@@ -68,6 +69,42 @@ import Testing
         #expect(attempts[1].result == .succeeded)
     }
 
+    @Test func queueRecoveryRetryAtomicallyPersistsConfigurationAndQueues() async throws {
+        let fixture = try await failedFixture()
+        let configuration = AttemptConfiguration(language: "pt", speechModel: "small", template: "email")
+
+        let attempt = try await fixture.store.queueRecoveryRetry(jobID: fixture.job.id, configuration: configuration)
+
+        #expect(attempt.configuration == configuration)
+        #expect(try await fixture.store.job(id: fixture.job.id)?.state == .queued)
+        #expect(try await fixture.store.latestUnfinishedAttempt(jobID: fixture.job.id) == attempt)
+    }
+
+    @Test func queueRecoveryRetryRollsBackAttemptWhenTransitionFails() async throws {
+        let fixture = try await failedFixture()
+        try installQueueTransitionFailure(databaseURL: fixture.database.url)
+
+        await #expect(throws: (any Error).self) {
+            try await fixture.store.queueRecoveryRetry(jobID: fixture.job.id, configuration: .init(language: "pt"))
+        }
+
+        #expect(try await fixture.store.job(id: fixture.job.id)?.state.kind == .failed)
+        #expect(try await fixture.store.attempts(jobID: fixture.job.id).isEmpty)
+    }
+
+    @Test func concurrentQueueRecoveryRetryHasOneWinnerAndNoOrphanAttempt() async throws {
+        let fixture = try await failedFixture()
+        let second = try TranscriptionJobStore(databaseURL: fixture.database.url, clock: FixedJobClock(now: Date(timeIntervalSince1970: 1_001)))
+
+        async let firstResult = retryResult(store: fixture.store, id: fixture.job.id, language: "en")
+        async let secondResult = retryResult(store: second, id: fixture.job.id, language: "pt")
+        let results = await [firstResult, secondResult]
+
+        #expect(results.count { if case .success = $0 { true } else { false } } == 1)
+        #expect(try await fixture.store.job(id: fixture.job.id)?.state == .queued)
+        #expect(try await fixture.store.attempts(jobID: fixture.job.id).count == 1)
+    }
+
     @Test func readsLatestUnfinishedAttemptAndAtomicallyCompletesItWithJob() async throws {
         let fixture = try await fixture()
         try await fixture.store.transition(fixture.job.id, from: .queued, to: .processing(stage: .preparing))
@@ -133,6 +170,27 @@ import Testing
         let job = try await store.create(kind: .recovery, source: .init(reference: "audio.wav"), now: clock.now)
         return (database, store, job)
     }
+
+    private func failedFixture() async throws -> (database: TemporaryJobDatabase, store: TranscriptionJobStore, job: TranscriptionJob) {
+        let fixture = try await fixture()
+        try await fixture.store.transition(fixture.job.id, from: .queued, to: .processing(stage: .preparing))
+        try await fixture.store.transition(fixture.job.id, from: .processing, to: .failed(.init(stage: .transcribing, message: "offline")))
+        return fixture
+    }
+
+    private func installQueueTransitionFailure(databaseURL: URL) throws {
+        var database: OpaquePointer?
+        guard sqlite3_open(databaseURL.path, &database) == SQLITE_OK, let database else { throw CocoaError(.fileWriteUnknown) }
+        defer { sqlite3_close(database) }
+        guard sqlite3_exec(database, "CREATE TRIGGER fail_retry_queue BEFORE UPDATE OF state ON transcription_jobs WHEN NEW.state = 'queued' BEGIN SELECT RAISE(ABORT, 'injected queue failure'); END;", nil, nil, nil) == SQLITE_OK else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+    }
+}
+
+private func retryResult(store: TranscriptionJobStore, id: UUID, language: String) async -> Result<JobAttempt, Error> {
+    do { return .success(try await store.queueRecoveryRetry(jobID: id, configuration: .init(language: language))) }
+    catch { return .failure(error) }
 }
 
 private struct FixedJobClock: JobClock {

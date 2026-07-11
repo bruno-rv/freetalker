@@ -2,6 +2,18 @@ import AVFoundation
 import Combine
 import Foundation
 
+protocol RecoveryAudioPlaying: AnyObject {
+    func play() -> Bool
+}
+
+extension AVAudioPlayer: RecoveryAudioPlaying {}
+
+enum RecoveryPlaybackError: LocalizedError, Equatable {
+    case couldNotStart
+
+    var errorDescription: String? { "The recovery audio could not start playing." }
+}
+
 @MainActor
 final class JobLibraryStore: ObservableObject {
     @Published private(set) var recoveryJobs: [TranscriptionJob] = []
@@ -10,11 +22,17 @@ final class JobLibraryStore: ObservableObject {
     private let store: TranscriptionJobStore
     private let recoveryDirectory: URL
     private var enqueueRecovery: (@Sendable (UUID) async -> Void)?
-    private var player: AVAudioPlayer?
+    private let playbackFactory: (URL) throws -> any RecoveryAudioPlaying
+    private var player: (any RecoveryAudioPlaying)?
 
-    init(store: TranscriptionJobStore, recoveryDirectory: URL? = nil) {
+    init(
+        store: TranscriptionJobStore,
+        recoveryDirectory: URL? = nil,
+        playbackFactory: @escaping (URL) throws -> any RecoveryAudioPlaying = { try AVAudioPlayer(contentsOf: $0) }
+    ) {
         self.store = store
         self.recoveryDirectory = recoveryDirectory ?? URL(fileURLWithPath: "/dev/null")
+        self.playbackFactory = playbackFactory
     }
 
     func configureRetry(_ enqueue: @escaping @Sendable (UUID) async -> Void) {
@@ -29,13 +47,16 @@ final class JobLibraryStore: ObservableObject {
     }
 
     func retry(id: UUID, configuration: AttemptConfiguration) async throws {
-        guard let job = try await store.job(id: id), case .failed = job.state else {
-            throw JobStoreError.invalidTransition
-        }
-        _ = try await store.beginAttempt(jobID: id, configuration: configuration)
-        try await store.transition(id, from: .failed, to: .queued)
+        _ = try await store.queueRecoveryRetry(jobID: id, configuration: configuration)
         await enqueueRecovery?(id)
         try await refresh()
+    }
+
+    func preserve(samples: [Float], metadata: RecoveryMetadata) async throws -> UUID {
+        let id = try await RecoveryCaptureService(directory: recoveryDirectory, store: store)
+            .preserve(samples: samples, metadata: metadata)
+        try await refresh()
+        return id
     }
 
     func delete(id: UUID) async throws {
@@ -51,7 +72,8 @@ final class JobLibraryStore: ObservableObject {
         guard let job = recoveryJobs.first(where: { $0.id == id }) else {
             throw JobStoreError.jobNotFound
         }
-        player = try AVAudioPlayer(contentsOf: URL(fileURLWithPath: job.source.reference))
-        player?.play()
+        let nextPlayer = try playbackFactory(URL(fileURLWithPath: job.source.reference))
+        guard nextPlayer.play() else { throw RecoveryPlaybackError.couldNotStart }
+        player = nextPlayer
     }
 }
