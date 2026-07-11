@@ -85,6 +85,7 @@ final class AppCoordinator: ObservableObject {
     private let recoveryStore: TranscriptionJobStore?
     let jobLibraryStore: JobLibraryStore?
     private var recoveryRunner: LocalJobRunner?
+    private var mediaImportRunner: LocalJobRunner?
     private var cancellables = Set<AnyCancellable>()
     private var permissionPollTimer: Timer?
 
@@ -1272,6 +1273,10 @@ final class AppCoordinator: ObservableObject {
         applicationSupportDirectory.appendingPathComponent("failed-dictations", isDirectory: true)
     }
 
+    private static var mediaImportsDirectory: URL {
+        applicationSupportDirectory.appendingPathComponent("media-imports", isDirectory: true)
+    }
+
     private static func makeRecoveryStore() throws -> TranscriptionJobStore {
         try FileManager.default.createDirectory(at: applicationSupportDirectory, withIntermediateDirectories: true)
         return try TranscriptionJobStore(
@@ -1344,6 +1349,46 @@ final class AppCoordinator: ObservableObject {
             .purgeExpired(now: Date(), retention: AppSettings.shared.recoveryRetention)
         await runner.resumeQueuedJobs()
         try? await jobLibraryStore?.refresh()
+    }
+
+    func launchMediaImportWorkflows() async {
+        guard mediaImportRunner == nil, let recoveryStore, let jobLibraryStore else { return }
+        do {
+            try FileManager.default.createDirectory(at: Self.mediaImportsDirectory, withIntermediateDirectories: true)
+        } catch {
+            lastError = "Could not prepare local media imports: \(error.localizedDescription)"
+            return
+        }
+        let service = MediaImportService(store: recoveryStore)
+        let pipeline = MediaImportPipeline(
+            store: recoveryStore,
+            jobsDirectory: Self.mediaImportsDirectory,
+            decoder: service,
+            transcriber: TimestampedWhisperTranscriber(backend: whisperEngine),
+            diarizer: LocalFluidAudioDiarizer(),
+            language: AppSettings.shared.languagePin == "auto" ? nil : AppSettings.shared.languagePin,
+            model: AppSettings.shared.whisperModel
+        )
+        let runner = pipeline.localJobRunner { [weak jobLibraryStore] _ in
+            try? await jobLibraryStore?.refresh()
+        }
+        mediaImportRunner = runner
+        jobLibraryStore.configureImports(
+            service: service,
+            directory: Self.mediaImportsDirectory,
+            enqueue: { [weak runner] id in await runner?.enqueue(id) },
+            cancel: { [weak runner] id in await runner?.cancel(id) ?? .notRunning }
+        )
+        if let days = AppSettings.shared.mediaImportRetention.days {
+            let cutoff = Date().addingTimeInterval(-Double(days) * 86_400)
+            if let imports = try? await recoveryStore.jobs(kind: .mediaImport) {
+                for job in imports where job.createdAt < cutoff && [.ready, .failed, .cancelled].contains(job.state.kind) {
+                    try? await recoveryStore.deleteMediaImport(jobID: job.id, jobsDirectory: Self.mediaImportsDirectory)
+                }
+            }
+        }
+        await runner.resumeQueuedJobs()
+        try? await jobLibraryStore.refresh()
     }
 
     private func processRecoveredDictation(

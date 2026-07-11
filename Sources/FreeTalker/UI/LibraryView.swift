@@ -35,7 +35,8 @@ struct LibraryView: View {
                 if let recoveryStore = coordinator.jobLibraryStore { RecoveriesView(store: recoveryStore) }
                 else { ContentUnavailableView("Recoveries Unavailable", systemImage: "exclamationmark.triangle") }
             case .imports:
-                ContentUnavailableView("Imports", systemImage: "square.and.arrow.down", description: Text("Media imports are not available yet."))
+                if let importStore = coordinator.jobLibraryStore { ImportsView(store: importStore) }
+                else { ContentUnavailableView("Imports Unavailable", systemImage: "exclamationmark.triangle") }
             }
         }
         .frame(minWidth: 720, maxWidth: .infinity, minHeight: 480, maxHeight: .infinity)

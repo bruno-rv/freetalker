@@ -88,7 +88,7 @@ Settings (menu bar → "Settings…") shows live permission status.
   retry with optional language/model/template overrides, or permanently delete it. Recovery
   audio is never uploaded by the recovery library itself. Settings → General → Recovery controls
   automatic deletion after 1, 7 (default), 30, or 90 days, or keeps it until you delete it.
-- **Library → Imports** is a placeholder; media import is not part of the recovery workflow yet.
+- **Library → Imports** accepts WAV, M4A, MP3, MP4, and MOV from the file picker or drag and drop. FreeTalker extracts video audio, transcribes it with the selected local Whisper model, separates speakers locally, and lets you rename speakers and export TXT, Markdown, SRT, or VTT. Imports default to 7-day retention (configurable in Settings). The source file is never modified or deleted, and imported media, derived audio, transcripts, and speaker data never leave your Mac.
 - An optional **Redo-last key** (Settings → General, unbound by default) re-inserts the newest
   Library entry at your cursor without re-recording — handy when a paste got dismissed or
   overwritten.

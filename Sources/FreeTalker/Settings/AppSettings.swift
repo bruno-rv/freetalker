@@ -143,6 +143,10 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(recoveryRetention.rawValue, forKey: Keys.recoveryRetention) }
     }
 
+    @Published var mediaImportRetention: MediaImportRetention {
+        didSet { defaults.set(mediaImportRetention.rawValue, forKey: Keys.mediaImportRetention) }
+    }
+
     @Published var localContextScope: LocalContextScope {
         didSet { defaults.set(localContextScope.rawValue, forKey: Keys.localContextScope) }
     }
@@ -434,6 +438,7 @@ final class AppSettings: ObservableObject {
         static let cloudLLMModel = "cloudLLMModel"
         static let activeTemplateID = "activeTemplateID"
         static let recoveryRetention = "recoveryRetention"
+        static let mediaImportRetention = "mediaImportRetention"
         static let localContextScope = "localContextScope"
         static let automaticStyleEnabled = "automaticStyleEnabled"
         static let handsFreeMaxMinutes = "handsFreeMaxMinutes"
@@ -500,6 +505,7 @@ final class AppSettings: ObservableObject {
         }
         activeTemplateID = defaults.string(forKey: Keys.activeTemplateID) ?? Template.defaultID
         recoveryRetention = RecoveryRetention(rawValue: defaults.object(forKey: Keys.recoveryRetention) as? Int ?? 7) ?? .sevenDays
+        mediaImportRetention = MediaImportRetention(rawValue: defaults.object(forKey: Keys.mediaImportRetention) as? Int ?? 7) ?? .default
         let storedLocalContextScope = defaults.string(forKey: Keys.localContextScope)
         localContextScope = storedLocalContextScope.flatMap(LocalContextScope.init(rawValue:)) ?? .off
         automaticStyleEnabled = defaults.bool(forKey: Keys.automaticStyleEnabled)
