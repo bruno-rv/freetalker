@@ -63,6 +63,7 @@ actor SpeechModelDownloadCoordinator {
 }
 
 enum SpeechModelEngineEvent: Sendable, Equatable {
+    case active
     case downloading(progress: Double)
     case busy(reloadTarget: String)
     case downloaded
@@ -318,6 +319,9 @@ final class SpeechModelStore: ObservableObject, SpeechModelEngineEventReceiving 
         guard states[variant] != nil else { return }
         guard !deletingVariants.contains(variant) else { return }
         switch event {
+        case .active:
+            for id in states.keys { states[id]?.active = id == variant }
+            states[variant]?.phase = .downloaded
         case .downloading(let progress):
             states[variant]?.phase = .downloading(progress)
         case .busy(let target): states[variant]?.phase = .busy(reloadTarget: target)

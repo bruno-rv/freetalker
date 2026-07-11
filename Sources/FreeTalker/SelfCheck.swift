@@ -24,27 +24,40 @@ struct FakeTranscriptionEngine: TranscriptionEngine {
     }
 }
 
-private final class ReloadSerializationProbe: @unchecked Sendable {
-    private struct State { var active = 0; var maximum = 0; var completed: [String] = []; var latest: String? }
-    private let state = OSAllocatedUnfairLock(initialState: State())
-    private let gate = SerialGate()
+private enum FakeReloadError: Error { case failed }
 
-    func run(requested: String) async {
-        state.withLock { $0.latest = requested }
-        try? await gate.run {
-            self.state.withLock { value in
-                value.active += 1
-                value.maximum = max(value.maximum, value.active)
-            }
-            await Task.yield()
-            self.state.withLock { value in
-                value.active -= 1
-                if let latest = value.latest, value.completed.last != latest { value.completed.append(latest) }
-            }
-        }
+private actor ProductionReloadProbe {
+    var setting: String
+    private(set) var events: [SpeechModelEngineEvent] = []
+    private(set) var installed: [String] = []
+    private(set) var activeLoads = 0
+    private(set) var maximumActiveLoads = 0
+    var failVariants: Set<String> = []
+    var supersede: (failed: String, latest: String)?
+
+    init(setting: String) { self.setting = setting }
+
+    func load(_ variant: String) async throws -> String {
+        activeLoads += 1
+        maximumActiveLoads = max(maximumActiveLoads, activeLoads)
+        defer { activeLoads -= 1 }
+        await Task.yield()
+        if let supersede, supersede.failed == variant { setting = supersede.latest }
+        if failVariants.contains(variant) { throw FakeReloadError.failed }
+        return "\(variant)-kit"
     }
 
-    var result: (Int, [String]) { state.withLock { ($0.maximum, $0.completed) } }
+    func receive(_ event: SpeechModelEngineEvent, variant: String) { events.append(event) }
+    func didInstall(_ variant: String) { installed.append(variant) }
+    func revert(failed: String, previous: String) {
+        if setting == failed { setting = previous }
+    }
+    func configureFailure(_ variants: Set<String>, supersede: (String, String)? = nil) {
+        failVariants = variants
+        self.supersede = supersede
+    }
+    func setSetting(_ value: String) { setting = value }
+    func resetEvents() { events = []; installed = [] }
 }
 
 /// No-op `PostProcessor` for the pipeline contract check below — returns the transcript
@@ -2611,6 +2624,82 @@ enum SelfCheck {
     @MainActor
     private static func speechModelManagementChecks() async -> [String] {
         var failures: [String] = []
+        let controller = ModelReloadController<String>()
+        let probe = ProductionReloadProbe(setting: "old")
+        let loader: ModelReloadController<String>.Loader = { try await probe.load($0) }
+        let event: ModelReloadController<String>.EventSink = { await probe.receive($0, variant: $1) }
+        let installed: ModelReloadController<String>.InstallSink = { await probe.didInstall($0) }
+        do {
+            _ = try await controller.loadIfNeeded(requested: "old", loader: loader, event: event, didInstall: installed)
+        } catch {
+            failures.append("speech model engine controller: initial fake load threw \(error)")
+        }
+        let initialEvents = await probe.events
+        let initialInstalls = await probe.installed
+        if controller.state.snapshot().kit != "old-kit"
+            || initialEvents != [.busy(reloadTarget: "old"), .active]
+            || initialInstalls != ["old"] {
+            failures.append("speech model engine controller: initial busy/install/active ordering mismatch")
+        }
+
+        await probe.resetEvents()
+        await probe.configureFailure(["new"])
+        await probe.setSetting("new")
+        await controller.reload(
+            to: "new",
+            currentSetting: { await probe.setting },
+            revertSetting: { await probe.revert(failed: $0, previous: $1) },
+            loader: loader,
+            event: event,
+            didInstall: installed
+        )
+        let failureEvents = await probe.events
+        let revertedSetting = await probe.setting
+        if controller.state.snapshot().kit != "old-kit" || revertedSetting != "old"
+            || failureEvents.count != 2 || failureEvents.first != .busy(reloadTarget: "new") {
+            failures.append("speech model engine controller: failed candidate did not preserve old/busy/revert")
+        } else if case .failed = failureEvents[1] {} else {
+            failures.append("speech model engine controller: failed candidate terminal event mismatch")
+        }
+
+        await probe.resetEvents()
+        await probe.configureFailure(["new"], supersede: ("new", "third"))
+        await probe.setSetting("new")
+        await controller.reload(
+            to: "new",
+            currentSetting: { await probe.setting },
+            revertSetting: { await probe.revert(failed: $0, previous: $1) },
+            loader: loader,
+            event: event,
+            didInstall: installed
+        )
+        let supersedingEvents = await probe.events
+        let supersededSetting = await probe.setting
+        if controller.state.snapshot().kit != "third-kit" || supersededSetting != "third"
+            || supersedingEvents.contains(.active) == false || supersedingEvents.contains(.downloaded) {
+            failures.append("speech model engine controller: newer selection was clobbered or not converged")
+        }
+        await probe.configureFailure([])
+        await probe.setSetting("fourth")
+        let fourth = Task {
+            await controller.reload(
+                to: "fourth", currentSetting: { await probe.setting },
+                revertSetting: { await probe.revert(failed: $0, previous: $1) },
+                loader: loader, event: event, didInstall: installed
+            )
+        }
+        await Task.yield()
+        await probe.setSetting("fifth")
+        await controller.reload(
+            to: "fifth", currentSetting: { await probe.setting },
+            revertSetting: { await probe.revert(failed: $0, previous: $1) },
+            loader: loader, event: event, didInstall: installed
+        )
+        await fourth.value
+        let maximumActiveLoads = await probe.maximumActiveLoads
+        if controller.state.snapshot().kit != "fifth-kit" || maximumActiveLoads != 1 {
+            failures.append("speech model engine controller: production reload seam was not serialized/latest-wins")
+        }
         if WhisperKitEngine.shouldReload(loadedVariant: nil, requestedVariant: "new")
             || WhisperKitEngine.shouldReload(loadedVariant: "same", requestedVariant: "same")
             || !WhisperKitEngine.shouldReload(loadedVariant: "old", requestedVariant: "new") {
@@ -2638,15 +2727,6 @@ enum SelfCheck {
             failures.append("speech model engine: failed reload did not preserve kit")
         }
 
-        let serialized = ReloadSerializationProbe()
-        let second = Task { await serialized.run(requested: "second") }
-        await Task.yield()
-        await serialized.run(requested: "third")
-        await second.value
-        let serializedResult = serialized.result
-        if serializedResult.0 != 1 || serializedResult.1.last != "third" {
-            failures.append("speech model engine: reloads were not serialized/superseded")
-        }
         let fm = FileManager.default
         let base = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? fm.removeItem(at: base) }
@@ -2741,6 +2821,10 @@ enum SelfCheck {
 
         // Coordinator activity, including engine-owned downloads, is observable by the store.
         let activityStore = SpeechModelStore(baseURL: base, coordinator: coordinator, fallbackSupport: [variant])
+        activityStore.receiveEngineEvent(.active, for: variant)
+        if activityStore.states[variant]?.active != true || activityStore.states[variant]?.phase != .downloaded {
+            failures.append("speech model engine event: active install did not align store state")
+        }
         await activityStore.connectCoordinatorActivity()
         let engineStarted = OneShotSignal()
         let engineRelease = OneShotSignal()

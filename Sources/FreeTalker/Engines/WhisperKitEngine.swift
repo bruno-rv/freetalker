@@ -137,13 +137,85 @@ final class GuardedKitState<Kit>: @unchecked Sendable {
     }
 }
 
+final class ModelReloadController<Kit>: @unchecked Sendable {
+    private final class ResultBox: @unchecked Sendable { var kit: Kit? }
+    typealias Loader = @Sendable (String) async throws -> Kit
+    typealias EventSink = @Sendable (SpeechModelEngineEvent, String) async -> Void
+    typealias SettingReader = @Sendable () async -> String
+    typealias SettingReverter = @Sendable (String, String) async -> Void
+    typealias InstallSink = @Sendable (String) async -> Void
+
+    let state = GuardedKitState<Kit>()
+    private let reloadGate = SerialGate()
+
+    func loadIfNeeded(
+        requested: String,
+        loader: @escaping Loader,
+        event: @escaping EventSink,
+        didInstall: @escaping InstallSink
+    ) async throws -> Kit {
+        if let kit = state.snapshot().kit { return kit }
+        let result = ResultBox()
+        try await reloadGate.run {
+            if let existing = self.state.snapshot().kit {
+                result.kit = existing
+                return
+            }
+            await event(.busy(reloadTarget: requested), requested)
+            do {
+                let kit = try await loader(requested)
+                self.state.installIfEmpty(kit: kit, variant: requested)
+                let installed = self.state.snapshot()
+                await event(.active, installed.variant ?? requested)
+                await didInstall(installed.variant ?? requested)
+                result.kit = installed.kit ?? kit
+            } catch {
+                await event(.failed(hint: error.localizedDescription), requested)
+                throw error
+            }
+        }
+        return result.kit!
+    }
+
+    func reload(
+        to requested: String,
+        currentSetting: @escaping SettingReader,
+        revertSetting: @escaping SettingReverter,
+        loader: @escaping Loader,
+        event: @escaping EventSink,
+        didInstall: @escaping InstallSink
+    ) async {
+        try? await reloadGate.run {
+            var target: String? = requested
+            while let requestedVariant = target {
+                let oldVariant = self.state.snapshot().variant
+                guard WhisperKitEngine.shouldReload(loadedVariant: oldVariant, requestedVariant: requestedVariant) else { return }
+                await event(.busy(reloadTarget: requestedVariant), requestedVariant)
+                do {
+                    let candidate = try await loader(requestedVariant)
+                    self.state.swap(kit: candidate, variant: requestedVariant)
+                    await event(.active, requestedVariant)
+                    await didInstall(requestedVariant)
+                } catch {
+                    await event(.failed(hint: error.localizedDescription), requestedVariant)
+                    let setting = await currentSetting()
+                    if let oldVariant, setting == requestedVariant {
+                        await revertSetting(requestedVariant, oldVariant)
+                    }
+                }
+                let current = await currentSetting()
+                target = current == self.state.snapshot().variant ? nil : current
+            }
+        }
+    }
+}
+
 final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked Sendable {
     let name = "WhisperKit"
     @MainActor @Published private(set) var statusText: String = "Not loaded"
 
-    private let kitState = GuardedKitState<WhisperKit>()
+    private let modelController = ModelReloadController<WhisperKit>()
     private let gate = SerialGate()
-    private let reloadGate = SerialGate()
     private let downloadCoordinator: SpeechModelDownloadCoordinator
     @MainActor private weak var eventReceiver: (any SpeechModelEngineEventReceiving)?
 
@@ -152,7 +224,7 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
     /// STT is the active engine, preview must never trigger a fresh multi-hundred-MB local model
     /// load just to satisfy a tick; it only runs if WhisperKit already happens to be loaded.
     /// This stays a cheap synchronous property for its SwiftUI and AppCoordinator call sites.
-    var isLoaded: Bool { kitState.isLoaded }
+    var isLoaded: Bool { modelController.state.isLoaded }
 
     init(downloadCoordinator: SpeechModelDownloadCoordinator = .shared) {
         self.downloadCoordinator = downloadCoordinator
@@ -367,54 +439,42 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
     }
 
     private func kitForTranscription() async throws -> WhisperKit {
-        if let kit = kitState.snapshot().kit { return kit }
+        if let kit = modelController.state.snapshot().kit { return kit }
         return try await loadedKit()
     }
 
     private func loadedKit() async throws -> WhisperKit {
-        if let kit = kitState.snapshot().kit { return kit }
+        if let kit = modelController.state.snapshot().kit { return kit }
         let variant = await AppSettings.shared.whisperModel
-        await emit(.busy(reloadTarget: variant), for: variant)
-        do {
-            let kit = try await loadModel(variant: variant)
-            kitState.installIfEmpty(kit: kit, variant: variant)
-            return kitState.snapshot().kit ?? kit
-        } catch {
-            await emit(.failed(hint: error.localizedDescription), for: variant)
-            throw error
-        }
+        return try await modelController.loadIfNeeded(
+            requested: variant,
+            loader: { try await self.loadModel(variant: $0) },
+            event: { await self.emit($0, for: $1) },
+            didInstall: { _ in await self.setReadyStatus() }
+        )
     }
 
     func reload(to requested: String) async {
-        try? await reloadGate.run { [self] in
-            var target: String? = requested
-            while let requestedVariant = target {
-                let loadedVariant = kitState.snapshot().variant
-                guard Self.shouldReload(loadedVariant: loadedVariant, requestedVariant: requestedVariant) else { return }
-                await emit(.busy(reloadTarget: requestedVariant), for: requestedVariant)
-                do {
-                    let candidate = try await loadModel(variant: requestedVariant)
-                    kitState.swap(kit: candidate, variant: requestedVariant)
-                    await setReadyStatus()
-                } catch {
-                    await emit(.failed(hint: error.localizedDescription), for: requestedVariant)
-                    await setStatus("Failed to load \(Self.displayName(for: requestedVariant)): \(error.localizedDescription)")
-                    if let revert = Self.failedReloadRevert(
-                        setting: await AppSettings.shared.whisperModel,
-                        failedRequested: requestedVariant,
-                        loadedVariant: loadedVariant
-                    ) {
-                        await MainActor.run {
-                            if AppSettings.shared.whisperModel == requestedVariant {
-                                AppSettings.shared.applyAutomaticWhisperModel(revert)
-                            }
-                        }
+        await modelController.reload(
+            to: requested,
+            currentSetting: { await AppSettings.shared.whisperModel },
+            revertSetting: { failed, previous in
+                await MainActor.run {
+                    if AppSettings.shared.whisperModel == failed {
+                        AppSettings.shared.applyAutomaticWhisperModel(previous)
                     }
                 }
-                let current = await AppSettings.shared.whisperModel
-                target = current == kitState.snapshot().variant ? nil : current
-            }
-        }
+            },
+            loader: { variant in
+                do { return try await self.loadModel(variant: variant) }
+                catch {
+                    await self.setStatus("Failed to load \(Self.displayName(for: variant)): \(error.localizedDescription)")
+                    throw error
+                }
+            },
+            event: { await self.emit($0, for: $1) },
+            didInstall: { _ in await self.setReadyStatus() }
+        )
     }
 
     private func loadModel(variant: String) async throws -> WhisperKit {
@@ -423,11 +483,9 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
         let folder = try await downloadCoordinator.download(variant: variant) { [weak self] progress in
             Task { await self?.reportDownloadProgress(progress, variant: variant, displayName: displayName) }
         }
-        await emit(.downloaded, for: variant)
         await setStatus("Loading \(displayName)…")
         let config = WhisperKitConfig(modelFolder: folder.path, verbose: false, logLevel: .none, load: true, download: false)
         let kit = try await WhisperKit(config)
-        await setStatus("Ready — \(displayName)")
         return kit
     }
 
@@ -441,7 +499,7 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
     }
 
     private func setReadyStatus() async {
-        let variant = kitState.snapshot().variant
+        let variant = modelController.state.snapshot().variant
         await setStatus(variant.map { "Ready — \(Self.displayName(for: $0))" } ?? "Not loaded")
     }
 
