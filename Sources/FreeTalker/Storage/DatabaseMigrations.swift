@@ -20,6 +20,9 @@ enum DatabaseMigrator {
                 let version = offset + 1
                 guard version > appliedVersions.count else { continue }
                 try execute(db, migration)
+                if version == 5 {
+                    try migrateLegacySnippetRows(db)
+                }
                 try execute(db, "INSERT INTO schema_migrations (version) VALUES (\(version));")
             }
 
@@ -125,16 +128,50 @@ enum DatabaseMigrator {
         snippet_id TEXT NOT NULL,
         trigger TEXT NOT NULL,
         normalized_trigger TEXT NOT NULL,
+        is_legacy INTEGER NOT NULL DEFAULT 0,
+        FOREIGN KEY (snippet_id) REFERENCES snippets(id) ON DELETE CASCADE,
         PRIMARY KEY (snippet_id, trigger)
     );
     INSERT INTO snippets (id, name, replacement, created_at, updated_at)
         SELECT id, trigger, replacement, created_at, updated_at FROM legacy_snippets;
-    INSERT INTO snippet_triggers (snippet_id, trigger, normalized_trigger)
-        SELECT id, trigger, lower(trim(trigger)) FROM legacy_snippets;
-    DROP TABLE legacy_snippets;
     """
 
     private static let migrations = [migration1, migration2, migration3, migration4, migration5]
+
+    private static func migrateLegacySnippetRows(_ db: OpaquePointer) throws {
+        var select: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT id, trigger FROM legacy_snippets;", -1, &select, nil) == SQLITE_OK,
+              let select else { throw DatabaseError.sqlFailed(lastError(db)) }
+        defer { sqlite3_finalize(select) }
+
+        var insert: OpaquePointer?
+        guard sqlite3_prepare_v2(
+            db,
+            "INSERT INTO snippet_triggers (snippet_id, trigger, normalized_trigger, is_legacy) VALUES (?, ?, ?, 1);",
+            -1, &insert, nil
+        ) == SQLITE_OK, let insert else { throw DatabaseError.sqlFailed(lastError(db)) }
+        defer { sqlite3_finalize(insert) }
+
+        var result = sqlite3_step(select)
+        while result == SQLITE_ROW {
+            let id = String(cString: sqlite3_column_text(select, 0))
+            let trigger = String(cString: sqlite3_column_text(select, 1))
+            bind(id, at: 1, to: insert)
+            bind(trigger, at: 2, to: insert)
+            bind(TriggerNormalizer.normalize(trigger), at: 3, to: insert)
+            guard sqlite3_step(insert) == SQLITE_DONE else { throw DatabaseError.sqlFailed(lastError(db)) }
+            sqlite3_reset(insert)
+            sqlite3_clear_bindings(insert)
+            result = sqlite3_step(select)
+        }
+        guard result == SQLITE_DONE else { throw DatabaseError.sqlFailed(lastError(db)) }
+        try execute(db, "DROP TABLE legacy_snippets;")
+        try execute(db, "CREATE UNIQUE INDEX idx_snippet_triggers_normalized_unique ON snippet_triggers(normalized_trigger) WHERE is_legacy = 0;")
+    }
+
+    private static func bind(_ value: String, at index: Int32, to statement: OpaquePointer) {
+        sqlite3_bind_text(statement, index, value, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+    }
 
     private static func appliedVersions(_ db: OpaquePointer) throws -> [Int] {
         var statement: OpaquePointer?

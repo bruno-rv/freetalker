@@ -4,8 +4,9 @@ import Foundation
 actor SnippetStore {
     private let connection: SQLiteSnippetConnection
     private var handle: OpaquePointer { connection.handle }
+    private let transactionDidBegin: @Sendable () -> Void
 
-    init(databaseURL: URL) throws {
+    init(databaseURL: URL, transactionDidBegin: @escaping @Sendable () -> Void = {}) throws {
         var database: OpaquePointer?
         guard sqlite3_open(databaseURL.path, &database) == SQLITE_OK, let database else {
             let message = database.map { String(cString: sqlite3_errmsg($0)) } ?? "Could not open database"
@@ -14,62 +15,39 @@ actor SnippetStore {
         }
         sqlite3_busy_timeout(database, 5_000)
         do {
+            try Self.execute(database, "PRAGMA foreign_keys=ON;")
             try DatabaseMigrator.migrate(database)
-            try Self.normalizeStoredTriggers(database)
+            guard try Self.foreignKeysEnabled(database) else {
+                throw DatabaseError.sqlFailed("SQLite foreign key enforcement could not be enabled")
+            }
         } catch {
             sqlite3_close(database)
             throw error
         }
         connection = SQLiteSnippetConnection(handle: database)
+        self.transactionDidBegin = transactionDidBegin
     }
 
     nonisolated static func normalizeTrigger(_ trigger: String) -> String {
-        let folded = trigger.folding(options: [.caseInsensitive], locale: Locale(identifier: "und"))
-        let collapsed = folded.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
-        return collapsed.trimmingCharacters(in: .punctuationCharacters.union(.whitespacesAndNewlines))
+        TriggerNormalizer.normalize(trigger)
     }
 
-    private static func normalizeStoredTriggers(_ database: OpaquePointer) throws {
-        var select: OpaquePointer?
-        guard sqlite3_prepare_v2(
-            database, "SELECT snippet_id, trigger FROM snippet_triggers;", -1, &select, nil
-        ) == SQLITE_OK, let select else {
+    private static func execute(_ database: OpaquePointer, _ sql: String) throws {
+        guard sqlite3_exec(database, sql, nil, nil, nil) == SQLITE_OK else {
             throw DatabaseError.sqlFailed(String(cString: sqlite3_errmsg(database)))
         }
-        defer { sqlite3_finalize(select) }
+    }
 
-        var rows: [(String, String)] = []
-        var result = sqlite3_step(select)
-        while result == SQLITE_ROW {
-            rows.append((
-                String(cString: sqlite3_column_text(select, 0)),
-                String(cString: sqlite3_column_text(select, 1))
-            ))
-            result = sqlite3_step(select)
-        }
-        guard result == SQLITE_DONE else {
+    private static func foreignKeysEnabled(_ database: OpaquePointer) throws -> Bool {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, "PRAGMA foreign_keys;", -1, &statement, nil) == SQLITE_OK else {
             throw DatabaseError.sqlFailed(String(cString: sqlite3_errmsg(database)))
         }
-
-        var update: OpaquePointer?
-        guard sqlite3_prepare_v2(
-            database,
-            "UPDATE snippet_triggers SET normalized_trigger = ? WHERE snippet_id = ? AND trigger = ?;",
-            -1, &update, nil
-        ) == SQLITE_OK, let update else {
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW else {
             throw DatabaseError.sqlFailed(String(cString: sqlite3_errmsg(database)))
         }
-        defer { sqlite3_finalize(update) }
-        for (snippetID, trigger) in rows {
-            sqlite3_bind_text(update, 1, normalizeTrigger(trigger), -1, sqliteTransient)
-            sqlite3_bind_text(update, 2, snippetID, -1, sqliteTransient)
-            sqlite3_bind_text(update, 3, trigger, -1, sqliteTransient)
-            guard sqlite3_step(update) == SQLITE_DONE else {
-                throw DatabaseError.sqlFailed(String(cString: sqlite3_errmsg(database)))
-            }
-            sqlite3_reset(update)
-            sqlite3_clear_bindings(update)
-        }
+        return sqlite3_column_int(statement, 0) == 1
     }
 
     func create(name: String, triggers: [String], expansion: String, now: Date = Date()) throws -> Snippet {
@@ -85,20 +63,23 @@ actor SnippetStore {
     func update(
         id: String, name: String, triggers: [String], expansion: String, now: Date = Date()
     ) throws -> Snippet {
-        guard let existing = try snippet(id: id) else { throw SnippetStoreError.notFound }
-        let snippet = Snippet(
-            id: id, name: name, triggers: triggers, expansion: expansion,
-            createdAt: existing.createdAt, updatedAt: now
-        )
-        try write(snippet, replacing: id)
-        guard let stored = try self.snippet(id: snippet.id) else { throw SnippetStoreError.notFound }
+        let normalized = try validatedTriggers(triggers)
+        try transaction {
+            guard let existing = try snippet(id: id) else { throw SnippetStoreError.notFound }
+            let snippet = Snippet(
+                id: id, name: name, triggers: triggers, expansion: expansion,
+                createdAt: existing.createdAt, updatedAt: now
+            )
+            try writeBody(snippet, replacing: id, normalized: normalized)
+        }
+        guard let stored = try self.snippet(id: id) else { throw SnippetStoreError.notFound }
         return stored
     }
 
     func delete(id: String) throws {
         try transaction {
-            try execute("DELETE FROM snippet_triggers WHERE snippet_id = ?;", bindings: [.text(id)])
             try execute("DELETE FROM snippets WHERE id = ?;", bindings: [.text(id)])
+            guard sqlite3_changes(handle) == 1 else { throw SnippetStoreError.notFound }
         }
     }
 
@@ -127,41 +108,46 @@ actor SnippetStore {
     private func write(_ snippet: Snippet, replacing id: String?) throws {
         let normalized = try validatedTriggers(snippet.triggers)
         try transaction {
-            for value in normalized {
-                if try scalarInt(
-                    "SELECT COUNT(*) FROM snippet_triggers WHERE normalized_trigger = ? AND snippet_id != ?;",
-                    bindings: [.text(value), .text(id ?? snippet.id)]
-                ) > 0 {
-                    throw SnippetStoreError.duplicateTrigger(value)
-                }
-            }
-            if try scalarInt(
-                "SELECT COUNT(*) FROM snippets WHERE name = ? AND id != ?;",
-                bindings: [.text(snippet.name), .text(id ?? snippet.id)]
-            ) > 0 {
-                throw SnippetStoreError.duplicateName
-            }
+            try writeBody(snippet, replacing: id, normalized: normalized)
+        }
+    }
 
-            if id == nil {
-                try execute(
-                    "INSERT INTO snippets (id, name, replacement, created_at, updated_at) VALUES (?, ?, ?, ?, ?);",
-                    bindings: [.text(snippet.id), .text(snippet.name), .text(snippet.expansion),
-                               .double(snippet.createdAt.timeIntervalSince1970), .double(snippet.updatedAt.timeIntervalSince1970)]
-                )
-            } else {
-                try execute(
-                    "UPDATE snippets SET name = ?, replacement = ?, updated_at = ? WHERE id = ?;",
-                    bindings: [.text(snippet.name), .text(snippet.expansion),
-                               .double(snippet.updatedAt.timeIntervalSince1970), .text(snippet.id)]
-                )
-                try execute("DELETE FROM snippet_triggers WHERE snippet_id = ?;", bindings: [.text(snippet.id)])
+    private func writeBody(_ snippet: Snippet, replacing id: String?, normalized: [String]) throws {
+        for value in normalized {
+            if try scalarInt(
+                "SELECT COUNT(*) FROM snippet_triggers WHERE normalized_trigger = ? AND snippet_id != ?;",
+                bindings: [.text(value), .text(id ?? snippet.id)]
+            ) > 0 {
+                throw SnippetStoreError.duplicateTrigger(value)
             }
-            for (trigger, normalizedTrigger) in zip(snippet.triggers, normalized) {
-                try execute(
-                    "INSERT INTO snippet_triggers (snippet_id, trigger, normalized_trigger) VALUES (?, ?, ?);",
-                    bindings: [.text(snippet.id), .text(trigger), .text(normalizedTrigger)]
-                )
-            }
+        }
+        if try scalarInt(
+            "SELECT COUNT(*) FROM snippets WHERE name = ? AND id != ?;",
+            bindings: [.text(snippet.name), .text(id ?? snippet.id)]
+        ) > 0 {
+            throw SnippetStoreError.duplicateName
+        }
+
+        if id == nil {
+            try execute(
+                "INSERT INTO snippets (id, name, replacement, created_at, updated_at) VALUES (?, ?, ?, ?, ?);",
+                bindings: [.text(snippet.id), .text(snippet.name), .text(snippet.expansion),
+                           .double(snippet.createdAt.timeIntervalSince1970), .double(snippet.updatedAt.timeIntervalSince1970)]
+            )
+        } else {
+            try execute(
+                "UPDATE snippets SET name = ?, replacement = ?, updated_at = ? WHERE id = ?;",
+                bindings: [.text(snippet.name), .text(snippet.expansion),
+                           .double(snippet.updatedAt.timeIntervalSince1970), .text(snippet.id)]
+            )
+            guard sqlite3_changes(handle) == 1 else { throw SnippetStoreError.notFound }
+            try execute("DELETE FROM snippet_triggers WHERE snippet_id = ?;", bindings: [.text(snippet.id)])
+        }
+        for (trigger, normalizedTrigger) in zip(snippet.triggers, normalized) {
+            try execute(
+                "INSERT INTO snippet_triggers (snippet_id, trigger, normalized_trigger, is_legacy) VALUES (?, ?, ?, 0);",
+                bindings: [.text(snippet.id), .text(trigger), .text(normalizedTrigger)]
+            )
         }
     }
 
@@ -210,6 +196,7 @@ actor SnippetStore {
 
     private func transaction(_ body: () throws -> Void) throws {
         try execute("BEGIN IMMEDIATE;")
+        transactionDidBegin()
         do {
             try body()
             try execute("COMMIT;")
