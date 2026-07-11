@@ -24,6 +24,8 @@ Glossary of canonical terms. No implementation details.
 
 **Transcription Engine** — the component turning audio into a Transcript. Local-first (on-device Whisper) with an optional user-configured cloud engine.
 
+**Speech Model** — one on-device Whisper variant (differing in size, speed, and accuracy) usable by the local Transcription Engine. Models are downloaded on demand, exactly one is Active at a time, and only multilingual variants (English + Portuguese capable) are offered. Downloaded models can be deleted, except the Active one.
+
 **Post-Processor** — the component applying a Template to a Transcript. Cloud (BYOK) whenever the user has a fully configured cloud provider (key, endpoint, model); otherwise the on-device Apple model. Never selected per Template.
 
 **BYOK** — "bring your own key": cloud engines/models are only ever used with the user's own API credentials, never a bundled key.

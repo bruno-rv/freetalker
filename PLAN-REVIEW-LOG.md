@@ -1,84 +1,87 @@
-# Plan Review Log: Spoken Commands + Language Pin + Recording Panel
-Act 1 (grill-with-docs) complete — plan locked, CONTEXT.md updated (Spoken Command, Language Pin, Recording Panel). MAX_ROUNDS=5.
+# Plan Review Log: Speech Model picker
+Act 1 (grill-with-docs) complete — plan locked, CONTEXT.md updated (Speech Model term). MAX_ROUNDS=5.
 
-## Round 1 — Codex (thread 019f4d2c-e224-7961-9e52-60d10710ffa2)
-14 findings, VERDICT: REVISE.
-1. "Small shared spot" for forced language = mutable singleton risk across preview/final calls.
-2. Vocabulary/baseURL still read mid-transcribe while language is snapshotted — inconsistent determinism.
-3. Per-app language as a "picker column" doesn't fit appRules-driven row model (Add requires Template).
-4. Row removal deletes only appRules — stale language overrides survive invisibly.
-5. Invalid one-shot could block valid rule/pin unless candidates normalize independently.
-6. One-shot cleanup unspecified for early returns/pipeline failures.
-7. refined==transcript marks raw AND post-processing fallback — indistinguishable.
-8. Raw rows recording the skipped Template's name violates Library semantics.
-9. HUD 460pt cap/preview-drop not specified as a layout contract.
-10. Parent onTapGesture + child Buttons double-fire/swallow risk.
-11. Panel template cycle contradicts glossary "no per-dictation picker".
-12. Prompt-only spoken commands unverifiable by marker substrings; needs behavioral verification.
-13. Cloud STT forced-language field compat undocumented.
-14. Riskiest behavior (panel event delivery/focus) untested by SelfCheck.
+## Round 1 — Codex
+15 findings, VERDICT: REVISE.
+1. recommendedModels() is local fallback config — use recommendedRemoteModels() async w/ fallback + cache.
+2. Global default may be unsupported on M1-class — resolve default per device.
+3. "Migration" claim wrong — need explicit prefixless→catalog-id alias normalization.
+4. Literal HF path assumption unsafe — derive from actual download-return/HubApi layout.
+5. Non-empty dir ≠ downloaded — require expected .mlmodelc artifacts.
+6. Delete could hit shared cache structure — delete only exact resolved variant dir.
+7. loadedFlag never-resets invariant breaks; audit isLoaded callers.
+8. Engine-object snapshot doesn't pin the MODEL — shared engine means queued transcribe could use new kit; capture kit locally in performTranscribe.
+9. Clear-then-load loses working model on failed reload — load-then-atomic-swap.
+10. First-launch Active model may be not-downloaded — needs explicit UI state.
+11. MainActor manager + heavy FS work — split state (main) from IO (background).
+12. Row state vs global statusText can diverge — single observable state source.
+13. "If support lookup fails" branch impossible for sync local call — moot with remote lookup.
+14. large-v2 exclusion undocumented.
+15. SelfCheck misses path mapping, reload-failure preservation, in-flight kit retention.
 
 ### Claude's response
-All 14 ACCEPTED (12 fully, 2 scoped):
-1. Protocol change: transcribe(samples:forcedLanguage:), preview passes nil, no shared state.
-2. Accepted as documented asymmetry (code comment): vocab/baseURL keep pre-existing engine-read pattern; language snapshot-threaded because one-shot is dictation-scoped.
-3+4. Unified per-app rule row (template-only/language-only/both); removal clears BOTH dicts; storage unchanged.
-5. Per-candidate normalization with fall-through; selfcheck covers invalid-one-shot→valid-rule.
-6. defer-based clearing on every terminal path incl. empty-samples return; reset at beginCapture.
-7+8. One fix: raw rows record reserved template name "Raw Transcript" — distinguishes from fallback (real name) and honors Library semantics. No schema change.
-9. Layout contract: maxWidth 460, template label truncates ~120pt, preview drops first, controls never drop.
-10. Panel mode removes whole-capsule gesture; per-control callbacks only.
-11. CONTEXT.md Active Template term updated: panel cycles the GLOBAL selection; no per-dictation template.
-12. SCOPED: selfcheck = prompt markers + guard sentence (no LLM in selfcheck env); behavior via manual E2E checklist (new step 15).
-13. Documented: OpenAI-compatible field, sent only when forced; rejection surfaces via existing status mapping.
-14. SCOPED: manual smoke-test checklist added as step 15 (panel focus/double-fire/paste-target, language precedence, command E2E).
+All 15 ACCEPTED. Plan rewritten: remote support w/ cached fallback (1,13); per-device default + preference order (2); alias normalization (3); variantDirectory(for:) derived from real layout, verified on-machine (4); artifact-based detection (5); exact-dir delete + last-component assertion (6); loadedFlag = "some kit loaded", caller audit (7); kit capture in performTranscribe (8); load-new-then-swap w/ visible selection revert (9); "Active — downloads on first use" row state, selectable-rule applies to changes only (10); SpeechModelStore state-on-main/IO-background (11,12); large-v2 rationale documented (14); selfcheck adds path mapping, fake-loader reload-failure, kit-identity retention checks (15).
 
 ## Round 2 — Codex
-5 findings, VERDICT: REVISE.
-1. Protocol change collides with preview-only transcribe(samples:allowEarlyCancel:) — needs explicit overload.
-2. CloudSTTError.badResponse leaks raw response body into localizedDescription/lastError.
-3. "Raw Transcript" reserved name can collide with a user-created template of that name.
-4. Stale template ID in unified row: display/resolution/cleanup semantics unspecified; language half must not be silently preserved or silently killed.
-5. Panel double-click/near-simultaneous controls can fire after state already left recording.
+9 findings, VERDICT: REVISE.
+1. Stale "Key decisions" bullets contradicted the revised design (reset-then-load; local-only support intersect).
+2. AppSettings init can't use async support cache — startup ordering undefined.
+3. Reload-failure revert races newer user selection (A→B fails after user picked C → bounces to A).
+4. Reload under the transcription gate blocks dictation for a whole model download.
+5. Kit "capture at entry" undefined when whisperKit == nil mid-reload.
+6. "ALL attempts route through store" vs engine-owned preload = circular ownership risk.
+7. Deleting a reload-target variant mid-load uncovered.
+8. Last-component-matches-catalog-id assertion too strict for fuzzy-resolved paths.
+9. recommendedRemoteModels from Settings rendering can hang/flicker — no timeout/offline contract.
 
 ### Claude's response
-All 5 ACCEPTED:
-1. Overload transcribe(samples:forcedLanguage:allowEarlyCancel:); witness passes false; preview passes (nil, true).
-2. badResponse redacted to status + classified hint, same contract as CloudLLMError/ConnectionTest.
-3. TemplateStore.upsert rejects "Raw Transcript" (case-insensitive, trimmed) with UI feedback.
-4. Row shows "(deleted template)", language half keeps working (resolveLanguage independent by design), row removable as one unit.
-5. Every panel callback routes through the state machine from current state; idle + panel events → .none in the pure table, selfcheck-covered.
+All 9 ACCEPTED:
+1. Stale bullets deleted.
+2. Sync alias-normalization in init; device-default applied later by store, only if user never explicitly chose (whisperModelChosen flag).
+3. reload(to:) reverts only if setting still equals the failed requested variant.
+4. Download/load outside the gate; tiny gated swap; separate reload lock.
+5. kitForTranscription() helper: loaded kit returned as-is (reload never clears); nil → normal gated load of current setting.
+6. Ownership boundary: engine does active-variant load/reload downloads + emits events; store owns scans/deletes/manual downloads; one downloader per operation.
+7. Reload target busy/non-deletable start→finish (new busy phase).
+8. Assertion validates against variantDirectory(for:) output, not raw catalog id.
+9. Render immediately from local fallback; background remote refresh w/ ~5s timeout tightens labels; rendering never awaits network.
 
 ## Round 3 — Codex
-4 findings, VERDICT: REVISE.
-1. pillClick from pttRecording LOCKS — Done/Raw need their own stop event.
-2. Cloud STT `decoded.language ?? "en"` fallback records EN for forced-PT dictations.
-3. upsert-only reservation misses pre-existing user template named "Raw Transcript" on disk.
-4. Glossary Transcript term still said language is always auto-detected.
+7 findings, VERDICT: REVISE.
+1. Reload-outside-gate makes whisperKit/loadedVariant concurrently accessed — needs one guarded state, all reads/writes through it.
+2. Separate loadedFlag can diverge — derive isLoaded from guarded kit != nil.
+3. "One download at a time across layers" asserted, not designed — needs shared coordinator.
+4. Engine preload vs manual download contention behavior undefined.
+5. whisperModelChosen via shared setter path can be set by programmatic reverts.
+6. Active model becoming unsupported after remote refresh — policy undefined.
+7. SelfCheck wording still had the rejected last-component assertion.
 
 ### Claude's response
-All 4 ACCEPTED:
-1. New `.panelFinish` event → stopAndTranscribe from pttRecording AND locked, .none from idle; Lock keeps pillClick; Cancel keeps esc-path.
-2. forcedLanguage != nil ⇒ TranscriptionOutput.language = forced code.
-3. Load-time rename of pre-existing collisions to "Raw Transcript (Template)", persisted.
-4. CONTEXT.md Transcript term updated (auto-detected unless pinned/ruled/panel-forced).
+All 7 ACCEPTED:
+1. Lock-guarded state struct (or actor) for whisperKit+loadedVariant; no bare access.
+2. loadedFlag deleted; isLoaded derived.
+3. SpeechModelDownloadCoordinator actor = sole WhisperKit.download caller, one slot.
+4. Reject-visibly: other Download buttons disabled with "waiting for current download"; no hidden queue.
+5. setWhisperModelFromUser(_:) flags; applyAutomaticWhisperModel(_:)/reverts use non-flagging setter.
+6. Active loaded model stays usable, flagged unsupported; auto-migrate only when not user-chosen.
+7. SelfCheck reworded: resolver self-consistency + cache-root containment.
 
 ## Round 4 — Codex
-No material remaining findings. VERDICT: APPROVED.
-
-## Resolution
-Converged in 4 rounds (14 + 5 + 4 + 0 findings; all 23 accepted, none rejected). Plan locked; parallel build dispatched.
-
-# Code Review Log (post-merge, main @ f9fa0b7)
-
-## Code Round 1 — Codex (thread 019f4d56-a993-7b42-9471-45bbdf85eafc, gpt-5.5)
-1 finding, VERDICT: REVISE: App Rules Add merged non-nil halves instead of replacing the row — stale template override survives a language-only re-add.
+5 findings, VERDICT: REVISE.
+1. Contradiction: "delete loadedFlag" vs next bullet still describing loadedFlag semantics.
+2. Settings step still wrote settings.whisperModel directly, bypassing setWhisperModelFromUser.
+3. Superseded reload request invisible in row state ("selected pending reload" missing).
+4. First-launch preload should emit .downloading through the store like manual downloads.
+5. SelfCheck missing guarded-state transition coverage.
 
 ### Claude's response
-ACCEPTED: pure AppSettings.applyingAppRule replaces the whole row (nil half removes that dict's entry); UI routes through it; selfcheck + mutation-tested. Commit 507a0e6.
+All 5 ACCEPTED: loadedFlag bullet rewritten as isLoaded-caller audit; Settings routes solely through setWhisperModelFromUser (single persist+flag+reload point); "selected — pending reload" row state; preload emits .downloading identically; selfcheck adds guarded-state transitions (nil→loaded, swap identity, failure preserves, isLoaded==kit!=nil).
 
-## Code Round 2 — Codex
-No new findings. VERDICT: APPROVED.
+## Round 5 — Codex
+VERDICT: APPROVED. 3 non-blocking implementation notes carried into the build brief:
+1. Prefer the download-returned folder URL as truth; pure resolver only for scan/delete, validated against it.
+2. Reload memory spike (two models resident) — keep failure path robust for memory/load errors, clear status hint.
+3. UI/README wording: "not recommended for this Mac; current model remains active" — unsupported ≠ broken.
 
 ## Resolution
-Code converged in 2 rounds (1 finding, accepted+fixed). (Ops note: round 2 first attempts failed on a bad thread-ID extraction of mine — resume with empty ID hangs; lesson saved to memory.)
+Converged in 5 rounds (15 + 9 + 7 + 5 + 0 findings; all 36 accepted, none rejected). Plan locked.
