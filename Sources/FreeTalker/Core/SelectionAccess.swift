@@ -24,7 +24,6 @@ protocol SelectionAccessibilityAdapting: AnyObject {
     func elementsEqual(_ lhs: AXUIElement?, _ rhs: AXUIElement?) -> Bool
     func selectedTextRange(of element: AXUIElement) -> NSRange?
     func selectedText(of element: AXUIElement) -> String?
-    func setSelectedTextRange(of element: AXUIElement, to range: NSRange) -> Bool
     func replaceSelectedText(of element: AXUIElement, with text: String) -> Bool
 }
 
@@ -62,14 +61,11 @@ final class SelectionAccess: SelectionAccessing {
     func replace(_ snapshot: SelectionSnapshot, with text: String) throws {
         let first = try readStableSelection()
         try validate(first, against: snapshot)
-        guard let element = first.target.focusedElement,
-              adapter.setSelectedTextRange(of: element, to: snapshot.range) else {
-            throw SelectionAccessError.replacementFailed
-        }
 
         // Accessibility has no compare-and-swap operation. Reasserting the exact captured range
-        // and immediately performing a second fully bracketed read minimizes (but cannot remove)
-        // the final race window before AXSelectedText is set.
+        // would itself be an unsafe write before validation. A second fully bracketed read,
+        // followed directly by one AXSelectedText set on that validated element, minimizes (but
+        // cannot remove) the final race window without mutating any rejected target.
         let final = try readStableSelection()
         try validate(final, against: snapshot)
         guard let finalElement = final.target.focusedElement,

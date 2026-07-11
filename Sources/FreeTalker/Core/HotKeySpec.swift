@@ -166,6 +166,10 @@ struct HotKeyMatcher {
     /// a keyUp with no matching keyDown.
     private var keyIsSwallowed = false
 
+    var swallowedKeyCodeAwaitingKeyUp: UInt16? {
+        keyIsSwallowed ? spec.keyCode : nil
+    }
+
     init(spec: HotKeySpec) {
         self.spec = spec
     }

@@ -36,6 +36,10 @@ final class HotKeyManager {
     private var matcher = HotKeyMatcher(spec: .default)
     private var redoMatcher: HotKeyMatcher?
     private var voiceEditMatcher: HotKeyMatcher?
+    /// Key-downs swallowed by an old matcher generation whose physical key-up may arrive after
+    /// a settings-driven tap restart. Repeated reconfiguration can accumulate old generations,
+    /// so insertion is explicitly capped by `maximumSwallowedKeyUpTombstones`.
+    private var swallowedKeyUpTombstones: Set<UInt16> = []
     /// Mirrors `HotKeyMatcher.keyIsSwallowed` for Esc: true between a swallowed Esc keyDown and
     /// its keyUp, so the keyUp is swallowed too even if `isRecording` has already flipped false
     /// by the time it arrives (cancellation is dispatched asynchronously — see `onEscape`).
@@ -93,6 +97,40 @@ final class HotKeyManager {
         matcher = HotKeyMatcher(spec: matcher.spec)
         redoMatcher = redoMatcher.map { HotKeyMatcher(spec: $0.spec) }
         voiceEditMatcher = voiceEditMatcher.map { HotKeyMatcher(spec: $0.spec) }
+    }
+
+    nonisolated static func captureSwallowedKeyUpTombstones(
+        matcher: HotKeyMatcher,
+        redoMatcher: HotKeyMatcher?,
+        voiceEditMatcher: HotKeyMatcher?
+    ) -> Set<UInt16> {
+        Set([
+            matcher.swallowedKeyCodeAwaitingKeyUp,
+            redoMatcher?.swallowedKeyCodeAwaitingKeyUp,
+            voiceEditMatcher?.swallowedKeyCodeAwaitingKeyUp
+        ].compactMap { $0 })
+    }
+
+    nonisolated static let maximumSwallowedKeyUpTombstones = 8
+
+    nonisolated static func mergeSwallowedKeyUpTombstones(
+        _ additions: Set<UInt16>,
+        into tombstones: inout Set<UInt16>
+    ) {
+        tombstones.formUnion(additions)
+        while tombstones.count > maximumSwallowedKeyUpTombstones,
+              let stale = tombstones.first {
+            tombstones.remove(stale)
+        }
+    }
+
+    nonisolated static func consumeSwallowedKeyUpTombstone(
+        kind: KeyEventKind,
+        keyCode: UInt16,
+        tombstones: inout Set<UInt16>
+    ) -> Bool {
+        guard case .keyUp = kind else { return false }
+        return tombstones.remove(keyCode) != nil
     }
 
     @MainActor
@@ -156,6 +194,7 @@ final class HotKeyManager {
                     // The system disables event taps after a timeout or suspicious input (and
                     // across sleep/wake); without re-enabling, push-to-talk would silently die.
                     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                        manager.swallowedKeyUpTombstones.removeAll()
                         if let tap = manager.eventTap {
                             CGEvent.tapEnable(tap: tap, enable: true)
                         }
@@ -169,6 +208,7 @@ final class HotKeyManager {
             },
             userInfo: refcon
         ) else {
+            swallowedKeyUpTombstones.removeAll()
             Self.logger.error("tap create FAILED: AXIsProcessTrusted=\(axTrusted, privacy: .public) IOHIDCheckAccess=\(hidAccess.rawValue, privacy: .public)")
             return false
         }
@@ -183,6 +223,11 @@ final class HotKeyManager {
     }
 
     func stop() {
+        Self.mergeSwallowedKeyUpTombstones(Self.captureSwallowedKeyUpTombstones(
+            matcher: matcher,
+            redoMatcher: redoMatcher,
+            voiceEditMatcher: voiceEditMatcher
+        ), into: &swallowedKeyUpTombstones)
         if let tap = eventTap {
             CGEvent.tapEnable(tap: tap, enable: false)
         }
@@ -218,6 +263,18 @@ final class HotKeyManager {
         case .keyDown: kind = .keyDown
         case .keyUp: kind = .keyUp
         default: return Unmanaged.passUnretained(event)
+        }
+        if Self.consumeSwallowedKeyUpTombstone(
+            kind: kind,
+            keyCode: keyCode,
+            tombstones: &swallowedKeyUpTombstones
+        ) {
+            return nil
+        }
+        if case .keyDown = kind {
+            // A new down starts a new physical cycle; any old unmatched tombstone for this key
+            // can no longer safely claim its eventual key-up.
+            swallowedKeyUpTombstones.remove(keyCode)
         }
         let isAutorepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
         let outcome = Self.dispatch(kind: kind, keyCode: keyCode, flags: event.flags.rawValue, isAutorepeat: isAutorepeat, matcher: &matcher, redoMatcher: &redoMatcher, voiceEditMatcher: &voiceEditMatcher)
