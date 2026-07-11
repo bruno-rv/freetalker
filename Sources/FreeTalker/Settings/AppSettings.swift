@@ -26,7 +26,7 @@ struct LLMProviderDefault: Equatable {
 final class AppSettings: ObservableObject {
     static let shared = AppSettings()
 
-    private let defaults = UserDefaults.standard
+    private let defaults: UserDefaults
 
     /// The push-to-talk hotkey: modifier chord and/or non-modifier key. Persisted as JSON;
     /// legacy single-modifier installs (pre-HotKeySpec `hotKeyDeviceMask`) are migrated in
@@ -120,6 +120,10 @@ final class AppSettings: ObservableObject {
 
     @Published var recoveryRetention: RecoveryRetention {
         didSet { defaults.set(recoveryRetention.rawValue, forKey: Keys.recoveryRetention) }
+    }
+
+    @Published var localContextScope: LocalContextScope {
+        didSet { defaults.set(localContextScope.rawValue, forKey: Keys.localContextScope) }
     }
 
     @Published var handsFreeMaxMinutes: Int {
@@ -404,6 +408,7 @@ final class AppSettings: ObservableObject {
         static let cloudLLMModel = "cloudLLMModel"
         static let activeTemplateID = "activeTemplateID"
         static let recoveryRetention = "recoveryRetention"
+        static let localContextScope = "localContextScope"
         static let handsFreeMaxMinutes = "handsFreeMaxMinutes"
         static let appRules = "appRules"
         static let languagePin = "languagePin"
@@ -412,7 +417,8 @@ final class AppSettings: ObservableObject {
         static let vocabularyText = "vocabularyText"
     }
 
-    private init() {
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
         if let data = defaults.data(forKey: Keys.hotKeySpec),
            let spec = try? JSONDecoder().decode(HotKeySpec.self, from: data) {
             hotKeySpec = spec
@@ -462,6 +468,7 @@ final class AppSettings: ObservableObject {
         }
         activeTemplateID = defaults.string(forKey: Keys.activeTemplateID) ?? Template.defaultID
         recoveryRetention = RecoveryRetention(rawValue: defaults.object(forKey: Keys.recoveryRetention) as? Int ?? 7) ?? .sevenDays
+        localContextScope = LocalContextScope(rawValue: defaults.string(forKey: Keys.localContextScope) ?? "") ?? .off
         let storedHandsFreeMaxMinutes = defaults.object(forKey: Keys.handsFreeMaxMinutes) as? Int ?? 5
         handsFreeMaxMinutes = Self.clampHandsFreeMaxMinutes(storedHandsFreeMaxMinutes)
         appRules = defaults.dictionary(forKey: Keys.appRules) as? [String: String] ?? [:]
