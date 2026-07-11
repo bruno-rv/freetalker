@@ -1,6 +1,7 @@
 import CoreGraphics
 import CSQLite
 import Foundation
+import os
 
 /// Runnable without any test framework. This CLT-only environment (no Xcode.app) has no
 /// working XCTest/swift-testing *runtime* — `Tests/FreeTalkerTests` compiles fine (proves the
@@ -20,6 +21,73 @@ struct FakeTranscriptionEngine: TranscriptionEngine {
 
     func transcribe(samples: [Float], forcedLanguage: String?) async throws -> TranscriptionOutput {
         TranscriptionOutput(text: cannedText, language: forcedLanguage ?? "en")
+    }
+}
+
+private enum FakeReloadError: Error { case failed }
+
+private actor ProductionReloadProbe {
+    var setting: String
+    private(set) var events: [SpeechModelEngineEvent] = []
+    private(set) var installed: [String] = []
+    private(set) var activeLoads = 0
+    private(set) var maximumActiveLoads = 0
+    var failVariants: Set<String> = []
+    var supersede: (failed: String, latest: String)?
+
+    init(setting: String) { self.setting = setting }
+
+    func load(_ variant: String) async throws -> String {
+        activeLoads += 1
+        maximumActiveLoads = max(maximumActiveLoads, activeLoads)
+        defer { activeLoads -= 1 }
+        await Task.yield()
+        if let supersede, supersede.failed == variant { setting = supersede.latest }
+        if failVariants.contains(variant) { throw FakeReloadError.failed }
+        return "\(variant)-kit"
+    }
+
+    func receive(_ event: SpeechModelEngineEvent, variant: String) { events.append(event) }
+    func didInstall(_ variant: String) { installed.append(variant) }
+    func revert(failed: String, previous: String) {
+        if setting == failed { setting = previous }
+    }
+    func configureFailure(_ variants: Set<String>, supersede: (String, String)? = nil) {
+        failVariants = variants
+        self.supersede = supersede
+    }
+    func setSetting(_ value: String) { setting = value }
+    func resetEvents() { events = []; installed = [] }
+}
+
+private actor RapidReloadProbe {
+    var setting = "A"
+    private(set) var attempts: [String: Int] = [:]
+    private(set) var lifecycles: [String] = []
+    private(set) var statuses: [String] = []
+    let aStarted = OneShotSignal()
+    let releaseA = OneShotSignal()
+
+    func load(_ variant: String, lifecycle: String) async throws -> String {
+        attempts[variant, default: 0] += 1
+        if variant == "A" {
+            await aStarted.fire()
+            await releaseA.wait()
+            return "A-kit"
+        }
+        statuses.append("\(lifecycle):B-progress")
+        throw FakeReloadError.failed
+    }
+
+    func begin(_ variant: String) -> String {
+        lifecycles.append(variant)
+        return "lifecycle-\(variant)"
+    }
+
+    func setSetting(_ value: String) { setting = value }
+
+    func revert(failed: String, previous: String) {
+        if setting == failed { setting = previous }
     }
 }
 
@@ -78,6 +146,24 @@ private actor OneShotSignal {
         for waiter in waiters { waiter.resume() }
         waiters.removeAll()
     }
+}
+
+private actor FakeDownloadProbe {
+    private(set) var attempts = 0
+    private var progress: (@Sendable (Double) -> Void)?
+
+    func start(progress: @escaping @Sendable (Double) -> Void) {
+        attempts += 1
+        self.progress = progress
+    }
+
+    func sendProgress(_ value: Double) {
+        progress?(value)
+    }
+}
+
+private enum FakeDownloadError: Error {
+    case failed
 }
 
 enum SelfCheck {
@@ -229,6 +315,10 @@ enum SelfCheck {
             failures.append(contentsOf: await rawPathChecks())
             failures.append(contentsOf: reservedTemplateNameChecks())
             failures.append(contentsOf: cloudSTTErrorChecks())
+            failures.append(contentsOf: speechModelCatalogChecks())
+            failures.append(contentsOf: speechModelSettingsChecks())
+            failures.append(contentsOf: await speechModelManagementChecks())
+            failures.append(contentsOf: await speechModelIntegrationChecks())
 
             if failures.isEmpty {
                 print("SelfCheck PASSED (template seeding, FTS round-trip, pipeline contract, mic device enumeration, hotkey spec/matcher, vocabulary normalization/injection, app rule resolution, paste-target drift, prompt app-name sanitization, live preview gating/availability, SerialGate cancellation, preview early-cancel decisions, built-in template prompt upgrade (incl. v3->v4 Spoken Commands), LLM provider defaults, BYOK Keychain key migration, global cloud-selection routing, BYOK connection-test status-code mapping/config gating, hands-free recording state machine/esc/cap-clamp/cancel, Library deletion: per-row/Delete All/latestDictation tiebreak/dangling source_id/secure_delete/unfiltered total count, SQLite step classification (readAll/dictationExists error propagation), WAL checkpoint busy path, debug-audio purge scoping (incl. directory-named-*.wav skip, unreadable-directory error), LibraryStore privacy-step-then-always sequencing, Redo Last gating/spec-constraints/matcher/result message/spec validation, Language Pin resolution (precedence/invalid-fallthrough/normalization), unified App Rules row join/removal, Recording Panel action routing (button×state incl. stale-click no-ops)/template-cycle order, one-shot language lifecycle (set/toggle/clear), Raw path (post-processor not invoked, refined==transcript, reserved template name recorded), Raw Transcript reserved-name rejection/load-time rename, Cloud STT error status classification)")
@@ -240,6 +330,250 @@ enum SelfCheck {
             }
         }
         dispatchMain()
+    }
+
+    @MainActor
+    private static func speechModelIntegrationChecks() async -> [String] {
+        var failures: [String] = []
+        var selected: String?
+        var reloaded: String?
+        await AppCoordinator.routeSpeechModelSelection(
+            "openai_whisper-small",
+            setFromUser: { selected = $0 },
+            reload: { reloaded = $0 }
+        )
+        if selected != "openai_whisper-small" || reloaded != selected {
+            failures.append("speech model selection: user setter and reload were not routed together")
+        }
+
+        let downloaded = SpeechModelStore.State(phase: .downloaded, active: false, supported: true)
+        let pending = SpeechModelRowPresentation.make(
+            state: downloaded,
+            selected: true,
+            activeDownloadVariant: nil
+        )
+        if pending.status != "Selected — pending reload" || pending.canSelect || pending.canDelete {
+            failures.append("speech model row: pending selection presentation mismatch")
+        }
+        let pendingBusy = SpeechModelRowPresentation.make(
+            state: .init(
+                phase: .busy(reloadTarget: "openai_whisper-small"),
+                active: false,
+                supported: true
+            ),
+            selected: true,
+            activeDownloadVariant: nil
+        )
+        if pendingBusy.status != "Selected — pending reload · Loading Whisper Small…" {
+            failures.append("speech model row: selected busy target hid loading state")
+        }
+        let firstLaunch = SpeechModelRowPresentation.make(
+            state: .init(phase: .notDownloaded, active: true, supported: true),
+            selected: true,
+            activeDownloadVariant: nil
+        )
+        if firstLaunch.status != "Active — downloads on first use" || firstLaunch.canDelete {
+            failures.append("speech model row: first-launch active presentation mismatch")
+        }
+        let unsupportedActive = SpeechModelRowPresentation.make(
+            state: .init(phase: .downloaded, active: true, supported: false),
+            selected: true,
+            activeDownloadVariant: nil
+        )
+        if unsupportedActive.status != "Active — unsupported on this Mac" || unsupportedActive.canSelect {
+            failures.append("speech model row: unsupported active policy mismatch")
+        }
+        let waiting = SpeechModelRowPresentation.make(
+            state: .init(phase: .notDownloaded, active: false, supported: true),
+            selected: false,
+            activeDownloadVariant: "other"
+        )
+        if waiting.action != .download || waiting.actionCaption != "waiting for current download" || waiting.actionEnabled {
+            failures.append("speech model row: waiting download presentation mismatch")
+        }
+        let failed = SpeechModelRowPresentation.make(
+            state: .init(phase: .failed("network"), active: false, supported: true),
+            selected: false,
+            activeDownloadVariant: nil
+        )
+        if failed.status != "Failed — network" || failed.canSelect {
+            failures.append("speech model row: failed revert visibility mismatch")
+        }
+        if SpeechModelRowPresentation.radioAccessibilityLabel(
+            displayName: "Whisper Small",
+            active: false,
+            selected: true
+        ) != "Whisper Small, selected — pending reload" {
+            failures.append("speech model row: radio accessibility label omitted model/state")
+        }
+        if SpeechModelDeleteFailure.message(modelName: "Whisper Small", hint: "denied")
+            != "Couldn't delete Whisper Small: denied" {
+            failures.append("speech model deletion: accessible failure text mismatch")
+        }
+
+        let savedModel = AppSettings.shared.whisperModel
+        let savedChosen = AppSettings.shared.whisperModelChosen
+        defer {
+            AppSettings.shared.applyAutomaticWhisperModel(savedModel)
+            AppSettings.shared.whisperModelChosen = savedChosen
+        }
+        AppSettings.shared.whisperModelChosen = false
+        AppSettings.shared.applyAutomaticWhisperModel(SpeechModelCatalog.defaultID)
+        let automaticTarget = "openai_whisper-small"
+        let initialFallbackStore = SpeechModelStore(
+            coordinator: SpeechModelDownloadCoordinator(),
+            settings: AppSettings.shared,
+            fallbackSupport: [automaticTarget]
+        )
+        if AppSettings.shared.whisperModel != automaticTarget
+            || initialFallbackStore.states[automaticTarget]?.active != true {
+            failures.append("speech model lifecycle: initial fallback correction was not first-launch active")
+        }
+        AppSettings.shared.applyAutomaticWhisperModel(SpeechModelCatalog.defaultID)
+        let automaticReloaded = OneShotSignal()
+        let automaticStore = SpeechModelStore(
+            coordinator: SpeechModelDownloadCoordinator(),
+            settings: AppSettings.shared,
+            fallbackSupport: [SpeechModelCatalog.defaultID],
+            remoteSupportFetcher: { [automaticTarget] in [automaticTarget] }
+        )
+        automaticStore.onAutomaticSelection = { target in
+            if target == automaticTarget { Task { await automaticReloaded.fire() } }
+        }
+        automaticStore.refreshRemoteSupportOnce()
+        await automaticReloaded.wait()
+        if AppSettings.shared.whisperModel != automaticTarget
+            || automaticStore.states[automaticTarget]?.active == true {
+            failures.append("speech model lifecycle: automatic correction skipped reload or claimed active before install")
+        }
+        var loadedLifecycle: [String] = []
+        await AppCoordinator.routeAutomaticSpeechModelSelection(
+            automaticTarget,
+            kitLoaded: true,
+            localEngineSelected: true,
+            preload: { loadedLifecycle.append("preload") },
+            reload: { loadedLifecycle.append("reload:\($0)") }
+        )
+        if loadedLifecycle != ["reload:\(automaticTarget)"] {
+            failures.append("speech model lifecycle: loaded kit did not reload directly")
+        }
+        var localUnloadedLifecycle: [String] = []
+        await AppCoordinator.routeAutomaticSpeechModelSelection(
+            automaticTarget,
+            kitLoaded: false,
+            localEngineSelected: true,
+            preload: { localUnloadedLifecycle.append("preload") },
+            reload: { localUnloadedLifecycle.append("reload:\($0)") }
+        )
+        if localUnloadedLifecycle != ["preload", "reload:\(automaticTarget)"] {
+            failures.append("speech model lifecycle: local unloaded correction did not preload and converge")
+        }
+        var cloudUnloadedLifecycle: [String] = []
+        await AppCoordinator.routeAutomaticSpeechModelSelection(
+            automaticTarget,
+            kitLoaded: false,
+            localEngineSelected: false,
+            preload: { cloudUnloadedLifecycle.append("preload") },
+            reload: { cloudUnloadedLifecycle.append("reload:\($0)") }
+        )
+        if !cloudUnloadedLifecycle.isEmpty {
+            failures.append("speech model lifecycle: cloud selection triggered a local model download")
+        }
+
+        let app = AppCoordinator.shared
+        if app.speechModelDownloadCoordinator !== SpeechModelDownloadCoordinator.shared {
+            failures.append("speech model lifecycle: app did not expose one shared coordinator/store")
+        }
+        return failures
+    }
+
+    private static func speechModelCatalogChecks() -> [String] {
+        var failures: [String] = []
+        let entries = SpeechModelCatalog.entries
+        let expectedIDs = [
+            "openai_whisper-tiny", "openai_whisper-base", "openai_whisper-small",
+            "openai_whisper-medium", "openai_whisper-large-v3_947MB",
+            "openai_whisper-large-v3-v20240930_turbo_632MB",
+            "openai_whisper-large-v3_turbo_954MB",
+        ]
+        if entries.map(\.id) != expectedIDs { failures.append("speech catalog: display order/coverage mismatch") }
+        if Set(entries.map(\.id)).count != entries.count { failures.append("speech catalog: duplicate ids") }
+        if entries.contains(where: { !$0.isMultilingual || $0.id.contains(".en") || $0.id.contains("distil-") }) {
+            failures.append("speech catalog: contains a non-multilingual variant")
+        }
+        if entries.contains(where: { $0.displayName.isEmpty || $0.approximateSize.isEmpty }) {
+            failures.append("speech catalog: missing display metadata")
+        }
+        if entries.contains(where: {
+            $0.quickTip.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || !$0.quickTip.contains($0.id)
+        }) {
+            failures.append("speech catalog: quick tip missing content or exact searchable id")
+        }
+        if Set(entries.map(\.quickTip)).count != entries.count {
+            failures.append("speech catalog: quick tips are not model-specific")
+        }
+        if entries.contains(where: { $0.compactTradeoff.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
+            || Set(entries.map(\.compactTradeoff)).count < 4 {
+            failures.append("speech catalog: compact tradeoff metadata missing or insufficiently specific")
+        }
+        if Set(SpeechModelCatalog.preferenceOrder) != Set(expectedIDs) || SpeechModelCatalog.preferenceOrder.count != entries.count {
+            failures.append("speech catalog: preference order does not cover every entry exactly once")
+        }
+        if SpeechModelCatalog.entry(for: "openai_whisper-small")?.id != "openai_whisper-small" {
+            failures.append("speech catalog: lookup failed")
+        }
+        if SpeechModelCatalog.normalize("large-v3_turbo_954MB") != SpeechModelCatalog.defaultID {
+            failures.append("speech catalog: prefixless alias did not normalize")
+        }
+        if SpeechModelCatalog.normalize("openai_whisper-base") != "openai_whisper-base" {
+            failures.append("speech catalog: catalog id did not remain unchanged")
+        }
+        if SpeechModelCatalog.normalize("unknown") != SpeechModelCatalog.defaultID {
+            failures.append("speech catalog: unknown did not normalize to static default")
+        }
+        if SpeechModelCatalog.bestSupported(in: ["openai_whisper-small", "openai_whisper-medium"]) != "openai_whisper-medium" {
+            failures.append("speech catalog: support-set preference was not applied")
+        }
+        if SpeechModelCatalog.bestSupported(in: []) != SpeechModelCatalog.defaultID ||
+            SpeechModelCatalog.bestSupported(in: ["unknown"]) != SpeechModelCatalog.defaultID {
+            failures.append("speech catalog: empty/unknown support set was not deterministic")
+        }
+        if SpeechModelCatalog.bestSupported(in: ["tiny"]) != "openai_whisper-tiny" {
+            failures.append("speech catalog: support set did not accept prefixless alias")
+        }
+        return failures
+    }
+
+    @MainActor
+    private static func speechModelSettingsChecks() -> [String] {
+        var failures: [String] = []
+        let settings = AppSettings.shared
+        let savedModel = settings.whisperModel
+        let savedChosen = settings.whisperModelChosen
+        defer {
+            settings.applyAutomaticWhisperModel(savedModel)
+            settings.whisperModelChosen = savedChosen
+        }
+
+        settings.whisperModelChosen = false
+        settings.applyAutomaticWhisperModel("small")
+        if settings.whisperModel != "openai_whisper-small" || settings.whisperModelChosen {
+            failures.append("speech settings: automatic update did not persist normalized model without flagging intent")
+        }
+        settings.setWhisperModelFromUser("base")
+        if settings.whisperModel != "openai_whisper-base" || !settings.whisperModelChosen {
+            failures.append("speech settings: user update did not persist normalized model and flag intent")
+        }
+        if UserDefaults.standard.string(forKey: "whisperModel") != "openai_whisper-base" ||
+            !(UserDefaults.standard.object(forKey: "whisperModelChosen") as? Bool ?? false) {
+            failures.append("speech settings: persistence keys did not reflect API updates")
+        }
+        settings.applyAutomaticWhisperModel("not-real")
+        if settings.whisperModel != SpeechModelCatalog.defaultID || !settings.whisperModelChosen {
+            failures.append("speech settings: automatic revert changed existing user intent")
+        }
+        return failures
     }
 
     /// Pure-logic hotkey checks: HotKeySpec encode/decode roundtrip and the HotKeyMatcher
@@ -1231,6 +1565,72 @@ enum SelfCheck {
         let blankBaseURL = snapshot(baseURL: "", model: "claude-sonnet-4-5", key: "sk-test")
         if AppCoordinator.isCloudLLMConfigured(snapshot: blankBaseURL) {
             failures.append("isCloudLLMConfigured: expected a blank base URL to fall back to on-device")
+        }
+
+        func openAICompatible(baseURL: String, key: String?) -> CloudLLMSettingsSnapshot {
+            CloudLLMSettingsSnapshot(
+                provider: .openAICompatible,
+                baseURL: baseURL,
+                model: "llama3.2",
+                key: key,
+                vocabulary: []
+            )
+        }
+
+        for loopbackURL in [
+            "http://localhost:11434/v1",
+            "http://localhost:80/v1",
+            "http://localhost/v1",
+            "http://127.0.0.1:11434/v1",
+            "http://[::1]:11434/v1",
+        ] where !AppCoordinator.isCloudLLMConfigured(snapshot: openAICompatible(baseURL: loopbackURL, key: "   ")) {
+            failures.append("isCloudLLMConfigured: expected empty-key local OpenAI-compatible URL to be eligible: \(loopbackURL)")
+        }
+
+        for invalidPortURL in [
+            "http://localhost:/v1",
+            "http://localhost:0/v1",
+            "http://localhost:65536/v1",
+            "http://localhost:99999/v1",
+            "http://localhost:not-a-port/v1",
+        ] where AppCoordinator.isCloudLLMConfigured(snapshot: openAICompatible(baseURL: invalidPortURL, key: nil)) {
+            failures.append("isCloudLLMConfigured: expected malformed or out-of-range port to be ineligible: \(invalidPortURL)")
+        }
+
+        for remoteURL in ["http://example.com/v1", "https://example.com/v1"]
+        where AppCoordinator.isCloudLLMConfigured(snapshot: openAICompatible(baseURL: remoteURL, key: nil)) {
+            failures.append("isCloudLLMConfigured: expected empty-key remote URL to be ineligible: \(remoteURL)")
+        }
+
+        for malformedURL in ["not a URL", "http://", "://localhost:11434/v1"]
+        where AppCoordinator.isCloudLLMConfigured(snapshot: openAICompatible(baseURL: malformedURL, key: "sk-test")) {
+            failures.append("isCloudLLMConfigured: expected malformed URL to be ineligible: \(malformedURL)")
+        }
+
+        if !AppCoordinator.isCloudLLMConfigured(snapshot: openAICompatible(baseURL: "http://localhost:11434/v1", key: "local-key")) {
+            failures.append("isCloudLLMConfigured: expected supplied local key to remain eligible")
+        }
+        let localAnthropicWithoutKey = CloudLLMSettingsSnapshot(
+            provider: .anthropic,
+            baseURL: "http://localhost:11434/v1",
+            model: "claude-local",
+            key: nil,
+            vocabulary: []
+        )
+        if AppCoordinator.isCloudLLMConfigured(snapshot: localAnthropicWithoutKey) {
+            failures.append("isCloudLLMConfigured: expected localhost exception not to affect Anthropic")
+        }
+
+        let emptyKeyHeaders = CloudLLMProcessor.openAICompatibleHeaders(apiKey: nil)
+        if emptyKeyHeaders["Authorization"] != nil {
+            failures.append("openAICompatibleHeaders: expected Authorization to be omitted without a key")
+        }
+        if emptyKeyHeaders["Content-Type"] != "application/json" {
+            failures.append("openAICompatibleHeaders: expected JSON content type without a key")
+        }
+        let suppliedKeyHeaders = CloudLLMProcessor.openAICompatibleHeaders(apiKey: "local-key")
+        if suppliedKeyHeaders["Authorization"] != "Bearer local-key" {
+            failures.append("openAICompatibleHeaders: expected supplied local key to retain bearer authorization")
         }
 
         // Legacy templates.json with the removed `useCloud` key must still decode — synthesized
@@ -2484,6 +2884,437 @@ enum SelfCheck {
             failures.append("badResponse.errorDescription: expected the status and classified hint, got \"\(description)\"")
         }
 
+        return failures
+    }
+
+    @MainActor
+    private static func speechModelManagementChecks() async -> [String] {
+        var failures: [String] = []
+        let progressGuard = ModelLoadProgressGuard()
+        let activeProgress = progressGuard.begin(variant: "delayed-active")
+        let activeRelease = OneShotSignal()
+        var activeVisible = "loading"
+        let delayedActiveProgress = Task { @MainActor in
+            await activeRelease.wait()
+            if progressGuard.isCurrent(activeProgress) { activeVisible = "downloading" }
+        }
+        progressGuard.finish(activeProgress)
+        activeVisible = "Ready — Delayed Active"
+        await activeRelease.fire()
+        await delayedActiveProgress.value
+        if activeVisible != "Ready — Delayed Active" {
+            failures.append("speech model engine: delayed progress regressed terminal active/Ready")
+        }
+
+        let failedProgress = progressGuard.begin(variant: "delayed-failure")
+        let failureRelease = OneShotSignal()
+        var failureVisible = "loading"
+        let delayedFailureProgress = Task { @MainActor in
+            await failureRelease.wait()
+            if progressGuard.isCurrent(failedProgress) { failureVisible = "downloading" }
+        }
+        progressGuard.finish(failedProgress)
+        failureVisible = "Failed to load Delayed Failure"
+        await failureRelease.fire()
+        await delayedFailureProgress.value
+        if failureVisible != "Failed to load Delayed Failure" {
+            failures.append("speech model engine: delayed progress regressed terminal failure")
+        }
+        let controller = ModelReloadController<String>()
+        let probe = ProductionReloadProbe(setting: "old")
+        let loader: ModelReloadController<String>.Loader = { try await probe.load($0) }
+        let event: ModelReloadController<String>.EventSink = { await probe.receive($0, variant: $1) }
+        let installed: ModelReloadController<String>.InstallSink = { await probe.didInstall($0) }
+        do {
+            _ = try await controller.loadIfNeeded(requested: "old", loader: loader, event: event, didInstall: installed)
+        } catch {
+            failures.append("speech model engine controller: initial fake load threw \(error)")
+        }
+        let initialEvents = await probe.events
+        let initialInstalls = await probe.installed
+        if controller.state.snapshot().kit != "old-kit"
+            || initialEvents != [.busy(reloadTarget: "old"), .active]
+            || initialInstalls != ["old"] {
+            failures.append("speech model engine controller: initial busy/install/active ordering mismatch")
+        }
+
+        await probe.resetEvents()
+        await probe.configureFailure(["new"])
+        await probe.setSetting("new")
+        await controller.reload(
+            to: "new",
+            currentSetting: { await probe.setting },
+            revertSetting: { await probe.revert(failed: $0, previous: $1) },
+            loader: loader,
+            event: event,
+            didInstall: installed
+        )
+        let failureEvents = await probe.events
+        let revertedSetting = await probe.setting
+        if controller.state.snapshot().kit != "old-kit" || revertedSetting != "old"
+            || failureEvents.count != 2 || failureEvents.first != .busy(reloadTarget: "new") {
+            failures.append("speech model engine controller: failed candidate did not preserve old/busy/revert")
+        } else if case .failed = failureEvents[1] {} else {
+            failures.append("speech model engine controller: failed candidate terminal event mismatch")
+        }
+
+        await probe.resetEvents()
+        await probe.configureFailure(["new"], supersede: ("new", "third"))
+        await probe.setSetting("new")
+        await controller.reload(
+            to: "new",
+            currentSetting: { await probe.setting },
+            revertSetting: { await probe.revert(failed: $0, previous: $1) },
+            loader: loader,
+            event: event,
+            didInstall: installed
+        )
+        let supersedingEvents = await probe.events
+        let supersededSetting = await probe.setting
+        if controller.state.snapshot().kit != "third-kit" || supersededSetting != "third"
+            || supersedingEvents.contains(.active) == false || supersedingEvents.contains(.downloaded) {
+            failures.append("speech model engine controller: newer selection was clobbered or not converged")
+        }
+        await probe.configureFailure([])
+        await probe.setSetting("fourth")
+        let fourth = Task {
+            await controller.reload(
+                to: "fourth", currentSetting: { await probe.setting },
+                revertSetting: { await probe.revert(failed: $0, previous: $1) },
+                loader: loader, event: event, didInstall: installed
+            )
+        }
+        await Task.yield()
+        await probe.setSetting("fifth")
+        await controller.reload(
+            to: "fifth", currentSetting: { await probe.setting },
+            revertSetting: { await probe.revert(failed: $0, previous: $1) },
+            loader: loader, event: event, didInstall: installed
+        )
+        await fourth.value
+        let maximumActiveLoads = await probe.maximumActiveLoads
+        if controller.state.snapshot().kit != "fifth-kit" || maximumActiveLoads != 1 {
+            failures.append("speech model engine controller: production reload seam was not serialized/latest-wins")
+        }
+
+        let rapidController = ModelReloadController<String>()
+        rapidController.state.installIfEmpty(kit: "old-kit", variant: "old")
+        let rapid = RapidReloadProbe()
+        let a = Task {
+            await rapidController.reloadWithLifecycle(
+                currentSetting: { await rapid.setting },
+                revertSetting: { await rapid.revert(failed: $0, previous: $1) },
+                beginAttempt: { await rapid.begin($0) },
+                loader: { try await rapid.load($0, lifecycle: $1) },
+                event: { _, _, _ in },
+                didInstall: { _ in },
+                finishAttempt: { _ in }
+            )
+        }
+        await rapid.aStarted.wait()
+        await rapid.setSetting("B")
+        let b = Task {
+            await rapidController.reloadWithLifecycle(
+                currentSetting: { await rapid.setting },
+                revertSetting: { await rapid.revert(failed: $0, previous: $1) },
+                beginAttempt: { await rapid.begin($0) },
+                loader: { try await rapid.load($0, lifecycle: $1) },
+                event: { _, _, _ in },
+                didInstall: { _ in },
+                finishAttempt: { _ in }
+            )
+        }
+        await rapid.releaseA.fire()
+        await a.value
+        await b.value
+        let rapidAttempts = await rapid.attempts
+        let rapidLifecycles = await rapid.lifecycles
+        let rapidStatuses = await rapid.statuses
+        let rapidSetting = await rapid.setting
+        if rapidAttempts["A"] != 1 || rapidAttempts["B"] != 1
+            || rapidLifecycles != ["A", "B"] || rapidStatuses != ["lifecycle-B:B-progress"]
+            || rapidSetting != "A" || rapidController.state.snapshot().variant != "A" {
+            failures.append("speech model engine controller: rapid A→B owner/failed-B retry lifecycle mismatch")
+        }
+        if WhisperKitEngine.shouldReload(loadedVariant: nil, requestedVariant: "new")
+            || WhisperKitEngine.shouldReload(loadedVariant: "same", requestedVariant: "same")
+            || !WhisperKitEngine.shouldReload(loadedVariant: "old", requestedVariant: "new") {
+            failures.append("speech model engine: reload decision mismatch")
+        }
+        if WhisperKitEngine.failedReloadRevert(setting: "new", failedRequested: "new", loadedVariant: "old") != "old"
+            || WhisperKitEngine.failedReloadRevert(setting: "third", failedRequested: "new", loadedVariant: "old") != nil
+            || WhisperKitEngine.failedReloadRevert(setting: "new", failedRequested: "new", loadedVariant: nil) != nil {
+            failures.append("speech model engine: failed reload settings revert mismatch")
+        }
+
+        let status = EngineStatusComposer(initial: "Ready — Old")
+        let reload = status.beginReload("Checking for New…")
+        async let staleDetect: Void = status.setOperation("Detecting language…")
+        async let staleTranscribe: Void = status.setOperation("Transcribing…")
+        _ = await (staleDetect, staleTranscribe)
+        if status.rendered != "Checking for New…" {
+            failures.append("speech model engine: old-kit operation status overrode reload lifecycle")
+        }
+        status.setReload("Loading New…", token: reload)
+        status.setOperation("Ready — Old")
+        if status.rendered != "Loading New…" {
+            failures.append("speech model engine: old-kit Ready overrode loading reload target")
+        }
+        status.finishReload("Ready — New", token: reload)
+        if status.rendered != "Ready — New" {
+            failures.append("speech model engine: successful reload terminal status was not exposed")
+        }
+        let failedReload = status.beginReload("Checking for Broken…")
+        status.setOperation("Ready — Old")
+        status.setReloadFailure("Failed to load Broken", token: failedReload)
+        status.finishReload("Ready — Old", token: failedReload)
+        if status.rendered != "Failed to load Broken" {
+            failures.append("speech model engine: failed reload terminal status was not exposed")
+        }
+
+        let guarded = GuardedKitState<String>()
+        if guarded.isLoaded || guarded.snapshot().variant != nil {
+            failures.append("speech model engine: initial guarded state was loaded")
+        }
+        guarded.installIfEmpty(kit: "old-kit", variant: "old")
+        let capturedSignal = OneShotSignal()
+        let resumeCapture = OneShotSignal()
+        let operation = Task {
+            try await guarded.withCapturedKit { kit in
+                await capturedSignal.fire()
+                await resumeCapture.wait()
+                return kit
+            }
+        }
+        await capturedSignal.wait()
+        guarded.swap(kit: "new-kit", variant: "new")
+        await resumeCapture.fire()
+        let captured = try? await operation.value
+        if !guarded.isLoaded || guarded.snapshot().kit != "new-kit"
+            || guarded.snapshot().variant != "new" || captured != "old-kit" {
+            failures.append("speech model engine: guarded load/swap or transcription capture mismatch")
+        }
+        // A failed candidate load performs no swap, preserving the old identity.
+        if guarded.snapshot().kit != "new-kit" {
+            failures.append("speech model engine: failed reload did not preserve kit")
+        }
+
+        let fm = FileManager.default
+        let base = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? fm.removeItem(at: base) }
+        let variant = SpeechModelCatalog.entries[0].id
+        let repoRoot = SpeechModelStore.repositoryRoot(baseURL: base)
+        let directory = SpeechModelStore.variantDirectory(for: variant, baseURL: base)
+        if directory != repoRoot.appendingPathComponent(variant, isDirectory: true)
+            || directory == repoRoot || !SpeechModelStore.isSafeVariantDirectory(directory, baseURL: base) {
+            failures.append("speech model resolver: mapping/containment mismatch")
+        }
+        if SpeechModelStore.isSafeVariantDirectory(repoRoot, baseURL: base)
+            || SpeechModelStore.isSafeVariantDirectory(base.appendingPathComponent("outside"), baseURL: base) {
+            failures.append("speech model resolver: accepted root/outside target")
+        }
+
+        do {
+            if SpeechModelStore.inspectVariant(variant, baseURL: base).downloaded {
+                failures.append("speech model detection: missing directory counted as downloaded")
+            }
+            try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+            try Data([1, 2, 3]).write(to: directory.appendingPathComponent("junk.bin"))
+            if SpeechModelStore.inspectVariant(variant, baseURL: base).downloaded {
+                failures.append("speech model detection: junk-only directory counted as downloaded")
+            }
+            for artifact in SpeechModelStore.requiredArtifacts {
+                let artifactDirectory = directory.appendingPathComponent(artifact, isDirectory: true)
+                try fm.createDirectory(at: artifactDirectory, withIntermediateDirectories: true)
+                try Data(repeating: 1, count: 7).write(to: artifactDirectory.appendingPathComponent("data"))
+            }
+            let inspection = SpeechModelStore.inspectVariant(variant, baseURL: base)
+            if !inspection.downloaded || inspection.sizeBytes != Int64(3 + 7 * SpeechModelStore.requiredArtifacts.count) {
+                failures.append("speech model detection: artifacts/recursive size mismatch")
+            }
+            let sibling = repoRoot.appendingPathComponent("sibling", isDirectory: true)
+            try fm.createDirectory(at: sibling, withIntermediateDirectories: true)
+            try Data([9]).write(to: sibling.appendingPathComponent("keep"))
+            try SpeechModelStore.deleteVariantDirectory(variant, baseURL: base)
+            if fm.fileExists(atPath: directory.path) || !fm.fileExists(atPath: sibling.path) {
+                failures.append("speech model deletion: target/sibling scope mismatch")
+            }
+        } catch {
+            failures.append("speech model filesystem checks threw: \(error)")
+        }
+
+        if SpeechModelStore.canDelete(phase: .downloaded, active: false)
+            != true || SpeechModelStore.canDelete(phase: .downloaded, active: true)
+            || SpeechModelStore.canDelete(phase: .downloading(0.5), active: false)
+            || SpeechModelStore.canDelete(phase: .busy(reloadTarget: variant), active: false) {
+            failures.append("speech model deletion: eligibility mismatch")
+        }
+
+        let coordinator = SpeechModelDownloadCoordinator()
+        let started = OneShotSignal()
+        let release = OneShotSignal()
+        let first = Task {
+            try await coordinator.download(variant: variant) { _, _ in
+                await started.fire()
+                await release.wait()
+                return base
+            }
+        }
+        await started.wait()
+        do {
+            _ = try await coordinator.download(variant: "other") { _, _ in base }
+            failures.append("speech model coordinator: contention was queued/accepted")
+        } catch SpeechModelDownloadCoordinator.Error.busy(let active) {
+            if active != variant { failures.append("speech model coordinator: wrong active variant") }
+        } catch {
+            failures.append("speech model coordinator: unexpected contention error \(error)")
+        }
+        await release.fire()
+        _ = try? await first.value
+        if await coordinator.activeVariant != nil {
+            failures.append("speech model coordinator: active slot not released")
+        }
+
+        // A rescan must not erase a visible failure hint merely because the folder is absent.
+        let failedState = SpeechModelStore.State(phase: .failed("network failed"))
+        if SpeechModelStore.merging(inspection: .init(downloaded: false, sizeBytes: nil), into: failedState).phase
+            != .failed("network failed") {
+            failures.append("speech model refresh: failed phase was overwritten")
+        }
+
+        // A user choice is never eligible for automatic support-based correction.
+        if SpeechModelStore.shouldApplyAutomaticDefault(
+            chosenByUser: true,
+            current: SpeechModelCatalog.defaultID,
+            supported: [variant]
+        ) {
+            failures.append("speech model support: user choice was eligible for automatic migration")
+        }
+
+        // Coordinator activity, including engine-owned downloads, is observable by the store.
+        let activityStore = SpeechModelStore(baseURL: base, coordinator: coordinator, fallbackSupport: [variant])
+        activityStore.receiveEngineEvent(.active, for: variant)
+        if activityStore.states[variant]?.active != true || activityStore.states[variant]?.phase != .downloaded {
+            failures.append("speech model engine event: active install did not align store state")
+        }
+        await activityStore.connectCoordinatorActivity()
+        let engineStarted = OneShotSignal()
+        let engineRelease = OneShotSignal()
+        let engineDownload = Task {
+            try await coordinator.download(variant: variant) { _, _ in
+                await engineStarted.fire()
+                await engineRelease.wait()
+                return base
+            }
+        }
+        await engineStarted.wait()
+        for _ in 0..<20 where activityStore.activeDownloadVariant != variant { await Task.yield() }
+        if activityStore.activeDownloadVariant != variant {
+            failures.append("speech model coordinator: shared activity did not reach store")
+        }
+        await engineRelease.fire()
+        _ = try? await engineDownload.value
+        for _ in 0..<20 where activityStore.activeDownloadVariant != nil { await Task.yield() }
+        if activityStore.activeDownloadVariant != nil {
+            failures.append("speech model coordinator: shared activity did not clear")
+        }
+
+        // Deletion reserves the row synchronously before its first suspension and ignores engine
+        // events until the filesystem operation completes.
+        do {
+            let deleteVariant = SpeechModelCatalog.entries[1].id
+            let deleteDirectory = SpeechModelStore.variantDirectory(for: deleteVariant, baseURL: base)
+            for artifact in SpeechModelStore.requiredArtifacts {
+                try fm.createDirectory(at: deleteDirectory.appendingPathComponent(artifact), withIntermediateDirectories: true)
+            }
+            let deleteRelease = OneShotSignal()
+            let blockedDownload = FakeDownloadProbe()
+            let deleteStore = SpeechModelStore(
+                baseURL: base,
+                coordinator: coordinator,
+                fallbackSupport: [variant, deleteVariant],
+                manualDownloader: { _, progress in
+                    await blockedDownload.start(progress: progress)
+                    return base
+                },
+                deleteOperation: { _, _ in
+                    await deleteRelease.wait()
+                }
+            )
+            await deleteStore.refresh()
+            let deletion = Task { try await deleteStore.delete(deleteVariant) }
+            for _ in 0..<20 where deleteStore.states[deleteVariant]?.phase != .busy(reloadTarget: deleteVariant) { await Task.yield() }
+            if deleteStore.states[deleteVariant]?.phase != .busy(reloadTarget: deleteVariant) {
+                failures.append("speech model deletion: row was not reserved busy before await")
+            }
+            await deleteStore.download(deleteVariant)
+            if await blockedDownload.attempts != 0 {
+                failures.append("speech model deletion: manual downloader started for reserved row")
+            }
+            deleteStore.receiveEngineEvent(.downloading(progress: 0.4), for: deleteVariant)
+            if deleteStore.states[deleteVariant]?.phase != .busy(reloadTarget: deleteVariant) {
+                failures.append("speech model deletion: engine event replaced delete reservation")
+            }
+            await deleteRelease.fire()
+            _ = try? await deletion.value
+        } catch {
+            failures.append("speech model deletion reservation check threw: \(error)")
+        }
+
+        let timeoutStart = ContinuousClock.now
+        let timedResult: Int? = await SpeechModelStore.firstResult(within: .milliseconds(20)) {
+            try? await Task.sleep(for: .seconds(2))
+            return 1
+        }
+        if timedResult != nil || ContinuousClock.now - timeoutStart > .milliseconds(250) {
+            failures.append("speech model remote support: timeout waited for noncooperative child")
+        }
+
+        // Progress delivery is asynchronous; callbacks arriving after terminal success/failure
+        // must not resurrect the row as downloading.
+        let successBase = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? fm.removeItem(at: successBase) }
+        let successProbe = FakeDownloadProbe()
+        let successStore = SpeechModelStore(
+            baseURL: successBase,
+            coordinator: SpeechModelDownloadCoordinator(),
+            fallbackSupport: [variant],
+            manualDownloader: { downloadedVariant, progress in
+                await successProbe.start(progress: progress)
+                let target = SpeechModelStore.variantDirectory(for: downloadedVariant, baseURL: successBase)
+                for artifact in SpeechModelStore.requiredArtifacts {
+                    try FileManager.default.createDirectory(at: target.appendingPathComponent(artifact), withIntermediateDirectories: true)
+                }
+                return target
+            }
+        )
+        await successStore.download(variant)
+        await successProbe.sendProgress(0.9)
+        for _ in 0..<20 { await Task.yield() }
+        if successStore.states[variant]?.phase != .downloaded {
+            failures.append("speech model download: late progress overwrote terminal success")
+        }
+
+        let failureBase = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? fm.removeItem(at: failureBase) }
+        let failureProbe = FakeDownloadProbe()
+        let failureStore = SpeechModelStore(
+            baseURL: failureBase,
+            coordinator: SpeechModelDownloadCoordinator(),
+            fallbackSupport: [variant],
+            manualDownloader: { _, progress in
+                await failureProbe.start(progress: progress)
+                throw FakeDownloadError.failed
+            }
+        )
+        await failureStore.download(variant)
+        await failureProbe.sendProgress(0.7)
+        for _ in 0..<20 { await Task.yield() }
+        if case .failed = failureStore.states[variant]?.phase {
+            // expected
+        } else {
+            failures.append("speech model download: late progress overwrote terminal failure")
+        }
         return failures
     }
 }

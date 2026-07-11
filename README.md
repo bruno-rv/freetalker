@@ -31,6 +31,18 @@ menu-bar-only, plus the microphone usage string), and ad-hoc codesigns the bundl
 First launch will download the WhisperKit `large-v3-turbo` model (~1 GB) — the menu bar
 status line shows download progress.
 
+## Speech models
+
+Settings offers seven multilingual Whisper models, from Tiny and Base through Small,
+Medium, Large v3, and two Large v3 Turbo variants. Smaller models download faster, use
+less disk space, and usually transcribe faster. Larger models favor accuracy, while the
+Turbo variants balance speed and accuracy.
+
+Download a model on demand, then select it to reload the transcription engine. You can
+also delete downloaded models that aren't active. FreeTalker keeps the active model so a
+cleanup can't remove the model currently serving dictation. WhisperKit shares model files
+under `~/Documents/huggingface`.
+
 ## Permissions walkthrough
 
 On first launch, grant (System Settings → Privacy & Security):
@@ -139,13 +151,18 @@ app, or logged.
   provider, base URL, and model. Supported providers are OpenAI-compatible endpoints
   (including [Ollama cloud](https://ollama.com/v1)) and Anthropic. Once a provider has a key,
   endpoint, and model all set, cloud post-processing runs automatically for every Dictation —
-  it isn't chosen per Template. Leave any of the three unset and FreeTalker falls back to the
-  on-device Apple model.
+  it isn't chosen per Template. A key is optional only for an OpenAI-compatible loopback HTTP
+  endpoint (`localhost`, `127.0.0.1`, or `::1`); other endpoints and providers still require
+  one. Leave any required field unset and FreeTalker falls back to the on-device Apple model.
 
 Both sections have a **Test connection** button, enabled once the required fields are filled
 in. It sends a single request and reports a fixed status hint — "Connected ✓", an HTTP failure
 like "Failed — HTTP 401 (check API key)", or "Failed — cannot reach host" — never the raw
 response body or the key itself.
+
+For fully local LLM post-processing, run Ollama Desktop and use the existing
+OpenAI-compatible BYOK provider with `http://localhost:11434/v1`. Ollama's local endpoint
+doesn't require an API key; FreeTalker omits the Authorization header when the key is empty.
 
 ![Settings](docs/settings.png)
 *Settings → General: permissions status, hotkey, hands-free auto-stop, microphone, engine
@@ -206,6 +223,3 @@ substitute for today's environment.
 - **`swift test` cannot run** in this CLT-only environment (see "Running tests" above);
   `make selfcheck` is the working substitute. The test target still compiles and documents
   intent for a full-Xcode environment.
-- **WhisperKit model variant** is pinned to the exact HF repo folder name
-  `large-v3_turbo_954MB` rather than a glob, to avoid ambiguous matches against sibling
-  distil/dated turbo variants in `argmaxinc/whisperkit-coreml`. See `WhisperKitEngine.swift`.
