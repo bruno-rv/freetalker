@@ -46,3 +46,18 @@ The follow-up began by referencing the required production reload seam and activ
 - Offline checks cover initial busy→active ordering, failure preservation/revert, third-selection non-clobber and convergence, absence of premature downloaded events, captured old-kit identity, active store alignment, and maximum one concurrent candidate load.
 
 Fresh final verification: `make selfcheck` passed and `git diff --check` passed.
+
+## Delayed-progress and initial-failure follow-up
+
+### RED
+
+SelfCheck first referenced the production progress-attempt guard before implementation. `make selfcheck` failed with `cannot find 'ModelLoadProgressGuard' in scope`.
+
+### GREEN
+
+- Every controller failure now reaches the engine's terminal event path, which publishes `Failed to load <catalog display name>: <hint>` for preload, lazy load, initial transcription load, and reload alike.
+- `preload()` no longer overwrites that specific failure with a generic status.
+- Each engine download receives a unique attempt identity. Progress delivery and terminal invalidation are ordered on `MainActor`; active/failure invalidates the attempt before publishing terminal store/status state, so callbacks scheduled later are ignored.
+- Async offline checks deliberately hold progress callbacks until after terminal active/Ready and failure states, then release them and verify neither state regresses.
+
+Fresh final verification: `make selfcheck` passed without warnings and `git diff --check` passed.
