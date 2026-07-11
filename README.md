@@ -88,10 +88,12 @@ pricing" — is still transcribed literally; when in doubt, the model transcribe
 
 ### Context awareness
 
-Settings → Templates → **App Rules** maps an app (by bundle ID) to a Template, so dictating in
-Slack can default to Refined Message while Mail defaults to Email. The Active Template is still
-used when no rule matches. The frontmost app's identity is also passed to the post-processor as
-context, so refined output can account for where it's headed.
+Settings → Templates → **App Rules** maps an app (by bundle ID) to a Template and/or a forced
+Transcript language, so dictating in Slack can default to Refined Message while Mail defaults to
+Email — a rule can set either half alone or both together. The Active Template is still used
+when no rule's Template half matches; see "Language" below for how the language half fits with
+the pin and the Recording Panel. The frontmost app's identity is also passed to the
+post-processor as context, so refined output can account for where it's headed.
 
 ### Custom vocabulary
 
@@ -139,6 +141,11 @@ app, or logged.
   endpoint, and model all set, cloud post-processing runs automatically for every Dictation —
   it isn't chosen per Template. Leave any of the three unset and FreeTalker falls back to the
   on-device Apple model.
+
+Both sections have a **Test connection** button, enabled once the required fields are filled
+in. It sends a single request and reports a fixed status hint — "Connected ✓", an HTTP failure
+like "Failed — HTTP 401 (check API key)", or "Failed — cannot reach host" — never the raw
+response body or the key itself.
 
 ![Settings](docs/settings.png)
 *Settings → General: permissions status, hotkey, hands-free auto-stop, microphone, engine
