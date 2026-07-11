@@ -84,6 +84,21 @@ final class AppSettings: ObservableObject {
     @Published var cloudSTTBaseURL: String {
         didSet { defaults.set(cloudSTTBaseURL, forKey: Keys.cloudSTTBaseURL) }
     }
+    @Published private(set) var whisperModel: String {
+        didSet { defaults.set(whisperModel, forKey: Keys.whisperModel) }
+    }
+    @Published var whisperModelChosen: Bool {
+        didSet { defaults.set(whisperModelChosen, forKey: Keys.whisperModelChosen) }
+    }
+
+    func setWhisperModelFromUser(_ model: String) {
+        whisperModel = SpeechModelCatalog.normalize(model)
+        whisperModelChosen = true
+    }
+
+    func applyAutomaticWhisperModel(_ model: String) {
+        whisperModel = SpeechModelCatalog.normalize(model)
+    }
 
     /// Whether the HUD shows a live rolling transcript while push-to-talk is held. Default ON.
     /// See PLAN 3 "Settings" — `AppCoordinator.isLivePreviewEnabled` combines this with the
@@ -433,6 +448,8 @@ final class AppSettings: ObservableObject {
         static let legacyHotKeyDeviceMask = "hotKeyDeviceMask"
         static let sttEngine = "sttEngine"
         static let cloudSTTBaseURL = "cloudSTTBaseURL"
+        static let whisperModel = "whisperModel"
+        static let whisperModelChosen = "whisperModelChosen"
         static let livePreviewEnabled = "livePreviewEnabled"
         static let llmProvider = "llmProvider"
         static let cloudLLMBaseURL = "cloudLLMBaseURL"
@@ -463,6 +480,13 @@ final class AppSettings: ObservableObject {
         }
         sttEngine = STTEngineKind(rawValue: defaults.string(forKey: Keys.sttEngine) ?? "") ?? .whisperKit
         cloudSTTBaseURL = defaults.string(forKey: Keys.cloudSTTBaseURL) ?? "https://api.openai.com/v1"
+        let storedWhisperModel = defaults.string(forKey: Keys.whisperModel) ?? SpeechModelCatalog.defaultID
+        let normalizedWhisperModel = SpeechModelCatalog.normalize(storedWhisperModel)
+        whisperModel = normalizedWhisperModel
+        whisperModelChosen = defaults.object(forKey: Keys.whisperModelChosen) as? Bool ?? false
+        if normalizedWhisperModel != storedWhisperModel {
+            defaults.set(normalizedWhisperModel, forKey: Keys.whisperModel)
+        }
         // Default ON — `.object(forKey:)` (not `.bool(forKey:)`) so an unset key is distinguished
         // from an explicit `false`, which `.bool(forKey:)` can't do (it returns false for both).
         livePreviewEnabled = defaults.object(forKey: Keys.livePreviewEnabled) as? Bool ?? true
@@ -545,6 +569,55 @@ struct CloudLLMSettingsSnapshot {
     /// a key is present. nil/empty both mean "no key".
     let key: String?
     let vocabulary: [String]
+
+    var eligibility: CloudLLMEligibility {
+        let trimmedBaseURL = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard
+            !trimmedModel.isEmpty,
+            let components = URLComponents(string: trimmedBaseURL),
+            let scheme = components.scheme?.lowercased(),
+            scheme == "http" || scheme == "https",
+            let host = components.host?.lowercased(),
+            !host.isEmpty,
+            Self.hasValidPortSyntax(in: trimmedBaseURL, components: components)
+        else {
+            return .invalidConfiguration
+        }
+
+        let trimmedKey = key?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !trimmedKey.isEmpty {
+            return .eligible(apiKey: trimmedKey)
+        }
+
+        let normalizedHost = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        let loopbackHosts: Set<String> = ["localhost", "127.0.0.1", "::1"]
+        if provider == .openAICompatible, scheme == "http", loopbackHosts.contains(normalizedHost) {
+            return .eligible(apiKey: nil)
+        }
+        return .missingAPIKey
+    }
+
+    private static func hasValidPortSyntax(in url: String, components: URLComponents) -> Bool {
+        guard let schemeEnd = url.range(of: "://") else { return false }
+        let remainder = url[schemeEnd.upperBound...]
+        let authorityEnd = remainder.firstIndex { "/?#".contains($0) } ?? remainder.endIndex
+        let authority = remainder[..<authorityEnd]
+        guard !authority.hasSuffix(":") else { return false }
+        guard let port = components.port else { return true }
+        return (1...65_535).contains(port)
+    }
+}
+
+enum CloudLLMEligibility {
+    case eligible(apiKey: String?)
+    case invalidConfiguration
+    case missingAPIKey
+
+    var isEligible: Bool {
+        if case .eligible = self { return true }
+        return false
+    }
 }
 
 extension AppSettings {

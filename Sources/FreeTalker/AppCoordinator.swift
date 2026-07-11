@@ -56,7 +56,9 @@ final class AppCoordinator: ObservableObject {
     /// pure decision SelfCheck exercises directly.
     private var oneShotLanguage: String?
 
-    let whisperEngine = WhisperKitEngine()
+    let speechModelDownloadCoordinator: SpeechModelDownloadCoordinator
+    let speechModelStore: SpeechModelStore
+    let whisperEngine: WhisperKitEngine
     let cloudSTTEngine = CloudSTTEngine()
     private let appleFMProcessor = AppleFMProcessor()
 
@@ -81,6 +83,26 @@ final class AppCoordinator: ObservableObject {
     }
 
     private init() {
+        let downloadCoordinator = SpeechModelDownloadCoordinator.shared
+        let modelStore = SpeechModelStore(coordinator: downloadCoordinator)
+        speechModelDownloadCoordinator = downloadCoordinator
+        speechModelStore = modelStore
+        whisperEngine = WhisperKitEngine(downloadCoordinator: downloadCoordinator)
+        whisperEngine.setEventReceiver(modelStore)
+        modelStore.onAutomaticSelection = { [weak whisperEngine] target in
+            guard let whisperEngine else { return }
+            let kitLoaded = whisperEngine.isLoaded
+            let localEngineSelected = AppSettings.shared.sttEngine == .whisperKit
+            Task {
+                await Self.routeAutomaticSpeechModelSelection(
+                    target,
+                    kitLoaded: kitLoaded,
+                    localEngineSelected: localEngineSelected,
+                    preload: { await whisperEngine.preload() },
+                    reload: { await whisperEngine.reload(to: $0) }
+                )
+            }
+        }
         // Forward engine status changes (e.g. WhisperKit download progress) so the menu bar
         // and Settings, which observe `AppCoordinator`, actually re-render live — not just
         // when the menu happens to reopen.
@@ -129,6 +151,38 @@ final class AppCoordinator: ObservableObject {
         hud.onPanelLanguage = { [weak self] code in self?.handlePanelOneShotLanguage(code) }
         hud.onPanelCycleTemplate = { [weak self] in self?.handlePanelCycleTemplate() }
         hud.onPanelLock = { [weak self] in self?.handlePillClick() }
+    }
+
+    func selectSpeechModelFromUser(_ variant: String) async {
+        await Self.routeSpeechModelSelection(
+            variant,
+            setFromUser: { AppSettings.shared.setWhisperModelFromUser($0) },
+            reload: { [whisperEngine] in await whisperEngine.reload(to: $0) }
+        )
+    }
+
+    static func routeSpeechModelSelection(
+        _ variant: String,
+        setFromUser: (String) -> Void,
+        reload: (String) async -> Void
+    ) async {
+        setFromUser(variant)
+        await reload(variant)
+    }
+
+    static func routeAutomaticSpeechModelSelection(
+        _ variant: String,
+        kitLoaded: Bool,
+        localEngineSelected: Bool,
+        preload: () async -> Void,
+        reload: (String) async -> Void
+    ) async {
+        if kitLoaded {
+            await reload(variant)
+        } else if localEngineSelected {
+            await preload()
+            await reload(variant)
+        }
     }
 
     /// Single entry point that (re)creates the global hotkey event tap whenever it is dead.
@@ -670,16 +724,13 @@ final class AppCoordinator: ObservableObject {
 
     /// Pure global routing rule (Amendment A1, replacing the removed per-Template
     /// `Template.useCloud` toggle): the Cloud Post-Processor is used for every Template — never
-    /// selected per Template — iff the active provider's config is complete: trimmed base URL
-    /// non-empty, trimmed model non-empty, and a non-empty provider-scoped Keychain key present.
-    /// Any one missing falls back to the on-device `AppleFMProcessor`. Takes the same
+    /// selected per Template — iff the shared snapshot eligibility rule accepts the URL, model,
+    /// and credentials. An empty key is accepted only for an OpenAI-compatible loopback HTTP
+    /// endpoint; any other incomplete or invalid config falls back to `AppleFMProcessor`. Takes the same
     /// `CloudLLMSettingsSnapshot` passed into `CloudLLMProcessor.process`, so the routing decision
     /// and the request it drives can never disagree. See PLAN.md Amendment A.
     nonisolated static func isCloudLLMConfigured(snapshot: CloudLLMSettingsSnapshot) -> Bool {
-        let baseURL = snapshot.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        let model = snapshot.model.trimmingCharacters(in: .whitespacesAndNewlines)
-        let key = snapshot.key?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return !baseURL.isEmpty && !model.isEmpty && !key.isEmpty
+        snapshot.eligibility.isEligible
     }
 
     /// Same shape as `isCloudLLMConfigured` for Cloud STT's config: trimmed base URL and trimmed

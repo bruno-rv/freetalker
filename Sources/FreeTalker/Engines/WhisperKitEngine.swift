@@ -102,43 +102,276 @@ actor SerialGate {
 /// The class itself is nonisolated (`transcribe` does CPU-heavy work that must not tie up the
 /// main actor); only `statusText` is main-actor-isolated since it feeds SwiftUI directly.
 /// `@unchecked Sendable` is safe here because the only mutable state that matters for Sendable
-/// purposes, `whisperKit`, is fully gate-confined: it is written only inside `loadedKit()` and
-/// read only inside `loadedKit()`/`performTranscribe()`, and every call site that can reach
-/// those two methods (`transcribe`, `preload`) does so exclusively through `gate.run`, which
-/// serializes them so at most one is ever "inside" at a time. `whisperKit` itself carries no
-/// `nonisolated(unsafe)` annotation and is never touched from outside that gated path — in
-/// particular, `isLoaded` (below) does not read it. Load state that genuinely does need a cheap
-/// synchronous cross-context read is published separately via `loadedFlag`, a lock-guarded
-/// `Bool` that's actually safe to read/write concurrently (unlike a bare strong-ref read/write,
-/// which is not atomic under Swift concurrency — see prior Codex finding this replaces).
+/// purposes is held by `GuardedKitState`: kit identity and loaded variant are read and swapped
+/// under one lock. The transcription gate still serializes WhisperKit inference, while reloads
+/// construct a candidate outside that gate and perform only the final atomic state swap.
+final class GuardedKitState<Kit>: @unchecked Sendable {
+    private final class KitBox: @unchecked Sendable {
+        let value: Kit
+        init(_ value: Kit) { self.value = value }
+    }
+    struct Snapshot: @unchecked Sendable {
+        let kit: Kit?
+        let variant: String?
+    }
+
+    private struct State: @unchecked Sendable {
+        var kit: KitBox?
+        var variant: String?
+    }
+
+    private let lock = OSAllocatedUnfairLock(initialState: State())
+
+    var isLoaded: Bool { lock.withLock { $0.kit != nil } }
+    func snapshot() -> Snapshot { lock.withLock { Snapshot(kit: $0.kit?.value, variant: $0.variant) } }
+    func capturedKit() -> Kit? { snapshot().kit }
+    func installIfEmpty(kit: Kit, variant: String) {
+        let box = KitBox(kit)
+        lock.withLock { state in
+            guard state.kit == nil else { return }
+            state = State(kit: box, variant: variant)
+        }
+    }
+    func swap(kit: Kit, variant: String) {
+        let box = KitBox(kit)
+        lock.withLock { $0 = State(kit: box, variant: variant) }
+    }
+
+    func withCapturedKit<Result: Sendable>(
+        _ operation: @Sendable (Kit) async throws -> Result
+    ) async throws -> Result? {
+        guard let kit = capturedKit() else { return nil }
+        return try await operation(kit)
+    }
+}
+
+/// Composes operation and reload statuses under one lock. A reload lifecycle has display
+/// precedence until its matching terminal update, so an old captured kit can continue working
+/// without regressing the menu status to Detecting/Transcribing/Ready for the old model.
+final class EngineStatusComposer: @unchecked Sendable {
+    struct ReloadToken: Equatable, Sendable { fileprivate let id: UUID }
+
+    private struct ReloadState: Sendable {
+        let token: ReloadToken
+        var status: String
+        var terminalFailure: String?
+    }
+
+    private struct State: Sendable {
+        var operation: String
+        var reload: ReloadState?
+    }
+
+    private let lock: OSAllocatedUnfairLock<State>
+
+    init(initial: String) {
+        lock = OSAllocatedUnfairLock(initialState: State(operation: initial, reload: nil))
+    }
+
+    var rendered: String { lock.withLock { $0.reload?.status ?? $0.operation } }
+
+    @discardableResult
+    func beginReload(_ status: String) -> ReloadToken {
+        let token = ReloadToken(id: UUID())
+        lock.withLock { $0.reload = ReloadState(token: token, status: status, terminalFailure: nil) }
+        return token
+    }
+
+    func setOperation(_ status: String) {
+        lock.withLock { $0.operation = status }
+    }
+
+    func setReload(_ status: String, token: ReloadToken) {
+        lock.withLock { state in
+            guard state.reload?.token == token else { return }
+            state.reload?.status = status
+            state.reload?.terminalFailure = nil
+        }
+    }
+
+    func setReloadFailure(_ status: String, token: ReloadToken) {
+        lock.withLock { state in
+            guard state.reload?.token == token else { return }
+            state.reload?.status = status
+            state.reload?.terminalFailure = status
+        }
+    }
+
+    func finishReload(_ status: String, token: ReloadToken) {
+        lock.withLock { state in
+            guard state.reload?.token == token else { return }
+            state.operation = state.reload?.terminalFailure ?? status
+            state.reload = nil
+        }
+    }
+}
+
+final class ModelLoadProgressGuard: @unchecked Sendable {
+    struct Attempt: Sendable, Equatable {
+        let id: UUID
+        let variant: String
+    }
+
+    private let attempts = OSAllocatedUnfairLock(initialState: [String: UUID]())
+
+    func begin(variant: String) -> Attempt {
+        let attempt = Attempt(id: UUID(), variant: variant)
+        attempts.withLock { $0[variant] = attempt.id }
+        return attempt
+    }
+
+    func isCurrent(_ attempt: Attempt) -> Bool {
+        attempts.withLock { $0[attempt.variant] == attempt.id }
+    }
+
+    func finish(_ attempt: Attempt) {
+        attempts.withLock {
+            if $0[attempt.variant] == attempt.id { $0.removeValue(forKey: attempt.variant) }
+        }
+    }
+
+    func finishCurrent(variant: String) {
+        _ = attempts.withLock { $0.removeValue(forKey: variant) }
+    }
+}
+
+final class ModelReloadController<Kit>: @unchecked Sendable {
+    private final class ResultBox: @unchecked Sendable { var kit: Kit? }
+    typealias Loader = @Sendable (String) async throws -> Kit
+    typealias EventSink = @Sendable (SpeechModelEngineEvent, String) async -> Void
+    typealias SettingReader = @Sendable () async -> String
+    typealias SettingReverter = @Sendable (String, String) async -> Void
+    typealias InstallSink = @Sendable (String) async -> Void
+
+    let state = GuardedKitState<Kit>()
+    private let reloadGate = SerialGate()
+
+    func loadIfNeeded(
+        requested: String,
+        loader: @escaping Loader,
+        event: @escaping EventSink,
+        didInstall: @escaping InstallSink
+    ) async throws -> Kit {
+        if let kit = state.snapshot().kit { return kit }
+        let result = ResultBox()
+        try await reloadGate.run {
+            if let existing = self.state.snapshot().kit {
+                result.kit = existing
+                return
+            }
+            await event(.busy(reloadTarget: requested), requested)
+            do {
+                let kit = try await loader(requested)
+                self.state.installIfEmpty(kit: kit, variant: requested)
+                let installed = self.state.snapshot()
+                await event(.active, installed.variant ?? requested)
+                await didInstall(installed.variant ?? requested)
+                result.kit = installed.kit ?? kit
+            } catch {
+                await event(.failed(hint: error.localizedDescription), requested)
+                throw error
+            }
+        }
+        return result.kit!
+    }
+
+    func reload(
+        to requested: String,
+        currentSetting: @escaping SettingReader,
+        revertSetting: @escaping SettingReverter,
+        loader: @escaping Loader,
+        event: @escaping EventSink,
+        didInstall: @escaping InstallSink
+    ) async {
+        await reloadWithLifecycle(
+            currentSetting: currentSetting,
+            revertSetting: revertSetting,
+            beginAttempt: { _ in () },
+            loader: { variant, _ in try await loader(variant) },
+            event: { value, variant, _ in await event(value, variant) },
+            didInstall: didInstall,
+            finishAttempt: { _ in }
+        )
+    }
+
+    func reloadWithLifecycle<Context: Sendable>(
+        currentSetting: @escaping SettingReader,
+        revertSetting: @escaping SettingReverter,
+        beginAttempt: @escaping @Sendable (String) async -> Context,
+        loader: @escaping @Sendable (String, Context) async throws -> Kit,
+        event: @escaping @Sendable (SpeechModelEngineEvent, String, Context) async -> Void,
+        didInstall: @escaping InstallSink,
+        finishAttempt: @escaping @Sendable (Context) async -> Void
+    ) async {
+        try? await reloadGate.run {
+            // Re-read only after owning the gate. Another owner may already have consumed or
+            // reverted this caller's original intent while this call was queued.
+            var target: String? = await currentSetting()
+            while let requestedVariant = target {
+                let oldVariant = self.state.snapshot().variant
+                guard WhisperKitEngine.shouldReload(loadedVariant: oldVariant, requestedVariant: requestedVariant) else { return }
+                let context = await beginAttempt(requestedVariant)
+                await event(.busy(reloadTarget: requestedVariant), requestedVariant, context)
+                do {
+                    let candidate = try await loader(requestedVariant, context)
+                    self.state.swap(kit: candidate, variant: requestedVariant)
+                    await event(.active, requestedVariant, context)
+                    await didInstall(requestedVariant)
+                } catch {
+                    await event(.failed(hint: error.localizedDescription), requestedVariant, context)
+                    let setting = await currentSetting()
+                    if let oldVariant, setting == requestedVariant {
+                        await revertSetting(requestedVariant, oldVariant)
+                    }
+                }
+                await finishAttempt(context)
+                let current = await currentSetting()
+                target = current == self.state.snapshot().variant ? nil : current
+            }
+        }
+    }
+}
+
 final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked Sendable {
-    let name = "WhisperKit (large-v3-turbo)"
+    let name = "WhisperKit"
     @MainActor @Published private(set) var statusText: String = "Not loaded"
 
-    // Exact HF repo folder name for the large-v3-turbo CoreML export — avoids ambiguous
-    // glob matches against sibling variants (distil/turbo/dated) in the model repo.
-    private static let modelVariant = "large-v3_turbo_954MB"
-
-    private var whisperKit: WhisperKit?
+    private let modelController = ModelReloadController<WhisperKit>()
     private let gate = SerialGate()
-
-    /// Set to `true` inside `loadedKit()`, exactly once, right after the gated load completes —
-    /// never reset to `false` (no unload path exists). `OSAllocatedUnfairLock` (macOS 13+;
-    /// deployment target is macOS 26, see Package.swift) gives a genuinely thread-safe
-    /// synchronous read/write, unlike the `nonisolated(unsafe)` strong-ref read this replaces:
-    /// a class reference read racing a gated write is undefined behavior under Swift
-    /// concurrency, not just imprecise — `Bool` reads/writes under a lock are well-defined.
-    private let loadedFlag = OSAllocatedUnfairLock(initialState: false)
+    private let downloadCoordinator: SpeechModelDownloadCoordinator
+    private let progressGuard = ModelLoadProgressGuard()
+    private let status = EngineStatusComposer(initial: "Not loaded")
+    @MainActor private weak var eventReceiver: (any SpeechModelEngineEventReceiving)?
 
     /// Whether the model has already been loaded (preloaded at launch, or lazily by an earlier
     /// call). Read by the live preview availability check — see PLAN 3 "Settings": when Cloud
     /// STT is the active engine, preview must never trigger a fresh multi-hundred-MB local model
     /// load just to satisfy a tick; it only runs if WhisperKit already happens to be loaded.
-    /// Reads `loadedFlag`, not `whisperKit` — this stays a cheap synchronous property (its call
-    /// sites are a SwiftUI view body and a non-async AppCoordinator method, neither of which can
-    /// await a gated read without much larger ripple) while keeping `whisperKit` itself fully
-    /// gate-confined.
-    var isLoaded: Bool { loadedFlag.withLock { $0 } }
+    /// This stays a cheap synchronous property for its SwiftUI and AppCoordinator call sites.
+    var isLoaded: Bool { modelController.state.isLoaded }
+
+    init(downloadCoordinator: SpeechModelDownloadCoordinator = .shared) {
+        self.downloadCoordinator = downloadCoordinator
+    }
+
+    @MainActor
+    func setEventReceiver(_ receiver: (any SpeechModelEngineEventReceiving)?) {
+        eventReceiver = receiver
+    }
+
+    nonisolated static func shouldReload(loadedVariant: String?, requestedVariant: String?) -> Bool {
+        guard let loadedVariant, let requestedVariant else { return false }
+        return loadedVariant != requestedVariant
+    }
+
+    nonisolated static func failedReloadRevert(
+        setting: String,
+        failedRequested: String,
+        loadedVariant: String?
+    ) -> String? {
+        guard setting == failedRequested else { return nil }
+        return loadedVariant
+    }
 
     /// Warms up the model outside the hot path (e.g. at app launch) so the first real
     /// dictation doesn't pay the load/download cost. Errors are swallowed into `statusText`
@@ -148,14 +381,14 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
             // Routed through `gate` too — otherwise a live preview tick firing mid-launch-load
             // (PLAN 3: preview starts as soon as a recording begins, independent of whether
             // preload has finished) could call `loadedKit()` a second time concurrently with
-            // this one, racing two `WhisperKit.download`/load calls against the same cache dir.
+            // this one, racing two coordinator-backed download/load calls against the same cache.
             // See PLAN 3 "Concurrency rules".
             // Discards inside the closure (not `_ = gate.run { ... }`) — `WhisperKit` itself
             // isn't `Sendable`, so the gate's `T: Sendable` result type must be inferred as
             // `Void`, not the loaded instance.
             try await gate.run { _ = try await self.loadedKit() }
         } catch {
-            await setStatus("Preload failed: \(error.localizedDescription)")
+            // `loadedKit` publishes the model-named terminal failure status/event.
         }
     }
 
@@ -241,7 +474,7 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
     }
 
     private func performTranscribe(samples: [Float], forcedLanguage: String?, cancelFlag: OSAllocatedUnfairLock<Bool>?) async throws -> TranscriptionOutput {
-        let kit = try await loadedKit()
+        let kit = try await kitForTranscription()
         try checkPreviewCancellation(cancelFlag)
 
         do {
@@ -313,47 +546,134 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
             // partial text rather than throwing, so cancellation has to be checked explicitly
             // here rather than inferred from a caught error.
             if let cancelFlag, Self.shouldDiscardPreviewResult(cancelled: cancelFlag.withLock({ $0 })) {
-                await setStatus("Ready")
+                await setReadyStatus()
                 throw CancellationError()
             }
 
-            await setStatus("Ready")
+            await setReadyStatus()
             let text = results.map(\.text).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
             // When forced, the recorded language is always the forced code — never whatever
             // WhisperKit's decode result happens to report — mirroring CloudSTTEngine's contract.
             // See PLAN.md step 5.
             return TranscriptionOutput(text: text, language: forcedLanguage ?? results.first?.language ?? language)
         } catch {
-            await setStatus("Ready")
+            await setReadyStatus()
             throw error
         }
     }
 
-    // ponytail: no single-flight guard for concurrent loads — AppCoordinator already
-    // serializes calls via its isRecording/isProcessing state, so re-entry can't happen.
-    private func loadedKit() async throws -> WhisperKit {
-        if let whisperKit { return whisperKit }
-        let kit = try await loadModel()
-        whisperKit = kit
-        loadedFlag.withLock { $0 = true }
-        return kit
+    private func kitForTranscription() async throws -> WhisperKit {
+        if let kit = modelController.state.capturedKit() { return kit }
+        return try await loadedKit()
     }
 
-    private func loadModel() async throws -> WhisperKit {
-        await setStatus("Checking for model…")
-        let folder = try await WhisperKit.download(variant: Self.modelVariant) { [weak self] progress in
-            let percent = Int(progress.fractionCompleted * 100)
-            Task { @MainActor in self?.statusText = "Downloading model… \(percent)%" }
+    private func loadedKit() async throws -> WhisperKit {
+        if let kit = modelController.state.snapshot().kit { return kit }
+        let variant = await AppSettings.shared.whisperModel
+        return try await modelController.loadIfNeeded(
+            requested: variant,
+            loader: { try await self.loadModel(variant: $0, reload: nil) },
+            event: { await self.emit($0, for: $1, reload: nil) },
+            didInstall: { _ in await self.setReadyStatus() }
+        )
+    }
+
+    func reload(to requested: String) async {
+        await modelController.reloadWithLifecycle(
+            currentSetting: { await AppSettings.shared.whisperModel },
+            revertSetting: { failed, previous in
+                await MainActor.run {
+                    if AppSettings.shared.whisperModel == failed {
+                        AppSettings.shared.applyAutomaticWhisperModel(previous)
+                    }
+                }
+            },
+            beginAttempt: { await self.beginReloadStatus(for: $0) },
+            loader: { try await self.loadModel(variant: $0, reload: $1) },
+            event: { await self.emit($0, for: $1, reload: $2) },
+            didInstall: { _ in },
+            finishAttempt: { await self.finishReloadStatus($0) }
+        )
+    }
+
+    private func loadModel(variant: String, reload: EngineStatusComposer.ReloadToken?) async throws -> WhisperKit {
+        let displayName = Self.displayName(for: variant)
+        let attempt = progressGuard.begin(variant: variant)
+        await setStatus("Checking for \(displayName)…", reload: reload)
+        let folder = try await downloadCoordinator.download(variant: variant) { [weak self] progress in
+            Task { @MainActor in self?.reportDownloadProgress(progress, attempt: attempt, displayName: displayName, reload: reload) }
         }
-        await setStatus("Loading model…")
+        await setStatus("Loading \(displayName)…", reload: reload)
         let config = WhisperKitConfig(modelFolder: folder.path, verbose: false, logLevel: .none, load: true, download: false)
         let kit = try await WhisperKit(config)
-        await setStatus("Ready")
         return kit
     }
 
     @MainActor
-    private func setStatus(_ text: String) {
-        statusText = text
+    private func reportDownloadProgress(
+        _ progress: Double,
+        attempt: ModelLoadProgressGuard.Attempt,
+        displayName: String,
+        reload: EngineStatusComposer.ReloadToken?
+    ) {
+        guard progressGuard.isCurrent(attempt) else { return }
+        eventReceiver?.receiveEngineEvent(.downloading(progress: progress), for: attempt.variant)
+        let text = "Downloading \(displayName)… \(Int(progress * 100))%"
+        if let reload { status.setReload(text, token: reload) }
+        else { status.setOperation(text) }
+        statusText = status.rendered
+    }
+
+    private func emit(
+        _ event: SpeechModelEngineEvent,
+        for variant: String,
+        reload: EngineStatusComposer.ReloadToken?
+    ) async {
+        await MainActor.run {
+            switch event {
+            case .active:
+                progressGuard.finishCurrent(variant: variant)
+            case .failed(let hint):
+                progressGuard.finishCurrent(variant: variant)
+                let text = "Failed to load \(Self.displayName(for: variant)): \(hint)"
+                if let reload { status.setReloadFailure(text, token: reload) }
+                else { status.setOperation(text) }
+                statusText = status.rendered
+            default:
+                break
+            }
+            eventReceiver?.receiveEngineEvent(event, for: variant)
+        }
+    }
+
+    private func setReadyStatus() async {
+        let variant = modelController.state.snapshot().variant
+        await setStatus(variant.map { "Ready — \(Self.displayName(for: $0))" } ?? "Not loaded")
+    }
+
+    @MainActor
+    private func beginReloadStatus(for variant: String) -> EngineStatusComposer.ReloadToken {
+        let token = status.beginReload("Checking for \(Self.displayName(for: variant))…")
+        statusText = status.rendered
+        return token
+    }
+
+    @MainActor
+    private func finishReloadStatus(_ token: EngineStatusComposer.ReloadToken) {
+        let variant = modelController.state.snapshot().variant
+        let terminal = variant.map { "Ready — \(Self.displayName(for: $0))" } ?? "Not loaded"
+        status.finishReload(terminal, token: token)
+        statusText = status.rendered
+    }
+
+    private static func displayName(for variant: String) -> String {
+        SpeechModelCatalog.entry(for: variant)?.displayName ?? variant
+    }
+
+    @MainActor
+    private func setStatus(_ text: String, reload: EngineStatusComposer.ReloadToken? = nil) {
+        if let reload { status.setReload(text, token: reload) }
+        else { status.setOperation(text) }
+        statusText = status.rendered
     }
 }
