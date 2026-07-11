@@ -9,9 +9,10 @@ DONE
 - Added FluidAudio with the planned SwiftPM lower bound of 0.12.4 and linked its
   product to the FreeTalker executable target.
 - Added pure `Sendable` transcript, speaker-turn, attributed-segment, and export-format types.
-- Added a framework-independent timeline joiner that attributes a segment only when
-  every positive overlap belongs to one distinct speaker. Cross-speaker overlap is
-  explicitly ambiguous and remains unattributed.
+- Added a framework-independent timeline joiner that clips speaker turns to each
+  transcript segment, rejects genuinely concurrent distinct speakers as ambiguous,
+  and otherwise selects the unique greatest aggregate speaker duration. Per-speaker
+  interval unions prevent overlapping turns from being double-counted.
 - Added export-time speaker-name resolution for plain text, Markdown, SRT, and WebVTT.
 - Added format-specific escaping and valid, monotonic subtitle cue normalization.
 - Covered empty transcripts, missing/invalid speakers, zero/reversed durations, and
@@ -41,24 +42,28 @@ make app
 git diff --check
 ```
 
-All commands exited 0. The final `make test` passed 181 tests in 18 suites. `make app`
+All commands exited 0. The final `make test` passed 186 tests in 18 suites. `make app`
 completed the release build, bundle assembly, and ad-hoc signing. `git diff --check`
 produced no output.
 
 ## Review hardening
 
-- Added equal- and unequal-duration cross-speaker overlap tests; both now remain
-  unattributed instead of guessing a dominant speaker.
+- Added sequential equal/unequal speaker-transition tests and concurrent equal/unequal
+  speech tests. Sequential attribution uses the unique greatest union duration; exact
+  ties and any positive-duration concurrency across distinct speakers remain ambiguous.
 - Added strict join validation for transcript and speaker intervals: both endpoints
   must be finite, start must be nonnegative, and end must be greater than start.
   Invalid transcript segments remain in the result but are unattributed. Export cue
   normalization remains deliberately separate.
-- Expanded Markdown escaping for speaker labels and transcript text to cover
-  backslash, backtick, asterisk, underscore, braces, brackets, parentheses, heading,
-  list, link, and emphasis punctuation, with HTML entity escaping for ampersands and
+- Expanded Markdown escaping for speaker labels and transcript text to cover the full
+  CommonMark ASCII punctuation set, with safe HTML entity handling for ampersands and
   angle brackets.
-- Review-focused RED recorded five expected failures. The final focused GREEN passed
-  12 tests in `TimelineAndExportTests`.
+- Documented and enforced a 99:59:59.999 subtitle ceiling before millisecond integer
+  conversion. Huge finite timestamps saturate without trapping and near-ceiling cues
+  remain valid and monotonic.
+- Review-focused RED cycles recorded the expected ambiguity/escaping failures and the
+  prior fatal huge-timestamp conversion trap. The final focused GREEN passed 17 tests
+  in `TimelineAndExportTests`.
 
 ## Dependency note
 

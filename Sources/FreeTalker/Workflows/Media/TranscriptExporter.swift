@@ -1,6 +1,9 @@
 import Foundation
 
 struct TranscriptExporter: Sendable {
+    /// Largest timestamp emitted by SRT/VTT exports: 99:59:59.999.
+    static let maximumSubtitleTime: TimeInterval = 359_999.999
+
     func export(
         _ segments: [AttributedTranscriptSegment],
         format: TranscriptFormat,
@@ -34,35 +37,40 @@ struct TranscriptExporter: Sendable {
     }
 
     private func escapeMarkup(_ value: String, markdown: Bool) -> String {
-        let htmlEscaped = value
-            .replacingOccurrences(of: "&", with: "&amp;")
-            .replacingOccurrences(of: "<", with: "&lt;")
-            .replacingOccurrences(of: ">", with: "&gt;")
-        guard markdown else { return htmlEscaped }
-
-        let markdownSyntax = "\\`*_{}[]()#+-.!"
-        return htmlEscaped.reduce(into: "") { result, character in
-            if markdownSyntax.contains(character) {
-                result.append("\\")
+        let markdownPunctuation = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+        return value.reduce(into: "") { result, character in
+            switch character {
+            case "&": result += "&amp;"
+            case "<": result += "&lt;"
+            case ">": result += "&gt;"
+            default:
+                if markdown && markdownPunctuation.contains(character) {
+                    result.append("\\")
+                }
+                result.append(character)
             }
-            result.append(character)
         }
     }
 
     private func cues(for segments: [AttributedTranscriptSegment]) -> [(segment: AttributedTranscriptSegment, start: TimeInterval, end: TimeInterval)] {
+        let minimumDuration = 0.001
+        let latestStart = Self.maximumSubtitleTime - minimumDuration
         var previousEnd = 0.0
-        return segments.map { segment in
-            let rawStart = segment.start.isFinite ? max(0, segment.start) : 0
-            let rawEnd = segment.end.isFinite ? max(0, segment.end) : rawStart
-            let start = max(previousEnd, rawStart)
-            let end = max(start + 0.001, rawEnd)
+        var cues: [(AttributedTranscriptSegment, TimeInterval, TimeInterval)] = []
+        for segment in segments where previousEnd <= latestStart {
+            let rawStart = segment.start.isFinite ? min(max(0, segment.start), latestStart) : 0
+            let rawEnd = segment.end.isFinite ? min(max(0, segment.end), Self.maximumSubtitleTime) : rawStart
+            let start = min(max(previousEnd, rawStart), latestStart)
+            let end = min(max(start + minimumDuration, rawEnd), Self.maximumSubtitleTime)
             previousEnd = end
-            return (segment, start, end)
+            cues.append((segment, start, end))
         }
+        return cues
     }
 
     private func timestamp(_ seconds: TimeInterval, separator: Character) -> String {
-        let milliseconds = Int((seconds * 1_000).rounded())
+        let clamped = min(max(0, seconds), Self.maximumSubtitleTime)
+        let milliseconds = Int((clamped * 1_000).rounded())
         let hours = milliseconds / 3_600_000
         let minutes = milliseconds / 60_000 % 60
         let seconds = milliseconds / 1_000 % 60

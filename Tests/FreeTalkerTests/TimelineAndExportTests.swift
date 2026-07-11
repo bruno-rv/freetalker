@@ -18,8 +18,21 @@ import Testing
         #expect(result.map(\.speakerID) == ["speaker"])
     }
 
-    @Test func equalOverlapFromDistinctSpeakersIsAmbiguous() {
-        let transcript = [TranscriptSegment(start: 1, end: 3, text: "Tie")]
+    @Test func sameSpeakerOverlapsCountUnionDurationOnly() {
+        let result = joiner.join(
+            transcript: [.init(start: 0, end: 7, text: "Union")],
+            speakers: [
+                .init(speakerID: "duplicated", start: 0, end: 2),
+                .init(speakerID: "duplicated", start: 1, end: 3),
+                .init(speakerID: "longer", start: 3, end: 7)
+            ]
+        )
+
+        #expect(result.first?.speakerID == "longer")
+    }
+
+    @Test func sequentialEqualSpeakerDurationsAreAmbiguous() {
+        let transcript = [TranscriptSegment(start: 0, end: 4, text: "Tie")]
         let speakers = [
             SpeakerTurn(speakerID: "first", start: 0, end: 2),
             SpeakerTurn(speakerID: "second", start: 2, end: 4)
@@ -28,12 +41,23 @@ import Testing
         #expect(joiner.join(transcript: transcript, speakers: speakers).first?.speakerID == nil)
     }
 
-    @Test func unequalOverlapFromDistinctSpeakersIsStillAmbiguous() {
-        let transcript = [TranscriptSegment(start: 1, end: 5, text: "Overlap")]
+    @Test func sequentialUnequalSpeakerDurationsChooseUniqueGreatest() {
+        let transcript = [TranscriptSegment(start: 0, end: 4, text: "Transition")]
         let speakers = [
-            SpeakerTurn(speakerID: "brief", start: 1, end: 2),
-            SpeakerTurn(speakerID: "dominant", start: 2, end: 5)
+            SpeakerTurn(speakerID: "brief", start: 0, end: 1),
+            SpeakerTurn(speakerID: "dominant", start: 1, end: 4)
         ]
+
+        #expect(joiner.join(transcript: transcript, speakers: speakers).first?.speakerID == "dominant")
+    }
+
+    @Test(arguments: [
+        (SpeakerTurn(speakerID: "second", start: 1, end: 4), "equal concurrent overlap"),
+        (SpeakerTurn(speakerID: "second", start: 2, end: 3), "unequal concurrent overlap")
+    ])
+    func concurrentDistinctSpeakersAreAmbiguous(_ second: SpeakerTurn, _: String) {
+        let transcript = [TranscriptSegment(start: 0, end: 4, text: "Concurrent")]
+        let speakers = [SpeakerTurn(speakerID: "first", start: 0, end: 3), second]
 
         #expect(joiner.join(transcript: transcript, speakers: speakers).first?.speakerID == nil)
     }
@@ -118,6 +142,23 @@ import Testing
         #expect(markdown == "**\(escaped):** \(escaped)")
     }
 
+    @Test func markdownEscapesEveryCommonMarkASCIIPunctuationCharacter() {
+        let punctuation = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+
+        for character in punctuation {
+            let segment = AttributedTranscriptSegment(start: 0, end: 1, text: String(character), speakerID: nil)
+            let markdown = exporter.export([segment], format: .markdown, speakerNames: [:])
+            let expected: String
+            switch character {
+            case "&": expected = "&amp;"
+            case "<": expected = "&lt;"
+            case ">": expected = "&gt;"
+            default: expected = "\\\(character)"
+            }
+            #expect(markdown == "**Unknown Speaker:** \(expected)")
+        }
+    }
+
     @Test func subtitlesNormalizeInvalidOverlappingAndZeroDurationCues() {
         let segments = [
             AttributedTranscriptSegment(start: 2, end: 1, text: "first", speakerID: nil),
@@ -129,6 +170,30 @@ import Testing
         #expect(srt.contains("00:00:02,000 --> 00:00:02,001"))
         #expect(srt.contains("00:00:02,001 --> 00:00:02,002"))
         #expect(srt.contains("00:00:02,002 --> 00:00:10,000"))
+    }
+
+    @Test func subtitlesSaturateHugeFiniteTimesWithoutTrapping() {
+        let segment = AttributedTranscriptSegment(
+            start: Double.greatestFiniteMagnitude,
+            end: Double.greatestFiniteMagnitude,
+            text: "huge",
+            speakerID: nil
+        )
+
+        let srt = exporter.export([segment], format: .srt, speakerNames: [:])
+        #expect(srt.contains("99:59:59,998 --> 99:59:59,999"))
+    }
+
+    @Test func subtitlesStayMonotonicNearRepresentableMaximum() {
+        let maximum = TranscriptExporter.maximumSubtitleTime
+        let segments = [
+            AttributedTranscriptSegment(start: maximum - 0.003, end: maximum - 0.002, text: "near", speakerID: nil),
+            AttributedTranscriptSegment(start: Double.greatestFiniteMagnitude, end: Double.greatestFiniteMagnitude, text: "huge", speakerID: nil)
+        ]
+
+        let vtt = exporter.export(segments, format: .vtt, speakerNames: [:])
+        #expect(vtt.contains("99:59:59.996 --> 99:59:59.997"))
+        #expect(vtt.contains("99:59:59.998 --> 99:59:59.999"))
     }
 
     @Test func emptyTranscriptExportsValidEmptyRepresentations() {
