@@ -45,7 +45,7 @@ make app
 git diff --check
 ```
 
-The full suite passed with 154 tests in 16 suites. The release executable and ad-hoc signed app
+The final full suite passed with 157 tests in 16 suites. The release executable and ad-hoc signed app
 bundle built successfully. Diff whitespace validation passed.
 
 ## Concerns
@@ -53,3 +53,22 @@ bundle built successfully. Diff whitespace validation passed.
 - Task 4 still owns app lifecycle, hotkey-to-presentation wiring, and the snippet settings UI. This
   task accepts the existing `pendingVoiceEditSelection` snapshot through the coordinator initializer
   so that integration does not recapture or weaken the Task 1 trust boundary.
+
+## Review follow-up
+
+- Added operation-generation invalidation checks after both snippet lookup and local generation.
+  Cancel now clears state immediately, and suspended work cannot publish a late preview, chooser,
+  or error.
+- Made the sensitive selection snapshot nullable and observable through a privacy-state flag. Every
+  terminal path clears the snapshot and instruction; the preview no longer duplicates original text.
+- Made clipboard writes fallible and switched the system implementation to `writeObjects` without a
+  preemptive clear. Copy failures preserve the preview for retry and expose an actionable message;
+  the preview view dismisses only after a successful copy.
+- Mapped every `SelectionAccessError` to a specific accessible message while retaining the preview
+  for retry or explicit copy. The stale-confirm fake now throws before recording any mutation.
+
+### Review TDD evidence
+
+The focused RED build failed on the missing sensitive-state, fallible-copy, invalidation, and typed
+confirmation-error contracts. The focused GREEN run passed 11 tests, including five parameterized
+selection-error cases.
