@@ -142,10 +142,15 @@ final class SystemAccessibilityNodeAdapter: AccessibilityNodeAdapting {
     }
 
     func isSecure(_ node: AXUIElement) -> Bool {
-        if stringAttribute(kAXRoleAttribute, from: node) == "AXSecureTextField" { return true }
+        let role = stringAttribute(kAXRoleAttribute, from: node)
         var value: AnyObject?
         let result = AXUIElementCopyAttributeValue(node, "AXProtectedContent" as CFString, &value)
-        return result == .success && (value as? Bool == true || (value as? NSNumber)?.boolValue == true)
+        let protected = result == .success && (value as? Bool == true || (value as? NSNumber)?.boolValue == true)
+        return Self.isSecure(role: role, protected: protected)
+    }
+
+    nonisolated static func isSecure(role: String?, protected: Bool) -> Bool {
+        role == "AXSecureTextField" || protected
     }
 
     func visibleText(of node: AXUIElement) -> String? {
@@ -196,6 +201,21 @@ final class SystemAccessibilityNodeAdapter: AccessibilityNodeAdapting {
         var value: AnyObject?
         guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success else { return nil }
         return value as? NSNumber
+    }
+
+    func selectedTextRange(of element: AXUIElement) -> NSRange? {
+        var value: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &value) == .success,
+              let value, CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
+        let axValue = unsafeDowncast(value, to: AXValue.self)
+        guard AXValueGetType(axValue) == .cfRange else { return nil }
+        var range = CFRange()
+        guard AXValueGetValue(axValue, .cfRange, &range) else { return nil }
+        return NSRange(location: range.location, length: range.length)
+    }
+
+    func replaceSelectedText(of element: AXUIElement, with text: String) -> Bool {
+        AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFTypeRef) == .success
     }
 
     private func elementAttribute(_ name: String, from element: AXUIElement) -> AXUIElement? {

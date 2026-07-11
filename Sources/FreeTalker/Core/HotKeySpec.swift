@@ -114,6 +114,14 @@ struct HotKeySpec: Codable, Equatable {
         return candidate
     }
 
+    static func validActionSpec(_ candidate: HotKeySpec, pttSpec: HotKeySpec, otherActionSpec: HotKeySpec?) -> HotKeySpec? {
+        guard isValidRedoSpec(candidate),
+              !collides(candidate, pttSpec),
+              !redoShadowsHeldPTT(pttSpec: pttSpec, redoSpec: candidate),
+              otherActionSpec.map({ !collides(candidate, $0) }) ?? true else { return nil }
+        return candidate
+    }
+
     /// ANSI-US virtual keycode names for display. Fallback covers anything unmapped.
     static func keyName(for keyCode: UInt16) -> String {
         Self.keyNames[keyCode] ?? "Key\(keyCode)"

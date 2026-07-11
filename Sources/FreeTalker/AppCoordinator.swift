@@ -116,6 +116,11 @@ final class AppCoordinator: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.restartHotKeyListening() }
             .store(in: &cancellables)
+        AppSettings.shared.$voiceEditHotKeySpec
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.restartHotKeyListening() }
+            .store(in: &cancellables)
         // Cheap catch-all: the user activating the app (opening Settings, the Library, even
         // just the menu bar popover focusing a window) re-checks the tap — catching
         // permissions granted in System Settings while the app was already running.
@@ -182,7 +187,11 @@ final class AppCoordinator: ObservableObject {
         hotKeyManager.onKeyUp = { [weak self] eventSeconds in self?.handleKeyUp(eventSeconds: eventSeconds) }
         hotKeyManager.onEscape = { [weak self] in self?.handleEscape() }
         hotKeyManager.onRedoKeyDown = { [weak self] _ in self?.redoLast() }
-        if hotKeyManager.start(spec: AppSettings.shared.hotKeySpec, redoSpec: AppSettings.shared.redoHotKeySpec) {
+        if hotKeyManager.start(
+            spec: AppSettings.shared.hotKeySpec,
+            redoSpec: AppSettings.shared.redoHotKeySpec,
+            voiceEditSpec: AppSettings.shared.voiceEditHotKeySpec
+        ) {
             hotKeyStatusText = nil
             stopHotKeyRetryPoll()
         } else {

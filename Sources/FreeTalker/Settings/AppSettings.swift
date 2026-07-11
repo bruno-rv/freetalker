@@ -45,6 +45,10 @@ final class AppSettings: ObservableObject {
             if let redoHotKeySpec, HotKeySpec.validRedoSpec(redoHotKeySpec, pttSpec: hotKeySpec) == nil {
                 self.redoHotKeySpec = nil
             }
+            if let voiceEditHotKeySpec,
+               HotKeySpec.validActionSpec(voiceEditHotKeySpec, pttSpec: hotKeySpec, otherActionSpec: redoHotKeySpec) == nil {
+                self.voiceEditHotKeySpec = nil
+            }
         }
     }
 
@@ -60,7 +64,8 @@ final class AppSettings: ObservableObject {
             // reasoning as `vocabularyText`/`handsFreeMaxMinutes` above), so this falls straight
             // through to the persistence branch below on the next (nil) value. See Round 1 Codex
             // finding 10.
-            if let redoHotKeySpec, HotKeySpec.validRedoSpec(redoHotKeySpec, pttSpec: hotKeySpec) == nil {
+            if let redoHotKeySpec,
+               HotKeySpec.validActionSpec(redoHotKeySpec, pttSpec: hotKeySpec, otherActionSpec: voiceEditHotKeySpec) == nil {
                 self.redoHotKeySpec = nil
                 defaults.removeObject(forKey: Keys.redoHotKeySpec)
                 return
@@ -69,6 +74,22 @@ final class AppSettings: ObservableObject {
                 defaults.set(data, forKey: Keys.redoHotKeySpec)
             } else {
                 defaults.removeObject(forKey: Keys.redoHotKeySpec)
+            }
+        }
+    }
+
+    @Published var voiceEditHotKeySpec: HotKeySpec? {
+        didSet {
+            if let voiceEditHotKeySpec,
+               HotKeySpec.validActionSpec(voiceEditHotKeySpec, pttSpec: hotKeySpec, otherActionSpec: redoHotKeySpec) == nil {
+                self.voiceEditHotKeySpec = nil
+                defaults.removeObject(forKey: Keys.voiceEditHotKeySpec)
+                return
+            }
+            if let voiceEditHotKeySpec, let data = try? JSONEncoder().encode(voiceEditHotKeySpec) {
+                defaults.set(data, forKey: Keys.voiceEditHotKeySpec)
+            } else {
+                defaults.removeObject(forKey: Keys.voiceEditHotKeySpec)
             }
         }
     }
@@ -400,6 +421,7 @@ final class AppSettings: ObservableObject {
     private enum Keys {
         static let hotKeySpec = "hotKeySpec"
         static let redoHotKeySpec = "redoHotKeySpec"
+        static let voiceEditHotKeySpec = "voiceEditHotKeySpec"
         /// Legacy (read-only, for migration): single-modifier NX device mask bit.
         static let legacyHotKeyDeviceMask = "hotKeyDeviceMask"
         static let sttEngine = "sttEngine"
@@ -437,6 +459,11 @@ final class AppSettings: ObservableObject {
             redoHotKeySpec = try? JSONDecoder().decode(HotKeySpec.self, from: data)
         } else {
             redoHotKeySpec = nil
+        }
+        if let data = defaults.data(forKey: Keys.voiceEditHotKeySpec) {
+            voiceEditHotKeySpec = try? JSONDecoder().decode(HotKeySpec.self, from: data)
+        } else {
+            voiceEditHotKeySpec = nil
         }
         sttEngine = STTEngineKind(rawValue: defaults.string(forKey: Keys.sttEngine) ?? "") ?? .whisperKit
         cloudSTTBaseURL = defaults.string(forKey: Keys.cloudSTTBaseURL) ?? "https://api.openai.com/v1"
@@ -514,9 +541,15 @@ final class AppSettings: ObservableObject {
         // collides/shadows it — must be re-validated here, since a direct init assignment (like
         // the `redoHotKeySpec =` above) doesn't trigger its own `didSet` (same reasoning as
         // `vocabularyText`'s clamp above). See Round 1 Codex finding 10.
-        if let redoHotKeySpec, HotKeySpec.validRedoSpec(redoHotKeySpec, pttSpec: hotKeySpec) == nil {
+        if let redoHotKeySpec,
+           HotKeySpec.validActionSpec(redoHotKeySpec, pttSpec: hotKeySpec, otherActionSpec: voiceEditHotKeySpec) == nil {
             self.redoHotKeySpec = nil
             defaults.removeObject(forKey: Keys.redoHotKeySpec)
+        }
+        if let voiceEditHotKeySpec,
+           HotKeySpec.validActionSpec(voiceEditHotKeySpec, pttSpec: hotKeySpec, otherActionSpec: redoHotKeySpec) == nil {
+            self.voiceEditHotKeySpec = nil
+            defaults.removeObject(forKey: Keys.voiceEditHotKeySpec)
         }
     }
 }
