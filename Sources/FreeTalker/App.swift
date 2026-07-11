@@ -19,6 +19,7 @@ struct FreeTalkerApp: App {
         AppCoordinator.shared.primeMicrophonePermission()
         AppCoordinator.shared.speechModelStore.refreshRemoteSupportOnce()
         Task { await AppCoordinator.shared.speechModelStore.refresh() }
+        Task { await AppCoordinator.shared.launchRecoveryWorkflows() }
         if AppSettings.shared.sttEngine == .whisperKit {
             Task { await AppCoordinator.shared.whisperEngine.preload() }
         }

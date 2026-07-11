@@ -57,6 +57,8 @@ final class AppCoordinator: ObservableObject {
     private let hotKeyManager = HotKeyManager()
     private let audioCapture = AudioCapture()
     private let hud = HUDController()
+    private let recoveryStore: TranscriptionJobStore?
+    private var recoveryRunner: LocalJobRunner?
     private var cancellables = Set<AnyCancellable>()
     private var permissionPollTimer: Timer?
 
@@ -76,6 +78,7 @@ final class AppCoordinator: ObservableObject {
         speechModelDownloadCoordinator = downloadCoordinator
         speechModelStore = modelStore
         whisperEngine = WhisperKitEngine(downloadCoordinator: downloadCoordinator)
+        recoveryStore = try? Self.makeRecoveryStore()
         whisperEngine.setEventReceiver(modelStore)
         modelStore.onAutomaticSelection = { [weak whisperEngine] target in
             guard let whisperEngine else { return }
@@ -777,14 +780,14 @@ final class AppCoordinator: ObservableObject {
                 hud.hide()
             }
         } catch PipelineError.emptyTranscript {
-            let saved = saveFailedAudio(samples)
-            hud.flash(saved != nil ? "Transcription failed — audio saved" : "Transcription failed — audio could NOT be saved")
+            let saved = await preserveFailedAudio(samples, failure: JobFailure(stage: .transcribing, message: "Empty transcript"))
+            hud.flash(saved ? "Transcription failed — audio saved" : "Transcription failed — audio could NOT be saved")
         } catch PipelineError.recordFailed(_) {
             hud.flash("Library save failed")
         } catch {
             lastError = "Transcription failed: \(error.localizedDescription)"
-            let saved = saveFailedAudio(samples)
-            hud.flash(saved != nil ? "Transcription failed — audio saved" : "Transcription failed — audio could NOT be saved")
+            let saved = await preserveFailedAudio(samples, failure: JobFailure(stage: .transcribing, message: error.localizedDescription))
+            hud.flash(saved ? "Transcription failed — audio saved" : "Transcription failed — audio could NOT be saved")
         }
     }
 
@@ -874,31 +877,82 @@ final class AppCoordinator: ObservableObject {
         return (transcription.text, refined, posted, fallbackReason)
     }
 
-    /// Persists captured audio that failed transcription (or transcribed to nothing) so the
-    /// user's words aren't silently lost. Returns the saved file's URL, or nil if the save
-    /// itself failed — callers must not claim the audio was saved unless this succeeds. No
-    /// retry UI in v1 — the user can locate the WAV manually. See Round 1 Codex findings 1/2,
-    /// Round 2 Codex finding 3.
-    // ponytail: no retry/import UI + upgrade path: add a "Recover…" menu item that lists this
-    // directory and re-runs the pipeline on a chosen file.
-    @discardableResult
-    private func saveFailedAudio(_ samples: [Float]) -> URL? {
-        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        let dir = support.appendingPathComponent("FreeTalker/failed-dictations", isDirectory: true)
+    private static let applicationSupportDirectory: URL = {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("FreeTalker", isDirectory: true)
+    }()
+
+    private static var recoveryDirectory: URL {
+        applicationSupportDirectory.appendingPathComponent("failed-dictations", isDirectory: true)
+    }
+
+    private static func makeRecoveryStore() throws -> TranscriptionJobStore {
+        try FileManager.default.createDirectory(at: applicationSupportDirectory, withIntermediateDirectories: true)
+        return try TranscriptionJobStore(
+            databaseURL: applicationSupportDirectory.appendingPathComponent("jobs.db"),
+            clock: SystemJobClock()
+        )
+    }
+
+    private func preserveFailedAudio(_ samples: [Float], failure: JobFailure) async -> Bool {
+        guard let recoveryStore else { return false }
         do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            // UUID prefix avoids two failures in the same second overwriting each other.
-            // See Round 2 Codex finding 4.
-            let uuidPrefix = UUID().uuidString.prefix(8)
-            let name = "failed-\(Int(Date().timeIntervalSince1970))-\(uuidPrefix).wav"
-            let data = WAVEncoder.encode(samples: samples, sampleRate: 16_000)
-            let url = dir.appendingPathComponent(name)
-            try data.write(to: url)
-            return url
+            _ = try await RecoveryCaptureService(directory: Self.recoveryDirectory, store: recoveryStore)
+                .preserve(samples: samples, metadata: RecoveryMetadata(capturedAt: Date(), failure: failure))
+            return true
         } catch {
             lastError = "Failed to save recovery audio: \(error.localizedDescription)"
-            return nil
+            return false
         }
+    }
+
+    func launchRecoveryWorkflows() async {
+        guard let recoveryStore else { return }
+        let pipeline = RecoveryRetryPipeline(
+            store: recoveryStore,
+            processDictation: { [weak self] samples, configuration in
+                guard let self else { throw CancellationError() }
+                return try await self.processRecoveredDictation(samples: samples, configuration: configuration)
+            },
+            errorStage: { error in
+                if case PipelineError.recordFailed = error { return .persisting }
+                return .transcribing
+            }
+        )
+        let runner = LocalJobRunner(store: recoveryStore, executorFinalizesJob: true) { job, token in
+            try await pipeline.execute(jobID: job.id, configuration: AttemptConfiguration(), cancellation: token)
+        }
+        recoveryRunner = runner
+        _ = try? await recoveryStore.recoverInterruptedJobs()
+        _ = try? await RecoveryRetentionService(directory: Self.recoveryDirectory, store: recoveryStore)
+            .purgeExpired(now: Date(), retention: AppSettings.shared.recoveryRetention)
+        await runner.resumeQueuedJobs()
+    }
+
+    private func processRecoveredDictation(
+        samples: [Float],
+        configuration: AttemptConfiguration
+    ) async throws -> RecoveryDictation {
+        if let model = configuration.speechModel { await whisperEngine.reload(to: model) }
+        let template = TemplateStore.shared.templates.first {
+            $0.id == configuration.template || $0.name == configuration.template
+        } ?? TemplateStore.shared.template(id: AppSettings.shared.activeTemplateID) ?? Template.builtIns[0]
+        let engine = activeSTTEngine
+        let result = try await processDictation(
+            samples: samples,
+            engine: engine,
+            engineName: AppSettings.shared.sttEngine.rawValue,
+            template: template,
+            forcedLanguage: configuration.language,
+            insert: { _, _ in false }
+        )
+        return RecoveryDictation(
+            language: configuration.language ?? "detected",
+            template: template.name,
+            transcript: result.transcript,
+            refined: result.refined,
+            engine: AppSettings.shared.sttEngine.rawValue
+        )
     }
 
     /// Overwrites `~/Library/Application Support/FreeTalker/last-dictation.wav` with the most
