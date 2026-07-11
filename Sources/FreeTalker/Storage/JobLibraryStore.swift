@@ -18,6 +18,7 @@ enum RecoveryPlaybackError: LocalizedError, Equatable {
 final class JobLibraryStore: ObservableObject {
     @Published private(set) var recoveryJobs: [TranscriptionJob] = []
     @Published private(set) var importJobs: [TranscriptionJob] = []
+    @Published private(set) var importStatusMessage: String?
 
     private let store: TranscriptionJobStore
     private let recoveryDirectory: URL
@@ -68,13 +69,17 @@ final class JobLibraryStore: ObservableObject {
         await enqueueImport?(id)
     }
 
-    func cancelImport(id: UUID) async throws {
+    @discardableResult
+    func cancelImport(id: UUID) async throws -> LocalJobRunner.CancellationOutcome {
         guard let cancelImport else { throw JobStoreError.invalidTransition }
-        let outcome = await cancelImport(id)
+        var outcome = await cancelImport(id)
         if outcome == .notRunning, let job = try await store.job(id: id), job.state == .queued {
             try await store.transition(id, from: .queued, to: .cancelled)
+            outcome = .accepted
         }
+        importStatusMessage = MediaImportPresentation.cancellationMessage(outcome)
         try await refresh()
+        return outcome
     }
 
     func deleteImport(id: UUID) async throws {

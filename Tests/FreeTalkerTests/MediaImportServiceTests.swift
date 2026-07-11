@@ -224,6 +224,24 @@ import UniformTypeIdentifiers
         #expect(!FileManager.default.fileExists(atPath: fixture.output.path))
         #expect(FileManager.default.fileExists(atPath: fixture.silentVideo.path))
     }
+
+    @Test func generatedVideoWithAudioImportsAndExtractsNormalizedFramesWithoutChangingSource() async throws {
+        let fixture = try MediaFixture()
+        let video = try await fixture.makeVideoWithAudio()
+        let sourceBytes = try Data(contentsOf: video)
+        let access = BookmarkProbe(resolvedURL: video)
+        let store = MediaStoreProbe()
+        let service = MediaImportService(store: store, bookmarkAccess: access)
+
+        let id = try await service.createJob(for: video)
+        try await service.decode(jobID: id, destination: fixture.output, cancellation: CancellationToken()) { _ in }
+
+        let output = try AVAudioFile(forReading: fixture.output)
+        #expect(output.fileFormat.sampleRate == 16_000)
+        #expect(output.fileFormat.channelCount == 1)
+        #expect(output.length > 0)
+        #expect(try Data(contentsOf: video) == sourceBytes)
+    }
 }
 
 private actor MediaStoreProbe: MediaImportJobStoring {
@@ -289,6 +307,7 @@ private final class MediaFixture: @unchecked Sendable {
     let tone: URL
     let output: URL
     let silentVideo: URL
+    let videoWithAudio: URL
 
     init(duration: Double = 0.1) throws {
         directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -296,6 +315,7 @@ private final class MediaFixture: @unchecked Sendable {
         tone = directory.appendingPathComponent("tone.wav")
         output = directory.appendingPathComponent("normalized.wav")
         silentVideo = directory.appendingPathComponent("silent-video.mov")
+        videoWithAudio = directory.appendingPathComponent("video-with-audio.mov")
         if duration == 0.1 {
             try FileManager.default.copyItem(at: Bundle.module.url(forResource: "tone", withExtension: "wav", subdirectory: "Fixtures")!, to: tone)
         } else {
@@ -314,6 +334,26 @@ private final class MediaFixture: @unchecked Sendable {
             at: Bundle.module.url(forResource: "silent-video", withExtension: "mov", subdirectory: "Fixtures")!,
             to: silentVideo
         )
+    }
+
+    func makeVideoWithAudio() async throws -> URL {
+        let silent = Bundle.module.url(forResource: "silent-video", withExtension: "mov", subdirectory: "Fixtures")!
+        let videoAsset = AVURLAsset(url: silent)
+        let audioAsset = AVURLAsset(url: tone)
+        let composition = AVMutableComposition()
+        let videoSource = try #require(await videoAsset.loadTracks(withMediaType: .video).first)
+        let audioSource = try #require(await audioAsset.loadTracks(withMediaType: .audio).first)
+        let videoDuration = try await videoAsset.load(.duration)
+        let audioDuration = try await audioAsset.load(.duration)
+        let duration = CMTimeMinimum(videoDuration, audioDuration)
+        let videoTrack = try #require(composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid))
+        let audioTrack = try #require(composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid))
+        try videoTrack.insertTimeRange(.init(start: .zero, duration: duration), of: videoSource, at: .zero)
+        try audioTrack.insertTimeRange(.init(start: .zero, duration: duration), of: audioSource, at: .zero)
+        let exporter = try #require(AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetHighestQuality))
+        guard #available(macOS 15, *) else { throw CocoaError(.featureUnsupported) }
+        try await exporter.export(to: videoWithAudio, as: .mov)
+        return videoWithAudio
     }
 
     deinit { try? FileManager.default.removeItem(at: directory) }

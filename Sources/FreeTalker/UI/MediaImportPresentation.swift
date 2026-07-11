@@ -41,6 +41,15 @@ enum MediaImportRetention: Int, CaseIterable, Sendable {
 
     static let `default`: Self = .sevenDays
     var days: Int? { self == .never ? nil : rawValue }
+
+    func purgeCandidates(_ jobs: [TranscriptionJob], now: Date) -> [TranscriptionJob] {
+        guard let days else { return [] }
+        let cutoff = now.addingTimeInterval(-Double(days) * 86_400)
+        return jobs.filter { job in
+            guard job.kind == .mediaImport, job.state == .ready else { return false }
+            return (job.completedAt ?? job.updatedAt) <= cutoff
+        }
+    }
 }
 
 enum MediaImportPresentation {
@@ -62,7 +71,10 @@ enum MediaImportPresentation {
 
     static func actions(state: JobState, transcriptReady: Bool) -> [MediaImportAction] {
         switch state {
-        case .queued, .processing:
+        case .queued:
+            return transcriptReady ? [.cancel, .export] : [.cancel]
+        case .processing(let stage):
+            if stage == .finalizing { return transcriptReady ? [.export] : [] }
             return transcriptReady ? [.cancel, .export] : [.cancel]
         case .failed(let failure):
             let retry: MediaImportAction = failure.stage == .diarizing && transcriptReady ? .retrySpeakerSeparation : .retry
@@ -71,6 +83,14 @@ enum MediaImportPresentation {
             return transcriptReady ? [.retry, .export, .delete] : [.retry, .delete]
         case .ready:
             return transcriptReady ? [.export, .delete] : [.delete]
+        }
+    }
+
+    static func cancellationMessage(_ outcome: LocalJobRunner.CancellationOutcome) -> String {
+        switch outcome {
+        case .accepted: "Cancellation requested."
+        case .tooLate: "This import is already finishing and can no longer be cancelled."
+        case .notRunning: "This import is not currently running."
         }
     }
 

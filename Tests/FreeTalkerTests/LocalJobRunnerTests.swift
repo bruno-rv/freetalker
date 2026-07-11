@@ -28,6 +28,31 @@ import Testing
         #expect(try await fixture.store.job(id: second.id)?.state == .ready)
     }
 
+    @Test func separateKindRunnersShareOneSerialExecutionAuthority() async throws {
+        let fixture = try RunnerFixture()
+        let recovery = try await fixture.makeJob(.recovery, "recovery.wav")
+        let media = try await fixture.makeJob(.mediaImport, "media.mov")
+        let probe = SuspendedExecutorProbe()
+        let authority = LocalJobExecutionAuthority()
+        let recoveryRunner = LocalJobRunner(store: fixture.store, kind: .recovery, executionAuthority: authority, executor: probe.execute)
+        let mediaRunner = LocalJobRunner(store: fixture.store, kind: .mediaImport, executionAuthority: authority, executor: probe.execute)
+
+        await recoveryRunner.enqueue(recovery.id)
+        await mediaRunner.enqueue(media.id)
+        await probe.waitUntilStarted(recovery.id)
+        #expect(await probe.maximumConcurrentExecutions == 1)
+        #expect(await probe.started == [recovery.id])
+
+        await probe.resume(recovery.id)
+        await probe.waitUntilStarted(media.id)
+        #expect(await probe.maximumConcurrentExecutions == 1)
+        await probe.resume(media.id)
+        await recoveryRunner.waitUntilIdle()
+        await mediaRunner.waitUntilIdle()
+        #expect(try await fixture.store.job(id: recovery.id)?.state == .ready)
+        #expect(try await fixture.store.job(id: media.id)?.state == .ready)
+    }
+
     @Test func runnerPublishesProcessingAndTerminalChanges() async throws {
         let fixture = try RunnerFixture()
         let job = try await fixture.makeJob(.recovery, "changes.wav")
@@ -269,6 +294,27 @@ import Testing
         try await library.refresh()
 
         #expect(throws: RecoveryPlaybackError.couldNotStart) { try library.play(id: job.id) }
+    }
+
+    @Test @MainActor func importFacadePreservesEveryCancellationOutcomeAndMessage() async throws {
+        for outcome in [LocalJobRunner.CancellationOutcome.accepted, .tooLate, .notRunning] {
+            let fixture = try RunnerFixture()
+            let job = try await fixture.makeJob(.mediaImport, "movie.mov")
+            try await fixture.store.transition(job.id, from: .queued, to: .processing(stage: .finalizing))
+            if outcome == .notRunning { try await fixture.store.transition(job.id, from: .processing, to: .ready) }
+            let library = JobLibraryStore(store: fixture.store)
+            library.configureImports(
+                service: MediaImportService(store: fixture.store),
+                directory: fixture.database.directory,
+                enqueue: { _ in },
+                cancel: { _ in outcome }
+            )
+
+            let received = try await library.cancelImport(id: job.id)
+
+            #expect(received == outcome)
+            #expect(library.importStatusMessage == MediaImportPresentation.cancellationMessage(outcome))
+        }
     }
 
     @Test @MainActor func libraryFacadeRetryAndDeleteRaceHasOneDurableWinner() async throws {

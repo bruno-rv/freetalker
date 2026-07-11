@@ -120,7 +120,12 @@ struct ImportDetailView: View {
         catch { detail = nil; errorMessage = error.localizedDescription }
         loading = false
     }
-    @MainActor private func cancel() async { do { try await store.cancelImport(id: jobID) } catch { errorMessage = error.localizedDescription } }
+    @MainActor private func cancel() async {
+        do {
+            let outcome = try await store.cancelImport(id: jobID)
+            if outcome != .accepted { errorMessage = MediaImportPresentation.cancellationMessage(outcome) }
+        } catch { errorMessage = error.localizedDescription }
+    }
     @MainActor private func retry() async { do { try await store.retryImport(id: jobID) } catch { errorMessage = error.localizedDescription } }
     @MainActor private func deleteImport() async { do { try await store.deleteImport(id: jobID) } catch { errorMessage = error.localizedDescription } }
     private static func time(_ seconds: TimeInterval) -> String { String(format: "%d:%02d", Int(seconds) / 60, Int(seconds) % 60) }
