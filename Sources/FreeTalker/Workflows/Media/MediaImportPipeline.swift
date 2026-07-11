@@ -89,6 +89,7 @@ struct MediaImportPipeline: Sendable {
             try cancellation.checkCancellation()
             guard ownedDirectory.isNormalizedWAV(temporary) else { throw MediaImportError.decodeFailed("Decoded audio is not normalized 16 kHz mono WAV") }
             let promoted = try ownedDirectory.promote(temporary, to: "audio.wav")
+            try ownedDirectory.revalidateIdentity()
             try await store.persistDecodedMedia(jobID: job.id, owner: owner, derivedAudioPath: promoted.path)
             try await store.updateMediaProgress(jobID: job.id, owner: owner, progress: 0.25)
             completed.insert(.decode)
@@ -103,6 +104,7 @@ struct MediaImportPipeline: Sendable {
             try await store.advanceMediaStage(jobID: job.id, owner: owner, stage: .transcribing)
             let segments = try await transcriber.transcribeFile(at: inferenceAudio.url, language: language, model: model)
             try cancellation.checkCancellation()
+            try ownedDirectory.revalidateIdentity()
             try await store.persistTranscript(jobID: job.id, owner: owner, segments: segments)
             try await store.updateMediaProgress(jobID: job.id, owner: owner, progress: 0.5)
             completed.insert(.transcribe)
@@ -115,6 +117,7 @@ struct MediaImportPipeline: Sendable {
                 Task { try? await store.updateMediaProgress(jobID: job.id, owner: owner, progress: 0.5 + 0.25 * normalized(value)) }
             }
             try cancellation.checkCancellation()
+            try ownedDirectory.revalidateIdentity()
             try await store.persistSpeakerTurns(jobID: job.id, owner: owner, turns: turns)
             try await store.updateMediaProgress(jobID: job.id, owner: owner, progress: 0.75)
         }
@@ -122,6 +125,7 @@ struct MediaImportPipeline: Sendable {
         try cancellation.checkCancellation()
         try await store.advanceMediaStage(jobID: job.id, owner: owner, stage: .finalizing)
         try await cancellation.beginFinalization()
+        try ownedDirectory.revalidateIdentity()
         try await store.finalizeMediaImport(jobID: job.id, owner: owner)
     }
 }
