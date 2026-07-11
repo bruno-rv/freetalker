@@ -27,3 +27,30 @@ Implemented the shared rejecting download coordinator and the MainActor speech-m
 ## Commits
 
 - Recorded in the commit containing this report.
+
+## Review-finding fixes
+
+Commit `3ad09192d134b9340baf88340b5edfe382c0139c` fixes failed-state persistence across scans, bounded remote support refresh without structured-scope waiting, atomic delete reservation/rollback/event exclusion, and coordinator-owned shared activity propagation. It also removes the tautological exact-path comparison while retaining standardized resolution and containment validation.
+
+Focused regressions were added before the fixes. The RED command and relevant output were:
+
+```text
+$ make selfcheck
+error: type 'SpeechModelStore' has no member 'merging'
+error: type 'SpeechModelStore' has no member 'shouldApplyAutomaticDefault'
+error: extra argument 'fallbackSupport' in call
+error: type 'SpeechModelStore' has no member 'firstResult'
+make: *** [build] Error 1
+```
+
+Final GREEN verification was:
+
+```text
+$ make selfcheck
+Build complete! (10.02s)
+SelfCheck: found 2 input device(s): HD Webcam C615, MacBook Pro Microphone
+SelfCheck PASSED (...)
+
+$ git diff --check
+(no output; exit 0)
+```
