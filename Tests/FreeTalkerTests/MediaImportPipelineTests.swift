@@ -225,6 +225,25 @@ import Testing
         #expect(try await fixture.store.completedMediaStages(jobID: job.id).isEmpty)
     }
 
+    @Test func runnerPublishesMeaningfulIntermediateStageAndProgressChanges() async throws {
+        let fixture = try MediaPipelineFixture()
+        let job = try await fixture.store.create(kind: .mediaImport, source: .init(reference: fixture.source.path), now: .now)
+        let observed = PipelineObservationProbe(store: fixture.store)
+        let pipeline = fixture.pipeline(decoder: ProgressPipelineDecoder())
+        let runner = pipeline.localJobRunner { id in await observed.record(id) }
+
+        await runner.enqueue(job.id)
+        await runner.waitUntilIdle()
+        await observed.waitForTerminal()
+
+        let snapshots = await observed.snapshots
+        #expect(snapshots.contains { $0.state == .processing(stage: .decoding) && $0.progress > 0 && $0.progress < 0.25 })
+        #expect(snapshots.contains { $0.state == .processing(stage: .transcribing) })
+        #expect(snapshots.contains { $0.state == .processing(stage: .diarizing) && $0.progress >= 0.5 })
+        #expect(snapshots.last?.state == .ready)
+        #expect(snapshots.count < 20)
+    }
+
     @Test func speakerTurnsRemainRawWhenNamesChange() async throws {
         let fixture = try MediaPipelineFixture()
         let job = try await fixture.store.create(kind: .mediaImport, source: .init(reference: fixture.source.path), now: .now)
@@ -401,6 +420,29 @@ private actor PipelineDecodeProbe: MediaJobAudioDecoding {
     private(set) var calls = 0
     func decode(jobID: UUID, destination: URL, cancellation: CancellationToken, progress: @escaping @Sendable (Double) -> Void) async throws {
         calls += 1; try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true); try writeValidWAV(to: destination); progress(1)
+    }
+}
+
+private actor ProgressPipelineDecoder: MediaJobAudioDecoding {
+    func decode(jobID: UUID, destination: URL, cancellation: CancellationToken, progress: @escaping @Sendable (Double) -> Void) async throws {
+        try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try writeValidWAV(to: destination)
+        progress(0.2); try await Task.sleep(for: .milliseconds(10))
+        progress(0.21); try await Task.sleep(for: .milliseconds(10))
+        progress(0.8); try await Task.sleep(for: .milliseconds(10))
+        progress(1); try await Task.sleep(for: .milliseconds(10))
+    }
+}
+
+private actor PipelineObservationProbe {
+    let store: TranscriptionJobStore
+    private(set) var snapshots: [TranscriptionJob] = []
+    init(store: TranscriptionJobStore) { self.store = store }
+    func record(_ id: UUID) async {
+        if let job = try? await store.job(id: id) { snapshots.append(job) }
+    }
+    func waitForTerminal() async {
+        while snapshots.last?.state.kind != .ready { await Task.yield() }
     }
 }
 

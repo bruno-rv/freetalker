@@ -86,6 +86,7 @@ final class AppCoordinator: ObservableObject {
     let jobLibraryStore: JobLibraryStore?
     private var recoveryRunner: LocalJobRunner?
     private var mediaImportRunner: LocalJobRunner?
+    private let localJobExecutionAuthority = LocalJobExecutionAuthority()
     private var cancellables = Set<AnyCancellable>()
     private var permissionPollTimer: Timer?
 
@@ -149,6 +150,18 @@ final class AppCoordinator: ObservableObject {
             .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.restartHotKeyListening() }
+            .store(in: &cancellables)
+        AppSettings.shared.$mediaImportRetention
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] retention in
+                Task { @MainActor in
+                    guard let self else { return }
+                    await Self.routeMediaImportRetentionChange(retention) { [weak self] value in
+                        await self?.purgeMediaImports(retention: value)
+                    }
+                }
+            }
             .store(in: &cancellables)
         // Cheap catch-all: the user activating the app (opening Settings, the Library, even
         // just the menu bar popover focusing a window) re-checks the tap — catching
@@ -1337,7 +1350,8 @@ final class AppCoordinator: ObservableObject {
             kind: .recovery,
             executorFinalizesJob: true,
             finalizationFailure: pipeline.failFinalization,
-            didChange: { [weak jobLibraryStore] _ in try? await jobLibraryStore?.refresh() }
+            didChange: { [weak jobLibraryStore] _ in try? await jobLibraryStore?.refresh() },
+            executionAuthority: localJobExecutionAuthority
         ) { job, token in
             try await pipeline.execute(jobID: job.id, configuration: nil, cancellation: token)
         }
@@ -1369,7 +1383,7 @@ final class AppCoordinator: ObservableObject {
             language: AppSettings.shared.languagePin == "auto" ? nil : AppSettings.shared.languagePin,
             model: AppSettings.shared.whisperModel
         )
-        let runner = pipeline.localJobRunner { [weak jobLibraryStore] _ in
+        let runner = pipeline.localJobRunner(executionAuthority: localJobExecutionAuthority) { [weak jobLibraryStore] _ in
             try? await jobLibraryStore?.refresh()
         }
         mediaImportRunner = runner
@@ -1379,16 +1393,25 @@ final class AppCoordinator: ObservableObject {
             enqueue: { [weak runner] id in await runner?.enqueue(id) },
             cancel: { [weak runner] id in await runner?.cancel(id) ?? .notRunning }
         )
-        if let days = AppSettings.shared.mediaImportRetention.days {
-            let cutoff = Date().addingTimeInterval(-Double(days) * 86_400)
-            if let imports = try? await recoveryStore.jobs(kind: .mediaImport) {
-                for job in imports where job.createdAt < cutoff && [.ready, .failed, .cancelled].contains(job.state.kind) {
-                    try? await recoveryStore.deleteMediaImport(jobID: job.id, jobsDirectory: Self.mediaImportsDirectory)
-                }
-            }
-        }
+        await purgeMediaImports(retention: AppSettings.shared.mediaImportRetention)
         await runner.resumeQueuedJobs()
         try? await jobLibraryStore.refresh()
+    }
+
+    static func routeMediaImportRetentionChange(
+        _ retention: MediaImportRetention,
+        purge: @Sendable (MediaImportRetention) async -> Void
+    ) async {
+        await purge(retention)
+    }
+
+    private func purgeMediaImports(retention: MediaImportRetention) async {
+        guard let recoveryStore else { return }
+        let imports = (try? await recoveryStore.jobs(kind: .mediaImport)) ?? []
+        for job in retention.purgeCandidates(imports, now: Date()) {
+            try? await recoveryStore.deleteMediaImport(jobID: job.id, jobsDirectory: Self.mediaImportsDirectory)
+        }
+        try? await jobLibraryStore?.refresh()
     }
 
     private func processRecoveredDictation(

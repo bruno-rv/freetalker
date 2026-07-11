@@ -16,6 +16,33 @@ protocol LeasedTranscriptionJobStoring: TranscriptionJobStoring {
 
 extension TranscriptionJobStore: TranscriptionJobStoring {}
 
+actor LocalJobExecutionAuthority {
+    private var occupied = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func run<T: Sendable>(_ operation: @Sendable () async throws -> T) async throws -> T {
+        await acquire()
+        do {
+            let value = try await operation()
+            release()
+            return value
+        } catch {
+            release()
+            throw error
+        }
+    }
+
+    private func acquire() async {
+        guard occupied else { occupied = true; return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    private func release() {
+        if waiters.isEmpty { occupied = false }
+        else { waiters.removeFirst().resume() }
+    }
+}
+
 final class CancellationToken: @unchecked Sendable {
     private let lock = NSLock()
     private var isCancelled = false
@@ -76,6 +103,7 @@ actor LocalJobRunner {
     private let finalizationFailure: FinalizationFailure?
     private let didChange: DidChange?
     private let leaseDuration: TimeInterval
+    private let executionAuthority: LocalJobExecutionAuthority?
     private var queue: [UUID] = []
     private var worker: Task<Void, Never>?
     private var current: CurrentExecution?
@@ -87,6 +115,7 @@ actor LocalJobRunner {
         finalizationFailure: FinalizationFailure? = nil,
         didChange: DidChange? = nil,
         leaseDuration: TimeInterval = 30,
+        executionAuthority: LocalJobExecutionAuthority? = nil,
         executor: @escaping Executor
     ) {
         self.store = store
@@ -95,6 +124,7 @@ actor LocalJobRunner {
         self.finalizationFailure = finalizationFailure
         self.didChange = didChange
         self.leaseDuration = leaseDuration
+        self.executionAuthority = executionAuthority
         self.executor = executor
     }
 
@@ -194,7 +224,11 @@ actor LocalJobRunner {
         do {
             try token.checkCancellation()
             let currentJob = try await store.job(id: id) ?? job
-            try await executor(currentJob, token)
+            if let executionAuthority {
+                try await executionAuthority.run { try await executor(currentJob, token) }
+            } else {
+                try await executor(currentJob, token)
+            }
             if !executorFinalizesJob { try await token.beginFinalization() }
             if !executorFinalizesJob {
                 try await transitionTerminal(id, token: token, state: .ready)
