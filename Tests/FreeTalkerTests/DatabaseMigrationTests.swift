@@ -8,14 +8,14 @@ import Testing
 
         try DatabaseMigrator.migrate(db.handle)
 
-        #expect(try db.tableNames().isSuperset(of: [
+        #expect(try db.tableNames() == [
             "transcription_jobs", "job_attempts", "speaker_segments",
             "speaker_names", "snippets", "schema_migrations"
-        ]))
-        #expect(try db.indexNames().isSuperset(of: [
+        ])
+        #expect(try db.indexNames() == [
             "idx_transcription_jobs_state_expires_at",
             "idx_job_attempts_job_id"
-        ]))
+        ])
         #expect(try db.migrationVersions() == [DatabaseMigrator.latestVersion])
     }
 
@@ -28,6 +28,40 @@ import Testing
 
         #expect(try db.schema() == schema)
         #expect(try db.migrationVersions() == [DatabaseMigrator.latestVersion])
+    }
+
+    @Test func rollsBackEntireMigrationWhenSchemaCreationFails() throws {
+        let db = try TemporaryDatabase()
+        try db.execute("CREATE TABLE job_attempts (collision INTEGER);")
+
+        #expect(throws: DatabaseError.self) {
+            try DatabaseMigrator.migrate(db.handle)
+        }
+
+        #expect(try db.tableNames() == ["job_attempts"])
+    }
+
+    @Test func rejectsSchemaVersionNewerThanMigrator() throws {
+        let db = try TemporaryDatabase()
+        try db.createMigrationLedger(versions: [DatabaseMigrator.latestVersion + 1])
+
+        #expect(throws: DatabaseError.self) {
+            try DatabaseMigrator.migrate(db.handle)
+        }
+
+        #expect(try db.migrationVersions() == [DatabaseMigrator.latestVersion + 1])
+    }
+
+    @Test func rejectsDiscontinuousMigrationLedger() throws {
+        let db = try TemporaryDatabase()
+        try db.createMigrationLedger(versions: [0])
+
+        #expect(throws: DatabaseError.self) {
+            try DatabaseMigrator.migrate(db.handle)
+        }
+
+        #expect(try db.migrationVersions() == [0])
+        #expect(try db.tableNames() == ["schema_migrations"])
     }
 }
 
@@ -48,11 +82,17 @@ private final class TemporaryDatabase {
     }
 
     func tableNames() throws -> Set<String> {
-        try strings("SELECT name FROM sqlite_master WHERE type = 'table';")
+        try strings("""
+        SELECT name FROM sqlite_master
+        WHERE type = 'table' AND name NOT LIKE 'sqlite_%';
+        """)
     }
 
     func indexNames() throws -> Set<String> {
-        try strings("SELECT name FROM sqlite_master WHERE type = 'index';")
+        try strings("""
+        SELECT name FROM sqlite_master
+        WHERE type = 'index' AND name NOT LIKE 'sqlite_autoindex_%';
+        """)
     }
 
     func migrationVersions() throws -> [Int] {
@@ -61,6 +101,27 @@ private final class TemporaryDatabase {
 
     func schema() throws -> Set<String> {
         try strings("SELECT type || ':' || name || ':' || sql FROM sqlite_master WHERE sql IS NOT NULL;")
+    }
+
+    func createMigrationLedger(versions: [Int]) throws {
+        try execute("""
+        CREATE TABLE schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at REAL NOT NULL DEFAULT (unixepoch())
+        );
+        """)
+        for version in versions {
+            try execute("INSERT INTO schema_migrations (version) VALUES (\(version));")
+        }
+    }
+
+    func execute(_ sql: String) throws {
+        var errorMessage: UnsafeMutablePointer<CChar>?
+        guard sqlite3_exec(handle, sql, nil, nil, &errorMessage) == SQLITE_OK else {
+            let message = errorMessage.map { String(cString: $0) } ?? lastError()
+            sqlite3_free(errorMessage)
+            throw DatabaseError.sqlFailed(message)
+        }
     }
 
     private func strings(_ sql: String) throws -> Set<String> {

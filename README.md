@@ -10,8 +10,10 @@ on-device Apple post-processing by default; cloud engines are optional and BYOK-
 ## Requirements
 
 - macOS 26, Apple Silicon.
-- Xcode Command Line Tools (Swift 6.3+). **No Xcode.app is required or used** — this is a
-  Swift Package, not an `.xcodeproj`.
+- Xcode Command Line Tools (Swift 6.3+) are sufficient to build and run the app; the app is
+  a Swift Package, not an `.xcodeproj`.
+- Contributors running the test suite need full Xcode installed at
+  `/Applications/Xcode.app` by default so Swift Testing is available.
 
 ## Build
 
@@ -21,6 +23,15 @@ open FreeTalker.app
 ```
 
 Or in one step: `make run`.
+
+The app build remains Command Line Tools-only and does not change the selected developer
+directory. To run tests, use `make test`. The Makefile checks for full Xcode and Swift Testing,
+prints the developer directory it uses, and scopes `DEVELOPER_DIR` to the test command without
+mutating `xcode-select`. Override a non-default Xcode location explicitly:
+
+```sh
+make test XCODE_DEVELOPER_DIR=/path/to/Xcode.app/Contents/Developer
+```
 
 `make app` copies the release binary into `FreeTalker.app/Contents/MacOS/`, writes
 `Contents/Info.plist` (from `Info.plist` at the repo root — `LSUIElement=true` so it's
