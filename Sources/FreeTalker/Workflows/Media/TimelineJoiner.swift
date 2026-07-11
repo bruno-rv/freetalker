@@ -6,17 +6,19 @@ struct TimelineJoiner: Sendable {
         speakers: [SpeakerTurn]
     ) -> [AttributedTranscriptSegment] {
         transcript.map { segment in
-            let speakerID = speakers.enumerated().reduce(
-                into: (index: Int.max, overlap: 0.0, speakerID: Optional<String>.none)
-            ) { best, candidate in
-                let turn = candidate.element
-                guard !turn.speakerID.isEmpty, turn.end > turn.start else { return }
-                let overlap = min(segment.end, turn.end) - max(segment.start, turn.start)
-                guard overlap > 0 else { return }
-                if overlap > best.overlap || (overlap == best.overlap && candidate.offset < best.index) {
-                    best = (candidate.offset, overlap, turn.speakerID)
+            let speakerID: String?
+            if isValid(start: segment.start, end: segment.end) {
+                let overlappingSpeakers = speakers.reduce(into: Set<String>()) { result, turn in
+                    guard !turn.speakerID.isEmpty, isValid(start: turn.start, end: turn.end) else { return }
+                    let overlap = min(segment.end, turn.end) - max(segment.start, turn.start)
+                    if overlap > 0 {
+                        result.insert(turn.speakerID)
+                    }
                 }
-            }.speakerID
+                speakerID = overlappingSpeakers.count == 1 ? overlappingSpeakers.first : nil
+            } else {
+                speakerID = nil
+            }
 
             return AttributedTranscriptSegment(
                 start: segment.start,
@@ -25,5 +27,9 @@ struct TimelineJoiner: Sendable {
                 speakerID: speakerID
             )
         }
+    }
+
+    private func isValid(start: TimeInterval, end: TimeInterval) -> Bool {
+        start.isFinite && end.isFinite && start >= 0 && end > start
     }
 }

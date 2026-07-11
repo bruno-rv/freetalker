@@ -34,14 +34,19 @@ struct TranscriptExporter: Sendable {
     }
 
     private func escapeMarkup(_ value: String, markdown: Bool) -> String {
-        var escaped = value
+        let htmlEscaped = value
             .replacingOccurrences(of: "&", with: "&amp;")
             .replacingOccurrences(of: "<", with: "&lt;")
             .replacingOccurrences(of: ">", with: "&gt;")
-        if markdown {
-            escaped = escaped.replacingOccurrences(of: "*", with: "\\*")
+        guard markdown else { return htmlEscaped }
+
+        let markdownSyntax = "\\`*_{}[]()#+-.!"
+        return htmlEscaped.reduce(into: "") { result, character in
+            if markdownSyntax.contains(character) {
+                result.append("\\")
+            }
+            result.append(character)
         }
-        return escaped
     }
 
     private func cues(for segments: [AttributedTranscriptSegment]) -> [(segment: AttributedTranscriptSegment, start: TimeInterval, end: TimeInterval)] {
