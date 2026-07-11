@@ -181,6 +181,20 @@ import Testing
         #expect(!coordinator.hasSensitiveContent)
     }
 
+    @Test func unavailableSnippetStoreNeverFallsThroughToGeneration() async {
+        let editor = StubLocalEditService(result: .success("must not generate"))
+        let coordinator = makeCoordinator(editor: editor, matcher: { _ in
+            throw VoiceEditSnippetError.storeUnavailable("database unavailable")
+        })
+
+        await coordinator.begin()
+
+        #expect(editor.requests.isEmpty)
+        #expect(coordinator.preview == nil)
+        #expect(coordinator.error == .snippetStoreUnavailable("database unavailable"))
+        #expect(coordinator.errorMessage?.contains("database unavailable") == true)
+    }
+
     private func makeCoordinator(
         selection: SelectionSnapshot? = Self.snapshot(),
         instruction: String = "make concise",

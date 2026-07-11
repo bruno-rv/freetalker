@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import Testing
 @testable import FreeTalker
 
@@ -30,6 +31,20 @@ import Testing
         #expect(VoiceEditPreviewAccessibility.proposedLabel == "Proposed replacement text")
         #expect(VoiceEditPreviewAccessibility.replaceHint.contains("revalidates"))
         #expect(VoiceEditPreviewAccessibility.copyHint.contains("does not replace"))
+    }
+
+    @Test func previewWindowDoesNotActivateFreeTalkerOrStealFrontmostOwnership() {
+        let presentation = VoiceEditPreviewWindowPresentation.make()
+        #expect(presentation.styleMask.contains(.nonactivatingPanel))
+        #expect(presentation.becomesKeyOnlyIfNeeded)
+        #expect(!presentation.activatesApplication)
+    }
+
+    @Test func snippetStoreInitializationFailureIsVisibleAndRecoverable() {
+        let presentation = SnippetStoreAvailabilityPresentation.failure("database unavailable")
+        #expect(presentation.message.contains("database unavailable"))
+        #expect(presentation.message.contains("local"))
+        #expect(presentation.showsRetry)
     }
 
     @Test func targetDriftMessageKeepsCopyRecoveryAccurate() {

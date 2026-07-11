@@ -48,16 +48,45 @@ enum SnippetEditorPresentation {
     }
 }
 
+struct SnippetStoreAvailabilityPresentation: Equatable {
+    let message: String
+    let showsRetry: Bool
+
+    static func failure(_ detail: String) -> Self {
+        Self(
+            message: "The local snippet storage is unavailable: \(detail). Check that FreeTalker can write to Application Support, then retry.",
+            showsRetry: true
+        )
+    }
+}
+
 struct SnippetsSettingsView: View {
-    let store: SnippetStore
+    let store: SnippetStore?
+    let initializationError: String?
+    let retry: () -> Void
     @State private var snippets: [Snippet] = []
     @State private var selectedID: String?
     @State private var draft = SnippetDraft()
     @State private var errorMessage: String?
     @State private var pendingDelete: Snippet?
 
+    init(store: SnippetStore?, initializationError: String? = nil, retry: @escaping () -> Void = {}) {
+        self.store = store
+        self.initializationError = initializationError
+        self.retry = retry
+    }
+
     var body: some View {
-        HSplitView {
+        VStack(alignment: .leading, spacing: 12) {
+            if let initializationError {
+                let availability = SnippetStoreAvailabilityPresentation.failure(initializationError)
+                Label(availability.message, systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.red)
+                if availability.showsRetry {
+                    Button("Retry local snippet storage", action: retry)
+                }
+            }
+            HSplitView {
             VStack(alignment: .leading) {
                 List(selection: $selectedID) {
                     ForEach(snippets) { snippet in Text(snippet.name).tag(snippet.id as String?) }
@@ -97,6 +126,8 @@ struct SnippetsSettingsView: View {
                 }
             }
             .frame(minWidth: 320)
+            }
+            .disabled(store == nil)
         }
         .task { await reload() }
         .onChange(of: selectedID) { _, id in
@@ -121,6 +152,7 @@ struct SnippetsSettingsView: View {
     }
 
     private func reload(select id: String? = nil) async {
+        guard let store else { return }
         do {
             snippets = try await store.snippets()
             if let id { selectedID = id }
@@ -130,7 +162,7 @@ struct SnippetsSettingsView: View {
     }
 
     private func save() {
-        guard draft.validationMessage == nil else { return }
+        guard draft.validationMessage == nil, let store else { return }
         let id = selectedID
         let draft = draft
         Task {
@@ -158,7 +190,7 @@ struct SnippetsSettingsView: View {
     }
 
     private func deletePending() {
-        guard let snippet = pendingDelete else { return }
+        guard let snippet = pendingDelete, let store else { return }
         pendingDelete = nil
         Task {
             do {

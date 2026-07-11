@@ -7,6 +7,20 @@ enum VoiceEditPreviewAccessibility {
     static let copyHint = "Copies the proposed text and does not replace the selection"
 }
 
+struct VoiceEditPreviewWindowPresentation {
+    let styleMask: NSWindow.StyleMask
+    let becomesKeyOnlyIfNeeded: Bool
+    let activatesApplication: Bool
+
+    static func make() -> Self {
+        Self(
+            styleMask: [.titled, .closable, .resizable, .nonactivatingPanel],
+            becomesKeyOnlyIfNeeded: true,
+            activatesApplication: false
+        )
+    }
+}
+
 struct VoiceEditPreviewView: View {
     @ObservedObject var coordinator: VoiceEditCoordinator
     let onDismiss: () -> Void

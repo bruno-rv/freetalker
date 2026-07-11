@@ -27,3 +27,15 @@
 edits to expose the original selection, disable stale replacement, and provide the requested
 keyboard/VoiceOver presentation. The unrelated pre-existing deletions of Task 1 and Task 2 reports
 were not staged or committed.
+
+## Review follow-up
+
+- Replaced the activating preview window with a nonactivating `NSPanel`, preserving the original
+  frontmost target while retaining explicit keyboard and button actions. Selection replacement
+  still performs the full double target/range/fingerprint revalidation.
+- Unified dictation and Voice Edit audio ownership behind one mutually exclusive capture gate.
+- Preserved snippet-store initialization errors, exposed retry guidance in Settings, and made an
+  unavailable store a typed Voice Edit failure that cannot fall through to local generation.
+- RED: focused tests failed on missing preview ownership, capture ownership, and storage failure APIs.
+- GREEN: focused review regression suite passed 42 tests in 3 suites; full `make test` passed
+  169 tests in 17 suites.
