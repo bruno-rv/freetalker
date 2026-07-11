@@ -95,6 +95,60 @@ import Testing
         await #expect(throws: CancellationError.self) { try await task.value }
         await backend.waitUntilCancelled()
     }
+
+    @Test func diarizerDrainsUncancellableBackendAndSuppressesProgressAndResultAfterCancellation() async throws {
+        let release = ReleaseProbe()
+        let backend = UncancellableDiarizerBackend(release: release)
+        let progress = LockedValues<Double>()
+        let completion = CompletionProbe()
+        let task = Task {
+            defer { completion.markComplete() }
+            return try await FluidAudioDiarizer(backend: backend).diarizeFile(
+                at: URL(fileURLWithPath: "/tmp/long.wav"),
+                progress: { progress.append($0) }
+            )
+        }
+        await backend.waitUntilStarted()
+        backend.report(0.25)
+
+        task.cancel()
+        backend.report(0.75)
+        await Task.yield()
+        #expect(!completion.isComplete)
+        #expect(progress.values == [0, 0.25])
+        #expect(!release.wasReleased)
+
+        backend.drain(returning: [.init(speakerID: "S1", start: 0, end: 1)])
+        await #expect(throws: CancellationError.self) { try await task.value }
+        #expect(completion.isComplete)
+        #expect(release.wasReleased)
+        #expect(progress.values == [0, 0.25])
+    }
+
+    @Test func modelPreparationSharesConcurrentFirstUsePerDirectory() async throws {
+        let coordinator = FluidAudioModelPreparationCoordinator<Int>()
+        let loader = ModelLoaderProbe(results: [.success(42)])
+        let directory = URL(fileURLWithPath: "/tmp/models")
+
+        async let first = coordinator.model(for: directory) { try await loader.load() }
+        async let second = coordinator.model(for: directory) { try await loader.load() }
+
+        #expect(try await (first, second) == (42, 42))
+        #expect(await loader.calls == 1)
+    }
+
+    @Test func modelPreparationFailureIsRetryableAndDoesNotPoisonCache() async throws {
+        let coordinator = FluidAudioModelPreparationCoordinator<Int>()
+        let expected = AdapterProbeError.modelUnavailable("download failed")
+        let loader = ModelLoaderProbe(results: [.failure(expected), .success(7)])
+        let directory = URL(fileURLWithPath: "/tmp/models")
+
+        await #expect(throws: expected) {
+            try await coordinator.model(for: directory) { try await loader.load() }
+        }
+        #expect(try await coordinator.model(for: directory) { try await loader.load() } == 7)
+        #expect(await loader.calls == 2)
+    }
 }
 
 private enum AdapterProbeError: Error, Equatable { case modelUnavailable(String) }
@@ -148,4 +202,67 @@ private final class LockedValues<Value: Sendable>: @unchecked Sendable {
     private var storage: [Value] = []
     var values: [Value] { lock.withLock { storage } }
     func append(_ value: Value) { lock.withLock { storage.append(value) } }
+}
+
+private final class CompletionProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var complete = false
+    var isComplete: Bool { lock.withLock { complete } }
+    func markComplete() { lock.withLock { complete = true } }
+}
+
+private final class ReleaseProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var released = false
+    var wasReleased: Bool { lock.withLock { released } }
+    func markReleased() { lock.withLock { released = true } }
+}
+
+private final class HeldResource: @unchecked Sendable {
+    let release: ReleaseProbe
+    init(release: ReleaseProbe) { self.release = release }
+    deinit { release.markReleased() }
+}
+
+private final class UncancellableDiarizerBackend: SpeakerDiarizationBackend, @unchecked Sendable {
+    private struct State {
+        var started = false
+        var continuation: CheckedContinuation<[RawSpeakerTurn], Never>?
+        var progress: (@Sendable (Double) -> Void)?
+    }
+    private let state = NSLock()
+    private var storage = State()
+    private let release: ReleaseProbe
+    init(release: ReleaseProbe) { self.release = release }
+    func diarizeFile(at url: URL, progress: @escaping @Sendable (Double) -> Void) async throws -> [RawSpeakerTurn] {
+        let resource = HeldResource(release: release)
+        defer { _fixLifetime(resource) }
+        return await withCheckedContinuation { continuation in
+            state.withLock {
+                storage.started = true
+                storage.progress = progress
+                storage.continuation = continuation
+            }
+        }
+    }
+    func waitUntilStarted() async { while !state.withLock({ storage.started }) { await Task.yield() } }
+    func report(_ value: Double) { state.withLock { storage.progress }?(value) }
+    func drain(returning turns: [RawSpeakerTurn]) {
+        let continuation = state.withLock { () -> CheckedContinuation<[RawSpeakerTurn], Never>? in
+            defer { storage.continuation = nil; storage.progress = nil }
+            return storage.continuation
+        }
+        continuation?.resume(returning: turns)
+    }
+}
+
+private actor ModelLoaderProbe {
+    private var results: [Result<Int, AdapterProbeError>]
+    private(set) var calls = 0
+    init(results: [Result<Int, AdapterProbeError>]) { self.results = results }
+    func load() async throws -> Int {
+        calls += 1
+        await Task.yield()
+        return try results.removeFirst().get()
+    }
 }

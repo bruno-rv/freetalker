@@ -17,7 +17,11 @@ protocol SpeakerDiarizationBackend: Sendable {
 }
 
 private final class MonotonicProgress: @unchecked Sendable {
-    private let value = OSAllocatedUnfairLock(initialState: 0.0)
+    private struct State {
+        var value = 0.0
+        var cancelled = false
+    }
+    private let state = OSAllocatedUnfairLock(initialState: State())
     private let sink: @Sendable (Double) -> Void
 
     init(sink: @escaping @Sendable (Double) -> Void) {
@@ -25,12 +29,49 @@ private final class MonotonicProgress: @unchecked Sendable {
     }
 
     func report(_ candidate: Double) {
-        let next = value.withLock { current in
-            let normalized = min(1, max(0, candidate.isFinite ? candidate : current))
-            current = max(current, normalized)
-            return current
+        state.withLock { current in
+            guard !current.cancelled else { return }
+            let normalized = min(1, max(0, candidate.isFinite ? candidate : current.value))
+            current.value = max(current.value, normalized)
+            sink(current.value)
         }
-        sink(next)
+    }
+
+    func cancel() { state.withLock { $0.cancelled = true } }
+    var isCancelled: Bool { state.withLock { $0.cancelled } }
+}
+
+actor FluidAudioModelPreparationCoordinator<Model: Sendable> {
+    private struct InFlight: Sendable {
+        let id: UUID
+        let task: Task<Model, Error>
+    }
+
+    private var prepared: [URL: Model] = [:]
+    private var inFlight: [URL: InFlight] = [:]
+
+    func model(
+        for directory: URL,
+        loader: @escaping @Sendable () async throws -> Model
+    ) async throws -> Model {
+        let key = directory.standardizedFileURL
+        if let model = prepared[key] { return model }
+        if let pending = inFlight[key] { return try await pending.task.value }
+
+        let id = UUID()
+        let task = Task { try await loader() }
+        inFlight[key] = InFlight(id: id, task: task)
+        do {
+            let model = try await task.value
+            if inFlight[key]?.id == id {
+                inFlight.removeValue(forKey: key)
+                prepared[key] = model
+            }
+            return model
+        } catch {
+            if inFlight[key]?.id == id { inFlight.removeValue(forKey: key) }
+            throw error
+        }
     }
 }
 
@@ -45,10 +86,18 @@ struct FluidAudioDiarizer<Backend: SpeakerDiarizationBackend>: SpeakerDiarizing 
         let monotonic = MonotonicProgress(sink: progress)
         monotonic.report(0)
         try Task.checkCancellation()
-        let raw = try await withPromptCancellation {
-            try await backend.diarizeFile(at: url) { monotonic.report($0) }
+        let raw: [RawSpeakerTurn]
+        do {
+            raw = try await withTaskCancellationHandler {
+                try await backend.diarizeFile(at: url) { monotonic.report($0) }
+            } onCancel: {
+                monotonic.cancel()
+            }
+        } catch {
+            if monotonic.isCancelled { throw CancellationError() }
+            throw error
         }
-        try Task.checkCancellation()
+        if monotonic.isCancelled { throw CancellationError() }
         return try raw.enumerated().map { index, turn in
             guard !turn.speakerID.isEmpty, turn.start.isFinite, turn.end.isFinite,
                   turn.start >= 0, turn.end > turn.start else {
@@ -66,6 +115,7 @@ extension FluidAudioDiarizer where Backend == FluidAudioBackend {
 }
 
 struct FluidAudioBackend: SpeakerDiarizationBackend {
+    private static let modelCoordinator = FluidAudioModelPreparationCoordinator<OfflineDiarizerModels>()
     private let modelsDirectory: URL
 
     init(modelsDirectory: URL = Self.defaultModelsDirectory) {
@@ -75,8 +125,10 @@ struct FluidAudioBackend: SpeakerDiarizationBackend {
     func diarizeFile(at url: URL, progress: @escaping @Sendable (Double) -> Void) async throws -> [RawSpeakerTurn] {
         try Task.checkCancellation()
         let manager = OfflineDiarizerManager()
-        let models = try await OfflineDiarizerModels.load(from: modelsDirectory) { update in
-            progress(update.fractionCompleted * 0.5)
+        let models = try await Self.modelCoordinator.model(for: modelsDirectory) {
+            try await OfflineDiarizerModels.load(from: modelsDirectory) { update in
+                progress(update.fractionCompleted * 0.5)
+            }
         }
         try Task.checkCancellation()
         manager.initialize(models: models)

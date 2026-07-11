@@ -1,5 +1,4 @@
 import Foundation
-import os
 
 protocol TimestampedTranscribing: Sendable {
     func transcribeFile(at url: URL, language: String?, model: String) async throws -> [TranscriptSegment]
@@ -35,79 +34,6 @@ enum MediaAdapterError: Error, Equatable, LocalizedError {
     }
 }
 
-private final class PromptCancellationGate<Value: Sendable>: @unchecked Sendable {
-    private struct State {
-        var continuation: CheckedContinuation<Value, Error>?
-        var task: Task<Void, Never>?
-        var result: Result<Value, Error>?
-        var cancelled = false
-    }
-
-    private let state = OSAllocatedUnfairLock(initialState: State())
-
-    func start(_ operation: @escaping @Sendable () async throws -> Value) {
-        let task = Task {
-            let result: Result<Value, Error>
-            do { result = .success(try await operation()) }
-            catch { result = .failure(error) }
-            finish(result)
-        }
-        let cancelled = state.withLock { current in
-            current.task = task
-            return current.cancelled
-        }
-        if cancelled { task.cancel() }
-    }
-
-    func wait() async throws -> Value {
-        try await withCheckedThrowingContinuation { continuation in
-            let immediate = state.withLock { current -> Result<Value, Error>? in
-                if current.cancelled { return .failure(CancellationError()) }
-                if let result = current.result { return result }
-                current.continuation = continuation
-                return nil
-            }
-            if let immediate { continuation.resume(with: immediate) }
-        }
-    }
-
-    func cancel() {
-        let values = state.withLock { current -> (Task<Void, Never>?, CheckedContinuation<Value, Error>?) in
-            guard !current.cancelled, current.result == nil else { return (nil, nil) }
-            current.cancelled = true
-            let continuation = current.continuation
-            current.continuation = nil
-            return (current.task, continuation)
-        }
-        values.0?.cancel()
-        values.1?.resume(throwing: CancellationError())
-    }
-
-    private func finish(_ result: Result<Value, Error>) {
-        let continuation = state.withLock { current -> CheckedContinuation<Value, Error>? in
-            guard !current.cancelled, current.result == nil else { return nil }
-            current.result = result
-            let continuation = current.continuation
-            current.continuation = nil
-            return continuation
-        }
-        continuation?.resume(with: result)
-    }
-}
-
-func withPromptCancellation<Value: Sendable>(
-    _ operation: @escaping @Sendable () async throws -> Value
-) async throws -> Value {
-    try Task.checkCancellation()
-    let gate = PromptCancellationGate<Value>()
-    gate.start(operation)
-    return try await withTaskCancellationHandler {
-        try await gate.wait()
-    } onCancel: {
-        gate.cancel()
-    }
-}
-
 struct TimestampedWhisperTranscriber<Backend: WhisperFileTranscriptionBackend>: TimestampedTranscribing {
     private let backend: Backend
 
@@ -118,7 +44,7 @@ struct TimestampedWhisperTranscriber<Backend: WhisperFileTranscriptionBackend>: 
     func transcribeFile(at url: URL, language: String?, model: String) async throws -> [TranscriptSegment] {
         try Task.checkCancellation()
         let request = WhisperFileRequest(url: url, language: language, model: model)
-        let raw = try await withPromptCancellation { try await backend.transcribeFile(request) }
+        let raw = try await backend.transcribeFile(request)
         try Task.checkCancellation()
         return try raw.enumerated().map { index, segment in
             guard segment.start.isFinite, segment.end.isFinite,
