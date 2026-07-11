@@ -231,6 +231,7 @@ enum SelfCheck {
             failures.append(contentsOf: cloudSTTErrorChecks())
             failures.append(contentsOf: speechModelCatalogChecks())
             failures.append(contentsOf: speechModelSettingsChecks())
+            failures.append(contentsOf: await speechModelManagementChecks())
 
             if failures.isEmpty {
                 print("SelfCheck PASSED (template seeding, FTS round-trip, pipeline contract, mic device enumeration, hotkey spec/matcher, vocabulary normalization/injection, app rule resolution, paste-target drift, prompt app-name sanitization, live preview gating/availability, SerialGate cancellation, preview early-cancel decisions, built-in template prompt upgrade (incl. v3->v4 Spoken Commands), LLM provider defaults, BYOK Keychain key migration, global cloud-selection routing, BYOK connection-test status-code mapping/config gating, hands-free recording state machine/esc/cap-clamp/cancel, Library deletion: per-row/Delete All/latestDictation tiebreak/dangling source_id/secure_delete/unfiltered total count, SQLite step classification (readAll/dictationExists error propagation), WAL checkpoint busy path, debug-audio purge scoping (incl. directory-named-*.wav skip, unreadable-directory error), LibraryStore privacy-step-then-always sequencing, Redo Last gating/spec-constraints/matcher/result message/spec validation, Language Pin resolution (precedence/invalid-fallthrough/normalization), unified App Rules row join/removal, Recording Panel action routing (button×state incl. stale-click no-ops)/template-cycle order, one-shot language lifecycle (set/toggle/clear), Raw path (post-processor not invoked, refined==transcript, reserved template name recorded), Raw Transcript reserved-name rejection/load-time rename, Cloud STT error status classification)")
@@ -2562,6 +2563,87 @@ enum SelfCheck {
             failures.append("badResponse.errorDescription: expected the status and classified hint, got \"\(description)\"")
         }
 
+        return failures
+    }
+
+    @MainActor
+    private static func speechModelManagementChecks() async -> [String] {
+        var failures: [String] = []
+        let fm = FileManager.default
+        let base = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? fm.removeItem(at: base) }
+        let variant = SpeechModelCatalog.entries[0].id
+        let repoRoot = SpeechModelStore.repositoryRoot(baseURL: base)
+        let directory = SpeechModelStore.variantDirectory(for: variant, baseURL: base)
+        if directory != repoRoot.appendingPathComponent(variant, isDirectory: true)
+            || directory == repoRoot || !SpeechModelStore.isSafeVariantDirectory(directory, baseURL: base) {
+            failures.append("speech model resolver: mapping/containment mismatch")
+        }
+        if SpeechModelStore.isSafeVariantDirectory(repoRoot, baseURL: base)
+            || SpeechModelStore.isSafeVariantDirectory(base.appendingPathComponent("outside"), baseURL: base) {
+            failures.append("speech model resolver: accepted root/outside target")
+        }
+
+        do {
+            if SpeechModelStore.inspectVariant(variant, baseURL: base).downloaded {
+                failures.append("speech model detection: missing directory counted as downloaded")
+            }
+            try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+            try Data([1, 2, 3]).write(to: directory.appendingPathComponent("junk.bin"))
+            if SpeechModelStore.inspectVariant(variant, baseURL: base).downloaded {
+                failures.append("speech model detection: junk-only directory counted as downloaded")
+            }
+            for artifact in SpeechModelStore.requiredArtifacts {
+                let artifactDirectory = directory.appendingPathComponent(artifact, isDirectory: true)
+                try fm.createDirectory(at: artifactDirectory, withIntermediateDirectories: true)
+                try Data(repeating: 1, count: 7).write(to: artifactDirectory.appendingPathComponent("data"))
+            }
+            let inspection = SpeechModelStore.inspectVariant(variant, baseURL: base)
+            if !inspection.downloaded || inspection.sizeBytes != Int64(3 + 7 * SpeechModelStore.requiredArtifacts.count) {
+                failures.append("speech model detection: artifacts/recursive size mismatch")
+            }
+            let sibling = repoRoot.appendingPathComponent("sibling", isDirectory: true)
+            try fm.createDirectory(at: sibling, withIntermediateDirectories: true)
+            try Data([9]).write(to: sibling.appendingPathComponent("keep"))
+            try SpeechModelStore.deleteVariantDirectory(variant, baseURL: base)
+            if fm.fileExists(atPath: directory.path) || !fm.fileExists(atPath: sibling.path) {
+                failures.append("speech model deletion: target/sibling scope mismatch")
+            }
+        } catch {
+            failures.append("speech model filesystem checks threw: \(error)")
+        }
+
+        if SpeechModelStore.canDelete(phase: .downloaded, active: false)
+            != true || SpeechModelStore.canDelete(phase: .downloaded, active: true)
+            || SpeechModelStore.canDelete(phase: .downloading(0.5), active: false)
+            || SpeechModelStore.canDelete(phase: .busy(reloadTarget: variant), active: false) {
+            failures.append("speech model deletion: eligibility mismatch")
+        }
+
+        let coordinator = SpeechModelDownloadCoordinator()
+        let started = OneShotSignal()
+        let release = OneShotSignal()
+        let first = Task {
+            try await coordinator.download(variant: variant) { _, _ in
+                await started.fire()
+                await release.wait()
+                return base
+            }
+        }
+        await started.wait()
+        do {
+            _ = try await coordinator.download(variant: "other") { _, _ in base }
+            failures.append("speech model coordinator: contention was queued/accepted")
+        } catch SpeechModelDownloadCoordinator.Error.busy(let active) {
+            if active != variant { failures.append("speech model coordinator: wrong active variant") }
+        } catch {
+            failures.append("speech model coordinator: unexpected contention error \(error)")
+        }
+        await release.fire()
+        _ = try? await first.value
+        if await coordinator.activeVariant != nil {
+            failures.append("speech model coordinator: active slot not released")
+        }
         return failures
     }
 }
