@@ -23,6 +23,9 @@ enum DatabaseMigrator {
                 if version == 5 {
                     try migrateLegacySnippetRows(db)
                 }
+                if version == 9 {
+                    try migrateAttemptTriggersV9(db)
+                }
                 try execute(db, "INSERT INTO schema_migrations (version) VALUES (\(version));")
             }
 
@@ -214,12 +217,44 @@ enum DatabaseMigrator {
          language, speech_model, template, result)
     SELECT id, job_id, attempt_number, started_at, completed_at, failure_stage, failure_message,
            language, speech_model, template, result
-    FROM legacy_job_attempts;
-    DROP TABLE legacy_job_attempts;
-    CREATE INDEX idx_job_attempts_job_id ON job_attempts(job_id);
+    FROM legacy_job_attempts AS attempt
+    WHERE EXISTS (SELECT 1 FROM transcription_jobs AS job WHERE job.id = attempt.job_id);
     """
 
     private static let migrations = [migration1, migration2, migration3, migration4, migration5, migration6, migration7, migration8, migration9]
+
+    private static func migrateAttemptTriggersV9(_ db: OpaquePointer) throws {
+        if try tableExists("job_attempt_triggers", db: db) {
+            try execute(db, """
+        ALTER TABLE job_attempt_triggers RENAME TO legacy_job_attempt_triggers;
+        CREATE TABLE job_attempt_triggers (
+            attempt_id INTEGER NOT NULL,
+            trigger TEXT NOT NULL,
+            PRIMARY KEY (attempt_id, trigger),
+            FOREIGN KEY (attempt_id) REFERENCES job_attempts(id) ON DELETE CASCADE
+        );
+        INSERT INTO job_attempt_triggers (attempt_id, trigger)
+        SELECT legacy.attempt_id, legacy.trigger
+        FROM legacy_job_attempt_triggers AS legacy
+        JOIN job_attempts AS attempt ON attempt.id = legacy.attempt_id;
+        DROP TABLE legacy_job_attempt_triggers;
+        CREATE INDEX idx_job_attempt_triggers_attempt_id ON job_attempt_triggers(attempt_id);
+        """)
+        }
+        try execute(db, """
+        DROP TABLE legacy_job_attempts;
+        CREATE INDEX idx_job_attempts_job_id ON job_attempts(job_id);
+        """)
+    }
+
+    private static func tableExists(_ name: String, db: OpaquePointer) throws -> Bool {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?;", -1, &statement, nil) == SQLITE_OK,
+              let statement else { throw DatabaseError.sqlFailed(lastError(db)) }
+        defer { sqlite3_finalize(statement) }
+        bind(name, at: 1, to: statement)
+        return sqlite3_step(statement) == SQLITE_ROW
+    }
 
     private static func migrateLegacySnippetRows(_ db: OpaquePointer) throws {
         var select: OpaquePointer?
