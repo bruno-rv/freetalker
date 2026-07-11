@@ -317,7 +317,7 @@ final class ModelReloadController<Kit>: @unchecked Sendable {
     }
 }
 
-final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked Sendable {
+final class WhisperKitEngine: ObservableObject, TranscriptionEngine, WhisperFileTranscriptionBackend, @unchecked Sendable {
     let name = "WhisperKit"
     @MainActor @Published private(set) var statusText: String = "Not loaded"
 
@@ -382,6 +382,39 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
     /// `allowEarlyCancel: false`; see the overload above.
     func transcribe(samples: [Float], forcedLanguage: String?) async throws -> TranscriptionOutput {
         try await transcribe(samples: samples, forcedLanguage: forcedLanguage, allowEarlyCancel: false)
+    }
+
+    func transcribeFile(_ request: WhisperFileRequest) async throws -> [RawTranscriptSegment] {
+        let cancelFlag = OSAllocatedUnfairLock(initialState: false)
+        return try await withTaskCancellationHandler {
+            try await gate.run {
+                try Task.checkCancellation()
+                let kit = try await self.kitForFileTranscription(model: request.model)
+                try Task.checkCancellation()
+                var options = DecodingOptions()
+                options.language = request.language
+                options.usePrefillPrompt = true
+                options.detectLanguage = request.language == nil
+                let callback: TranscriptionCallback = { _ in
+                    Self.earlyStopDecision(cancelled: cancelFlag.withLock { $0 })
+                }
+                let results = try await kit.transcribe(
+                    audioPath: request.url.path,
+                    decodeOptions: options,
+                    callback: callback
+                )
+                if cancelFlag.withLock({ $0 }) { throw CancellationError() }
+                return results.flatMap(\.segments).map {
+                    RawTranscriptSegment(
+                        start: TimeInterval($0.start),
+                        end: TimeInterval($0.end),
+                        text: $0.text
+                    )
+                }
+            }
+        } onCancel: {
+            cancelFlag.withLock { $0 = true }
+        }
     }
 
     /// Pure decision for the preview-only early-stop `TranscriptionCallback` WhisperKit invokes
@@ -501,6 +534,21 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
     private func kitForTranscription() async throws -> WhisperKit {
         if let kit = modelController.state.capturedKit() { return kit }
         return try await loadedKit()
+    }
+
+    private func kitForFileTranscription(model: String) async throws -> WhisperKit {
+        let snapshot = modelController.state.snapshot()
+        if snapshot.variant == model, let kit = snapshot.kit { return kit }
+        do {
+            let kit = try await loadModel(variant: model, reload: nil)
+            progressGuard.finishCurrent(variant: model)
+            await emit(.downloaded, for: model, reload: nil)
+            await setReadyStatus()
+            return kit
+        } catch {
+            await emit(.failed(hint: error.localizedDescription), for: model, reload: nil)
+            throw error
+        }
     }
 
     private func loadedKit() async throws -> WhisperKit {
