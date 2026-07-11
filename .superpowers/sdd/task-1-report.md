@@ -146,3 +146,52 @@ Result: exit 0; 36 tests in 4 suites passed, the release build completed, and
 ### Concerns
 
 None.
+
+## Final review follow-up: atomic purge-claim versus retry-attempt arbitration
+
+### RED
+
+Added a two-connection, on-disk SQLite test covering both deterministic orderings. The focused
+suite exited 1 because the store did not yet expose a distinct claimed error:
+
+```text
+error: type 'JobStoreError' has no member 'purgeClaimed'
+```
+
+### GREEN
+
+`beginAttempt` now uses one `INSERT ... SELECT` whose parent-row predicate requires
+`purge_claimed_at IS NULL`; a zero-row insert is classified as `jobNotFound`, `purgeClaimed`,
+or `invalidTransition`. Purge claiming's single `UPDATE ... RETURNING` now excludes jobs with
+an unfinished attempt. Therefore SQLite write serialization chooses exactly one winner across
+separate store actors and connections.
+
+Focused command:
+
+```text
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter RecoveryStorageTests
+```
+
+Result: exit 0; 15 recovery tests passed.
+
+Full command:
+
+```text
+make test && DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build -c release && git diff --check
+```
+
+Result: exit 0; 37 tests in 4 suites passed, the release build completed, and the diff check
+produced no output.
+
+### Self-review
+
+- Claim-first produces one persistent claim, a distinct `purgeClaimed` attempt failure, and no
+  attempt row.
+- Attempt-first produces one unfinished attempt and no purge claim.
+- Attempt numbering remains computed inside the insert statement, eliminating the prior
+  max-number/read gap as well.
+- Existing missing-job and ordinary invalid-state errors remain distinct from `purgeClaimed`.
+
+### Concerns
+
+None.
