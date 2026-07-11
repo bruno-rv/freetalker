@@ -107,6 +107,90 @@ import Testing
         settings = AppSettings(defaults: defaults)
         #expect(settings?.localContextScope == .activeWindow)
     }
+
+    @Test func invalidPersistedScopeIsNormalizedToOff() {
+        let suite = "LocalContextProviderTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set("future-invalid-scope", forKey: "localContextScope")
+
+        let settings = AppSettings(defaults: defaults)
+
+        #expect(settings.localContextScope == .off)
+        #expect(defaults.string(forKey: "localContextScope") == LocalContextScope.off.rawValue)
+    }
+
+    @Test func captureUsesOneApplicationSnapshotPIDForAllAXReads() {
+        let adapter = FakeAccessibilityContext(
+            identity: .init(appName: "Original", bundleID: "original.app", pid: 41),
+            activeWindow: .init(title: "Original window", visibleText: "Original content")
+        )
+        adapter.identityAfterFirstRead = .init(appName: "Changed", bundleID: "changed.app", pid: 99)
+        let provider = AccessibilityLocalContextProvider(accessibility: adapter)
+
+        let capture = provider.capture(scope: .activeWindow)
+
+        #expect(capture.context.appName == "Original")
+        #expect(capture.context.text == "Original content")
+        #expect(adapter.requestedPIDs == [41])
+        #expect(adapter.calls.filter { $0 == .identity }.count == 1)
+    }
+}
+
+@MainActor
+@Suite struct AccessibilityTreeReaderTests {
+    @Test func cycleVisitsEveryNodeAtMostOnce() {
+        let adapter = FakeNodeAdapter(nodes: [
+            1: .init(text: "one", children: [2]),
+            2: .init(text: "two", children: [1])
+        ])
+        let reader = AccessibilityTreeReader(adapter: adapter)
+
+        let text = reader.visibleText(root: 1)
+
+        #expect(text == "one\ntwo")
+        #expect(adapter.childrenReads == 2)
+    }
+
+    @Test func deepTreeStopsAtMaximumDepthWithoutRecursion() {
+        var nodes: [Int: FakeNodeAdapter.Record] = [:]
+        for id in 0...10_000 {
+            nodes[id] = .init(text: id == AccessibilityTreeReader<FakeNodeAdapter>.maxDepth ? "last" : nil,
+                              children: id == 10_000 ? [] : [id + 1])
+        }
+        let adapter = FakeNodeAdapter(nodes: nodes)
+        let reader = AccessibilityTreeReader(adapter: adapter)
+
+        let text = reader.visibleText(root: 0)
+
+        #expect(text == "last")
+        #expect(adapter.identityReads == AccessibilityTreeReader<FakeNodeAdapter>.maxDepth + 1)
+    }
+
+    @Test func hugeTextlessTreeStopsAtNodeBudget() {
+        let children = Array(1...10_000)
+        var nodes = Dictionary(uniqueKeysWithValues: children.map { ($0, FakeNodeAdapter.Record(text: nil, children: [])) })
+        nodes[0] = .init(text: nil, children: children)
+        let adapter = FakeNodeAdapter(nodes: nodes)
+        let reader = AccessibilityTreeReader(adapter: adapter)
+
+        #expect(reader.visibleText(root: 0).isEmpty)
+        #expect(adapter.identityReads == AccessibilityTreeReader<FakeNodeAdapter>.maxNodes)
+    }
+
+    @Test func characterCapStopsFurtherNodeReads() {
+        let adapter = FakeNodeAdapter(nodes: [
+            1: .init(text: String(repeating: "x", count: AccessibilityTreeReader<FakeNodeAdapter>.maxCharacters), children: [2]),
+            2: .init(text: "must not be read", children: [])
+        ])
+        let reader = AccessibilityTreeReader(adapter: adapter)
+
+        let text = reader.visibleText(root: 1)
+
+        #expect(text.count == AccessibilityTreeReader<FakeNodeAdapter>.maxCharacters)
+        #expect(adapter.identityReads == 1)
+        #expect(adapter.childrenReads == 0)
+    }
 }
 
 @MainActor
@@ -114,15 +198,17 @@ private final class FakeAccessibilityContext: AccessibilityContextProviding {
     enum Call: Equatable { case identity, permission, selectedText, focusedField, activeWindow, windowMetadata }
 
     let trusted: Bool
-    let identityValue: AccessibilityAppIdentity
+    var identityValue: AccessibilityAppIdentity
+    var identityAfterFirstRead: AccessibilityAppIdentity?
     let selectedTextValue: String?
     let focusedFieldValue: AccessibilityFocusedField?
     let activeWindowValue: AccessibilityWindow?
     var calls: [Call] = []
+    var requestedPIDs: [pid_t] = []
 
     init(
         trusted: Bool = true,
-        identity: AccessibilityAppIdentity = .init(appName: nil, bundleID: nil),
+        identity: AccessibilityAppIdentity = .init(appName: nil, bundleID: nil, pid: 0),
         selectedText: String? = nil,
         focusedField: AccessibilityFocusedField? = nil,
         activeWindow: AccessibilityWindow? = nil
@@ -134,13 +220,34 @@ private final class FakeAccessibilityContext: AccessibilityContextProviding {
         activeWindowValue = activeWindow
     }
 
-    func frontmostAppIdentity() -> AccessibilityAppIdentity { calls.append(.identity); return identityValue }
+    func frontmostAppIdentity() -> AccessibilityAppIdentity {
+        calls.append(.identity)
+        defer { if let identityAfterFirstRead { identityValue = identityAfterFirstRead } }
+        return identityValue
+    }
     func isTrusted() -> Bool { calls.append(.permission); return trusted }
-    func selectedText() -> String? { calls.append(.selectedText); return selectedTextValue }
-    func focusedField() -> AccessibilityFocusedField? { calls.append(.focusedField); return focusedFieldValue }
-    func activeWindow() -> AccessibilityWindow? { calls.append(.activeWindow); return activeWindowValue }
-    func activeWindowMetadata() -> AccessibilityWindowMetadata? {
+    func selectedText(pid: pid_t) -> String? { calls.append(.selectedText); requestedPIDs.append(pid); return selectedTextValue }
+    func focusedField(pid: pid_t) -> AccessibilityFocusedField? { calls.append(.focusedField); requestedPIDs.append(pid); return focusedFieldValue }
+    func activeWindow(pid: pid_t) -> AccessibilityWindow? { calls.append(.activeWindow); requestedPIDs.append(pid); return activeWindowValue }
+    func activeWindowMetadata(pid: pid_t) -> AccessibilityWindowMetadata? {
         calls.append(.windowMetadata)
+        requestedPIDs.append(pid)
         return activeWindowValue.map { .init(title: $0.title) }
     }
+}
+
+@MainActor
+private final class FakeNodeAdapter: AccessibilityNodeAdapting {
+    typealias Node = Int
+    typealias Identity = Int
+    struct Record { let text: String?; let children: [Int] }
+    let nodes: [Int: Record]
+    var identityReads = 0
+    var childrenReads = 0
+
+    init(nodes: [Int: Record]) { self.nodes = nodes }
+    func identity(of node: Int) -> Int { identityReads += 1; return node }
+    func isSecure(_ node: Int) -> Bool { false }
+    func visibleText(of node: Int) -> String? { nodes[node]?.text }
+    func children(of node: Int) -> [Int] { childrenReads += 1; return nodes[node]?.children ?? [] }
 }

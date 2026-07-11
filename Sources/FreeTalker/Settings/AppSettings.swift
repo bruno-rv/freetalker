@@ -468,7 +468,11 @@ final class AppSettings: ObservableObject {
         }
         activeTemplateID = defaults.string(forKey: Keys.activeTemplateID) ?? Template.defaultID
         recoveryRetention = RecoveryRetention(rawValue: defaults.object(forKey: Keys.recoveryRetention) as? Int ?? 7) ?? .sevenDays
-        localContextScope = LocalContextScope(rawValue: defaults.string(forKey: Keys.localContextScope) ?? "") ?? .off
+        let storedLocalContextScope = defaults.string(forKey: Keys.localContextScope)
+        localContextScope = storedLocalContextScope.flatMap(LocalContextScope.init(rawValue:)) ?? .off
+        if let storedLocalContextScope, LocalContextScope(rawValue: storedLocalContextScope) == nil {
+            defaults.set(LocalContextScope.off.rawValue, forKey: Keys.localContextScope)
+        }
         let storedHandsFreeMaxMinutes = defaults.object(forKey: Keys.handsFreeMaxMinutes) as? Int ?? 5
         handsFreeMaxMinutes = Self.clampHandsFreeMaxMinutes(storedHandsFreeMaxMinutes)
         appRules = defaults.dictionary(forKey: Keys.appRules) as? [String: String] ?? [:]
