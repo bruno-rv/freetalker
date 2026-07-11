@@ -186,6 +186,7 @@ extension TranscriptionJobStore {
             for path in paths {
                 try ownedDirectory.unlinkRegistered(path: path, source: URL(fileURLWithPath: current.source.reference), fileManager: fileManager)
             }
+            try ownedDirectory.removeCrashArtifactsAndDirectory(source: URL(fileURLWithPath: current.source.reference))
         } catch {
             let failure = try? mediaPrepare("UPDATE transcription_jobs SET deletion_error = ? WHERE id = ? AND deletion_owner = ?;")
             if let failure { mediaBind(error.localizedDescription, 1, failure); mediaBind(jobID.uuidString, 2, failure); mediaBind(deletionOwner.uuidString, 3, failure); try? mediaStep(failure); sqlite3_finalize(failure) }

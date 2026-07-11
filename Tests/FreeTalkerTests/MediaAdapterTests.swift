@@ -3,6 +3,24 @@ import Testing
 @testable import FreeTalker
 
 @Suite struct MediaAdapterTests {
+    @Test func exactReloadUsesRequestedModelInsteadOfGlobalSelection() async throws {
+        let controller = ModelReloadController<String>()
+        let loaded = AdapterStringProbe()
+        try await controller.reloadExact(to: "requested-small") { model in
+            await loaded.record(model); return model
+        } event: { _, _ in } didInstall: { _ in }
+        #expect(await loaded.values == ["requested-small"])
+        #expect(controller.state.snapshot().variant == "requested-small")
+    }
+
+    @Test func taskLocalExactModelDoesNotReplaceLiveModel() async throws {
+        let controller = ModelReloadController<String>()
+        controller.state.installIfEmpty(kit: "live-kit", variant: "global-large")
+        let recoveryKit = try await controller.exactModel(to: "recovery-small") { "kit-for-\($0)" }
+        #expect(recoveryKit == "kit-for-recovery-small")
+        #expect(controller.state.snapshot().kit == "live-kit")
+        #expect(controller.state.snapshot().variant == "global-large")
+    }
     @Test func timestampedAdapterForwardsRequestedFileLanguageAndModelAndPreservesSegments() async throws {
         let backend = WhisperBackendProbe(result: .success([
             .init(start: 0.25, end: 1.5, text: "  Hello  "),
@@ -265,4 +283,9 @@ private actor ModelLoaderProbe {
         await Task.yield()
         return try results.removeFirst().get()
     }
+}
+
+private actor AdapterStringProbe {
+    private(set) var values: [String] = []
+    func record(_ value: String) { values.append(value) }
 }

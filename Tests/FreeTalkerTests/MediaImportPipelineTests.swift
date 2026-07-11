@@ -391,6 +391,34 @@ import Testing
         #expect(try await fixture.store.job(id: job.id) == nil)
         #expect(FileManager.default.fileExists(atPath: outside.path))
     }
+
+    @Test func deletionRemovesCrashStagingAndEmptyJobDirectory() async throws {
+        let fixture = try MediaPipelineFixture()
+        let job = try await fixture.store.create(kind: .mediaImport, source: .init(reference: fixture.source.path), now: .now)
+        try FileManager.default.createDirectory(at: fixture.jobDirectory(job.id), withIntermediateDirectories: true)
+        let staging = fixture.jobDirectory(job.id).appendingPathComponent(".decode-\(UUID().uuidString).wav")
+        try Data("partial".utf8).write(to: staging)
+        try await fixture.store.transition(job.id, from: .queued, to: .cancelled)
+
+        try await fixture.store.deleteMediaImport(jobID: job.id, jobsDirectory: fixture.root)
+
+        #expect(!FileManager.default.fileExists(atPath: staging.path))
+        #expect(!FileManager.default.fileExists(atPath: fixture.jobDirectory(job.id).path))
+    }
+
+    @Test func deletionRejectsUnknownCrashArtifactWithoutTouchingIt() async throws {
+        let fixture = try MediaPipelineFixture()
+        let job = try await fixture.store.create(kind: .mediaImport, source: .init(reference: fixture.source.path), now: .now)
+        try FileManager.default.createDirectory(at: fixture.jobDirectory(job.id), withIntermediateDirectories: true)
+        let unknown = fixture.jobDirectory(job.id).appendingPathComponent(".decode-not-a-uuid.wav")
+        try Data("keep".utf8).write(to: unknown)
+        try await fixture.store.transition(job.id, from: .queued, to: .cancelled)
+
+        await #expect(throws: Error.self) { try await fixture.store.deleteMediaImport(jobID: job.id, jobsDirectory: fixture.root) }
+
+        #expect(try Data(contentsOf: unknown) == Data("keep".utf8))
+        #expect(try await fixture.store.job(id: job.id) != nil)
+    }
 }
 
 private enum PipelineTestError: Error, LocalizedError { case failed; var errorDescription: String? { "failed" } }

@@ -86,6 +86,7 @@ final class AppCoordinator: ObservableObject {
     let jobLibraryStore: JobLibraryStore?
     private var recoveryRunner: LocalJobRunner?
     private var mediaImportRunner: LocalJobRunner?
+    private var recoveryRetentionTask: Task<Void, Never>?
     private let localJobExecutionAuthority = LocalJobExecutionAuthority()
     private var cancellables = Set<AnyCancellable>()
     private var permissionPollTimer: Timer?
@@ -161,6 +162,13 @@ final class AppCoordinator: ObservableObject {
                         await self?.purgeMediaImports(retention: value)
                     }
                 }
+            }
+            .store(in: &cancellables)
+        AppSettings.shared.$recoveryRetention
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] retention in
+                self?.scheduleRecoveryRetentionPurge(retention)
             }
             .store(in: &cancellables)
         // Cheap catch-all: the user activating the app (opening Settings, the Library, even
@@ -1418,27 +1426,45 @@ final class AppCoordinator: ObservableObject {
         samples: [Float],
         configuration: AttemptConfiguration
     ) async throws -> RecoveryDictation {
-        if let model = configuration.speechModel { await whisperEngine.reload(to: model) }
         let template = TemplateStore.shared.templates.first {
             $0.id == configuration.template || $0.name == configuration.template
         } ?? TemplateStore.shared.template(id: AppSettings.shared.activeTemplateID) ?? Template.builtIns[0]
-        let engine = activeSTTEngine
-        let result = try await processDictation(
+        let transcription = try await RecoveryLocalProcessor(transcriber: whisperEngine).process(
             samples: samples,
-            engine: engine,
-            engineName: AppSettings.shared.sttEngine.rawValue,
-            template: template,
-            forcedLanguage: configuration.language,
-            insert: { _, _ in false }
+            configuration: configuration,
+            defaultModel: AppSettings.shared.whisperModel
         )
         return RecoveryDictation(
-            language: configuration.language ?? "detected",
+            language: transcription.language,
             template: template.name,
-            transcript: result.transcript,
-            refined: result.refined,
-            engine: AppSettings.shared.sttEngine.rawValue
+            transcript: transcription.text,
+            refined: transcription.text,
+            engine: "WhisperKit"
         )
     }
+
+    private func purgeRecoveries(retention: RecoveryRetention) async {
+        guard let recoveryStore else { return }
+        _ = try? await RecoveryRetentionService(directory: Self.recoveryDirectory, store: recoveryStore)
+            .purgeExpired(now: Date(), retention: retention)
+        try? await jobLibraryStore?.refresh()
+    }
+
+    private func scheduleRecoveryRetentionPurge(_ retention: RecoveryRetention) {
+        recoveryRetentionTask?.cancel()
+        recoveryRetentionTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard !Task.isCancelled, let self else { return }
+            await Self.routeRecoveryRetentionChange(retention) { [weak self] value in
+                await self?.purgeRecoveries(retention: value)
+            }
+        }
+    }
+
+    static func routeRecoveryRetentionChange(
+        _ retention: RecoveryRetention,
+        purge: @Sendable (RecoveryRetention) async -> Void
+    ) async { await purge(retention) }
 
     /// Overwrites `~/Library/Application Support/FreeTalker/last-dictation.wav` with the most
     /// recently captured audio, regardless of whether transcription succeeded. Cheap debug

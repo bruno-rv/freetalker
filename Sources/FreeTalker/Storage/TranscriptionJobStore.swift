@@ -6,7 +6,15 @@ actor TranscriptionJobStore {
     var handle: OpaquePointer { connection.handle }
     let clock: any JobClock
 
+    func secureDeleteEnabled() throws -> Bool {
+        let statement = try prepare("PRAGMA secure_delete;")
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW else { throw sqlError() }
+        return sqlite3_column_int(statement, 0) == 1
+    }
+
     init(databaseURL: URL, clock: any JobClock) throws {
+        try DatabasePrivacy.prepare(url: databaseURL)
         var database: OpaquePointer?
         guard sqlite3_open(databaseURL.path, &database) == SQLITE_OK, let database else {
             let message = database.map { String(cString: sqlite3_errmsg($0)) } ?? "Could not open database"
@@ -14,6 +22,7 @@ actor TranscriptionJobStore {
             throw DatabaseError.openFailed(message)
         }
         do {
+            try DatabasePrivacy.secureOpenedDatabase(database, url: databaseURL)
             guard sqlite3_exec(database, "PRAGMA foreign_keys = ON;", nil, nil, nil) == SQLITE_OK else {
                 throw DatabaseError.sqlFailed(String(cString: sqlite3_errmsg(database)))
             }

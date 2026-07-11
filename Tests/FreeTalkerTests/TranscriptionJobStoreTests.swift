@@ -1,9 +1,22 @@
 import Foundation
 import Testing
 import CSQLite
+import Darwin
 @testable import FreeTalker
 
 @Suite struct TranscriptionJobStoreTests {
+    @Test func databaseConnectionEnforcesPrivateModesAndSecureDelete() async throws {
+        let database = try TemporaryJobDatabase()
+        let privateDirectory = database.url.deletingLastPathComponent().appendingPathComponent("FreeTalker")
+        let privateURL = privateDirectory.appendingPathComponent("jobs.sqlite")
+        let store = try TranscriptionJobStore(databaseURL: privateURL, clock: SystemJobClock())
+        var directoryInfo = stat(); var fileInfo = stat()
+        #expect(stat(privateDirectory.path, &directoryInfo) == 0)
+        #expect(stat(privateURL.path, &fileInfo) == 0)
+        #expect(directoryInfo.st_mode & 0o777 == 0o700)
+        #expect(fileInfo.st_mode & 0o777 == 0o600)
+        #expect(try await store.secureDeleteEnabled())
+    }
     @Test func persistedEnumsHaveExactStableEncodings() {
         #expect(Dictionary(uniqueKeysWithValues: JobKind.allCases.map { ($0, $0.rawValue) }) == [
             .recovery: "recovery", .mediaImport: "media_import"
