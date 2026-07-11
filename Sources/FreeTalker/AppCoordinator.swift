@@ -7,6 +7,18 @@ import SwiftUI
 
 @MainActor
 final class AppCoordinator: ObservableObject {
+    enum CaptureOwner: Equatable { case none, dictation, voiceEdit }
+    enum CaptureDecision: Equatable { case start, stop, busy(CaptureOwner) }
+
+    nonisolated static func captureStartDecision(current: CaptureOwner, requested: CaptureOwner) -> CaptureDecision {
+        current == .none ? .start : .busy(current)
+    }
+
+    nonisolated static func capturePressDecision(current: CaptureOwner, pressed: CaptureOwner) -> CaptureDecision {
+        if current == pressed { return .stop }
+        return captureStartDecision(current: current, requested: pressed)
+    }
+
     static let shared = AppCoordinator()
 
     @Published private(set) var isRecording = false
@@ -60,11 +72,12 @@ final class AppCoordinator: ObservableObject {
     private let contextTargetSnapshotter = ContextTargetSnapshotter()
     private let selectionAccess: any SelectionAccessing = SelectionAccess()
     private(set) var pendingVoiceEditSelection: SelectionSnapshot?
-    let snippetStore: SnippetStore?
+    @Published private(set) var snippetStore: SnippetStore?
+    @Published private(set) var snippetStoreInitializationError: String?
     private var voiceEditCoordinator: VoiceEditCoordinator?
     private var voiceEditWindow: NSWindow?
     private var voiceEditWindowDelegate: VoiceEditWindowDelegate?
-    private var isRecordingVoiceEditInstruction = false
+    private var captureOwner: CaptureOwner = .none
 
     private let hotKeyManager = HotKeyManager()
     private let audioCapture = AudioCapture()
@@ -93,7 +106,13 @@ final class AppCoordinator: ObservableObject {
         whisperEngine = WhisperKitEngine(downloadCoordinator: downloadCoordinator)
         let recoveryStore = try? Self.makeRecoveryStore()
         self.recoveryStore = recoveryStore
-        snippetStore = try? Self.makeSnippetStore()
+        do {
+            snippetStore = try Self.makeSnippetStore()
+            snippetStoreInitializationError = nil
+        } catch {
+            snippetStore = nil
+            snippetStoreInitializationError = Self.snippetStoreErrorMessage(error)
+        }
         jobLibraryStore = recoveryStore.map { JobLibraryStore(store: $0, recoveryDirectory: Self.recoveryDirectory) }
         whisperEngine.setEventReceiver(modelStore)
         modelStore.onAutomaticSelection = { [weak whisperEngine] target in
@@ -217,9 +236,15 @@ final class AppCoordinator: ObservableObject {
     }
 
     private func handleVoiceEditHotKey() {
-        if isRecordingVoiceEditInstruction {
+        switch Self.capturePressDecision(current: captureOwner, pressed: .voiceEdit) {
+        case .stop:
             finishVoiceEditInstructionRecording()
             return
+        case .busy:
+            hud.flash("Finish the current recording first")
+            return
+        case .start:
+            break
         }
         Self.handleVoiceEditHotKey(
             selectionAccess: selectionAccess,
@@ -231,7 +256,8 @@ final class AppCoordinator: ObservableObject {
     }
 
     private func beginVoiceEditInstructionRecording() {
-        guard !isRecording, !isProcessing else {
+        guard Self.captureStartDecision(current: captureOwner, requested: .voiceEdit) == .start,
+              !isProcessing else {
             hud.flash("Finish the current recording first")
             pendingVoiceEditSelection = nil
             return
@@ -243,7 +269,7 @@ final class AppCoordinator: ObservableObject {
         }
         do {
             try audioCapture.start(deviceUID: AppSettings.shared.microphoneDeviceUID)
-            isRecordingVoiceEditInstruction = true
+            captureOwner = .voiceEdit
             isRecording = true
             hotKeyManager.isRecording = true
             hud.show(text: "Speak the edit instruction, then press Voice Edit again")
@@ -256,7 +282,7 @@ final class AppCoordinator: ObservableObject {
     private func finishVoiceEditInstructionRecording() {
         let selection = pendingVoiceEditSelection
         pendingVoiceEditSelection = nil
-        isRecordingVoiceEditInstruction = false
+        captureOwner = .none
         isRecording = false
         hotKeyManager.isRecording = false
         let samples = audioCapture.stop()
@@ -288,21 +314,27 @@ final class AppCoordinator: ObservableObject {
     private func presentVoiceEdit(selection: SelectionSnapshot, instruction: String) {
         closeVoiceEditWindow(clearCoordinator: true)
         let store = snippetStore
+        let storeError = snippetStoreInitializationError ?? "storage initialization failed"
         let coordinator = VoiceEditCoordinator(
             selection: selection,
             instruction: instruction,
             selectionAccess: selectionAccess,
             snippetMatcher: { trigger in
-                guard let store else { return .none }
+                guard let store else {
+                    throw VoiceEditSnippetError.storeUnavailable(storeError)
+                }
                 return try await store.match(trigger)
             }
         )
         voiceEditCoordinator = coordinator
 
-        let window = NSWindow(
+        let presentation = VoiceEditPreviewWindowPresentation.make()
+        let window = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 520, height: 420),
-            styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false
+            styleMask: presentation.styleMask, backing: .buffered, defer: false
         )
+        window.becomesKeyOnlyIfNeeded = presentation.becomesKeyOnlyIfNeeded
+        window.isFloatingPanel = true
         window.title = "Voice Edit Preview"
         window.isReleasedWhenClosed = false
         window.contentView = NSHostingView(rootView: VoiceEditPreviewView(coordinator: coordinator) { [weak self] in
@@ -318,7 +350,6 @@ final class AppCoordinator: ObservableObject {
         voiceEditWindowDelegate = delegate
         voiceEditWindow = window
         window.center()
-        NSApp.activate()
         window.makeKeyAndOrderFront(nil)
         Task { await coordinator.begin() }
     }
@@ -419,7 +450,7 @@ final class AppCoordinator: ObservableObject {
         // one — mirrors the pre-Amendment-B `!isProcessing` guard. `recordingState` is already
         // back to `.idle` by the time processing starts (set before the async pipeline `Task`
         // below), so the state machine alone can't tell these apart.
-        guard !isProcessing else { return }
+        guard !isProcessing, captureOwner != .voiceEdit else { return }
         let (newState, action) = RecordingStateMachine.transition(state: recordingState, event: .keyDown, currentGeneration: recordingGeneration)
         switch action {
         case .startCapture:
@@ -474,8 +505,8 @@ final class AppCoordinator: ObservableObject {
     }
 
     private func handleEscape() {
-        if isRecordingVoiceEditInstruction {
-            isRecordingVoiceEditInstruction = false
+        if captureOwner == .voiceEdit {
+            captureOwner = .none
             pendingVoiceEditSelection = nil
             isRecording = false
             hotKeyManager.isRecording = false
@@ -584,6 +615,9 @@ final class AppCoordinator: ObservableObject {
     /// capture-start failure, so the caller never commits the state transition for a recording
     /// that never actually started.
     private func beginCapture() -> Bool {
+        guard Self.captureStartDecision(current: captureOwner, requested: .dictation) == .start else {
+            return false
+        }
         oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .clear)
         let micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
         Self.logger.log("key down: micAuthorizationStatus=\(micStatus.rawValue, privacy: .public)")
@@ -597,6 +631,7 @@ final class AppCoordinator: ObservableObject {
         }
         do {
             try audioCapture.start(deviceUID: AppSettings.shared.microphoneDeviceUID)
+            captureOwner = .dictation
             recordingGeneration += 1
             startLivePreviewIfNeeded()
             // startLivePreviewIfNeeded() just reset lastLivePreviewText to nil — seed it with the
@@ -720,6 +755,7 @@ final class AppCoordinator: ObservableObject {
 
         invalidateCapTimer()
         stopLivePreview()
+        captureOwner = .none
         let samples = audioCapture.stop()
 
         // Always cheap, always on: peak/RMS tells us in one line whether the mic tap delivered
@@ -849,6 +885,7 @@ final class AppCoordinator: ObservableObject {
 
     private func cancelRecording() {
         oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .clear)
+        captureOwner = .none
         Self.performCancelRecording(
             stopCapture: { _ = self.audioCapture.stop() },
             cancelLivePreview: { self.stopLivePreview() },
@@ -1246,6 +1283,20 @@ final class AppCoordinator: ObservableObject {
     private static func makeSnippetStore() throws -> SnippetStore {
         try FileManager.default.createDirectory(at: applicationSupportDirectory, withIntermediateDirectories: true)
         return try SnippetStore(databaseURL: applicationSupportDirectory.appendingPathComponent("jobs.db"))
+    }
+
+    private static func snippetStoreErrorMessage(_ error: Error) -> String {
+        String(describing: error)
+    }
+
+    func retrySnippetStoreInitialization() {
+        do {
+            snippetStore = try Self.makeSnippetStore()
+            snippetStoreInitializationError = nil
+        } catch {
+            snippetStore = nil
+            snippetStoreInitializationError = Self.snippetStoreErrorMessage(error)
+        }
     }
 
     private func preserveFailedAudio(_ samples: [Float], failure: JobFailure) async -> Bool {

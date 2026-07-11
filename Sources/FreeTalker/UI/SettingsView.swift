@@ -82,16 +82,20 @@ enum SpeechModelDeleteFailure {
 }
 
 struct SettingsView: View {
+    @ObservedObject private var coordinator = AppCoordinator.shared
+
     var body: some View {
         TabView {
             GeneralSettingsView()
                 .tabItem { Label("General", systemImage: "gearshape") }
             TemplatesSettingsView()
                 .tabItem { Label("Templates", systemImage: "text.badge.checkmark") }
-            if let snippetStore = AppCoordinator.shared.snippetStore {
-                SnippetsSettingsView(store: snippetStore)
-                    .tabItem { Label("Snippets", systemImage: "text.quote") }
-            }
+            SnippetsSettingsView(
+                store: coordinator.snippetStore,
+                initializationError: coordinator.snippetStoreInitializationError,
+                retry: { coordinator.retrySnippetStoreInitialization() }
+            )
+            .tabItem { Label("Snippets", systemImage: "text.quote") }
         }
         .padding(20)
         // A SINGLE frame call with both min and max: chaining `.frame(maxWidth: .infinity, ...)`

@@ -73,6 +73,18 @@ import Testing
         #expect(called)
     }
 
+    @Test func captureOwnershipRejectsPTTAndVoiceEditOverlapInBothDirections() {
+        #expect(AppCoordinator.captureStartDecision(current: .none, requested: .dictation) == .start)
+        #expect(AppCoordinator.captureStartDecision(current: .dictation, requested: .voiceEdit) == .busy(.dictation))
+        #expect(AppCoordinator.captureStartDecision(current: .voiceEdit, requested: .dictation) == .busy(.voiceEdit))
+    }
+
+    @Test func repeatedCapturePressStopsOnlyItsCurrentOwner() {
+        #expect(AppCoordinator.capturePressDecision(current: .voiceEdit, pressed: .voiceEdit) == .stop)
+        #expect(AppCoordinator.capturePressDecision(current: .dictation, pressed: .voiceEdit) == .busy(.dictation))
+        #expect(AppCoordinator.capturePressDecision(current: .voiceEdit, pressed: .dictation) == .busy(.voiceEdit))
+    }
+
     @Test func productionVoiceEditWiringCapturesPendingSelection() throws {
         let manager = HotKeyManager()
         let access = StubSelectionAccess(result: .success(Self.snapshot(text: "draft")))

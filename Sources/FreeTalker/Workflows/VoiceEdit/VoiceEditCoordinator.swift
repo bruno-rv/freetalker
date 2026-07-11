@@ -21,6 +21,7 @@ enum VoiceEditCoordinatorError: Error, Equatable {
     case secureField
     case noEditableSelection
     case replacementFailed
+    case snippetStoreUnavailable(String)
 
     var message: String {
         switch self {
@@ -32,8 +33,13 @@ enum VoiceEditCoordinatorError: Error, Equatable {
         case .secureField: "Voice Edit is unavailable in secure fields. Copy the result instead."
         case .noEditableSelection: "The target is no longer an editable selection. Reselect text and try again, or copy the result."
         case .replacementFailed: "The app rejected the replacement. Try again, or copy the result."
+        case .snippetStoreUnavailable(let detail): "Local snippets are unavailable (\(detail)). Retry storage setup in Settings before using Voice Edit."
         }
     }
+}
+
+enum VoiceEditSnippetError: Error, Equatable {
+    case storeUnavailable(String)
 }
 
 enum VoiceEditClipboardError: Error { case writeFailed }
@@ -121,7 +127,7 @@ final class VoiceEditCoordinator: ObservableObject {
         switch error {
         case .targetChanged, .selectionChanged, .secureField, .noEditableSelection, .replacementFailed:
             false
-        case .none, .noSelection, .generationFailed, .copyFailed:
+        case .none, .noSelection, .generationFailed, .copyFailed, .snippetStoreUnavailable:
             preview != nil
         }
     }
@@ -187,6 +193,11 @@ final class VoiceEditCoordinator: ObservableObject {
                 )
                 guard self.operationID == operationID, !Task.isCancelled else { return }
                 setPreview(result, source: .localModel)
+            }
+        } catch let snippetError as VoiceEditSnippetError {
+            guard self.operationID == operationID, !Task.isCancelled else { return }
+            switch snippetError {
+            case .storeUnavailable(let detail): finish(error: .snippetStoreUnavailable(detail))
             }
         } catch {
             guard !(error is CancellationError), self.operationID == operationID, !Task.isCancelled else { return }
