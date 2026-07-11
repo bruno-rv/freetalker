@@ -2644,6 +2644,88 @@ enum SelfCheck {
         if await coordinator.activeVariant != nil {
             failures.append("speech model coordinator: active slot not released")
         }
+
+        // A rescan must not erase a visible failure hint merely because the folder is absent.
+        let failedState = SpeechModelStore.State(phase: .failed("network failed"))
+        if SpeechModelStore.merging(inspection: .init(downloaded: false, sizeBytes: nil), into: failedState).phase
+            != .failed("network failed") {
+            failures.append("speech model refresh: failed phase was overwritten")
+        }
+
+        // A user choice is never eligible for automatic support-based correction.
+        if SpeechModelStore.shouldApplyAutomaticDefault(
+            chosenByUser: true,
+            current: SpeechModelCatalog.defaultID,
+            supported: [variant]
+        ) {
+            failures.append("speech model support: user choice was eligible for automatic migration")
+        }
+
+        // Coordinator activity, including engine-owned downloads, is observable by the store.
+        let activityStore = SpeechModelStore(baseURL: base, coordinator: coordinator, fallbackSupport: [variant])
+        await activityStore.connectCoordinatorActivity()
+        let engineStarted = OneShotSignal()
+        let engineRelease = OneShotSignal()
+        let engineDownload = Task {
+            try await coordinator.download(variant: variant) { _, _ in
+                await engineStarted.fire()
+                await engineRelease.wait()
+                return base
+            }
+        }
+        await engineStarted.wait()
+        for _ in 0..<20 where activityStore.activeDownloadVariant != variant { await Task.yield() }
+        if activityStore.activeDownloadVariant != variant {
+            failures.append("speech model coordinator: shared activity did not reach store")
+        }
+        await engineRelease.fire()
+        _ = try? await engineDownload.value
+        for _ in 0..<20 where activityStore.activeDownloadVariant != nil { await Task.yield() }
+        if activityStore.activeDownloadVariant != nil {
+            failures.append("speech model coordinator: shared activity did not clear")
+        }
+
+        // Deletion reserves the row synchronously before its first suspension and ignores engine
+        // events until the filesystem operation completes.
+        do {
+            let deleteVariant = SpeechModelCatalog.entries[1].id
+            let deleteDirectory = SpeechModelStore.variantDirectory(for: deleteVariant, baseURL: base)
+            for artifact in SpeechModelStore.requiredArtifacts {
+                try fm.createDirectory(at: deleteDirectory.appendingPathComponent(artifact), withIntermediateDirectories: true)
+            }
+            let deleteRelease = OneShotSignal()
+            let deleteStore = SpeechModelStore(
+                baseURL: base,
+                coordinator: coordinator,
+                fallbackSupport: [variant, deleteVariant],
+                deleteOperation: { _, _ in
+                    await deleteRelease.wait()
+                }
+            )
+            await deleteStore.refresh()
+            let deletion = Task { try await deleteStore.delete(deleteVariant) }
+            for _ in 0..<20 where deleteStore.states[deleteVariant]?.phase != .busy(reloadTarget: deleteVariant) { await Task.yield() }
+            if deleteStore.states[deleteVariant]?.phase != .busy(reloadTarget: deleteVariant) {
+                failures.append("speech model deletion: row was not reserved busy before await")
+            }
+            deleteStore.receiveEngineEvent(.downloading(progress: 0.4), for: deleteVariant)
+            if deleteStore.states[deleteVariant]?.phase != .busy(reloadTarget: deleteVariant) {
+                failures.append("speech model deletion: engine event replaced delete reservation")
+            }
+            await deleteRelease.fire()
+            _ = try? await deletion.value
+        } catch {
+            failures.append("speech model deletion reservation check threw: \(error)")
+        }
+
+        let timeoutStart = ContinuousClock.now
+        let timedResult: Int? = await SpeechModelStore.firstResult(within: .milliseconds(20)) {
+            try? await Task.sleep(for: .seconds(2))
+            return 1
+        }
+        if timedResult != nil || ContinuousClock.now - timeoutStart > .milliseconds(250) {
+            failures.append("speech model remote support: timeout waited for noncooperative child")
+        }
         return failures
     }
 }
