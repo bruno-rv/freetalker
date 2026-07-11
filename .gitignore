@@ -2,3 +2,4 @@
 .swiftpm/
 FreeTalker.app/
 .DS_Store
+.worktrees/
