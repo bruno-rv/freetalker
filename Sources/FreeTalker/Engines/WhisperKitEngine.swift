@@ -135,6 +135,74 @@ final class GuardedKitState<Kit>: @unchecked Sendable {
         let box = KitBox(kit)
         lock.withLock { $0 = State(kit: box, variant: variant) }
     }
+
+    func withCapturedKit<Result: Sendable>(
+        _ operation: @Sendable (Kit) async throws -> Result
+    ) async throws -> Result? {
+        guard let kit = snapshot().kit else { return nil }
+        return try await operation(kit)
+    }
+}
+
+/// Composes operation and reload statuses under one lock. A reload lifecycle has display
+/// precedence until its matching terminal update, so an old captured kit can continue working
+/// without regressing the menu status to Detecting/Transcribing/Ready for the old model.
+final class EngineStatusComposer: @unchecked Sendable {
+    struct ReloadToken: Equatable, Sendable { fileprivate let id: UUID }
+
+    private struct ReloadState: Sendable {
+        let token: ReloadToken
+        var status: String
+        var terminalFailure: String?
+    }
+
+    private struct State: Sendable {
+        var operation: String
+        var reload: ReloadState?
+    }
+
+    private let lock: OSAllocatedUnfairLock<State>
+
+    init(initial: String) {
+        lock = OSAllocatedUnfairLock(initialState: State(operation: initial, reload: nil))
+    }
+
+    var rendered: String { lock.withLock { $0.reload?.status ?? $0.operation } }
+
+    @discardableResult
+    func beginReload(_ status: String) -> ReloadToken {
+        let token = ReloadToken(id: UUID())
+        lock.withLock { $0.reload = ReloadState(token: token, status: status, terminalFailure: nil) }
+        return token
+    }
+
+    func setOperation(_ status: String) {
+        lock.withLock { $0.operation = status }
+    }
+
+    func setReload(_ status: String, token: ReloadToken) {
+        lock.withLock { state in
+            guard state.reload?.token == token else { return }
+            state.reload?.status = status
+            state.reload?.terminalFailure = nil
+        }
+    }
+
+    func setReloadFailure(_ status: String, token: ReloadToken) {
+        lock.withLock { state in
+            guard state.reload?.token == token else { return }
+            state.reload?.status = status
+            state.reload?.terminalFailure = status
+        }
+    }
+
+    func finishReload(_ status: String, token: ReloadToken) {
+        lock.withLock { state in
+            guard state.reload?.token == token else { return }
+            state.operation = state.reload?.terminalFailure ?? status
+            state.reload = nil
+        }
+    }
 }
 
 final class ModelLoadProgressGuard: @unchecked Sendable {
@@ -247,6 +315,7 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
     private let gate = SerialGate()
     private let downloadCoordinator: SpeechModelDownloadCoordinator
     private let progressGuard = ModelLoadProgressGuard()
+    private let status = EngineStatusComposer(initial: "Not loaded")
     @MainActor private weak var eventReceiver: (any SpeechModelEngineEventReceiving)?
 
     /// Whether the model has already been loaded (preloaded at launch, or lazily by an earlier
@@ -478,13 +547,14 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
         let variant = await AppSettings.shared.whisperModel
         return try await modelController.loadIfNeeded(
             requested: variant,
-            loader: { try await self.loadModel(variant: $0) },
-            event: { await self.emit($0, for: $1) },
+            loader: { try await self.loadModel(variant: $0, reload: nil) },
+            event: { await self.emit($0, for: $1, reload: nil) },
             didInstall: { _ in await self.setReadyStatus() }
         )
     }
 
     func reload(to requested: String) async {
+        let reload = await beginReloadStatus(for: requested)
         await modelController.reload(
             to: requested,
             currentSetting: { await AppSettings.shared.whisperModel },
@@ -495,40 +565,56 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
                     }
                 }
             },
-            loader: { try await self.loadModel(variant: $0) },
-            event: { await self.emit($0, for: $1) },
-            didInstall: { _ in await self.setReadyStatus() }
+            loader: { try await self.loadModel(variant: $0, reload: reload) },
+            event: { await self.emit($0, for: $1, reload: reload) },
+            didInstall: { _ in }
         )
+        await finishReloadStatus(reload)
     }
 
-    private func loadModel(variant: String) async throws -> WhisperKit {
+    private func loadModel(variant: String, reload: EngineStatusComposer.ReloadToken?) async throws -> WhisperKit {
         let displayName = Self.displayName(for: variant)
         let attempt = progressGuard.begin(variant: variant)
-        await setStatus("Checking for \(displayName)…")
+        await setStatus("Checking for \(displayName)…", reload: reload)
         let folder = try await downloadCoordinator.download(variant: variant) { [weak self] progress in
-            Task { @MainActor in self?.reportDownloadProgress(progress, attempt: attempt, displayName: displayName) }
+            Task { @MainActor in self?.reportDownloadProgress(progress, attempt: attempt, displayName: displayName, reload: reload) }
         }
-        await setStatus("Loading \(displayName)…")
+        await setStatus("Loading \(displayName)…", reload: reload)
         let config = WhisperKitConfig(modelFolder: folder.path, verbose: false, logLevel: .none, load: true, download: false)
         let kit = try await WhisperKit(config)
         return kit
     }
 
     @MainActor
-    private func reportDownloadProgress(_ progress: Double, attempt: ModelLoadProgressGuard.Attempt, displayName: String) {
+    private func reportDownloadProgress(
+        _ progress: Double,
+        attempt: ModelLoadProgressGuard.Attempt,
+        displayName: String,
+        reload: EngineStatusComposer.ReloadToken?
+    ) {
         guard progressGuard.isCurrent(attempt) else { return }
         eventReceiver?.receiveEngineEvent(.downloading(progress: progress), for: attempt.variant)
-        statusText = "Downloading \(displayName)… \(Int(progress * 100))%"
+        let text = "Downloading \(displayName)… \(Int(progress * 100))%"
+        if let reload { status.setReload(text, token: reload) }
+        else { status.setOperation(text) }
+        statusText = status.rendered
     }
 
-    private func emit(_ event: SpeechModelEngineEvent, for variant: String) async {
+    private func emit(
+        _ event: SpeechModelEngineEvent,
+        for variant: String,
+        reload: EngineStatusComposer.ReloadToken?
+    ) async {
         await MainActor.run {
             switch event {
             case .active:
                 progressGuard.finishCurrent(variant: variant)
             case .failed(let hint):
                 progressGuard.finishCurrent(variant: variant)
-                statusText = "Failed to load \(Self.displayName(for: variant)): \(hint)"
+                let text = "Failed to load \(Self.displayName(for: variant)): \(hint)"
+                if let reload { status.setReloadFailure(text, token: reload) }
+                else { status.setOperation(text) }
+                statusText = status.rendered
             default:
                 break
             }
@@ -541,12 +627,29 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
         await setStatus(variant.map { "Ready — \(Self.displayName(for: $0))" } ?? "Not loaded")
     }
 
+    @MainActor
+    private func beginReloadStatus(for variant: String) -> EngineStatusComposer.ReloadToken {
+        let token = status.beginReload("Checking for \(Self.displayName(for: variant))…")
+        statusText = status.rendered
+        return token
+    }
+
+    @MainActor
+    private func finishReloadStatus(_ token: EngineStatusComposer.ReloadToken) {
+        let variant = modelController.state.snapshot().variant
+        let terminal = variant.map { "Ready — \(Self.displayName(for: $0))" } ?? "Not loaded"
+        status.finishReload(terminal, token: token)
+        statusText = status.rendered
+    }
+
     private static func displayName(for variant: String) -> String {
         SpeechModelCatalog.entry(for: variant)?.displayName ?? variant
     }
 
     @MainActor
-    private func setStatus(_ text: String) {
-        statusText = text
+    private func setStatus(_ text: String, reload: EngineStatusComposer.ReloadToken? = nil) {
+        if let reload { status.setReload(text, token: reload) }
+        else { status.setOperation(text) }
+        statusText = status.rendered
     }
 }
