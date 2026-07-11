@@ -86,7 +86,7 @@ struct RecoveryRetryPipeline: Sendable {
 
     func failFinalization(jobID: UUID, error: any Error) async throws {
         guard let attempt = try await store.latestUnfinishedAttempt(jobID: jobID) else { return }
-        let failure = JobFailure(stage: errorStage(error), message: error.localizedDescription)
+        let failure = JobFailure(stage: .persisting, message: error.localizedDescription)
         try await store.failAttemptAndMarkJobFailed(jobID: jobID, attemptID: attempt.id, failure: failure)
     }
 
