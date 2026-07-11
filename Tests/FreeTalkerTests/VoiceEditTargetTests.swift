@@ -191,9 +191,15 @@ import Testing
 
         HotKeyManager.resetMatchers(matcher: &ptt, redoMatcher: &redo, voiceEditMatcher: &voice)
 
-        #expect(!HotKeyManager.consumeSwallowedKeyUpTombstone(kind: .keyUp, keyCode: 105, tombstones: &tombstones))
-        #expect(HotKeyManager.consumeSwallowedKeyUpTombstone(kind: .keyUp, keyCode: 107, tombstones: &tombstones))
-        #expect(!HotKeyManager.consumeSwallowedKeyUpTombstone(kind: .keyUp, keyCode: 107, tombstones: &tombstones))
+        #expect(HotKeyManager.handleSwallowedKeyUpTombstone(
+            kind: .keyUp, keyCode: 105, isAutorepeat: false, tombstones: &tombstones
+        ) == .dispatch)
+        #expect(HotKeyManager.handleSwallowedKeyUpTombstone(
+            kind: .keyUp, keyCode: 107, isAutorepeat: false, tombstones: &tombstones
+        ) == .swallowWithoutDispatch)
+        #expect(HotKeyManager.handleSwallowedKeyUpTombstone(
+            kind: .keyUp, keyCode: 107, isAutorepeat: false, tombstones: &tombstones
+        ) == .dispatch)
         #expect(voice?.handle(.keyUp, keyCode: 107, flags: 0).released == false)
     }
 
@@ -203,6 +209,37 @@ import Testing
             HotKeyManager.mergeSwallowedKeyUpTombstones([keyCode], into: &tombstones)
         }
         #expect(tombstones.count <= HotKeyManager.maximumSwallowedKeyUpTombstones)
+    }
+
+    @Test func autorepeatDownRetainsRestartTombstoneUntilMatchingKeyUp() {
+        var tombstones: Set<UInt16> = [107]
+
+        let repeatOne = HotKeyManager.handleSwallowedKeyUpTombstone(
+            kind: .keyDown, keyCode: 107, isAutorepeat: true, tombstones: &tombstones
+        )
+        let repeatTwo = HotKeyManager.handleSwallowedKeyUpTombstone(
+            kind: .keyDown, keyCode: 107, isAutorepeat: true, tombstones: &tombstones
+        )
+        #expect(repeatOne == .swallowWithoutDispatch)
+        #expect(repeatTwo == .swallowWithoutDispatch)
+        #expect(tombstones == [107])
+
+        let keyUp = HotKeyManager.handleSwallowedKeyUpTombstone(
+            kind: .keyUp, keyCode: 107, isAutorepeat: false, tombstones: &tombstones
+        )
+        #expect(keyUp == .swallowWithoutDispatch)
+        #expect(tombstones.isEmpty)
+        #expect(HotKeyManager.handleSwallowedKeyUpTombstone(
+            kind: .keyUp, keyCode: 107, isAutorepeat: false, tombstones: &tombstones
+        ) == .dispatch)
+    }
+
+    @Test func nonrepeatDownRetiresRestartTombstoneAndDispatchesNewCycle() {
+        var tombstones: Set<UInt16> = [107]
+        #expect(HotKeyManager.handleSwallowedKeyUpTombstone(
+            kind: .keyDown, keyCode: 107, isAutorepeat: false, tombstones: &tombstones
+        ) == .dispatch)
+        #expect(tombstones.isEmpty)
     }
 
     @Test func eventTapMainThreadContractIsExplicit() {
