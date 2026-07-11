@@ -31,6 +31,18 @@ menu-bar-only, plus the microphone usage string), and ad-hoc codesigns the bundl
 First launch will download the WhisperKit `large-v3-turbo` model (~1 GB) — the menu bar
 status line shows download progress.
 
+## Speech models
+
+Settings offers seven multilingual Whisper models, from Tiny and Base through Small,
+Medium, Large v3, and two Large v3 Turbo variants. Smaller models download faster, use
+less disk space, and usually transcribe faster. Larger models favor accuracy, while the
+Turbo variants balance speed and accuracy.
+
+Download a model on demand, then select it to reload the transcription engine. You can
+also delete downloaded models that aren't active. FreeTalker keeps the active model so a
+cleanup can't remove the model currently serving dictation. WhisperKit shares model files
+under `~/Documents/huggingface`.
+
 ## Permissions walkthrough
 
 On first launch, grant (System Settings → Privacy & Security):
@@ -147,6 +159,10 @@ in. It sends a single request and reports a fixed status hint — "Connected ✓
 like "Failed — HTTP 401 (check API key)", or "Failed — cannot reach host" — never the raw
 response body or the key itself.
 
+For fully local LLM post-processing, run Ollama Desktop and use the existing
+OpenAI-compatible BYOK provider with `http://localhost:11434/v1`. Ollama's local endpoint
+doesn't require an API key.
+
 ![Settings](docs/settings.png)
 *Settings → General: permissions status, hotkey, hands-free auto-stop, microphone, engine
 selection, and cloud post-processing.*
@@ -206,6 +222,3 @@ substitute for today's environment.
 - **`swift test` cannot run** in this CLT-only environment (see "Running tests" above);
   `make selfcheck` is the working substitute. The test target still compiles and documents
   intent for a full-Xcode environment.
-- **WhisperKit model variant** is pinned to the exact HF repo folder name
-  `large-v3_turbo_954MB` rather than a glob, to avoid ambiguous matches against sibling
-  distil/dated turbo variants in `argmaxinc/whisperkit-coreml`. See `WhisperKitEngine.swift`.

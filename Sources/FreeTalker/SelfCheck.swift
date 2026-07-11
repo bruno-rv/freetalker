@@ -287,6 +287,7 @@ enum SelfCheck {
             failures.append(contentsOf: speechModelCatalogChecks())
             failures.append(contentsOf: speechModelSettingsChecks())
             failures.append(contentsOf: await speechModelManagementChecks())
+            failures.append(contentsOf: await speechModelIntegrationChecks())
 
             if failures.isEmpty {
                 print("SelfCheck PASSED (template seeding, FTS round-trip, pipeline contract, mic device enumeration, hotkey spec/matcher, vocabulary normalization/injection, app rule resolution, paste-target drift, prompt app-name sanitization, live preview gating/availability, SerialGate cancellation, preview early-cancel decisions, built-in template prompt upgrade (incl. v3->v4 Spoken Commands), LLM provider defaults, BYOK Keychain key migration, global cloud-selection routing, BYOK connection-test status-code mapping/config gating, hands-free recording state machine/esc/cap-clamp/cancel, Library deletion: per-row/Delete All/latestDictation tiebreak/dangling source_id/secure_delete/unfiltered total count, SQLite step classification (readAll/dictationExists error propagation), WAL checkpoint busy path, debug-audio purge scoping (incl. directory-named-*.wav skip, unreadable-directory error), LibraryStore privacy-step-then-always sequencing, Redo Last gating/spec-constraints/matcher/result message/spec validation, Language Pin resolution (precedence/invalid-fallthrough/normalization), unified App Rules row join/removal, Recording Panel action routing (button×state incl. stale-click no-ops)/template-cycle order, one-shot language lifecycle (set/toggle/clear), Raw path (post-processor not invoked, refined==transcript, reserved template name recorded), Raw Transcript reserved-name rejection/load-time rename, Cloud STT error status classification)")
@@ -298,6 +299,69 @@ enum SelfCheck {
             }
         }
         dispatchMain()
+    }
+
+    @MainActor
+    private static func speechModelIntegrationChecks() async -> [String] {
+        var failures: [String] = []
+        var selected: String?
+        var reloaded: String?
+        await AppCoordinator.routeSpeechModelSelection(
+            "openai_whisper-small",
+            setFromUser: { selected = $0 },
+            reload: { reloaded = $0 }
+        )
+        if selected != "openai_whisper-small" || reloaded != selected {
+            failures.append("speech model selection: user setter and reload were not routed together")
+        }
+
+        let downloaded = SpeechModelStore.State(phase: .downloaded, active: false, supported: true)
+        let pending = SpeechModelRowPresentation.make(
+            state: downloaded,
+            selected: true,
+            activeDownloadVariant: nil
+        )
+        if pending.status != "Selected — pending reload" || !pending.canSelect || pending.canDelete {
+            failures.append("speech model row: pending selection presentation mismatch")
+        }
+        let firstLaunch = SpeechModelRowPresentation.make(
+            state: .init(phase: .notDownloaded, active: true, supported: true),
+            selected: true,
+            activeDownloadVariant: nil
+        )
+        if firstLaunch.status != "Active — downloads on first use" || firstLaunch.canDelete {
+            failures.append("speech model row: first-launch active presentation mismatch")
+        }
+        let unsupportedActive = SpeechModelRowPresentation.make(
+            state: .init(phase: .downloaded, active: true, supported: false),
+            selected: true,
+            activeDownloadVariant: nil
+        )
+        if unsupportedActive.status != "Active — unsupported on this Mac" || unsupportedActive.canSelect {
+            failures.append("speech model row: unsupported active policy mismatch")
+        }
+        let waiting = SpeechModelRowPresentation.make(
+            state: .init(phase: .notDownloaded, active: false, supported: true),
+            selected: false,
+            activeDownloadVariant: "other"
+        )
+        if waiting.action != .download || waiting.actionCaption != "waiting for current download" || waiting.actionEnabled {
+            failures.append("speech model row: waiting download presentation mismatch")
+        }
+        let failed = SpeechModelRowPresentation.make(
+            state: .init(phase: .failed("network"), active: false, supported: true),
+            selected: false,
+            activeDownloadVariant: nil
+        )
+        if failed.status != "Failed — network" || failed.canSelect {
+            failures.append("speech model row: failed revert visibility mismatch")
+        }
+
+        let app = AppCoordinator.shared
+        if app.speechModelDownloadCoordinator !== SpeechModelDownloadCoordinator.shared {
+            failures.append("speech model lifecycle: app did not expose one shared coordinator/store")
+        }
+        return failures
     }
 
     private static func speechModelCatalogChecks() -> [String] {

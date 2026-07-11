@@ -37,6 +37,8 @@ struct FreeTalkerApp: App {
         // met with a silent capture from `.notDetermined` status the first time they hold PTT.
         // No-op if already determined (granted or denied). See live-mic silence root cause H1.
         AppCoordinator.shared.primeMicrophonePermission()
+        AppCoordinator.shared.speechModelStore.refreshRemoteSupportOnce()
+        Task { await AppCoordinator.shared.speechModelStore.refresh() }
         if AppSettings.shared.sttEngine == .whisperKit {
             Task { await AppCoordinator.shared.whisperEngine.preload() }
         }
