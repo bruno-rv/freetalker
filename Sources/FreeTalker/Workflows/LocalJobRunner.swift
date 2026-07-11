@@ -48,12 +48,18 @@ actor LocalJobRunner {
 
     private let store: any TranscriptionJobStoring
     private let executor: Executor
+    private let executorFinalizesJob: Bool
     private var queue: [UUID] = []
     private var worker: Task<Void, Never>?
     private var current: CurrentExecution?
 
-    init(store: any TranscriptionJobStoring, executor: @escaping Executor) {
+    init(
+        store: any TranscriptionJobStoring,
+        executorFinalizesJob: Bool = false,
+        executor: @escaping Executor
+    ) {
         self.store = store
+        self.executorFinalizesJob = executorFinalizesJob
         self.executor = executor
     }
 
@@ -127,7 +133,9 @@ actor LocalJobRunner {
             try await executor(currentJob, token)
             try token.checkCancellation()
             current?.phase = .finalizing
-            try await store.transition(id, from: .processing, to: .ready)
+            if !executorFinalizesJob {
+                try await store.transition(id, from: .processing, to: .ready)
+            }
         } catch is CancellationError {
             try? await store.transition(id, from: .processing, to: .cancelled)
         } catch {
