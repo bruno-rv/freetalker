@@ -26,6 +26,29 @@ import Testing
         #expect(try await fixture.store.job(id: job.id)?.state == .ready)
     }
 
+    @Test func promotedAudioSurvivesLeaseTransferAndSuccessorAdopts() async throws {
+        let clock = MutableJobClock(Date(timeIntervalSince1970: 300)); let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString); try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let store = try TranscriptionJobStore(databaseURL: root.appendingPathComponent("jobs.sqlite"), clock: clock)
+        let job = try await store.create(kind: .mediaImport, source: .init(reference: "/source.wav"), now: clock.now)
+        let ownerA = UUID(); _ = try await store.claimQueuedJob(job.id, kind: .mediaImport, owner: ownerA, leaseDuration: 5)
+        let transfer = LeaseTransferProbe()
+        let fenced = AdoptionFailingStore(base: store) {
+            clock.advance(by: 6); _ = try await store.recoverStaleJobs(kind: .mediaImport)
+            let ownerB = UUID(); _ = try await store.claimQueuedJob(job.id, kind: .mediaImport, owner: ownerB, leaseDuration: 30); await transfer.record(ownerB)
+        }
+        let decoder = PipelineDecodeProbe(); let tokenA = CancellationToken(); tokenA.installLeaseOwner(ownerA)
+        let pipelineA = MediaImportPipeline(store: fenced, jobsDirectory: root, decoder: decoder, transcriber: PipelineTranscribeProbe(), diarizer: PipelineDiarizeProbe(), language: nil, model: "model")
+        await #expect(throws: JobStoreError.leaseLost) { try await pipelineA.execute(job: try #require(await store.job(id: job.id)), cancellation: tokenA) }
+        let audio = root.appendingPathComponent(job.id.uuidString).appendingPathComponent("audio.wav")
+        #expect(FileManager.default.fileExists(atPath: audio.path))
+        let ownerB = try #require(await transfer.owner); let tokenB = CancellationToken(); tokenB.installLeaseOwner(ownerB)
+        let pipelineB = MediaImportPipeline(store: store, jobsDirectory: root, decoder: decoder, transcriber: PipelineTranscribeProbe(), diarizer: PipelineDiarizeProbe(), language: nil, model: "model")
+        try await pipelineB.execute(job: try #require(await store.job(id: job.id)), cancellation: tokenB)
+        #expect(await decoder.calls == 1)
+        #expect(try await store.job(id: job.id)?.state == .ready)
+        #expect(FileManager.default.fileExists(atPath: audio.path))
+    }
+
     @Test func invalidOrSymlinkOrphansAreNeverAdopted() async throws {
         for symlink in [false, true] {
             let fixture = try MediaPipelineFixture(); let outside = fixture.root.deletingLastPathComponent().appendingPathComponent(UUID().uuidString); try Data("outside".utf8).write(to: outside)
@@ -445,8 +468,8 @@ private final class MutableJobClock: JobClock, @unchecked Sendable {
 }
 
 private actor AdoptionFailingStore: MediaImportPipelineStoring {
-    let base: TranscriptionJobStore; private var shouldFail = true
-    init(base: TranscriptionJobStore) { self.base = base }
+    let base: TranscriptionJobStore; private var shouldFail = true; private let transfer: (@Sendable () async throws -> Void)?
+    init(base: TranscriptionJobStore, transfer: (@Sendable () async throws -> Void)? = nil) { self.base = base; self.transfer = transfer }
     func job(id: UUID) async throws -> TranscriptionJob? { try await base.job(id: id) }
     func jobs(kind: JobKind?) async throws -> [TranscriptionJob] { try await base.jobs(kind: kind) }
     func transition(_ id: UUID, from: JobState.Kind, to state: JobState) async throws { try await base.transition(id, from: from, to: state) }
@@ -455,9 +478,11 @@ private actor AdoptionFailingStore: MediaImportPipelineStoring {
     func isDerivedMediaRegistered(jobID: UUID, path: String) async throws -> Bool { try await base.isDerivedMediaRegistered(jobID: jobID, path: path) }
     func advanceMediaStage(jobID: UUID, owner: UUID, stage: JobStage) async throws { try await base.advanceMediaStage(jobID: jobID, owner: owner, stage: stage) }
     func updateMediaProgress(jobID: UUID, owner: UUID, progress: Double) async throws { try await base.updateMediaProgress(jobID: jobID, owner: owner, progress: progress) }
-    func persistDecodedMedia(jobID: UUID, owner: UUID, derivedAudioPath: String) async throws { if shouldFail { shouldFail = false; throw AdoptionFailure.injected }; try await base.persistDecodedMedia(jobID: jobID, owner: owner, derivedAudioPath: derivedAudioPath) }
+    func persistDecodedMedia(jobID: UUID, owner: UUID, derivedAudioPath: String) async throws { if shouldFail { shouldFail = false; if let transfer { try await transfer(); throw JobStoreError.leaseLost }; throw AdoptionFailure.injected }; try await base.persistDecodedMedia(jobID: jobID, owner: owner, derivedAudioPath: derivedAudioPath) }
     func persistTranscript(jobID: UUID, owner: UUID, segments: [TranscriptSegment]) async throws { try await base.persistTranscript(jobID: jobID, owner: owner, segments: segments) }
     func persistSpeakerTurns(jobID: UUID, owner: UUID, turns: [SpeakerTurn]) async throws { try await base.persistSpeakerTurns(jobID: jobID, owner: owner, turns: turns) }
     func finalizeMediaImport(jobID: UUID, owner: UUID) async throws { try await base.finalizeMediaImport(jobID: jobID, owner: owner) }
     func invalidateInvalidDecodedMedia(jobID: UUID, owner: UUID) async throws { try await base.invalidateInvalidDecodedMedia(jobID: jobID, owner: owner) }
 }
+
+private actor LeaseTransferProbe { private(set) var owner: UUID?; func record(_ owner: UUID) { self.owner = owner } }
