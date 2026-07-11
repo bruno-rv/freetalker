@@ -56,6 +56,7 @@ final class AppCoordinator: ObservableObject {
     private let localContextProvider: any LocalContextProvider = AccessibilityLocalContextProvider()
     private let screenshotService: any ActiveWindowScreenshotCapturing = ActiveWindowScreenshotService()
     private let ocrService: any VisionOCRServicing = VisionOCRService()
+    private let contextTargetSnapshotter = ContextTargetSnapshotter()
 
     private let hotKeyManager = HotKeyManager()
     private let audioCapture = AudioCapture()
@@ -293,13 +294,14 @@ final class AppCoordinator: ObservableObject {
     private func handlePillClick() {
         let preSnapshottedFrontmostApp = NSWorkspace.shared.frontmostApplication
         let preSnapshottedTarget = Insertion.snapshotTarget(app: preSnapshottedFrontmostApp)
+        let preSnapshottedContextTarget = snapshotContextTarget(app: preSnapshottedFrontmostApp)
         let (newState, action) = RecordingStateMachine.transition(state: recordingState, event: .pillClick, currentGeneration: recordingGeneration)
         recordingState = newState
         switch action {
         case .enterLocked:
             enterLockedMode()
         case .stopAndTranscribe:
-            stopAndTranscribe(preSnapshotted: (app: preSnapshottedFrontmostApp, target: preSnapshottedTarget))
+            stopAndTranscribe(preSnapshotted: (app: preSnapshottedFrontmostApp, target: preSnapshottedTarget, contextTarget: preSnapshottedContextTarget))
         case .none, .startCapture, .cancel:
             break
         }
@@ -343,11 +345,12 @@ final class AppCoordinator: ObservableObject {
     private func handlePanelFinish(skipPostProcessing: Bool) {
         let preSnapshottedFrontmostApp = NSWorkspace.shared.frontmostApplication
         let preSnapshottedTarget = Insertion.snapshotTarget(app: preSnapshottedFrontmostApp)
+        let preSnapshottedContextTarget = snapshotContextTarget(app: preSnapshottedFrontmostApp)
         let (newState, action) = RecordingStateMachine.transition(state: recordingState, event: Self.recordingEvent(for: skipPostProcessing ? .raw : .done), currentGeneration: recordingGeneration)
         recordingState = newState
         switch action {
         case .stopAndTranscribe:
-            stopAndTranscribe(preSnapshotted: (app: preSnapshottedFrontmostApp, target: preSnapshottedTarget), skipPostProcessing: skipPostProcessing)
+            stopAndTranscribe(preSnapshotted: (app: preSnapshottedFrontmostApp, target: preSnapshottedTarget, contextTarget: preSnapshottedContextTarget), skipPostProcessing: skipPostProcessing)
         case .none, .startCapture, .enterLocked, .cancel:
             break
         }
@@ -489,8 +492,12 @@ final class AppCoordinator: ObservableObject {
         let activeTemplateName = TemplateStore.shared.template(id: AppSettings.shared.activeTemplateID)?.name ?? "Template"
         let contextScope = AppSettings.shared.localContextScope
         let contextPermissionHint: String?
-        if contextScope == .windowOCR, !Permissions.isScreenRecordingAuthorized() {
-            contextPermissionHint = "Screen Recording permission required"
+        if contextScope == .windowOCR {
+            contextPermissionHint = switch Permissions.screenRecordingAuthorization() {
+            case .authorized: nil
+            case .notDetermined: "Allow Screen Recording for Window + local OCR"
+            case .denied: "Screen Recording denied for Window + local OCR"
+            }
         } else if contextScope != .off, !Permissions.isAccessibilityTrusted() {
             contextPermissionHint = "Accessibility permission required"
         } else {
@@ -526,9 +533,16 @@ final class AppCoordinator: ObservableObject {
     /// synchronous, at key-up, before any `await`. `skipPostProcessing` (Feature 3's "Raw"
     /// button) rides straight through to `processDictation` — the raw flag is pipeline config,
     /// not lifecycle, so it isn't part of the state machine.
-    private func stopAndTranscribe(preSnapshotted: (app: NSRunningApplication?, target: InsertionTarget?)? = nil, skipPostProcessing: Bool = false) {
+    private func stopAndTranscribe(preSnapshotted: (app: NSRunningApplication?, target: InsertionTarget?, contextTarget: ContextTargetSnapshot)? = nil, skipPostProcessing: Bool = false) {
         let capturedOneShotLanguage = oneShotLanguage
         defer { oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .clear) }
+
+        // The destination and context target are the first stop-time reads. Keep this before
+        // audio teardown, logging, file I/O, and every async boundary so later focus changes
+        // cannot redirect AX reads or OCR to another window.
+        let frontmostApp = preSnapshotted?.app ?? NSWorkspace.shared.frontmostApplication
+        let insertionTarget = preSnapshotted?.target ?? Insertion.snapshotTarget(app: frontmostApp)
+        let contextTarget = preSnapshotted?.contextTarget ?? snapshotContextTarget(app: frontmostApp)
 
         invalidateCapTimer()
         stopLivePreview()
@@ -562,27 +576,19 @@ final class AppCoordinator: ObservableObject {
         // the wrong place. See Codex finding: paste-target drift / same-app target drift.
         let engine = activeSTTEngine
         let engineName = engine.name
-        let frontmostApp = preSnapshotted?.app ?? NSWorkspace.shared.frontmostApplication
         let bundleID = frontmostApp?.bundleIdentifier
         let appName = frontmostApp?.localizedName
-        let insertionTarget = preSnapshotted?.target ?? Insertion.snapshotTarget(app: frontmostApp)
         let contextScope = AppSettings.shared.localContextScope
-        let capturedContext = Self.captureApprovedContext(scope: contextScope, provider: localContextProvider)
-        let contextCapture = contextScope == .off
-            ? ContextCapture(
-                context: LocalProcessingContext(
-                    appName: appName,
-                    bundleID: bundleID,
-                    windowTitle: nil,
-                    text: ""
-                ),
-                limitation: nil
-            )
-            : capturedContext
-        let captureTarget = ActiveWindowCaptureTarget(
-            processID: frontmostApp?.processIdentifier ?? 0,
-            windowTitle: contextCapture.context.windowTitle
-        )
+        let capturedContext = Self.captureApprovedContext(scope: contextScope, target: contextTarget, provider: localContextProvider)
+        let contextCapture = contextScope == .off ? ContextCapture(
+            context: LocalProcessingContext(
+                appName: contextTarget.appName,
+                bundleID: contextTarget.bundleID,
+                windowTitle: contextTarget.windowTitle,
+                text: ""
+            ),
+            limitation: nil
+        ) : capturedContext
         let templates = TemplateStore.shared.templates
         let appRules = AppSettings.shared.appRules
         let activeTemplateID = AppSettings.shared.activeTemplateID
@@ -601,7 +607,7 @@ final class AppCoordinator: ObservableObject {
             let resolvedCapture = await resolveWindowOCR(
                 scope: contextScope,
                 capture: contextCapture,
-                target: captureTarget
+                target: contextTarget
             )
             if let hint = Self.contextPermissionHint(for: resolvedCapture.limitation) {
                 hud.show(text: hint)
@@ -634,7 +640,7 @@ final class AppCoordinator: ObservableObject {
     private func resolveWindowOCR(
         scope: LocalContextScope,
         capture: ContextCapture,
-        target: ActiveWindowCaptureTarget
+        target: ContextTargetSnapshot
     ) async -> ContextCapture {
         guard scope == .windowOCR, capture.limitation == nil else { return capture }
         do {
@@ -650,11 +656,23 @@ final class AppCoordinator: ObservableObject {
                 ),
                 limitation: nil
             )
-        } catch ActiveWindowScreenshotError.permissionRequired {
-            return ContextCapture(context: capture.context, limitation: .screenRecordingPermissionRequired)
+        } catch ActiveWindowScreenshotError.permissionNotDetermined {
+            return ContextCapture(context: capture.context, limitation: .screenRecordingPermissionNotDetermined)
+        } catch ActiveWindowScreenshotError.permissionDenied {
+            return ContextCapture(context: capture.context, limitation: .screenRecordingPermissionDenied)
+        } catch ActiveWindowScreenshotError.targetUnavailable {
+            return ContextCapture(context: capture.context, limitation: .screenCaptureTargetUnavailable)
         } catch {
-            return capture
+            return ContextCapture(context: capture.context, limitation: .screenCaptureFailed)
         }
+    }
+
+    private func snapshotContextTarget(app: NSRunningApplication?) -> ContextTargetSnapshot {
+        contextTargetSnapshotter.snapshot(
+            appName: app?.localizedName,
+            bundleID: app?.bundleIdentifier,
+            processID: app?.processIdentifier ?? 0
+        )
     }
 
     private func cancelRecording() {
@@ -695,10 +713,11 @@ final class AppCoordinator: ObservableObject {
 
     static func captureApprovedContext(
         scope: LocalContextScope,
+        target: ContextTargetSnapshot,
         provider: any LocalContextProvider
     ) -> ContextCapture {
         guard scope != .off else { return .empty }
-        return provider.capture(scope: scope)
+        return provider.capture(scope: scope, target: target)
     }
 
     nonisolated static func localContextForProcessor(
@@ -712,8 +731,14 @@ final class AppCoordinator: ObservableObject {
         switch limitation {
         case .accessibilityPermissionRequired:
             "Accessibility permission required for Local context"
-        case .screenRecordingPermissionRequired:
-            "Screen Recording permission required for Window + local OCR"
+        case .screenRecordingPermissionNotDetermined:
+            "Allow Screen Recording in Settings for Window + local OCR"
+        case .screenRecordingPermissionDenied:
+            "Screen Recording permission denied for Window + local OCR"
+        case .screenCaptureTargetUnavailable:
+            "Stopped window is no longer available for local OCR"
+        case .screenCaptureFailed:
+            "Window capture failed; continuing without local OCR"
         case nil:
             nil
         }

@@ -1,37 +1,98 @@
 import CoreGraphics
 import ScreenCaptureKit
 
-struct ActiveWindowCaptureTarget: Sendable {
-    let processID: pid_t
-    let windowTitle: String?
+enum ScreenRecordingAuthorization: Equatable, Sendable {
+    case authorized
+    case notDetermined
+    case denied
 }
 
-enum ActiveWindowScreenshotError: Error {
-    case permissionRequired
-    case windowUnavailable
+enum ActiveWindowScreenshotError: Error, Equatable {
+    case permissionNotDetermined
+    case permissionDenied
+    case targetUnavailable
+    case captureFailed
+}
+
+final class ScreenshotWindow: @unchecked Sendable {
+    let windowID: CGWindowID
+    let processID: pid_t
+    fileprivate let scWindow: SCWindow?
+
+    init(windowID: CGWindowID, processID: pid_t, scWindow: SCWindow? = nil) {
+        self.windowID = windowID
+        self.processID = processID
+        self.scWindow = scWindow
+    }
+}
+
+protocol ActiveWindowScreenshotBackend: Sendable {
+    func shareableWindows() async throws -> [ScreenshotWindow]
+    func capture(window: ScreenshotWindow) async throws -> CGImage
+}
+
+private struct ScreenCaptureKitScreenshotBackend: ActiveWindowScreenshotBackend {
+    func shareableWindows() async throws -> [ScreenshotWindow] {
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        return content.windows.compactMap { window in
+            guard let pid = window.owningApplication?.processID else { return nil }
+            return ScreenshotWindow(windowID: window.windowID, processID: pid, scWindow: window)
+        }
+    }
+
+    func capture(window: ScreenshotWindow) async throws -> CGImage {
+        guard let scWindow = window.scWindow else { throw ActiveWindowScreenshotError.targetUnavailable }
+        let configuration = SCStreamConfiguration()
+        configuration.width = max(1, Int(scWindow.frame.width * 2))
+        configuration.height = max(1, Int(scWindow.frame.height * 2))
+        configuration.showsCursor = false
+        return try await SCScreenshotManager.captureImage(
+            contentFilter: SCContentFilter(desktopIndependentWindow: scWindow),
+            configuration: configuration
+        )
+    }
 }
 
 protocol ActiveWindowScreenshotCapturing: Sendable {
-    func capture(target: ActiveWindowCaptureTarget) async throws -> CGImage
+    func capture(target: ContextTargetSnapshot) async throws -> CGImage
 }
 
 struct ActiveWindowScreenshotService: ActiveWindowScreenshotCapturing {
-    func capture(target: ActiveWindowCaptureTarget) async throws -> CGImage {
-        guard Permissions.isScreenRecordingAuthorized() else {
-            throw ActiveWindowScreenshotError.permissionRequired
-        }
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-        let candidates = content.windows.filter { $0.owningApplication?.processID == target.processID }
-        let window = candidates.first(where: { $0.title == target.windowTitle }) ?? candidates.first
-        guard let window else { throw ActiveWindowScreenshotError.windowUnavailable }
+    private let authorization: @Sendable () -> ScreenRecordingAuthorization
+    private let backend: any ActiveWindowScreenshotBackend
 
-        let configuration = SCStreamConfiguration()
-        configuration.width = max(1, Int(window.frame.width * 2))
-        configuration.height = max(1, Int(window.frame.height * 2))
-        configuration.showsCursor = false
-        return try await SCScreenshotManager.captureImage(
-            contentFilter: SCContentFilter(desktopIndependentWindow: window),
-            configuration: configuration
-        )
+    init(
+        authorization: @escaping @Sendable () -> ScreenRecordingAuthorization = Permissions.screenRecordingAuthorization,
+        backend: any ActiveWindowScreenshotBackend = ScreenCaptureKitScreenshotBackend()
+    ) {
+        self.authorization = authorization
+        self.backend = backend
+    }
+
+    func capture(target: ContextTargetSnapshot) async throws -> CGImage {
+        switch authorization() {
+        case .notDetermined: throw ActiveWindowScreenshotError.permissionNotDetermined
+        case .denied: throw ActiveWindowScreenshotError.permissionDenied
+        case .authorized: break
+        }
+        guard let targetWindowID = target.windowID else { throw ActiveWindowScreenshotError.targetUnavailable }
+        let windows: [ScreenshotWindow]
+        do {
+            windows = try await backend.shareableWindows()
+        } catch {
+            throw ActiveWindowScreenshotError.captureFailed
+        }
+        guard let window = windows.first(where: {
+            $0.windowID == targetWindowID && $0.processID == target.processID
+        }) else {
+            throw ActiveWindowScreenshotError.targetUnavailable
+        }
+        do {
+            return try await backend.capture(window: window)
+        } catch let error as ActiveWindowScreenshotError {
+            throw error
+        } catch {
+            throw ActiveWindowScreenshotError.captureFailed
+        }
     }
 }
