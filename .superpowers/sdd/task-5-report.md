@@ -47,6 +47,33 @@ new runnable checks cover:
   two-argument signature; they were updated mechanically to `{ _, _ in true }`.
 - `git diff --check` — passed with exit code 0 and no output.
 
+## Final rapid-reload ownership fix
+
+### Result
+
+- Moved reload lifecycle creation under `ModelReloadController`'s serial gate, so only the gate
+  owner creates and updates the visible attempt token.
+- A gate owner re-reads the current setting after acquisition, consumes newer intent in its
+  convergence loop, and queued callers re-read both setting and installed state before their
+  first attempt. An intent already installed or reverted is therefore not retried.
+- Production transcription kit acquisition now uses `GuardedKitState.capturedKit()`, the same
+  capture primitive used by the suspended async identity SelfCheck seam.
+
+### Focused RED
+
+`make selfcheck` failed to compile because `ModelReloadController` had no
+`reloadWithLifecycle` member. The new deterministic fake had already encoded the required race:
+A suspends, B queues, A's gate owner consumes B, B emits one progress/status record and fails,
+then reverts to installed A without a queued retry.
+
+### GREEN and full verification
+
+- `make selfcheck` — passed; the rapid A→B test observed exactly one A attempt, one B attempt,
+  lifecycle order `[A, B]`, exactly one B progress/status record, setting reverted to A, and A
+  remained installed.
+- `make test` — passed; application and test targets compiled and linked.
+- `git diff --check` — passed with exit code 0 and no output.
+
 ## Whole-branch final fix wave
 
 ### Result

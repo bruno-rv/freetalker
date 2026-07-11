@@ -124,6 +124,7 @@ final class GuardedKitState<Kit>: @unchecked Sendable {
 
     var isLoaded: Bool { lock.withLock { $0.kit != nil } }
     func snapshot() -> Snapshot { lock.withLock { Snapshot(kit: $0.kit?.value, variant: $0.variant) } }
+    func capturedKit() -> Kit? { snapshot().kit }
     func installIfEmpty(kit: Kit, variant: String) {
         let box = KitBox(kit)
         lock.withLock { state in
@@ -139,7 +140,7 @@ final class GuardedKitState<Kit>: @unchecked Sendable {
     func withCapturedKit<Result: Sendable>(
         _ operation: @Sendable (Kit) async throws -> Result
     ) async throws -> Result? {
-        guard let kit = snapshot().kit else { return nil }
+        guard let kit = capturedKit() else { return nil }
         return try await operation(kit)
     }
 }
@@ -282,24 +283,48 @@ final class ModelReloadController<Kit>: @unchecked Sendable {
         event: @escaping EventSink,
         didInstall: @escaping InstallSink
     ) async {
+        await reloadWithLifecycle(
+            currentSetting: currentSetting,
+            revertSetting: revertSetting,
+            beginAttempt: { _ in () },
+            loader: { variant, _ in try await loader(variant) },
+            event: { value, variant, _ in await event(value, variant) },
+            didInstall: didInstall,
+            finishAttempt: { _ in }
+        )
+    }
+
+    func reloadWithLifecycle<Context: Sendable>(
+        currentSetting: @escaping SettingReader,
+        revertSetting: @escaping SettingReverter,
+        beginAttempt: @escaping @Sendable (String) async -> Context,
+        loader: @escaping @Sendable (String, Context) async throws -> Kit,
+        event: @escaping @Sendable (SpeechModelEngineEvent, String, Context) async -> Void,
+        didInstall: @escaping InstallSink,
+        finishAttempt: @escaping @Sendable (Context) async -> Void
+    ) async {
         try? await reloadGate.run {
-            var target: String? = requested
+            // Re-read only after owning the gate. Another owner may already have consumed or
+            // reverted this caller's original intent while this call was queued.
+            var target: String? = await currentSetting()
             while let requestedVariant = target {
                 let oldVariant = self.state.snapshot().variant
                 guard WhisperKitEngine.shouldReload(loadedVariant: oldVariant, requestedVariant: requestedVariant) else { return }
-                await event(.busy(reloadTarget: requestedVariant), requestedVariant)
+                let context = await beginAttempt(requestedVariant)
+                await event(.busy(reloadTarget: requestedVariant), requestedVariant, context)
                 do {
-                    let candidate = try await loader(requestedVariant)
+                    let candidate = try await loader(requestedVariant, context)
                     self.state.swap(kit: candidate, variant: requestedVariant)
-                    await event(.active, requestedVariant)
+                    await event(.active, requestedVariant, context)
                     await didInstall(requestedVariant)
                 } catch {
-                    await event(.failed(hint: error.localizedDescription), requestedVariant)
+                    await event(.failed(hint: error.localizedDescription), requestedVariant, context)
                     let setting = await currentSetting()
                     if let oldVariant, setting == requestedVariant {
                         await revertSetting(requestedVariant, oldVariant)
                     }
                 }
+                await finishAttempt(context)
                 let current = await currentSetting()
                 target = current == self.state.snapshot().variant ? nil : current
             }
@@ -538,7 +563,7 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
     }
 
     private func kitForTranscription() async throws -> WhisperKit {
-        if let kit = modelController.state.snapshot().kit { return kit }
+        if let kit = modelController.state.capturedKit() { return kit }
         return try await loadedKit()
     }
 
@@ -554,9 +579,7 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
     }
 
     func reload(to requested: String) async {
-        let reload = await beginReloadStatus(for: requested)
-        await modelController.reload(
-            to: requested,
+        await modelController.reloadWithLifecycle(
             currentSetting: { await AppSettings.shared.whisperModel },
             revertSetting: { failed, previous in
                 await MainActor.run {
@@ -565,11 +588,12 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
                     }
                 }
             },
-            loader: { try await self.loadModel(variant: $0, reload: reload) },
-            event: { await self.emit($0, for: $1, reload: reload) },
-            didInstall: { _ in }
+            beginAttempt: { await self.beginReloadStatus(for: $0) },
+            loader: { try await self.loadModel(variant: $0, reload: $1) },
+            event: { await self.emit($0, for: $1, reload: $2) },
+            didInstall: { _ in },
+            finishAttempt: { await self.finishReloadStatus($0) }
         )
-        await finishReloadStatus(reload)
     }
 
     private func loadModel(variant: String, reload: EngineStatusComposer.ReloadToken?) async throws -> WhisperKit {
