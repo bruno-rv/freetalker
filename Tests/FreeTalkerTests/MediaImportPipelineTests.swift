@@ -12,6 +12,24 @@ import Testing
         let source = try #require(Bundle.module.url(forResource: "tone", withExtension: "wav", subdirectory: "Fixtures"))
         try await AVAudioDecoder().decode(source: source, destination: temporary.url, progress: { _ in }, cancellation: CancellationToken())
         #expect(directory.isNormalizedWAV(temporary))
+        var info = stat(); #expect(fstat(temporary.descriptor, &info) == 0)
+        var header = [UInt8](repeating: 0, count: 44); #expect(pread(temporary.descriptor, &header, header.count, 0) == 44)
+        let riffSize = UInt32(header[4]) | UInt32(header[5]) << 8 | UInt32(header[6]) << 16 | UInt32(header[7]) << 24
+        let dataSize = UInt32(header[40]) | UInt32(header[41]) << 8 | UInt32(header[42]) << 16 | UInt32(header[43]) << 24
+        #expect(UInt64(riffSize) + 8 == UInt64(info.st_size))
+        #expect(UInt64(dataSize) + 44 == UInt64(info.st_size))
+        #expect(dataSize > 0 && dataSize % 4 == 0)
+    }
+
+    @Test func cancelledDescriptorDecodesCloseDuplicatesAndCleanStaging() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString); try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let source = try #require(Bundle.module.url(forResource: "tone", withExtension: "wav", subdirectory: "Fixtures"))
+        for _ in 0..<5 {
+            let directory = try OwnedJobDirectory(root: root, jobID: UUID(), create: true); let temporary = try directory.createTemporaryFile(); let token = CancellationToken(); token.cancel()
+            await #expect(throws: CancellationError.self) { try await AVAudioDecoder().decode(source: source, destination: temporary.url, progress: { _ in }, cancellation: token) }
+            directory.discard(temporary); directory.close(temporary)
+            #expect((try FileManager.default.contentsOfDirectory(atPath: directory.directoryURL.path)).isEmpty)
+        }
     }
     @Test func symlinkedJobDirectoryIsRejectedBeforeDecode() async throws {
         let fixture = try MediaPipelineFixture(); let outside = fixture.root.deletingLastPathComponent().appendingPathComponent(UUID().uuidString)
@@ -41,7 +59,10 @@ import Testing
         let decoder = DirectorySwapDecoder(root: fixture.root, jobID: job.id, outside: outside)
         let runner = fixture.pipeline(decoder: decoder).localJobRunner(); await runner.enqueue(job.id); await runner.waitUntilIdle()
         #expect(!FileManager.default.fileExists(atPath: outside.appendingPathComponent("audio.wav").path))
-        #expect(try await fixture.store.job(id: job.id)?.state == .ready)
+        #expect(try await fixture.store.job(id: job.id)?.state.kind == .failed)
+        #expect(try await fixture.store.completedMediaStages(jobID: job.id).isEmpty)
+        let moved = fixture.root.appendingPathComponent(job.id.uuidString + "-moved")
+        #expect((try FileManager.default.contentsOfDirectory(atPath: moved.path)).isEmpty)
     }
     @Test func activeLeaseIsNotStolenByAnotherRunner() async throws {
         let fixture = try MediaPipelineFixture()

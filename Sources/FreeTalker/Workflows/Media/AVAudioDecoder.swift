@@ -2,6 +2,7 @@
 import AudioToolbox
 import CoreMedia
 import Foundation
+import Darwin
 
 struct AVAudioDecoder: MediaAudioDecoding {
     private static let outputFormat = AVAudioFormat(
@@ -18,12 +19,18 @@ struct AVAudioDecoder: MediaAudioDecoding {
         cancellation: CancellationToken
     ) async throws {
         let descriptorDestination = destination.path.hasPrefix("/dev/fd/")
-        let partial = descriptorDestination
-            ? FileManager.default.temporaryDirectory.appendingPathComponent("FreeTalker-decode-\(UUID().uuidString).wav")
-            : destination.appendingPathExtension("partial")
+        let partial = destination.appendingPathExtension("partial")
         let files = FileManager.default
-        try? files.removeItem(at: partial)
-        defer { try? files.removeItem(at: partial) }
+        let outputDescriptor: Int32
+        if descriptorDestination, let existing = Int32(destination.lastPathComponent) {
+            outputDescriptor = dup(existing)
+        } else {
+            try? files.removeItem(at: partial)
+            outputDescriptor = open(partial.path, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, S_IRUSR | S_IWUSR)
+        }
+        guard outputDescriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        defer { Darwin.close(outputDescriptor); if !descriptorDestination { try? files.removeItem(at: partial) } }
+        let writer = try PCMWAVFileWriter(descriptor: outputDescriptor)
 
         try cancellation.checkCancellation()
         progress(0)
@@ -50,7 +57,6 @@ struct AVAudioDecoder: MediaAudioDecoding {
         }
 
         do {
-            var writer: AVAudioFile?
             var converter: AVAudioConverter?
             while let sample = output.copyNextSampleBuffer() {
                 try cancellation.checkCancellation()
@@ -58,14 +64,8 @@ struct AVAudioDecoder: MediaAudioDecoding {
                     let sourceBuffer = try Self.pcmBuffer(from: sample)
                     if converter == nil {
                         converter = AVAudioConverter(from: sourceBuffer.format, to: Self.outputFormat)
-                        writer = try AVAudioFile(
-                            forWriting: partial,
-                            settings: Self.outputFormat.settings,
-                            commonFormat: .pcmFormatFloat32,
-                            interleaved: false
-                        )
                     }
-                    guard let converter, let writer else { throw MediaImportError.decodeFailed("audio converter could not be created") }
+                    guard let converter else { throw MediaImportError.decodeFailed("audio converter could not be created") }
                     _ = try Self.convert(sourceBuffer, with: converter, writingTo: writer)
                 }
                 let timestamp = CMSampleBufferGetPresentationTimeStamp(sample).seconds
@@ -78,24 +78,15 @@ struct AVAudioDecoder: MediaAudioDecoding {
             guard reader.status == .completed else {
                 throw MediaImportError.decodeFailed(reader.error?.localizedDescription ?? "reader stopped unexpectedly")
             }
-            guard let converter, let writer else { throw MediaImportError.decodeFailed("audio track contained no decodable samples") }
+            guard let converter else { throw MediaImportError.decodeFailed("audio track contained no decodable samples") }
             try Self.drain(converter, writingTo: writer, cancellation: cancellation)
-            if descriptorDestination {
-                let input = try FileHandle(forReadingFrom: partial)
-                let output = try FileHandle(forWritingTo: destination)
-                try output.truncate(atOffset: 0)
-                while true {
-                    try cancellation.checkCancellation()
-                    let chunk = try input.read(upToCount: 1_048_576) ?? Data()
-                    if chunk.isEmpty { break }
-                    try output.write(contentsOf: chunk)
+            try writer.finish()
+            if !descriptorDestination {
+                if files.fileExists(atPath: destination.path) {
+                    _ = try files.replaceItemAt(destination, withItemAt: partial)
+                } else {
+                    try files.moveItem(at: partial, to: destination)
                 }
-                try output.synchronize()
-                try input.close(); try output.close()
-            } else if files.fileExists(atPath: destination.path) {
-                _ = try files.replaceItemAt(destination, withItemAt: partial)
-            } else {
-                try files.moveItem(at: partial, to: destination)
             }
             progress(1)
         } catch {
@@ -126,7 +117,7 @@ struct AVAudioDecoder: MediaAudioDecoding {
     }
 
     @discardableResult
-    private static func convert(_ input: AVAudioPCMBuffer, with converter: AVAudioConverter, writingTo file: AVAudioFile) throws -> AVAudioConverterOutputStatus {
+    private static func convert(_ input: AVAudioPCMBuffer, with converter: AVAudioConverter, writingTo file: PCMWAVFileWriter) throws -> AVAudioConverterOutputStatus {
         let ratio = outputFormat.sampleRate / input.format.sampleRate
         let capacity = AVAudioFrameCount(ceil(Double(input.frameLength) * ratio)) + 32
         guard let converted = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: capacity) else {
@@ -142,11 +133,11 @@ struct AVAudioDecoder: MediaAudioDecoding {
         }
         if let conversionError { throw conversionError }
         guard status != .error else { throw MediaImportError.decodeFailed("audio conversion failed") }
-        if converted.frameLength > 0 { try file.write(from: converted) }
+        if converted.frameLength > 0 { try file.write(converted) }
         return status
     }
 
-    private static func drain(_ converter: AVAudioConverter, writingTo file: AVAudioFile, cancellation: CancellationToken) throws {
+    private static func drain(_ converter: AVAudioConverter, writingTo file: PCMWAVFileWriter, cancellation: CancellationToken) throws {
         while true {
             try cancellation.checkCancellation()
             guard let converted = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: 4_096) else {
@@ -159,7 +150,7 @@ struct AVAudioDecoder: MediaAudioDecoding {
             }
             if let conversionError { throw conversionError }
             guard status != .error else { throw MediaImportError.decodeFailed("audio conversion drain failed") }
-            if converted.frameLength > 0 { try file.write(from: converted) }
+            if converted.frameLength > 0 { try file.write(converted) }
             if status == .endOfStream { return }
         }
     }

@@ -11,17 +11,25 @@ final class OwnedJobDirectory: @unchecked Sendable {
     let directoryURL: URL
     private let rootDescriptor: Int32
     private let directoryDescriptor: Int32
+    private let jobName: String
+    private let openedDevice: dev_t
+    private let openedInode: ino_t
 
     init(root: URL, jobID: UUID, create: Bool) throws {
         let canonicalRoot = root.standardizedFileURL.resolvingSymlinksInPath()
         rootDescriptor = open(canonicalRoot.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
         guard rootDescriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
         let name = jobID.uuidString
+        jobName = name
         if create, mkdirat(rootDescriptor, name, S_IRWXU) != 0, errno != EEXIST {
             Darwin.close(rootDescriptor); throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
         directoryDescriptor = openat(rootDescriptor, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
         guard directoryDescriptor >= 0 else { Darwin.close(rootDescriptor); throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        var opened = stat()
+        guard fstat(directoryDescriptor, &opened) == 0 else { Darwin.close(directoryDescriptor); Darwin.close(rootDescriptor); throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        openedDevice = opened.st_dev
+        openedInode = opened.st_ino
         directoryURL = canonicalRoot.appendingPathComponent(name, isDirectory: true)
     }
 
@@ -65,16 +73,22 @@ final class OwnedJobDirectory: @unchecked Sendable {
     }
 
     func promote(_ temporary: TemporaryFile, to basename: String) throws -> URL {
+        try revalidateIdentity()
         var info = stat()
         guard fstat(temporary.descriptor, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else { throw POSIXError(.EFTYPE) }
-        var existing = stat()
-        guard fstatat(directoryDescriptor, basename, &existing, AT_SYMLINK_NOFOLLOW) != 0, errno == ENOENT else {
-            throw POSIXError(.EEXIST)
-        }
-        guard renameat(directoryDescriptor, temporary.name, directoryDescriptor, basename) == 0 else {
+        guard renameatx_np(directoryDescriptor, temporary.name, directoryDescriptor, basename, UInt32(RENAME_EXCL)) == 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
         return directoryURL.appendingPathComponent(basename)
+    }
+
+    func revalidateIdentity() throws {
+        var current = stat()
+        guard fstatat(rootDescriptor, jobName, &current, AT_SYMLINK_NOFOLLOW) == 0,
+              (current.st_mode & S_IFMT) == S_IFDIR,
+              current.st_dev == openedDevice, current.st_ino == openedInode else {
+            throw JobStoreError.corruptData("Media job directory identity changed")
+        }
     }
 
     func unlinkRegistered(path: String, source: URL, fileManager: FileManager) throws {
