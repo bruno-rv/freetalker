@@ -15,6 +15,7 @@ import Testing
         #expect(try db.indexNames() == [
             "idx_transcription_jobs_state_expires_at",
             "idx_transcription_jobs_purge_claimed_at",
+            "idx_transcription_jobs_needs_source_cleanup",
             "idx_job_attempts_job_id"
         ])
         #expect(try db.migrationVersions() == Array(1...DatabaseMigrator.latestVersion))
@@ -52,7 +53,7 @@ import Testing
 
         try DatabaseMigrator.migrate(db.handle)
 
-        #expect(try db.migrationVersions() == [1, 2, 3])
+        #expect(try db.migrationVersions() == Array(1...DatabaseMigrator.latestVersion))
         #expect(try db.integer("SELECT COUNT(*) FROM transcription_jobs WHERE id = 'job-1';") == 1)
         #expect(try db.integer("SELECT COUNT(*) FROM job_attempts WHERE id = 7 AND failure_message = 'old failure';") == 1)
         #expect(try db.integer("SELECT COUNT(*) FROM speaker_segments WHERE id = 8 AND transcript = 'hello';") == 1)
@@ -69,6 +70,24 @@ import Testing
         FROM job_attempts WHERE id = 7;
         """) == "pt|small|clean|failed")
         #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('transcription_jobs') WHERE name IN ('purge_claimed_at', 'purge_error');") == 2)
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('transcription_jobs') WHERE name IN ('needs_source_cleanup', 'source_cleanup_error');") == 2)
+    }
+
+    @Test func upgradesVersionThreeCleanupMetadataWithoutChangingRows() throws {
+        let db = try TemporaryDatabase()
+        try db.createVersionThreeSchema()
+        try db.execute("""
+        INSERT INTO transcription_jobs
+            (id, kind, source_reference, state, created_at, updated_at)
+        VALUES ('ready-recovery', 'recovery', '/tmp/audio.wav', 'ready', 100, 101);
+        """)
+
+        try DatabaseMigrator.migrate(db.handle)
+
+        #expect(try db.migrationVersions() == [1, 2, 3, 4])
+        #expect(try db.integer("SELECT COUNT(*) FROM transcription_jobs WHERE id = 'ready-recovery';") == 1)
+        #expect(try db.integer("SELECT needs_source_cleanup FROM transcription_jobs WHERE id = 'ready-recovery';") == 0)
+        #expect(try db.integer("SELECT source_cleanup_error IS NULL FROM transcription_jobs WHERE id = 'ready-recovery';") == 1)
     }
 
     @Test func rollsBackEntireMigrationWhenSchemaCreationFails() throws {
@@ -191,6 +210,22 @@ private final class TemporaryDatabase {
         CREATE INDEX idx_transcription_jobs_state_expires_at
             ON transcription_jobs (state, expires_at);
         CREATE INDEX idx_job_attempts_job_id ON job_attempts (job_id);
+        """)
+    }
+
+    func createVersionThreeSchema() throws {
+        try createVersionOneSchema()
+        try execute("""
+        ALTER TABLE job_attempts ADD COLUMN language TEXT;
+        ALTER TABLE job_attempts ADD COLUMN speech_model TEXT;
+        ALTER TABLE job_attempts ADD COLUMN template TEXT;
+        ALTER TABLE job_attempts ADD COLUMN result TEXT;
+        INSERT INTO schema_migrations (version) VALUES (2);
+        ALTER TABLE transcription_jobs ADD COLUMN purge_claimed_at REAL;
+        ALTER TABLE transcription_jobs ADD COLUMN purge_error TEXT;
+        CREATE INDEX idx_transcription_jobs_purge_claimed_at
+            ON transcription_jobs (purge_claimed_at);
+        INSERT INTO schema_migrations (version) VALUES (3);
         """)
     }
 

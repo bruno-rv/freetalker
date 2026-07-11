@@ -65,6 +65,8 @@ struct TranscriptionJob: Sendable, Equatable {
     let completedAt: Date?
     let expiresAt: Date?
     let result: String?
+    let needsSourceCleanup: Bool
+    let sourceCleanupError: String?
 }
 
 struct AttemptConfiguration: Sendable, Equatable {

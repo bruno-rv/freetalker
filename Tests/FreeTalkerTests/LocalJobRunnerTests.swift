@@ -80,6 +80,23 @@ import Testing
         #expect(await probe.started == [first.id, second.id])
     }
 
+    @Test func recoveryScopedRunnerIgnoresQueuedMediaImportsAndRejectsTheirEnqueue() async throws {
+        let fixture = try RunnerFixture()
+        let recovery = try await fixture.makeJob(.recovery, "recovery.wav")
+        let media = try await fixture.makeJob(.mediaImport, "media.wav")
+        let probe = SuspendedExecutorProbe()
+        let runner = LocalJobRunner(store: fixture.store, kind: .recovery, executor: probe.execute)
+
+        await runner.enqueue(media.id)
+        await runner.resumeQueuedJobs()
+        await probe.waitUntilStarted(recovery.id)
+        await probe.resume(recovery.id)
+        await runner.waitUntilIdle()
+
+        #expect(await probe.started == [recovery.id])
+        #expect(try await fixture.store.job(id: media.id)?.state == .queued)
+    }
+
     @Test func resumeDuringExecutionDoesNotRecoverTheRunningJob() async throws {
         let fixture = try RunnerFixture()
         let current = try await fixture.makeJob(.recovery, "current.wav")
@@ -259,8 +276,8 @@ private actor SuspendedReadyTransitionStore: TranscriptionJobStoring {
         try await base.jobs(kind: kind)
     }
 
-    func recoverInterruptedJobs() async throws -> Int {
-        try await base.recoverInterruptedJobs()
+    func recoverInterruptedJobs(kind: JobKind?) async throws -> Int {
+        try await base.recoverInterruptedJobs(kind: kind)
     }
 
     func transition(_ id: UUID, from: JobState.Kind, to state: JobState) async throws {
@@ -308,8 +325,8 @@ private actor SuspendedInitialReadStore: TranscriptionJobStoring {
         try await base.jobs(kind: kind)
     }
 
-    func recoverInterruptedJobs() async throws -> Int {
-        try await base.recoverInterruptedJobs()
+    func recoverInterruptedJobs(kind: JobKind?) async throws -> Int {
+        try await base.recoverInterruptedJobs(kind: kind)
     }
 
     func transition(_ id: UUID, from: JobState.Kind, to state: JobState) async throws {

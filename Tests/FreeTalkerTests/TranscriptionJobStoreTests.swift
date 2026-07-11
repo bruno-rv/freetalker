@@ -68,6 +68,35 @@ import Testing
         #expect(attempts[1].result == .succeeded)
     }
 
+    @Test func readsLatestUnfinishedAttemptAndAtomicallyCompletesItWithJob() async throws {
+        let fixture = try await fixture()
+        try await fixture.store.transition(fixture.job.id, from: .queued, to: .processing(stage: .preparing))
+        let attempt = try await fixture.store.beginAttempt(
+            jobID: fixture.job.id,
+            configuration: .init(language: "pt", speechModel: "small", template: "email")
+        )
+
+        #expect(try await fixture.store.latestUnfinishedAttempt(jobID: fixture.job.id) == attempt)
+        try await fixture.store.completeAttemptAndMarkJobReady(jobID: fixture.job.id, attemptID: attempt.id)
+
+        #expect(try await fixture.store.latestUnfinishedAttempt(jobID: fixture.job.id) == nil)
+        #expect(try await fixture.store.attempts(jobID: fixture.job.id).last?.result == .succeeded)
+        #expect(try await fixture.store.job(id: fixture.job.id)?.state == .ready)
+        #expect(try await fixture.store.job(id: fixture.job.id)?.needsSourceCleanup == true)
+    }
+
+    @Test func atomicCompletionRollsBackAttemptWhenReadyUpdateCannotApply() async throws {
+        let fixture = try await fixture()
+        let attempt = try await fixture.store.beginAttempt(jobID: fixture.job.id, configuration: .init())
+
+        await #expect(throws: JobStoreError.invalidTransition) {
+            try await fixture.store.completeAttemptAndMarkJobReady(jobID: fixture.job.id, attemptID: attempt.id)
+        }
+
+        #expect(try await fixture.store.attempts(jobID: fixture.job.id).last?.result == nil)
+        #expect(try await fixture.store.job(id: fixture.job.id)?.state == .queued)
+    }
+
     @Test func recoversInterruptedJobsAfterStoreRestart() async throws {
         let database = try TemporaryJobDatabase()
         let clock = FixedJobClock(now: Date(timeIntervalSince1970: 2_000))
