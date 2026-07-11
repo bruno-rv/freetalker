@@ -2,11 +2,22 @@ APP_NAME := FreeTalker
 BUNDLE := $(APP_NAME).app
 CONFIG := release
 BIN := .build/$(CONFIG)/$(APP_NAME)
+XCODE_DEVELOPER_DIR ?= /Applications/Xcode.app/Contents/Developer
 
-.PHONY: build app run clean
+.PHONY: build test test-preflight app run clean
 
 build:
 	swift build -c $(CONFIG)
+
+test: test-preflight
+	@echo "Using Xcode developer directory: $(XCODE_DEVELOPER_DIR)"
+	DEVELOPER_DIR="$(XCODE_DEVELOPER_DIR)" swift test
+
+test-preflight:
+	@test -x "$(XCODE_DEVELOPER_DIR)/usr/bin/xcodebuild" || \
+		( echo "error: full Xcode is required for tests; xcodebuild not found under $(XCODE_DEVELOPER_DIR)" >&2; exit 1 )
+	@test -d "$(XCODE_DEVELOPER_DIR)/Platforms/MacOSX.platform/Developer/Library/Frameworks/Testing.framework" || \
+		( echo "error: Swift Testing framework not found under $(XCODE_DEVELOPER_DIR)" >&2; exit 1 )
 
 # Assembles FreeTalker.app from the built executable — no .xcodeproj available (CLT only),
 # see README.md.

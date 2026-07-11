@@ -31,6 +31,8 @@ final class HUDController {
         var cap: TimeInterval
         var previewText: String?
         var activeTemplateName: String
+        var localContextScopeName: String
+        var localContextPermissionHint: String?
         /// nil / "en" / "pt" — which one-shot choice (if any) is currently highlighted.
         var oneShotLanguage: String?
     }
@@ -193,6 +195,12 @@ struct HUDView: View {
                     .foregroundStyle(.secondary)
                     .font(.caption)
             }
+            Text("Context: \(state.localContextScopeName)")
+                .font(.caption2)
+                .foregroundStyle(state.localContextPermissionHint == nil ? Color.secondary : Color.orange)
+                .help(state.localContextPermissionHint ?? "Local context scope")
+                .accessibilityLabel("Local context: \(state.localContextScopeName)")
+                .accessibilityHint(state.localContextPermissionHint ?? "Captured once when recording stops")
 
             Button(action: panelCallbacks.onCancel) {
                 Image(systemName: "xmark.circle")

@@ -279,6 +279,27 @@ final class ModelReloadController<Kit>: @unchecked Sendable {
         )
     }
 
+    func reloadExact(
+        to requested: String,
+        loader: @escaping Loader,
+        event: @escaping EventSink,
+        didInstall: @escaping InstallSink
+    ) async throws {
+        try await reloadGate.run {
+            guard self.state.snapshot().variant != requested else { return }
+            await event(.busy(reloadTarget: requested), requested)
+            let candidate = try await loader(requested)
+            self.state.swap(kit: candidate, variant: requested)
+            await event(.active, requested)
+            await didInstall(requested)
+        }
+    }
+
+    func exactModel(to requested: String, loader: @escaping Loader) async throws -> Kit {
+        if let current = state.snapshot().kit, state.snapshot().variant == requested { return current }
+        return try await loader(requested)
+    }
+
     func reloadWithLifecycle<Context: Sendable>(
         currentSetting: @escaping SettingReader,
         revertSetting: @escaping SettingReverter,
@@ -317,7 +338,7 @@ final class ModelReloadController<Kit>: @unchecked Sendable {
     }
 }
 
-final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked Sendable {
+final class WhisperKitEngine: ObservableObject, TranscriptionEngine, WhisperFileTranscriptionBackend, @unchecked Sendable {
     let name = "WhisperKit"
     @MainActor @Published private(set) var statusText: String = "Not loaded"
 
@@ -384,6 +405,46 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
         try await transcribe(samples: samples, forcedLanguage: forcedLanguage, allowEarlyCancel: false)
     }
 
+    func transcribe(samples: [Float], forcedLanguage: String?, exactModel: String) async throws -> TranscriptionOutput {
+        try await gate.run {
+            let kit = try await self.kitForFileTranscription(model: exactModel)
+            return try await self.performTranscribe(samples: samples, forcedLanguage: forcedLanguage, cancelFlag: nil, kitOverride: kit)
+        }
+    }
+
+    func transcribeFile(_ request: WhisperFileRequest) async throws -> [RawTranscriptSegment] {
+        let cancelFlag = OSAllocatedUnfairLock(initialState: false)
+        return try await withTaskCancellationHandler {
+            try await gate.run {
+                try Task.checkCancellation()
+                let kit = try await self.kitForFileTranscription(model: request.model)
+                try Task.checkCancellation()
+                var options = DecodingOptions()
+                options.language = request.language
+                options.usePrefillPrompt = true
+                options.detectLanguage = request.language == nil
+                let callback: TranscriptionCallback = { _ in
+                    Self.earlyStopDecision(cancelled: cancelFlag.withLock { $0 })
+                }
+                let results = try await kit.transcribe(
+                    audioPath: request.url.path,
+                    decodeOptions: options,
+                    callback: callback
+                )
+                if cancelFlag.withLock({ $0 }) { throw CancellationError() }
+                return results.flatMap(\.segments).map {
+                    RawTranscriptSegment(
+                        start: TimeInterval($0.start),
+                        end: TimeInterval($0.end),
+                        text: $0.text
+                    )
+                }
+            }
+        } onCancel: {
+            cancelFlag.withLock { $0 = true }
+        }
+    }
+
     /// Pure decision for the preview-only early-stop `TranscriptionCallback` WhisperKit invokes
     /// once per decoded token (`TextDecoder.swift`'s decode loop). Returning `false` is
     /// WhisperKit's documented "stop decoding now" signal; `true`/`nil` continue. See
@@ -415,8 +476,10 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
         }
     }
 
-    private func performTranscribe(samples: [Float], forcedLanguage: String?, cancelFlag: OSAllocatedUnfairLock<Bool>?) async throws -> TranscriptionOutput {
-        let kit = try await kitForTranscription()
+    private func performTranscribe(samples: [Float], forcedLanguage: String?, cancelFlag: OSAllocatedUnfairLock<Bool>?, kitOverride: WhisperKit? = nil) async throws -> TranscriptionOutput {
+        let kit: WhisperKit
+        if let kitOverride { kit = kitOverride }
+        else { kit = try await kitForTranscription() }
         try checkPreviewCancellation(cancelFlag)
 
         do {
@@ -503,6 +566,23 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
         return try await loadedKit()
     }
 
+    private func kitForFileTranscription(model: String) async throws -> WhisperKit {
+        let snapshot = modelController.state.snapshot()
+        if snapshot.variant == model, let kit = snapshot.kit { return kit }
+        do {
+            let kit = try await modelController.exactModel(to: model) {
+                try await self.loadModel(variant: $0, reload: nil)
+            }
+            progressGuard.finishCurrent(variant: model)
+            await emit(.downloaded, for: model, reload: nil)
+            await setReadyStatus()
+            return kit
+        } catch {
+            await emit(.failed(hint: error.localizedDescription), for: model, reload: nil)
+            throw error
+        }
+    }
+
     private func loadedKit() async throws -> WhisperKit {
         if let kit = modelController.state.snapshot().kit { return kit }
         let variant = await AppSettings.shared.whisperModel
@@ -515,21 +595,18 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, @unchecked 
     }
 
     func reload(to requested: String) async {
-        await modelController.reloadWithLifecycle(
-            currentSetting: { await AppSettings.shared.whisperModel },
-            revertSetting: { failed, previous in
-                await MainActor.run {
-                    if AppSettings.shared.whisperModel == failed {
-                        AppSettings.shared.applyAutomaticWhisperModel(previous)
-                    }
-                }
-            },
-            beginAttempt: { await self.beginReloadStatus(for: $0) },
-            loader: { try await self.loadModel(variant: $0, reload: $1) },
-            event: { await self.emit($0, for: $1, reload: $2) },
-            didInstall: { _ in },
-            finishAttempt: { await self.finishReloadStatus($0) }
-        )
+        let token = await beginReloadStatus(for: requested)
+        do {
+            try await modelController.reloadExact(
+                to: requested,
+                loader: { try await self.loadModel(variant: $0, reload: token) },
+                event: { await self.emit($0, for: $1, reload: token) },
+                didInstall: { _ in }
+            )
+        } catch {
+            await emit(.failed(hint: error.localizedDescription), for: requested, reload: token)
+        }
+        await finishReloadStatus(token)
     }
 
     private func loadModel(variant: String, reload: EngineStatusComposer.ReloadToken?) async throws -> WhisperKit {

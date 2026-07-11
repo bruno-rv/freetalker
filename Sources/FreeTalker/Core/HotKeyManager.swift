@@ -4,7 +4,8 @@ import Foundation
 import IOKit.hid
 import os
 
-final class HotKeyManager: @unchecked Sendable {
+@MainActor
+final class HotKeyManager {
     /// Fired with the originating `CGEvent`'s timestamp, converted to seconds since boot (see
     /// `handle(type:event:)`) — NOT the wall-clock time the callback happens to run at. Capture-
     /// start latency (the `Task { @MainActor in ... }` hop, or contention on the main run loop)
@@ -17,6 +18,10 @@ final class HotKeyManager: @unchecked Sendable {
     /// `shouldSwallowEscape` below.
     var onEscape: (@MainActor () -> Void)?
     var onRedoKeyDown: (@MainActor (TimeInterval) -> Void)?
+    /// Runs synchronously inside the event-tap callback, before it returns nil to swallow the
+    /// key. Voice-edit target capture must observe the exact focus/selection that owned the
+    /// hotkey event rather than a later main-actor turn.
+    var onVoiceEditKeyDown: (@MainActor (TimeInterval) -> Void)?
 
     /// True while a hands-free recording is in progress (ptt or locked) — mirrored synchronously
     /// by `AppCoordinator` on every `recordingState` transition. Both run on the main thread (the
@@ -30,6 +35,11 @@ final class HotKeyManager: @unchecked Sendable {
     private var runLoopSource: CFRunLoopSource?
     private var matcher = HotKeyMatcher(spec: .default)
     private var redoMatcher: HotKeyMatcher?
+    private var voiceEditMatcher: HotKeyMatcher?
+    /// Key-downs swallowed by an old matcher generation whose physical key-up may arrive after
+    /// a settings-driven tap restart. Repeated reconfiguration can accumulate old generations,
+    /// so insertion is explicitly capped by `maximumSwallowedKeyUpTombstones`.
+    private var swallowedKeyUpTombstones: Set<UInt16> = []
     /// Mirrors `HotKeyMatcher.keyIsSwallowed` for Esc: true between a swallowed Esc keyDown and
     /// its keyUp, so the keyUp is swallowed too even if `isRecording` has already flipped false
     /// by the time it arrives (cancellation is dispatched asynchronously — see `onEscape`).
@@ -38,7 +48,11 @@ final class HotKeyManager: @unchecked Sendable {
     private static let logger = Logger(subsystem: "com.bruno.freetalker", category: "hotkey")
 
     /// Esc virtual keycode (kVK_Escape).
-    static let escapeKeyCode: UInt16 = 53
+    nonisolated static let escapeKeyCode: UInt16 = 53
+
+    nonisolated static func eventTapThreadIsValid() -> Bool {
+        Thread.isMainThread
+    }
 
     nonisolated static func shouldSwallowEscape(keyCode: UInt16, isRecording: Bool) -> Bool {
         keyCode == escapeKeyCode && isRecording
@@ -50,25 +64,100 @@ final class HotKeyManager: @unchecked Sendable {
         var pttEngaged = false
         var pttReleased = false
         var redoEngaged = false
+        var voiceEditEngaged = false
         var swallow = false
     }
 
-    static func dispatch(
+    nonisolated static func dispatch(
         kind: KeyEventKind,
         keyCode: UInt16,
         flags: UInt64,
         isAutorepeat: Bool,
         matcher: inout HotKeyMatcher,
-        redoMatcher: inout HotKeyMatcher?
+        redoMatcher: inout HotKeyMatcher?,
+        voiceEditMatcher: inout HotKeyMatcher?
     ) -> DispatchOutcome {
         let outcome = matcher.handle(kind, keyCode: keyCode, flags: flags, isAutorepeat: isAutorepeat)
         let redoOutcome = redoMatcher?.handle(kind, keyCode: keyCode, flags: flags, isAutorepeat: isAutorepeat)
+        let voiceEditOutcome = voiceEditMatcher?.handle(kind, keyCode: keyCode, flags: flags, isAutorepeat: isAutorepeat)
         return DispatchOutcome(
             pttEngaged: outcome.engaged,
             pttReleased: outcome.released,
             redoEngaged: redoOutcome?.engaged == true,
-            swallow: outcome.swallow || redoOutcome?.swallow == true
+            voiceEditEngaged: voiceEditOutcome?.engaged == true,
+            swallow: outcome.swallow || redoOutcome?.swallow == true || voiceEditOutcome?.swallow == true
         )
+    }
+
+    nonisolated static func resetMatchers(
+        matcher: inout HotKeyMatcher,
+        redoMatcher: inout HotKeyMatcher?,
+        voiceEditMatcher: inout HotKeyMatcher?
+    ) {
+        matcher = HotKeyMatcher(spec: matcher.spec)
+        redoMatcher = redoMatcher.map { HotKeyMatcher(spec: $0.spec) }
+        voiceEditMatcher = voiceEditMatcher.map { HotKeyMatcher(spec: $0.spec) }
+    }
+
+    nonisolated static func captureSwallowedKeyUpTombstones(
+        matcher: HotKeyMatcher,
+        redoMatcher: HotKeyMatcher?,
+        voiceEditMatcher: HotKeyMatcher?
+    ) -> Set<UInt16> {
+        Set([
+            matcher.swallowedKeyCodeAwaitingKeyUp,
+            redoMatcher?.swallowedKeyCodeAwaitingKeyUp,
+            voiceEditMatcher?.swallowedKeyCodeAwaitingKeyUp
+        ].compactMap { $0 })
+    }
+
+    nonisolated static let maximumSwallowedKeyUpTombstones = 8
+
+    nonisolated static func mergeSwallowedKeyUpTombstones(
+        _ additions: Set<UInt16>,
+        into tombstones: inout Set<UInt16>
+    ) {
+        tombstones.formUnion(additions)
+        while tombstones.count > maximumSwallowedKeyUpTombstones,
+              let stale = tombstones.first {
+            tombstones.remove(stale)
+        }
+    }
+
+    enum TombstoneEventOutcome: Equatable {
+        case dispatch
+        case swallowWithoutDispatch
+    }
+
+    nonisolated static func handleSwallowedKeyUpTombstone(
+        kind: KeyEventKind,
+        keyCode: UInt16,
+        isAutorepeat: Bool,
+        tombstones: inout Set<UInt16>
+    ) -> TombstoneEventOutcome {
+        guard tombstones.contains(keyCode) else { return .dispatch }
+        switch kind {
+        case .keyUp:
+            tombstones.remove(keyCode)
+            return .swallowWithoutDispatch
+        case .keyDown where isAutorepeat:
+            return .swallowWithoutDispatch
+        case .keyDown:
+            tombstones.remove(keyCode)
+            return .dispatch
+        case .flagsChanged:
+            return .dispatch
+        }
+    }
+
+    @MainActor
+    static func deliverVoiceEditIfNeeded(
+        outcome: DispatchOutcome,
+        eventSeconds: TimeInterval,
+        action: (@MainActor (TimeInterval) -> Void)?
+    ) {
+        guard outcome.voiceEditEngaged else { return }
+        action?(eventSeconds)
     }
 
     /// True while the event tap exists and is enabled. `ensureHotKeyListening()` uses this to
@@ -85,10 +174,11 @@ final class HotKeyManager: @unchecked Sendable {
     /// (missing Accessibility/Input Monitoring permission — both TCC states are logged for
     /// diagnosis).
     @discardableResult
-    func start(spec: HotKeySpec, redoSpec: HotKeySpec?) -> Bool {
+    func start(spec: HotKeySpec, redoSpec: HotKeySpec?, voiceEditSpec: HotKeySpec? = nil) -> Bool {
         stop()
         matcher = HotKeyMatcher(spec: spec)
         redoMatcher = redoSpec.map { HotKeyMatcher(spec: $0) }
+        voiceEditMatcher = voiceEditSpec.map { HotKeyMatcher(spec: $0) }
 
         let axTrusted = AXIsProcessTrusted()
         let hidAccess = IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)
@@ -110,19 +200,32 @@ final class HotKeyManager: @unchecked Sendable {
             callback: { _, type, event, refcon in
                 guard let refcon else { return Unmanaged.passUnretained(event) }
                 let manager = Unmanaged<HotKeyManager>.fromOpaque(refcon).takeUnretainedValue()
-                // The system disables event taps after a timeout or suspicious input (and
-                // across sleep/wake); without re-enabling, push-to-talk would silently die
-                // after working fine initially.
-                if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-                    if let tap = manager.eventTap {
-                        CGEvent.tapEnable(tap: tap, enable: true)
+                // This tap's run-loop source is installed exclusively on the main run loop
+                // below. Assert that contract before entering MainActor isolation synchronously;
+                // event swallowing and voice-selection capture cannot be deferred.
+                precondition(HotKeyManager.eventTapThreadIsValid(), "HotKeyManager event tap must run on the main thread")
+                let eventAddress = UInt(bitPattern: Unmanaged.passUnretained(event).toOpaque())
+                let resultAddress: UInt = MainActor.assumeIsolated {
+                    let eventPointer = UnsafeMutableRawPointer(bitPattern: eventAddress)!
+                    let isolatedEvent = Unmanaged<CGEvent>.fromOpaque(eventPointer).takeUnretainedValue()
+                    // The system disables event taps after a timeout or suspicious input (and
+                    // across sleep/wake); without re-enabling, push-to-talk would silently die.
+                    if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                        manager.swallowedKeyUpTombstones.removeAll()
+                        if let tap = manager.eventTap {
+                            CGEvent.tapEnable(tap: tap, enable: true)
+                        }
+                        return eventAddress
                     }
-                    return Unmanaged.passUnretained(event)
+                    return manager.handle(type: type, event: isolatedEvent)
+                        .map { UInt(bitPattern: $0.toOpaque()) } ?? 0
                 }
-                return manager.handle(type: type, event: event)
+                guard let resultPointer = UnsafeMutableRawPointer(bitPattern: resultAddress) else { return nil }
+                return Unmanaged<CGEvent>.fromOpaque(resultPointer)
             },
             userInfo: refcon
         ) else {
+            swallowedKeyUpTombstones.removeAll()
             Self.logger.error("tap create FAILED: AXIsProcessTrusted=\(axTrusted, privacy: .public) IOHIDCheckAccess=\(hidAccess.rawValue, privacy: .public)")
             return false
         }
@@ -137,6 +240,11 @@ final class HotKeyManager: @unchecked Sendable {
     }
 
     func stop() {
+        Self.mergeSwallowedKeyUpTombstones(Self.captureSwallowedKeyUpTombstones(
+            matcher: matcher,
+            redoMatcher: redoMatcher,
+            voiceEditMatcher: voiceEditMatcher
+        ), into: &swallowedKeyUpTombstones)
         if let tap = eventTap {
             CGEvent.tapEnable(tap: tap, enable: false)
         }
@@ -145,6 +253,7 @@ final class HotKeyManager: @unchecked Sendable {
         }
         eventTap = nil
         runLoopSource = nil
+        Self.resetMatchers(matcher: &matcher, redoMatcher: &redoMatcher, voiceEditMatcher: &voiceEditMatcher)
     }
 
     /// Runs on the main thread (the tap's run-loop source is on the main run loop), so
@@ -173,7 +282,15 @@ final class HotKeyManager: @unchecked Sendable {
         default: return Unmanaged.passUnretained(event)
         }
         let isAutorepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
-        let outcome = Self.dispatch(kind: kind, keyCode: keyCode, flags: event.flags.rawValue, isAutorepeat: isAutorepeat, matcher: &matcher, redoMatcher: &redoMatcher)
+        if Self.handleSwallowedKeyUpTombstone(
+            kind: kind,
+            keyCode: keyCode,
+            isAutorepeat: isAutorepeat,
+            tombstones: &swallowedKeyUpTombstones
+        ) == .swallowWithoutDispatch {
+            return nil
+        }
+        let outcome = Self.dispatch(kind: kind, keyCode: keyCode, flags: event.flags.rawValue, isAutorepeat: isAutorepeat, matcher: &matcher, redoMatcher: &redoMatcher, voiceEditMatcher: &voiceEditMatcher)
         // CGEventTimestamp is nanoseconds since system startup (excluding sleep) — converted to
         // seconds here, at the tap callback, so `AppCoordinator`'s tap-vs-hold elapsed-time
         // calculation is immune to any delay between this event firing and the hop to the
@@ -187,6 +304,13 @@ final class HotKeyManager: @unchecked Sendable {
         }
         if outcome.redoEngaged {
             Task { @MainActor in self.onRedoKeyDown?(eventSeconds) }
+        }
+        if outcome.voiceEditEngaged {
+            Self.deliverVoiceEditIfNeeded(
+                outcome: outcome,
+                eventSeconds: eventSeconds,
+                action: onVoiceEditKeyDown
+            )
         }
         return outcome.swallow ? nil : Unmanaged.passUnretained(event)
     }

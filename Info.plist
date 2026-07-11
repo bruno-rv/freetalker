@@ -24,6 +24,8 @@
     <true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>FreeTalker records your voice while you hold the push-to-talk key so it can transcribe your dictation.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>FreeTalker can capture the active window once when dictation stops to extract local context with Apple Vision.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
 </dict>

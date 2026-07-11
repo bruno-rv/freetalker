@@ -3,9 +3,22 @@ import AVFoundation
 import Combine
 import Foundation
 import os
+import SwiftUI
 
 @MainActor
 final class AppCoordinator: ObservableObject {
+    enum CaptureOwner: Equatable { case none, dictation, voiceEdit }
+    enum CaptureDecision: Equatable { case start, stop, busy(CaptureOwner) }
+
+    nonisolated static func captureStartDecision(current: CaptureOwner, requested: CaptureOwner) -> CaptureDecision {
+        current == .none ? .start : .busy(current)
+    }
+
+    nonisolated static func capturePressDecision(current: CaptureOwner, pressed: CaptureOwner) -> CaptureDecision {
+        if current == pressed { return .stop }
+        return captureStartDecision(current: current, requested: pressed)
+    }
+
     static let shared = AppCoordinator()
 
     @Published private(set) var isRecording = false
@@ -53,10 +66,28 @@ final class AppCoordinator: ObservableObject {
     let whisperEngine: WhisperKitEngine
     let cloudSTTEngine = CloudSTTEngine()
     private let appleFMProcessor = AppleFMProcessor()
+    private let localContextProvider: any LocalContextProvider = AccessibilityLocalContextProvider()
+    private let screenshotService: any ActiveWindowScreenshotCapturing = ActiveWindowScreenshotService()
+    private let ocrService: any VisionOCRServicing = VisionOCRService()
+    private let contextTargetSnapshotter = ContextTargetSnapshotter()
+    private let selectionAccess: any SelectionAccessing = SelectionAccess()
+    private(set) var pendingVoiceEditSelection: SelectionSnapshot?
+    @Published private(set) var snippetStore: SnippetStore?
+    @Published private(set) var snippetStoreInitializationError: String?
+    private var voiceEditCoordinator: VoiceEditCoordinator?
+    private var voiceEditWindow: NSWindow?
+    private var voiceEditWindowDelegate: VoiceEditWindowDelegate?
+    private var captureOwner: CaptureOwner = .none
 
     private let hotKeyManager = HotKeyManager()
     private let audioCapture = AudioCapture()
     private let hud = HUDController()
+    private let recoveryStore: TranscriptionJobStore?
+    let jobLibraryStore: JobLibraryStore?
+    private var recoveryRunner: LocalJobRunner?
+    private var mediaImportRunner: LocalJobRunner?
+    private var recoveryRetentionTask: Task<Void, Never>?
+    private let localJobExecutionAuthority = LocalJobExecutionAuthority()
     private var cancellables = Set<AnyCancellable>()
     private var permissionPollTimer: Timer?
 
@@ -76,6 +107,16 @@ final class AppCoordinator: ObservableObject {
         speechModelDownloadCoordinator = downloadCoordinator
         speechModelStore = modelStore
         whisperEngine = WhisperKitEngine(downloadCoordinator: downloadCoordinator)
+        let recoveryStore = try? Self.makeRecoveryStore()
+        self.recoveryStore = recoveryStore
+        do {
+            snippetStore = try Self.makeSnippetStore()
+            snippetStoreInitializationError = nil
+        } catch {
+            snippetStore = nil
+            snippetStoreInitializationError = Self.snippetStoreErrorMessage(error)
+        }
+        jobLibraryStore = recoveryStore.map { JobLibraryStore(store: $0, recoveryDirectory: Self.recoveryDirectory) }
         whisperEngine.setEventReceiver(modelStore)
         modelStore.onAutomaticSelection = { [weak whisperEngine] target in
             guard let whisperEngine else { return }
@@ -105,6 +146,30 @@ final class AppCoordinator: ObservableObject {
             .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.restartHotKeyListening() }
+            .store(in: &cancellables)
+        AppSettings.shared.$voiceEditHotKeySpec
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.restartHotKeyListening() }
+            .store(in: &cancellables)
+        AppSettings.shared.$mediaImportRetention
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] retention in
+                Task { @MainActor in
+                    guard let self else { return }
+                    await Self.routeMediaImportRetentionChange(retention) { [weak self] value in
+                        await self?.purgeMediaImports(retention: value)
+                    }
+                }
+            }
+            .store(in: &cancellables)
+        AppSettings.shared.$recoveryRetention
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] retention in
+                self?.scheduleRecoveryRetentionPurge(retention)
+            }
             .store(in: &cancellables)
         // Cheap catch-all: the user activating the app (opening Settings, the Library, even
         // just the menu bar popover focusing a window) re-checks the tap — catching
@@ -172,12 +237,176 @@ final class AppCoordinator: ObservableObject {
         hotKeyManager.onKeyUp = { [weak self] eventSeconds in self?.handleKeyUp(eventSeconds: eventSeconds) }
         hotKeyManager.onEscape = { [weak self] in self?.handleEscape() }
         hotKeyManager.onRedoKeyDown = { [weak self] _ in self?.redoLast() }
-        if hotKeyManager.start(spec: AppSettings.shared.hotKeySpec, redoSpec: AppSettings.shared.redoHotKeySpec) {
+        Self.configureVoiceEditHotKey(manager: hotKeyManager) { [weak self] in
+            self?.handleVoiceEditHotKey()
+        }
+        if hotKeyManager.start(
+            spec: AppSettings.shared.hotKeySpec,
+            redoSpec: AppSettings.shared.redoHotKeySpec,
+            voiceEditSpec: AppSettings.shared.voiceEditHotKeySpec
+        ) {
             hotKeyStatusText = nil
             stopHotKeyRetryPoll()
         } else {
             updateHotKeyStatusText()
             beginHotKeyRetryPollIfNeeded()
+        }
+    }
+
+    static func configureVoiceEditHotKey(manager: HotKeyManager, handler: @escaping @MainActor () -> Void) {
+        manager.onVoiceEditKeyDown = { _ in handler() }
+    }
+
+    private func handleVoiceEditHotKey() {
+        switch Self.capturePressDecision(current: captureOwner, pressed: .voiceEdit) {
+        case .stop:
+            finishVoiceEditInstructionRecording()
+            return
+        case .busy:
+            hud.flash("Finish the current recording first")
+            return
+        case .start:
+            break
+        }
+        Self.handleVoiceEditHotKey(
+            selectionAccess: selectionAccess,
+            pendingSelection: &pendingVoiceEditSelection,
+            flash: { hud.flash($0) }
+        )
+        guard pendingVoiceEditSelection != nil else { return }
+        beginVoiceEditInstructionRecording()
+    }
+
+    private func beginVoiceEditInstructionRecording() {
+        guard Self.captureStartDecision(current: captureOwner, requested: .voiceEdit) == .start,
+              !isProcessing else {
+            hud.flash("Finish the current recording first")
+            pendingVoiceEditSelection = nil
+            return
+        }
+        guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
+            hud.flash("Microphone not authorized — check System Settings")
+            pendingVoiceEditSelection = nil
+            return
+        }
+        do {
+            try audioCapture.start(deviceUID: AppSettings.shared.microphoneDeviceUID)
+            captureOwner = .voiceEdit
+            isRecording = true
+            hotKeyManager.isRecording = true
+            hud.show(text: "Speak the edit instruction, then press Voice Edit again")
+        } catch {
+            pendingVoiceEditSelection = nil
+            lastError = "Mic error: \(error.localizedDescription)"
+        }
+    }
+
+    private func finishVoiceEditInstructionRecording() {
+        let selection = pendingVoiceEditSelection
+        pendingVoiceEditSelection = nil
+        captureOwner = .none
+        isRecording = false
+        hotKeyManager.isRecording = false
+        let samples = audioCapture.stop()
+        guard let selection, !samples.isEmpty else {
+            hud.flash("No voice instruction captured")
+            return
+        }
+        isProcessing = true
+        hud.show(text: "Transcribing instruction locally…")
+        Task {
+            defer { isProcessing = false }
+            do {
+                // Voice Edit is deliberately pinned to the on-device engine even when normal
+                // dictation is configured for cloud STT.
+                let transcription = try await whisperEngine.transcribe(samples: samples, forcedLanguage: nil)
+                let instruction = transcription.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !instruction.isEmpty else {
+                    hud.flash("No voice instruction recognized")
+                    return
+                }
+                presentVoiceEdit(selection: selection, instruction: instruction)
+                hud.hide()
+            } catch {
+                hud.flash("The local speech model could not transcribe the instruction")
+            }
+        }
+    }
+
+    private func presentVoiceEdit(selection: SelectionSnapshot, instruction: String) {
+        closeVoiceEditWindow(clearCoordinator: true)
+        let store = snippetStore
+        let storeError = snippetStoreInitializationError ?? "storage initialization failed"
+        let coordinator = VoiceEditCoordinator(
+            selection: selection,
+            instruction: instruction,
+            selectionAccess: selectionAccess,
+            snippetMatcher: { trigger in
+                guard let store else {
+                    throw VoiceEditSnippetError.storeUnavailable(storeError)
+                }
+                return try await store.match(trigger)
+            }
+        )
+        voiceEditCoordinator = coordinator
+
+        let presentation = VoiceEditPreviewWindowPresentation.make()
+        let window = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 420),
+            styleMask: presentation.styleMask, backing: .buffered, defer: false
+        )
+        window.becomesKeyOnlyIfNeeded = presentation.becomesKeyOnlyIfNeeded
+        window.isFloatingPanel = true
+        window.title = "Voice Edit Preview"
+        window.isReleasedWhenClosed = false
+        window.contentView = NSHostingView(rootView: VoiceEditPreviewView(coordinator: coordinator) { [weak self] in
+            self?.closeVoiceEditWindow(clearCoordinator: true)
+        })
+        let delegate = VoiceEditWindowDelegate { [weak self] in
+            self?.voiceEditCoordinator?.cancel()
+            self?.voiceEditCoordinator = nil
+            self?.voiceEditWindow = nil
+            self?.voiceEditWindowDelegate = nil
+        }
+        window.delegate = delegate
+        voiceEditWindowDelegate = delegate
+        voiceEditWindow = window
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        Task { await coordinator.begin() }
+    }
+
+    private func closeVoiceEditWindow(clearCoordinator: Bool) {
+        if clearCoordinator { voiceEditCoordinator?.cancel() }
+        voiceEditWindow?.delegate = nil
+        voiceEditWindow?.close()
+        voiceEditWindow = nil
+        voiceEditWindowDelegate = nil
+        if clearCoordinator { voiceEditCoordinator = nil }
+    }
+
+    static func handleVoiceEditHotKey(
+        selectionAccess: any SelectionAccessing,
+        pendingSelection: inout SelectionSnapshot?,
+        flash: (String) -> Void
+    ) {
+        do {
+            pendingSelection = try selectionAccess.capture()
+        } catch let error as SelectionAccessError {
+            pendingSelection = nil
+            switch error {
+            case .secureField:
+                flash("Voice Edit is unavailable in secure fields")
+            case .noEditableSelection, .noFrontmostApplication:
+                flash("Select editable text first")
+            case .targetChanged, .selectionChanged:
+                flash("Selection changed — select text and try again")
+            case .replacementFailed:
+                flash("Could not access the selected text")
+            }
+        } catch {
+            pendingSelection = nil
+            flash("Could not access the selected text")
         }
     }
 
@@ -243,7 +472,7 @@ final class AppCoordinator: ObservableObject {
         // one — mirrors the pre-Amendment-B `!isProcessing` guard. `recordingState` is already
         // back to `.idle` by the time processing starts (set before the async pipeline `Task`
         // below), so the state machine alone can't tell these apart.
-        guard !isProcessing else { return }
+        guard !isProcessing, captureOwner != .voiceEdit else { return }
         let (newState, action) = RecordingStateMachine.transition(state: recordingState, event: .keyDown, currentGeneration: recordingGeneration)
         switch action {
         case .startCapture:
@@ -284,19 +513,29 @@ final class AppCoordinator: ObservableObject {
     private func handlePillClick() {
         let preSnapshottedFrontmostApp = NSWorkspace.shared.frontmostApplication
         let preSnapshottedTarget = Insertion.snapshotTarget(app: preSnapshottedFrontmostApp)
+        let preSnapshottedContextTarget = snapshotContextTarget(app: preSnapshottedFrontmostApp)
         let (newState, action) = RecordingStateMachine.transition(state: recordingState, event: .pillClick, currentGeneration: recordingGeneration)
         recordingState = newState
         switch action {
         case .enterLocked:
             enterLockedMode()
         case .stopAndTranscribe:
-            stopAndTranscribe(preSnapshotted: (app: preSnapshottedFrontmostApp, target: preSnapshottedTarget))
+            stopAndTranscribe(preSnapshotted: (app: preSnapshottedFrontmostApp, target: preSnapshottedTarget, contextTarget: preSnapshottedContextTarget))
         case .none, .startCapture, .cancel:
             break
         }
     }
 
     private func handleEscape() {
+        if captureOwner == .voiceEdit {
+            captureOwner = .none
+            pendingVoiceEditSelection = nil
+            isRecording = false
+            hotKeyManager.isRecording = false
+            _ = audioCapture.stop()
+            hud.flash("Voice Edit cancelled")
+            return
+        }
         let (newState, action) = RecordingStateMachine.transition(state: recordingState, event: .esc, currentGeneration: recordingGeneration)
         recordingState = newState
         switch action {
@@ -334,11 +573,12 @@ final class AppCoordinator: ObservableObject {
     private func handlePanelFinish(skipPostProcessing: Bool) {
         let preSnapshottedFrontmostApp = NSWorkspace.shared.frontmostApplication
         let preSnapshottedTarget = Insertion.snapshotTarget(app: preSnapshottedFrontmostApp)
+        let preSnapshottedContextTarget = snapshotContextTarget(app: preSnapshottedFrontmostApp)
         let (newState, action) = RecordingStateMachine.transition(state: recordingState, event: Self.recordingEvent(for: skipPostProcessing ? .raw : .done), currentGeneration: recordingGeneration)
         recordingState = newState
         switch action {
         case .stopAndTranscribe:
-            stopAndTranscribe(preSnapshotted: (app: preSnapshottedFrontmostApp, target: preSnapshottedTarget), skipPostProcessing: skipPostProcessing)
+            stopAndTranscribe(preSnapshotted: (app: preSnapshottedFrontmostApp, target: preSnapshottedTarget, contextTarget: preSnapshottedContextTarget), skipPostProcessing: skipPostProcessing)
         case .none, .startCapture, .enterLocked, .cancel:
             break
         }
@@ -397,6 +637,9 @@ final class AppCoordinator: ObservableObject {
     /// capture-start failure, so the caller never commits the state transition for a recording
     /// that never actually started.
     private func beginCapture() -> Bool {
+        guard Self.captureStartDecision(current: captureOwner, requested: .dictation) == .start else {
+            return false
+        }
         oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .clear)
         let micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
         Self.logger.log("key down: micAuthorizationStatus=\(micStatus.rawValue, privacy: .public)")
@@ -410,6 +653,7 @@ final class AppCoordinator: ObservableObject {
         }
         do {
             try audioCapture.start(deviceUID: AppSettings.shared.microphoneDeviceUID)
+            captureOwner = .dictation
             recordingGeneration += 1
             startLivePreviewIfNeeded()
             // startLivePreviewIfNeeded() just reset lastLivePreviewText to nil — seed it with the
@@ -478,12 +722,26 @@ final class AppCoordinator: ObservableObject {
             cap = 0
         }
         let activeTemplateName = TemplateStore.shared.template(id: AppSettings.shared.activeTemplateID)?.name ?? "Template"
+        let contextScope = AppSettings.shared.localContextScope
+        let contextPermissionHint: String?
+        if contextScope == .windowOCR {
+            contextPermissionHint = switch Permissions.screenRecordingAuthorization() {
+            case .granted: nil
+            case .notGranted: "Screen Recording not granted for Window + local OCR"
+            }
+        } else if contextScope != .off, !Permissions.isAccessibilityTrusted() {
+            contextPermissionHint = "Accessibility permission required"
+        } else {
+            contextPermissionHint = nil
+        }
         let state = HUDController.RecordingPanelState(
             isLocked: isLocked,
             elapsed: elapsed,
             cap: cap,
             previewText: lastLivePreviewText.map { HUDController.tailTruncate($0, maxCharacters: 60) },
             activeTemplateName: activeTemplateName,
+            localContextScopeName: contextScope.displayName,
+            localContextPermissionHint: contextPermissionHint,
             oneShotLanguage: oneShotLanguage
         )
         hud.showRecordingPanel(state)
@@ -506,12 +764,20 @@ final class AppCoordinator: ObservableObject {
     /// synchronous, at key-up, before any `await`. `skipPostProcessing` (Feature 3's "Raw"
     /// button) rides straight through to `processDictation` — the raw flag is pipeline config,
     /// not lifecycle, so it isn't part of the state machine.
-    private func stopAndTranscribe(preSnapshotted: (app: NSRunningApplication?, target: InsertionTarget?)? = nil, skipPostProcessing: Bool = false) {
+    private func stopAndTranscribe(preSnapshotted: (app: NSRunningApplication?, target: InsertionTarget?, contextTarget: ContextTargetSnapshot)? = nil, skipPostProcessing: Bool = false) {
         let capturedOneShotLanguage = oneShotLanguage
         defer { oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .clear) }
 
+        // The destination and context target are the first stop-time reads. Keep this before
+        // audio teardown, logging, file I/O, and every async boundary so later focus changes
+        // cannot redirect AX reads or OCR to another window.
+        let frontmostApp = preSnapshotted?.app ?? NSWorkspace.shared.frontmostApplication
+        let insertionTarget = preSnapshotted?.target ?? Insertion.snapshotTarget(app: frontmostApp)
+        let contextTarget = preSnapshotted?.contextTarget ?? snapshotContextTarget(app: frontmostApp)
+
         invalidateCapTimer()
         stopLivePreview()
+        captureOwner = .none
         let samples = audioCapture.stop()
 
         // Always cheap, always on: peak/RMS tells us in one line whether the mic tap delivered
@@ -542,16 +808,24 @@ final class AppCoordinator: ObservableObject {
         // the wrong place. See Codex finding: paste-target drift / same-app target drift.
         let engine = activeSTTEngine
         let engineName = engine.name
-        let frontmostApp = preSnapshotted?.app ?? NSWorkspace.shared.frontmostApplication
         let bundleID = frontmostApp?.bundleIdentifier
         let appName = frontmostApp?.localizedName
-        let insertionTarget = preSnapshotted?.target ?? Insertion.snapshotTarget(app: frontmostApp)
-        let (template, ruleFired) = Self.resolveTemplate(
-            bundleID: bundleID,
-            rules: AppSettings.shared.appRules,
-            templates: TemplateStore.shared.templates,
-            activeTemplateID: AppSettings.shared.activeTemplateID
-        )
+        let contextScope = AppSettings.shared.localContextScope
+        let capturedContext = Self.captureApprovedContext(scope: contextScope, target: contextTarget, provider: localContextProvider)
+        let contextCapture = contextScope == .off ? ContextCapture(
+            context: LocalProcessingContext(
+                appName: contextTarget.appName,
+                bundleID: contextTarget.bundleID,
+                windowTitle: contextTarget.windowTitle,
+                text: ""
+            ),
+            limitation: nil
+        ) : capturedContext
+        let templates = TemplateStore.shared.templates
+        let appRules = AppSettings.shared.appRules
+        let activeTemplateID = AppSettings.shared.activeTemplateID
+        let automaticStyleEnabled = AppSettings.shared.automaticStyleEnabled
+        let processor = resolveActiveProcessor()
         let forcedLanguage = Self.resolveLanguage(
             oneShot: capturedOneShotLanguage,
             bundleID: bundleID,
@@ -559,13 +833,81 @@ final class AppCoordinator: ObservableObject {
             pin: AppSettings.shared.languagePin
         )
 
-        hud.show(text: ruleFired ? "Processing… (\(template.name))" : "Processing…")
+        hud.show(text: Self.contextPermissionHint(for: contextCapture.limitation) ?? "Processing…")
 
-        Task { await runPipeline(samples: samples, engine: engine, engineName: engineName, template: template, appName: appName, target: insertionTarget, forcedLanguage: forcedLanguage, skipPostProcessing: skipPostProcessing) }
+        Task {
+            let resolvedCapture = await resolveWindowOCR(
+                scope: contextScope,
+                capture: contextCapture,
+                target: contextTarget
+            )
+            if let hint = Self.contextPermissionHint(for: resolvedCapture.limitation) {
+                hud.show(text: hint)
+            }
+            let resolved = Self.resolveContextAwareTemplate(
+                automaticStyleEnabled: automaticStyleEnabled,
+                capture: resolvedCapture,
+                rules: appRules,
+                templates: templates,
+                activeTemplateID: activeTemplateID
+            )
+            await runPipeline(
+                samples: samples,
+                engine: engine,
+                engineName: engineName,
+                template: resolved.template,
+                appName: appName,
+                target: insertionTarget,
+                forcedLanguage: forcedLanguage,
+                skipPostProcessing: skipPostProcessing,
+                processor: processor,
+                localContext: Self.localContextForProcessor(
+                    isCloudConfigured: !(processor is AppleFMProcessor),
+                    capture: resolvedCapture
+                )
+            )
+        }
+    }
+
+    private func resolveWindowOCR(
+        scope: LocalContextScope,
+        capture: ContextCapture,
+        target: ContextTargetSnapshot
+    ) async -> ContextCapture {
+        guard scope == .windowOCR, capture.limitation == nil else { return capture }
+        do {
+            var image: CGImage? = try await screenshotService.capture(target: target)
+            let text = try await ocrService.recognizeText(in: image!)
+            image = nil
+            return ContextCapture(
+                context: LocalProcessingContext(
+                    appName: capture.context.appName,
+                    bundleID: capture.context.bundleID,
+                    windowTitle: capture.context.windowTitle,
+                    text: text
+                ),
+                limitation: nil
+            )
+        } catch ActiveWindowScreenshotError.permissionNotGranted {
+            return ContextCapture(context: capture.context, limitation: .screenRecordingPermissionNotGranted)
+        } catch ActiveWindowScreenshotError.targetUnavailable {
+            return ContextCapture(context: capture.context, limitation: .screenCaptureTargetUnavailable)
+        } catch {
+            return ContextCapture(context: capture.context, limitation: .screenCaptureFailed)
+        }
+    }
+
+    private func snapshotContextTarget(app: NSRunningApplication?) -> ContextTargetSnapshot {
+        contextTargetSnapshotter.snapshot(
+            appName: app?.localizedName,
+            bundleID: app?.bundleIdentifier,
+            processID: app?.processIdentifier ?? 0
+        )
     }
 
     private func cancelRecording() {
         oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .clear)
+        captureOwner = .none
         Self.performCancelRecording(
             stopCapture: { _ = self.audioCapture.stop() },
             cancelLivePreview: { self.stopLivePreview() },
@@ -598,6 +940,64 @@ final class AppCoordinator: ObservableObject {
             return (fallback, false)
         }
         return (matched, true)
+    }
+
+    static func captureApprovedContext(
+        scope: LocalContextScope,
+        target: ContextTargetSnapshot,
+        provider: any LocalContextProvider
+    ) -> ContextCapture {
+        guard scope != .off else { return .empty }
+        return provider.capture(scope: scope, target: target)
+    }
+
+    nonisolated static func localContextForProcessor(
+        isCloudConfigured: Bool,
+        capture: ContextCapture
+    ) -> LocalProcessingContext? {
+        isCloudConfigured ? nil : capture.context
+    }
+
+    nonisolated static func contextPermissionHint(for limitation: ContextCaptureLimitation?) -> String? {
+        switch limitation {
+        case .accessibilityPermissionRequired:
+            "Accessibility permission required for Local context"
+        case .screenRecordingPermissionNotGranted:
+            "Screen Recording not granted for Window + local OCR"
+        case .screenCaptureTargetUnavailable:
+            "Stopped window is no longer available for local OCR"
+        case .screenCaptureFailed:
+            "Window capture failed; continuing without local OCR"
+        case nil:
+            nil
+        }
+    }
+
+    nonisolated static func resolveContextAwareTemplate(
+        automaticStyleEnabled: Bool,
+        capture: ContextCapture,
+        rules: [String: String],
+        templates: [Template],
+        activeTemplateID: String
+    ) -> (template: Template, ruleFired: Bool) {
+        let manual = resolveTemplate(
+            bundleID: capture.context.bundleID,
+            rules: rules,
+            templates: templates,
+            activeTemplateID: activeTemplateID
+        )
+        guard !manual.ruleFired, automaticStyleEnabled else { return manual }
+        return (
+            AutomaticStyleClassifier().resolveTemplate(
+                bundleID: capture.context.bundleID,
+                windowTitle: capture.context.windowTitle,
+                context: capture.context.text,
+                rules: rules,
+                templates: templates,
+                activeTemplateID: activeTemplateID
+            ),
+            false
+        )
     }
 
     nonisolated static func resolveLanguage(
@@ -757,11 +1157,11 @@ final class AppCoordinator: ObservableObject {
         updateRecordingPanel()
     }
 
-    private func runPipeline(samples: [Float], engine: any TranscriptionEngine, engineName: String, template: Template, appName: String?, target: InsertionTarget?, forcedLanguage: String?, skipPostProcessing: Bool) async {
+    private func runPipeline(samples: [Float], engine: any TranscriptionEngine, engineName: String, template: Template, appName: String?, target: InsertionTarget?, forcedLanguage: String?, skipPostProcessing: Bool, processor: (any PostProcessor)? = nil, localContext: LocalProcessingContext? = nil) async {
         defer { isProcessing = false }
 
         do {
-            let result = try await processDictation(samples: samples, engine: engine, engineName: engineName, template: template, appName: appName, target: target, forcedLanguage: forcedLanguage, skipPostProcessing: skipPostProcessing)
+            let result = try await processDictation(samples: samples, engine: engine, engineName: engineName, template: template, appName: appName, target: target, forcedLanguage: forcedLanguage, skipPostProcessing: skipPostProcessing, processor: processor, localContext: localContext)
             if let fallbackReason = result.fallbackReason {
                 logPostProcessingFallback(fallbackReason)
             }
@@ -777,14 +1177,14 @@ final class AppCoordinator: ObservableObject {
                 hud.hide()
             }
         } catch PipelineError.emptyTranscript {
-            let saved = saveFailedAudio(samples)
-            hud.flash(saved != nil ? "Transcription failed — audio saved" : "Transcription failed — audio could NOT be saved")
+            let saved = await preserveFailedAudio(samples, failure: JobFailure(stage: .transcribing, message: "Empty transcript"))
+            hud.flash(saved ? "Transcription failed — audio saved" : "Transcription failed — audio could NOT be saved")
         } catch PipelineError.recordFailed(_) {
             hud.flash("Library save failed")
         } catch {
             lastError = "Transcription failed: \(error.localizedDescription)"
-            let saved = saveFailedAudio(samples)
-            hud.flash(saved != nil ? "Transcription failed — audio saved" : "Transcription failed — audio could NOT be saved")
+            let saved = await preserveFailedAudio(samples, failure: JobFailure(stage: .transcribing, message: error.localizedDescription))
+            hud.flash(saved ? "Transcription failed — audio saved" : "Transcription failed — audio could NOT be saved")
         }
     }
 
@@ -827,6 +1227,7 @@ final class AppCoordinator: ObservableObject {
         forcedLanguage: String? = nil,
         skipPostProcessing: Bool = false,
         processor: (any PostProcessor)? = nil,
+        localContext: LocalProcessingContext? = nil,
         insert: (String, InsertionTarget?) -> Bool = { Insertion.insert($0, target: $1) },
         record: (_ language: String, _ template: String, _ transcript: String, _ refined: String, _ engine: String) throws -> Void = { language, template, transcript, refined, engine in
             try LibraryStore.shared.record(language: language, template: template, transcript: transcript, refined: refined, engine: engine)
@@ -846,7 +1247,17 @@ final class AppCoordinator: ObservableObject {
         } else {
             let activeProcessor: any PostProcessor = processor ?? resolveActiveProcessor()
             do {
-                let processed = try await activeProcessor.process(transcript: transcription.text, template: template, appName: appName)
+                let processed: String
+                if let localProcessor = activeProcessor as? AppleFMProcessor, let localContext {
+                    processed = try await localProcessor.process(
+                        transcript: transcription.text,
+                        template: template,
+                        appName: appName,
+                        context: localContext
+                    )
+                } else {
+                    processed = try await activeProcessor.process(transcript: transcription.text, template: template, appName: appName)
+                }
                 let trimmed = processed.trimmingCharacters(in: .whitespacesAndNewlines)
                 // Never lose the user's words — fall back to the raw transcript if post-processing
                 // returns empty output without throwing. See Round 1 Codex finding 3.
@@ -874,32 +1285,186 @@ final class AppCoordinator: ObservableObject {
         return (transcription.text, refined, posted, fallbackReason)
     }
 
-    /// Persists captured audio that failed transcription (or transcribed to nothing) so the
-    /// user's words aren't silently lost. Returns the saved file's URL, or nil if the save
-    /// itself failed — callers must not claim the audio was saved unless this succeeds. No
-    /// retry UI in v1 — the user can locate the WAV manually. See Round 1 Codex findings 1/2,
-    /// Round 2 Codex finding 3.
-    // ponytail: no retry/import UI + upgrade path: add a "Recover…" menu item that lists this
-    // directory and re-runs the pipeline on a chosen file.
-    @discardableResult
-    private func saveFailedAudio(_ samples: [Float]) -> URL? {
-        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        let dir = support.appendingPathComponent("FreeTalker/failed-dictations", isDirectory: true)
+    private static let applicationSupportDirectory: URL = {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("FreeTalker", isDirectory: true)
+    }()
+
+    private static var recoveryDirectory: URL {
+        applicationSupportDirectory.appendingPathComponent("failed-dictations", isDirectory: true)
+    }
+
+    private static var mediaImportsDirectory: URL {
+        applicationSupportDirectory.appendingPathComponent("media-imports", isDirectory: true)
+    }
+
+    private static func makeRecoveryStore() throws -> TranscriptionJobStore {
+        try FileManager.default.createDirectory(at: applicationSupportDirectory, withIntermediateDirectories: true)
+        return try TranscriptionJobStore(
+            databaseURL: applicationSupportDirectory.appendingPathComponent("jobs.db"),
+            clock: SystemJobClock()
+        )
+    }
+
+    private static func makeSnippetStore() throws -> SnippetStore {
+        try FileManager.default.createDirectory(at: applicationSupportDirectory, withIntermediateDirectories: true)
+        return try SnippetStore(databaseURL: applicationSupportDirectory.appendingPathComponent("jobs.db"))
+    }
+
+    private static func snippetStoreErrorMessage(_ error: Error) -> String {
+        String(describing: error)
+    }
+
+    func retrySnippetStoreInitialization() {
         do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            // UUID prefix avoids two failures in the same second overwriting each other.
-            // See Round 2 Codex finding 4.
-            let uuidPrefix = UUID().uuidString.prefix(8)
-            let name = "failed-\(Int(Date().timeIntervalSince1970))-\(uuidPrefix).wav"
-            let data = WAVEncoder.encode(samples: samples, sampleRate: 16_000)
-            let url = dir.appendingPathComponent(name)
-            try data.write(to: url)
-            return url
+            snippetStore = try Self.makeSnippetStore()
+            snippetStoreInitializationError = nil
         } catch {
-            lastError = "Failed to save recovery audio: \(error.localizedDescription)"
-            return nil
+            snippetStore = nil
+            snippetStoreInitializationError = Self.snippetStoreErrorMessage(error)
         }
     }
+
+    private func preserveFailedAudio(_ samples: [Float], failure: JobFailure) async -> Bool {
+        guard let jobLibraryStore else { return false }
+        do {
+            _ = try await jobLibraryStore.preserve(
+                samples: samples,
+                metadata: RecoveryMetadata(capturedAt: Date(), failure: failure)
+            )
+            return true
+        } catch {
+            lastError = "Failed to save recovery audio: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    func launchRecoveryWorkflows() async {
+        guard let recoveryStore else { return }
+        let pipeline = RecoveryRetryPipeline(
+            directory: Self.recoveryDirectory,
+            store: recoveryStore,
+            processDictation: { [weak self] samples, configuration in
+                guard let self else { throw CancellationError() }
+                return try await self.processRecoveredDictation(samples: samples, configuration: configuration)
+            },
+            errorStage: { error in
+                if case PipelineError.recordFailed = error { return .persisting }
+                return .transcribing
+            }
+        )
+        let runner = LocalJobRunner(
+            store: recoveryStore,
+            kind: .recovery,
+            executorFinalizesJob: true,
+            finalizationFailure: pipeline.failFinalization,
+            didChange: { [weak jobLibraryStore] _ in try? await jobLibraryStore?.refresh() },
+            executionAuthority: localJobExecutionAuthority
+        ) { job, token in
+            try await pipeline.execute(jobID: job.id, configuration: nil, cancellation: token)
+        }
+        recoveryRunner = runner
+        jobLibraryStore?.configureRetry { [weak runner] id in await runner?.enqueue(id) }
+        await pipeline.retryPendingSourceCleanup()
+        _ = try? await recoveryStore.recoverInterruptedJobs(kind: .recovery)
+        _ = try? await RecoveryRetentionService(directory: Self.recoveryDirectory, store: recoveryStore)
+            .purgeExpired(now: Date(), retention: AppSettings.shared.recoveryRetention)
+        await runner.resumeQueuedJobs()
+        try? await jobLibraryStore?.refresh()
+    }
+
+    func launchMediaImportWorkflows() async {
+        guard mediaImportRunner == nil, let recoveryStore, let jobLibraryStore else { return }
+        do {
+            try FileManager.default.createDirectory(at: Self.mediaImportsDirectory, withIntermediateDirectories: true)
+        } catch {
+            lastError = "Could not prepare local media imports: \(error.localizedDescription)"
+            return
+        }
+        let service = MediaImportService(store: recoveryStore)
+        let pipeline = MediaImportPipeline(
+            store: recoveryStore,
+            jobsDirectory: Self.mediaImportsDirectory,
+            decoder: service,
+            transcriber: TimestampedWhisperTranscriber(backend: whisperEngine),
+            diarizer: LocalFluidAudioDiarizer(),
+            language: AppSettings.shared.languagePin == "auto" ? nil : AppSettings.shared.languagePin,
+            model: AppSettings.shared.whisperModel
+        )
+        let runner = pipeline.localJobRunner(executionAuthority: localJobExecutionAuthority) { [weak jobLibraryStore] _ in
+            try? await jobLibraryStore?.refresh()
+        }
+        mediaImportRunner = runner
+        jobLibraryStore.configureImports(
+            service: service,
+            directory: Self.mediaImportsDirectory,
+            enqueue: { [weak runner] id in await runner?.enqueue(id) },
+            cancel: { [weak runner] id in await runner?.cancel(id) ?? .notRunning }
+        )
+        await purgeMediaImports(retention: AppSettings.shared.mediaImportRetention)
+        await runner.resumeQueuedJobs()
+        try? await jobLibraryStore.refresh()
+    }
+
+    static func routeMediaImportRetentionChange(
+        _ retention: MediaImportRetention,
+        purge: @Sendable (MediaImportRetention) async -> Void
+    ) async {
+        await purge(retention)
+    }
+
+    private func purgeMediaImports(retention: MediaImportRetention) async {
+        guard let recoveryStore else { return }
+        let imports = (try? await recoveryStore.jobs(kind: .mediaImport)) ?? []
+        for job in retention.purgeCandidates(imports, now: Date()) {
+            try? await recoveryStore.deleteMediaImport(jobID: job.id, jobsDirectory: Self.mediaImportsDirectory)
+        }
+        try? await jobLibraryStore?.refresh()
+    }
+
+    private func processRecoveredDictation(
+        samples: [Float],
+        configuration: AttemptConfiguration
+    ) async throws -> RecoveryDictation {
+        let template = TemplateStore.shared.templates.first {
+            $0.id == configuration.template || $0.name == configuration.template
+        } ?? TemplateStore.shared.template(id: AppSettings.shared.activeTemplateID) ?? Template.builtIns[0]
+        let transcription = try await RecoveryLocalProcessor(transcriber: whisperEngine).process(
+            samples: samples,
+            configuration: configuration,
+            defaultModel: AppSettings.shared.whisperModel
+        )
+        return RecoveryDictation(
+            language: transcription.language,
+            template: template.name,
+            transcript: transcription.text,
+            refined: transcription.text,
+            engine: "WhisperKit"
+        )
+    }
+
+    private func purgeRecoveries(retention: RecoveryRetention) async {
+        guard let recoveryStore else { return }
+        _ = try? await RecoveryRetentionService(directory: Self.recoveryDirectory, store: recoveryStore)
+            .purgeExpired(now: Date(), retention: retention)
+        try? await jobLibraryStore?.refresh()
+    }
+
+    private func scheduleRecoveryRetentionPurge(_ retention: RecoveryRetention) {
+        recoveryRetentionTask?.cancel()
+        recoveryRetentionTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard !Task.isCancelled, let self else { return }
+            await Self.routeRecoveryRetentionChange(retention) { [weak self] value in
+                await self?.purgeRecoveries(retention: value)
+            }
+        }
+    }
+
+    static func routeRecoveryRetentionChange(
+        _ retention: RecoveryRetention,
+        purge: @Sendable (RecoveryRetention) async -> Void
+    ) async { await purge(retention) }
 
     /// Overwrites `~/Library/Application Support/FreeTalker/last-dictation.wav` with the most
     /// recently captured audio, regardless of whether transcription succeeded. Cheap debug
@@ -1007,4 +1572,15 @@ final class AppCoordinator: ObservableObject {
             hud.flash(Self.redoLastResultMessage(posted: posted))
         }
     }
+}
+
+@MainActor
+private final class VoiceEditWindowDelegate: NSObject, NSWindowDelegate {
+    private let onClose: () -> Void
+
+    init(onClose: @escaping () -> Void) {
+        self.onClose = onClose
+    }
+
+    func windowWillClose(_ notification: Notification) { onClose() }
 }

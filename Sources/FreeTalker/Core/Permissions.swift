@@ -49,4 +49,25 @@ enum Permissions {
     static func isInputMonitoringAuthorized() -> Bool {
         IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted
     }
+
+    static func screenRecordingAuthorization(
+        preflight: () -> Bool = { CGPreflightScreenCaptureAccess() }
+    ) -> ScreenRecordingAuthorization {
+        preflight() ? .granted : .notGranted
+    }
+
+    @discardableResult
+    static func requestScreenRecording(
+        request: () -> Bool = { CGRequestScreenCaptureAccess() },
+        preflight: () -> Bool = { CGPreflightScreenCaptureAccess() }
+    ) -> ScreenRecordingAuthorization {
+        _ = request()
+        return screenRecordingAuthorization(preflight: preflight)
+    }
+
+    static func openScreenRecordingSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+            NSWorkspace.shared.open(url)
+        }
+    }
 }
