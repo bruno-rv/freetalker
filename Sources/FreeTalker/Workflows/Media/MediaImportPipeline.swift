@@ -73,8 +73,25 @@ struct MediaImportPipeline: Sendable {
             if let existing { ownedDirectory.close(existing) }
             if !valid || !registered {
                 try await store.invalidateInvalidDecodedMedia(jobID: job.id, owner: owner)
-                try ownedDirectory.unlinkRegistered(path: audioURL.path, source: URL(fileURLWithPath: job.source.reference), fileManager: .default)
+                try ownedDirectory.removeInvalidArtifact("audio.wav", source: URL(fileURLWithPath: job.source.reference))
                 completed = []
+            }
+        }
+
+        if !completed.contains(.decode) {
+            if let orphan = try? ownedDirectory.openExisting("audio.wav") {
+                let valid = ownedDirectory.isNormalizedWAV(orphan)
+                ownedDirectory.close(orphan)
+                if valid {
+                    try ownedDirectory.revalidateIdentity()
+                    try await store.persistDecodedMedia(jobID: job.id, owner: owner, derivedAudioPath: audioURL.path)
+                    try await store.updateMediaProgress(jobID: job.id, owner: owner, progress: 0.25)
+                    completed.insert(.decode)
+                } else {
+                    try ownedDirectory.removeInvalidArtifact("audio.wav", source: URL(fileURLWithPath: job.source.reference))
+                }
+            } else {
+                try ownedDirectory.removeInvalidArtifact("audio.wav", source: URL(fileURLWithPath: job.source.reference))
             }
         }
 
@@ -90,7 +107,12 @@ struct MediaImportPipeline: Sendable {
             guard ownedDirectory.isNormalizedWAV(temporary) else { throw MediaImportError.decodeFailed("Decoded audio is not normalized 16 kHz mono WAV") }
             let promoted = try ownedDirectory.promote(temporary, to: "audio.wav")
             try ownedDirectory.revalidateIdentity()
-            try await store.persistDecodedMedia(jobID: job.id, owner: owner, derivedAudioPath: promoted.path)
+            do {
+                try await store.persistDecodedMedia(jobID: job.id, owner: owner, derivedAudioPath: promoted.path)
+            } catch {
+                try? ownedDirectory.removeInvalidArtifact("audio.wav", source: URL(fileURLWithPath: job.source.reference))
+                throw error
+            }
             try await store.updateMediaProgress(jobID: job.id, owner: owner, progress: 0.25)
             completed.insert(.decode)
         }

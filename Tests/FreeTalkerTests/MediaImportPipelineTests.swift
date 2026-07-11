@@ -5,6 +5,45 @@ import Testing
 @testable import FreeTalker
 
 @Suite struct MediaImportPipelineTests {
+    @Test func promotedAudioWithoutCheckpointIsAdoptedAfterRestart() async throws {
+        let fixture = try MediaPipelineFixture(); let job = try await fixture.store.create(kind: .mediaImport, source: .init(reference: fixture.source.path), now: .now)
+        try FileManager.default.createDirectory(at: fixture.jobDirectory(job.id), withIntermediateDirectories: true); try writeValidWAV(to: fixture.audioURL(job.id))
+        let decoder = PipelineDecodeProbe(); let runner = fixture.pipeline(decoder: decoder).localJobRunner(); await runner.enqueue(job.id); await runner.waitUntilIdle()
+        #expect(await decoder.calls == 0)
+        #expect(try await fixture.store.completedMediaStages(jobID: job.id).contains(.decode))
+        #expect(try await fixture.store.job(id: job.id)?.state == .ready)
+    }
+
+    @Test func adoptionPersistenceFailureRetainsAudioAndRetryConverges() async throws {
+        let fixture = try MediaPipelineFixture(); let job = try await fixture.store.create(kind: .mediaImport, source: .init(reference: fixture.source.path), now: .now)
+        let owner = try await fixture.claim(job.id); try FileManager.default.createDirectory(at: fixture.jobDirectory(job.id), withIntermediateDirectories: true); try writeValidWAV(to: fixture.audioURL(job.id))
+        let failing = AdoptionFailingStore(base: fixture.store); let decoder = PipelineDecodeProbe(); let token = CancellationToken(); token.installLeaseOwner(owner)
+        let first = MediaImportPipeline(store: failing, jobsDirectory: fixture.root, decoder: decoder, transcriber: PipelineTranscribeProbe(), diarizer: PipelineDiarizeProbe(), language: nil, model: "model")
+        await #expect(throws: AdoptionFailure.self) { try await first.execute(job: try #require(await fixture.store.job(id: job.id)), cancellation: token) }
+        #expect(FileManager.default.fileExists(atPath: fixture.audioURL(job.id).path))
+        let retry = fixture.pipeline(decoder: decoder); try await retry.execute(job: try #require(await fixture.store.job(id: job.id)), cancellation: token)
+        #expect(await decoder.calls == 0)
+        #expect(try await fixture.store.job(id: job.id)?.state == .ready)
+    }
+
+    @Test func invalidOrSymlinkOrphansAreNeverAdopted() async throws {
+        for symlink in [false, true] {
+            let fixture = try MediaPipelineFixture(); let outside = fixture.root.deletingLastPathComponent().appendingPathComponent(UUID().uuidString); try Data("outside".utf8).write(to: outside)
+            let job = try await fixture.store.create(kind: .mediaImport, source: .init(reference: fixture.source.path), now: .now); try FileManager.default.createDirectory(at: fixture.jobDirectory(job.id), withIntermediateDirectories: true)
+            if symlink { try FileManager.default.createSymbolicLink(at: fixture.audioURL(job.id), withDestinationURL: outside) } else { try Data("bad".utf8).write(to: fixture.audioURL(job.id)) }
+            let decoder = PipelineDecodeProbe(); let runner = fixture.pipeline(decoder: decoder).localJobRunner(); await runner.enqueue(job.id); await runner.waitUntilIdle()
+            #expect(await decoder.calls == 1); #expect(try await fixture.store.job(id: job.id)?.state == .ready); #expect(try Data(contentsOf: outside) == Data("outside".utf8))
+        }
+    }
+
+    @Test func wavWriterAcceptsAlignedLimitAndRejectsNextBlock() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString); let descriptor = Darwin.open(url.path, O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR); defer { Darwin.close(descriptor); try? FileManager.default.removeItem(at: url) }
+        let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: true)!; let block = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 1)!; block.frameLength = 1
+        let alignedMaximum = PCMWAVFileWriter.maximumDataBytes & ~UInt64(3)
+        let accepted = try PCMWAVFileWriter(descriptor: descriptor, initialDataBytes: alignedMaximum - 4); try accepted.write(block)
+        let rejected = try PCMWAVFileWriter(descriptor: descriptor, initialDataBytes: alignedMaximum)
+        #expect(throws: MediaImportError.self) { try rejected.write(block) }
+    }
     @Test func productionDecoderWritesNormalizedAudioThroughPreopenedDescriptor() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString); try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let directory = try OwnedJobDirectory(root: root, jobID: UUID(), create: true); let temporary = try directory.createTemporaryFile()
@@ -49,7 +88,7 @@ import Testing
         try FileManager.default.createSymbolicLink(at: fixture.audioURL(job.id), withDestinationURL: outside)
         let runner = fixture.pipeline().localJobRunner(); await runner.enqueue(job.id); await runner.waitUntilIdle()
         #expect(try Data(contentsOf: outside) == Data("outside".utf8))
-        #expect(try await fixture.store.job(id: job.id)?.state.kind == .failed)
+        #expect(try await fixture.store.job(id: job.id)?.state == .ready)
     }
 
     @Test func directorySwapAfterTempOpenCannotRedirectDecodeOrInference() async throws {
@@ -313,6 +352,7 @@ import Testing
 }
 
 private enum PipelineTestError: Error, LocalizedError { case failed; var errorDescription: String? { "failed" } }
+private enum AdoptionFailure: Error { case injected }
 
 private struct MediaPipelineFixture {
     let root: URL
@@ -402,4 +442,22 @@ private final class MutableJobClock: JobClock, @unchecked Sendable {
     init(_ value: Date) { self.value = value }
     var now: Date { lock.withLock { value } }
     func advance(by interval: TimeInterval) { lock.withLock { value = value.addingTimeInterval(interval) } }
+}
+
+private actor AdoptionFailingStore: MediaImportPipelineStoring {
+    let base: TranscriptionJobStore; private var shouldFail = true
+    init(base: TranscriptionJobStore) { self.base = base }
+    func job(id: UUID) async throws -> TranscriptionJob? { try await base.job(id: id) }
+    func jobs(kind: JobKind?) async throws -> [TranscriptionJob] { try await base.jobs(kind: kind) }
+    func transition(_ id: UUID, from: JobState.Kind, to state: JobState) async throws { try await base.transition(id, from: from, to: state) }
+    func recoverInterruptedJobs(kind: JobKind?) async throws -> Int { try await base.recoverInterruptedJobs(kind: kind) }
+    func completedMediaStages(jobID: UUID) async throws -> Set<MediaPipelineStage> { try await base.completedMediaStages(jobID: jobID) }
+    func isDerivedMediaRegistered(jobID: UUID, path: String) async throws -> Bool { try await base.isDerivedMediaRegistered(jobID: jobID, path: path) }
+    func advanceMediaStage(jobID: UUID, owner: UUID, stage: JobStage) async throws { try await base.advanceMediaStage(jobID: jobID, owner: owner, stage: stage) }
+    func updateMediaProgress(jobID: UUID, owner: UUID, progress: Double) async throws { try await base.updateMediaProgress(jobID: jobID, owner: owner, progress: progress) }
+    func persistDecodedMedia(jobID: UUID, owner: UUID, derivedAudioPath: String) async throws { if shouldFail { shouldFail = false; throw AdoptionFailure.injected }; try await base.persistDecodedMedia(jobID: jobID, owner: owner, derivedAudioPath: derivedAudioPath) }
+    func persistTranscript(jobID: UUID, owner: UUID, segments: [TranscriptSegment]) async throws { try await base.persistTranscript(jobID: jobID, owner: owner, segments: segments) }
+    func persistSpeakerTurns(jobID: UUID, owner: UUID, turns: [SpeakerTurn]) async throws { try await base.persistSpeakerTurns(jobID: jobID, owner: owner, turns: turns) }
+    func finalizeMediaImport(jobID: UUID, owner: UUID) async throws { try await base.finalizeMediaImport(jobID: jobID, owner: owner) }
+    func invalidateInvalidDecodedMedia(jobID: UUID, owner: UUID) async throws { try await base.invalidateInvalidDecodedMedia(jobID: jobID, owner: owner) }
 }
