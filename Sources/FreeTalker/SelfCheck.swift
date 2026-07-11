@@ -229,6 +229,8 @@ enum SelfCheck {
             failures.append(contentsOf: await rawPathChecks())
             failures.append(contentsOf: reservedTemplateNameChecks())
             failures.append(contentsOf: cloudSTTErrorChecks())
+            failures.append(contentsOf: speechModelCatalogChecks())
+            failures.append(contentsOf: speechModelSettingsChecks())
 
             if failures.isEmpty {
                 print("SelfCheck PASSED (template seeding, FTS round-trip, pipeline contract, mic device enumeration, hotkey spec/matcher, vocabulary normalization/injection, app rule resolution, paste-target drift, prompt app-name sanitization, live preview gating/availability, SerialGate cancellation, preview early-cancel decisions, built-in template prompt upgrade (incl. v3->v4 Spoken Commands), LLM provider defaults, BYOK Keychain key migration, global cloud-selection routing, BYOK connection-test status-code mapping/config gating, hands-free recording state machine/esc/cap-clamp/cancel, Library deletion: per-row/Delete All/latestDictation tiebreak/dangling source_id/secure_delete/unfiltered total count, SQLite step classification (readAll/dictationExists error propagation), WAL checkpoint busy path, debug-audio purge scoping (incl. directory-named-*.wav skip, unreadable-directory error), LibraryStore privacy-step-then-always sequencing, Redo Last gating/spec-constraints/matcher/result message/spec validation, Language Pin resolution (precedence/invalid-fallthrough/normalization), unified App Rules row join/removal, Recording Panel action routing (button×state incl. stale-click no-ops)/template-cycle order, one-shot language lifecycle (set/toggle/clear), Raw path (post-processor not invoked, refined==transcript, reserved template name recorded), Raw Transcript reserved-name rejection/load-time rename, Cloud STT error status classification)")
@@ -240,6 +242,82 @@ enum SelfCheck {
             }
         }
         dispatchMain()
+    }
+
+    private static func speechModelCatalogChecks() -> [String] {
+        var failures: [String] = []
+        let entries = SpeechModelCatalog.entries
+        let expectedIDs = [
+            "openai_whisper-tiny", "openai_whisper-base", "openai_whisper-small",
+            "openai_whisper-medium", "openai_whisper-large-v3_947MB",
+            "openai_whisper-large-v3-v20240930_turbo_632MB",
+            "openai_whisper-large-v3_turbo_954MB",
+        ]
+        if entries.map(\.id) != expectedIDs { failures.append("speech catalog: display order/coverage mismatch") }
+        if Set(entries.map(\.id)).count != entries.count { failures.append("speech catalog: duplicate ids") }
+        if entries.contains(where: { !$0.isMultilingual || $0.id.contains(".en") || $0.id.contains("distil-") }) {
+            failures.append("speech catalog: contains a non-multilingual variant")
+        }
+        if entries.contains(where: { $0.displayName.isEmpty || $0.approximateSize.isEmpty }) {
+            failures.append("speech catalog: missing display metadata")
+        }
+        if Set(SpeechModelCatalog.preferenceOrder) != Set(expectedIDs) || SpeechModelCatalog.preferenceOrder.count != entries.count {
+            failures.append("speech catalog: preference order does not cover every entry exactly once")
+        }
+        if SpeechModelCatalog.entry(for: "openai_whisper-small")?.id != "openai_whisper-small" {
+            failures.append("speech catalog: lookup failed")
+        }
+        if SpeechModelCatalog.normalize("large-v3_turbo_954MB") != SpeechModelCatalog.defaultID {
+            failures.append("speech catalog: prefixless alias did not normalize")
+        }
+        if SpeechModelCatalog.normalize("openai_whisper-base") != "openai_whisper-base" {
+            failures.append("speech catalog: catalog id did not remain unchanged")
+        }
+        if SpeechModelCatalog.normalize("unknown") != SpeechModelCatalog.defaultID {
+            failures.append("speech catalog: unknown did not normalize to static default")
+        }
+        if SpeechModelCatalog.bestSupported(in: ["openai_whisper-small", "openai_whisper-medium"]) != "openai_whisper-medium" {
+            failures.append("speech catalog: support-set preference was not applied")
+        }
+        if SpeechModelCatalog.bestSupported(in: []) != SpeechModelCatalog.defaultID ||
+            SpeechModelCatalog.bestSupported(in: ["unknown"]) != SpeechModelCatalog.defaultID {
+            failures.append("speech catalog: empty/unknown support set was not deterministic")
+        }
+        if SpeechModelCatalog.bestSupported(in: ["tiny"]) != "openai_whisper-tiny" {
+            failures.append("speech catalog: support set did not accept prefixless alias")
+        }
+        return failures
+    }
+
+    @MainActor
+    private static func speechModelSettingsChecks() -> [String] {
+        var failures: [String] = []
+        let settings = AppSettings.shared
+        let savedModel = settings.whisperModel
+        let savedChosen = settings.whisperModelChosen
+        defer {
+            settings.applyAutomaticWhisperModel(savedModel)
+            settings.whisperModelChosen = savedChosen
+        }
+
+        settings.whisperModelChosen = false
+        settings.applyAutomaticWhisperModel("small")
+        if settings.whisperModel != "openai_whisper-small" || settings.whisperModelChosen {
+            failures.append("speech settings: automatic update did not persist normalized model without flagging intent")
+        }
+        settings.setWhisperModelFromUser("base")
+        if settings.whisperModel != "openai_whisper-base" || !settings.whisperModelChosen {
+            failures.append("speech settings: user update did not persist normalized model and flag intent")
+        }
+        if UserDefaults.standard.string(forKey: "whisperModel") != "openai_whisper-base" ||
+            !(UserDefaults.standard.object(forKey: "whisperModelChosen") as? Bool ?? false) {
+            failures.append("speech settings: persistence keys did not reflect API updates")
+        }
+        settings.applyAutomaticWhisperModel("not-real")
+        if settings.whisperModel != SpeechModelCatalog.defaultID || !settings.whisperModelChosen {
+            failures.append("speech settings: automatic revert changed existing user intent")
+        }
+        return failures
     }
 
     /// Pure-logic hotkey checks: HotKeySpec encode/decode roundtrip and the HotKeyMatcher
