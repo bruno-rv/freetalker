@@ -118,6 +118,10 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(activeTemplateID, forKey: Keys.activeTemplateID) }
     }
 
+    @Published var recoveryRetention: RecoveryRetention {
+        didSet { defaults.set(recoveryRetention.rawValue, forKey: Keys.recoveryRetention) }
+    }
+
     @Published var handsFreeMaxMinutes: Int {
         didSet {
             let clamped = Self.clampHandsFreeMaxMinutes(handsFreeMaxMinutes)
@@ -399,6 +403,7 @@ final class AppSettings: ObservableObject {
         static let cloudLLMBaseURL = "cloudLLMBaseURL"
         static let cloudLLMModel = "cloudLLMModel"
         static let activeTemplateID = "activeTemplateID"
+        static let recoveryRetention = "recoveryRetention"
         static let handsFreeMaxMinutes = "handsFreeMaxMinutes"
         static let appRules = "appRules"
         static let languagePin = "languagePin"
@@ -456,6 +461,7 @@ final class AppSettings: ObservableObject {
             defaults.set(resolvedProviderDefaults.model, forKey: Keys.cloudLLMModel)
         }
         activeTemplateID = defaults.string(forKey: Keys.activeTemplateID) ?? Template.defaultID
+        recoveryRetention = RecoveryRetention(rawValue: defaults.object(forKey: Keys.recoveryRetention) as? Int ?? 7) ?? .sevenDays
         let storedHandsFreeMaxMinutes = defaults.object(forKey: Keys.handsFreeMaxMinutes) as? Int ?? 5
         handsFreeMaxMinutes = Self.clampHandsFreeMaxMinutes(storedHandsFreeMaxMinutes)
         appRules = defaults.dictionary(forKey: Keys.appRules) as? [String: String] ?? [:]
