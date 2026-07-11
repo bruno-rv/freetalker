@@ -257,7 +257,7 @@ private struct RetryFixture {
         )
     }
 
-    
+
 }
 
 private struct FailingReadyStore: RecoveryRetryStoring {
