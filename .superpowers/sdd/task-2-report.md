@@ -52,3 +52,17 @@ Both exited 0; 12 focused tests passed and the debug build completed.
 - Screenshot acquisition and permission UI remain Task 3 responsibilities. This task guarantees
   the OCR service does not retain its input image after recognition and caps/releases it in focused
   regression coverage.
+
+## P2 review follow-up
+
+- Replaced substring bundle matching with case-normalized exact known bundle-ID sets. Unrelated
+  identifiers such as `sparkle-editor`, `signalprocessing`, `wordcounter`, `mailroom`, and
+  `terminalvelocity` no longer collide. Unknown applications still use title/context evidence.
+- Moved the default Vision request and handler behind `VisionOCRRequestLifecycle`. `init()` uses
+  that seam, creates one operation inside its autorelease pool, performs it, and explicitly drops
+  the operation (and therefore its request, handler, and retained image) before leaving the scope.
+- Added a lifecycle probe regression asserting exact create/perform/discard ordering and image
+  release after `await`.
+- Added a small default-initializer Vision test using a blank in-memory image. It verifies that the
+  installed Vision implementation completes and the service does not retain the image; it is not
+  evidence of screenshot capture, permission UI, or user-visible workflow integration.

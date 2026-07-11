@@ -37,6 +37,35 @@ import Testing
         ) == .email)
     }
 
+    @Test(arguments: [
+        "com.example.sparkle-editor",
+        "org.example.signalprocessing",
+        "dev.example.wordcounter",
+        "net.example.mailroom",
+        "io.example.terminalvelocity"
+    ])
+    func unrelatedBundleIdentifiersDoNotCollideWithKnownApps(_ bundleID: String) {
+        #expect(classifier.classify(bundleID: bundleID, windowTitle: nil, context: "") == .document)
+    }
+
+    @Test(arguments: [
+        ("com.microsoft.Outlook", AutomaticStyle.email),
+        ("org.whispersystems.signal-desktop", AutomaticStyle.conversational),
+        ("com.googlecode.iterm2", AutomaticStyle.technical),
+        ("com.microsoft.Word", AutomaticStyle.document)
+    ])
+    func exactKnownBundleIdentifiersClassify(_ bundleID: String, _ expected: AutomaticStyle) {
+        #expect(classifier.classify(bundleID: bundleID, windowTitle: nil, context: "") == expected)
+    }
+
+    @Test func unknownApplicationUsesTitleAndContextEvidence() {
+        #expect(classifier.classify(
+            bundleID: "com.example.sparkle-editor",
+            windowTitle: "Feature.swift",
+            context: "func render() async throws"
+        ) == .technical)
+    }
+
     @Test func manualAppRuleWinsAutomaticStyle() {
         let manual = Template(id: "manual", name: "Manual", prompt: "Manual prompt")
         let active = Template(id: "active", name: "Active", prompt: "Active prompt")
@@ -99,12 +128,43 @@ import Testing
         let service = VisionOCRService { _ in String(repeating: "x", count: 12_001) }
         var lifetime: ImageLifetime? = ImageLifetime()
         weak let weakLifetime = lifetime
-        var image: CGImage? = Self.onePixelImage(lifetime: lifetime!)
+        var image: CGImage? = Self.blankImage(lifetime: lifetime!)
         lifetime = nil
         let result = try await service.recognizeText(in: image!)
         image = nil
 
         #expect(result.count == 12_000)
+        #expect(weakLifetime == nil)
+    }
+
+    @Test func defaultOCRLifecycleCreatesPerformsAndDiscardsOperationInsideScope() async throws {
+        let events = LockedEvents()
+        let lifecycle = FakeVisionOCRLifecycle(events: events, result: "recognized")
+        let service = VisionOCRService(lifecycle: lifecycle)
+        var lifetime: ImageLifetime? = ImageLifetime()
+        weak let weakLifetime = lifetime
+        var image: CGImage? = Self.blankImage(lifetime: lifetime!)
+        lifetime = nil
+
+        let result = try await service.recognizeText(in: image!)
+        image = nil
+
+        #expect(result == "recognized")
+        #expect(events.values == [.created, .performed, .discarded])
+        #expect(weakLifetime == nil)
+    }
+
+    @Test func defaultVisionIntegrationCompletesForBlankImageWithoutRetainingIt() async throws {
+        let service = VisionOCRService()
+        var lifetime: ImageLifetime? = ImageLifetime()
+        weak let weakLifetime = lifetime
+        var image: CGImage? = Self.blankImage(lifetime: lifetime!)
+        lifetime = nil
+
+        let result = try await service.recognizeText(in: image!)
+        image = nil
+
+        #expect(result.count <= VisionOCRService.maximumCharacters)
         #expect(weakLifetime == nil)
     }
 
@@ -115,24 +175,25 @@ import Testing
         _ = method
     }
 
-    private static func onePixelImage(lifetime: ImageLifetime) -> CGImage {
+    private static func blankImage(lifetime: ImageLifetime) -> CGImage {
+        let dimension = 16
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         let retained = Unmanaged.passRetained(lifetime).toOpaque()
         let provider = CGDataProvider(
             dataInfo: retained,
             data: lifetime.bytes,
-            size: 4,
+            size: lifetime.byteCount,
             releaseData: { info, _, _ in
                 guard let info else { return }
                 Unmanaged<ImageLifetime>.fromOpaque(info).release()
             }
         )!
         return CGImage(
-            width: 1,
-            height: 1,
+            width: dimension,
+            height: dimension,
             bitsPerComponent: 8,
             bitsPerPixel: 32,
-            bytesPerRow: 4,
+            bytesPerRow: dimension * 4,
             space: colorSpace,
             bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
             provider: provider,
@@ -144,12 +205,48 @@ import Testing
 }
 
 private final class ImageLifetime {
+    let byteCount = 16 * 16 * 4
     let bytes: UnsafeMutableRawPointer
 
     init() {
-        bytes = .allocate(byteCount: 4, alignment: 1)
-        bytes.initializeMemory(as: UInt8.self, repeating: 0, count: 4)
+        bytes = .allocate(byteCount: byteCount, alignment: 1)
+        bytes.initializeMemory(as: UInt8.self, repeating: 0, count: byteCount)
     }
 
     deinit { bytes.deallocate() }
+}
+
+private final class LockedEvents: @unchecked Sendable {
+    enum Event: Equatable { case created, performed, discarded }
+    private let lock = NSLock()
+    private var storage: [Event] = []
+    var values: [Event] { lock.withLock { storage } }
+    func append(_ event: Event) { lock.withLock { storage.append(event) } }
+}
+
+private struct FakeVisionOCRLifecycle: VisionOCRRequestLifecycle {
+    let events: LockedEvents
+    let result: String
+
+    func makeOperation(for image: CGImage) -> any VisionOCRRequestOperation {
+        events.append(.created)
+        return FakeVisionOCROperation(events: events, result: result)
+    }
+}
+
+private final class FakeVisionOCROperation: VisionOCRRequestOperation, @unchecked Sendable {
+    let events: LockedEvents
+    let result: String
+
+    init(events: LockedEvents, result: String) {
+        self.events = events
+        self.result = result
+    }
+
+    func perform() throws -> String {
+        events.append(.performed)
+        return result
+    }
+
+    deinit { events.append(.discarded) }
 }
