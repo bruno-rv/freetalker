@@ -1,25 +1,19 @@
 import AppKit
 import ApplicationServices
 
-struct AccessibilityAppIdentity: Equatable, Sendable {
-    let appName: String?
-    let bundleID: String?
-    let pid: pid_t
-
-    init(appName: String?, bundleID: String?, pid: pid_t = 0) {
-        self.appName = appName
-        self.bundleID = bundleID
-        self.pid = pid
-    }
-}
-
 struct AccessibilityFocusedField: Equatable, Sendable {
     let text: String
     let isSecure: Bool
 }
 
 struct AccessibilityWindowMetadata: Equatable, Sendable {
+    let windowID: CGWindowID?
     let title: String?
+
+    init(windowID: CGWindowID? = nil, title: String?) {
+        self.windowID = windowID
+        self.title = title
+    }
 }
 
 struct AccessibilityWindow: Equatable, Sendable {
@@ -28,13 +22,11 @@ struct AccessibilityWindow: Equatable, Sendable {
 }
 
 @MainActor
-protocol AccessibilityContextProviding: AnyObject {
-    func frontmostAppIdentity() -> AccessibilityAppIdentity
+protocol AccessibilityContextProviding: ContextTargetAccessibilityProviding {
     func isTrusted() -> Bool
     func selectedText(pid: pid_t) -> String?
     func focusedField(pid: pid_t) -> AccessibilityFocusedField?
     func activeWindow(pid: pid_t) -> AccessibilityWindow?
-    func activeWindowMetadata(pid: pid_t) -> AccessibilityWindowMetadata?
 }
 
 @MainActor
@@ -91,15 +83,6 @@ struct AccessibilityTreeReader<Adapter: AccessibilityNodeAdapting> {
 final class AccessibilityContext: AccessibilityContextProviding {
     private let adapter = SystemAccessibilityNodeAdapter()
 
-    func frontmostAppIdentity() -> AccessibilityAppIdentity {
-        let app = NSWorkspace.shared.frontmostApplication
-        return AccessibilityAppIdentity(
-            appName: app?.localizedName,
-            bundleID: app?.bundleIdentifier,
-            pid: app?.processIdentifier ?? 0
-        )
-    }
-
     func isTrusted() -> Bool {
         AXIsProcessTrusted()
     }
@@ -128,9 +111,12 @@ final class AccessibilityContext: AccessibilityContextProviding {
         )
     }
 
-    func activeWindowMetadata(pid: pid_t) -> AccessibilityWindowMetadata? {
+    func focusedWindowMetadata(pid: pid_t) -> AccessibilityWindowMetadata? {
         guard let window = adapter.focusedWindow(pid: pid) else { return nil }
-        return AccessibilityWindowMetadata(title: adapter.stringAttribute(kAXTitleAttribute, from: window))
+        return AccessibilityWindowMetadata(
+            windowID: adapter.numberAttribute("AXWindowNumber", from: window).map { CGWindowID($0.uint32Value) },
+            title: adapter.stringAttribute(kAXTitleAttribute, from: window)
+        )
     }
 }
 
@@ -204,6 +190,12 @@ final class SystemAccessibilityNodeAdapter: AccessibilityNodeAdapting {
         var value: AnyObject?
         guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success else { return nil }
         return value as? String
+    }
+
+    func numberAttribute(_ name: String, from element: AXUIElement) -> NSNumber? {
+        var value: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success else { return nil }
+        return value as? NSNumber
     }
 
     private func elementAttribute(_ name: String, from element: AXUIElement) -> AXUIElement? {

@@ -127,6 +127,11 @@ the active window's accessibility text, or a one-time active-window screenshot r
 Vision OCR. The scope defaults to Off and is captured exactly once when dictation stops. Manual
 App Rules always take precedence over the optional automatic local style.
 
+Selected text, Focused field, and Active window require Accessibility permission. Window + local
+OCR requires Screen Recording permission only; Accessibility can improve its window metadata but
+is not required for capture or OCR. If the exact stopped window is no longer available, FreeTalker
+continues without OCR instead of capturing another window.
+
 **Local-only privacy boundary:** accessibility text, screenshots, and OCR output stay in memory
 and are supplied only to Apple's on-device Foundation Model. Screenshot bytes are released
 immediately after local OCR. Local context is never persisted, logged, or included in cloud/BYOK

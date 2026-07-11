@@ -7,16 +7,19 @@ import Testing
     @Test func approvedScopeIsCapturedExactlyOnceAtStop() {
         let provider = CountingContextProvider()
 
-        let capture = AppCoordinator.captureApprovedContext(scope: .focusedField, provider: provider)
+        let target = ContextTargetSnapshot(appName: "Mail", bundleID: "com.apple.mail", processID: 41, windowID: 77, windowTitle: "Draft")
+        let capture = AppCoordinator.captureApprovedContext(scope: .focusedField, target: target, provider: provider)
 
         #expect(provider.scopes == [.focusedField])
+        #expect(provider.targets == [target])
         #expect(capture.context.text == "approved")
     }
 
     @Test func offDoesNotCallContextProvider() {
         let provider = CountingContextProvider()
 
-        let capture = AppCoordinator.captureApprovedContext(scope: .off, provider: provider)
+        let target = ContextTargetSnapshot(appName: "Mail", bundleID: "com.apple.mail", processID: 41, windowID: 77, windowTitle: nil)
+        let capture = AppCoordinator.captureApprovedContext(scope: .off, target: target, provider: provider)
 
         #expect(provider.scopes.isEmpty)
         #expect(capture == .empty)
@@ -38,6 +41,16 @@ import Testing
 
         #expect(AppCoordinator.contextPermissionHint(for: capture.limitation) == "Accessibility permission required for Local context")
         #expect(capture.context.appName == "Mail")
+    }
+
+    @Test(arguments: [
+        (ContextCaptureLimitation.screenRecordingPermissionNotDetermined, "Allow Screen Recording in Settings for Window + local OCR"),
+        (.screenRecordingPermissionDenied, "Screen Recording permission denied for Window + local OCR"),
+        (.screenCaptureTargetUnavailable, "Stopped window is no longer available for local OCR"),
+        (.screenCaptureFailed, "Window capture failed; continuing without local OCR")
+    ])
+    func everyOCRLimitationHasVisibleHint(_ limitation: ContextCaptureLimitation, _ hint: String) {
+        #expect(AppCoordinator.contextPermissionHint(for: limitation) == hint)
     }
 
     @Test func manualRuleWinsLocalAutomaticStyle() {
@@ -91,9 +104,11 @@ import Testing
 @MainActor
 private final class CountingContextProvider: LocalContextProvider {
     var scopes: [LocalContextScope] = []
+    var targets: [ContextTargetSnapshot] = []
 
-    func capture(scope: LocalContextScope) -> ContextCapture {
+    func capture(scope: LocalContextScope, target: ContextTargetSnapshot) -> ContextCapture {
         scopes.append(scope)
+        targets.append(target)
         return .approved
     }
 }

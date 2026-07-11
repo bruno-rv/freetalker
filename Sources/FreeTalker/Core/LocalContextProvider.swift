@@ -16,7 +16,10 @@ struct LocalProcessingContext: Equatable, Sendable {
 
 enum ContextCaptureLimitation: Equatable, Sendable {
     case accessibilityPermissionRequired
-    case screenRecordingPermissionRequired
+    case screenRecordingPermissionNotDetermined
+    case screenRecordingPermissionDenied
+    case screenCaptureTargetUnavailable
+    case screenCaptureFailed
 }
 
 struct ContextCapture: Equatable, Sendable {
@@ -31,7 +34,7 @@ struct ContextCapture: Equatable, Sendable {
 
 @MainActor
 protocol LocalContextProvider {
-    func capture(scope: LocalContextScope) -> ContextCapture
+    func capture(scope: LocalContextScope, target: ContextTargetSnapshot) -> ContextCapture
 }
 
 @MainActor
@@ -42,16 +45,16 @@ final class AccessibilityLocalContextProvider: LocalContextProvider {
         self.accessibility = accessibility
     }
 
-    func capture(scope: LocalContextScope) -> ContextCapture {
+    func capture(scope: LocalContextScope, target: ContextTargetSnapshot) -> ContextCapture {
         guard scope != .off else { return .empty }
 
-        let identity = accessibility.frontmostAppIdentity()
         let base = LocalProcessingContext(
-            appName: identity.appName,
-            bundleID: identity.bundleID,
-            windowTitle: nil,
+            appName: target.appName,
+            bundleID: target.bundleID,
+            windowTitle: scope == .windowOCR ? target.windowTitle : nil,
             text: ""
         )
+        if scope == .windowOCR { return ContextCapture(context: base, limitation: nil) }
         guard accessibility.isTrusted() else {
             return ContextCapture(context: base, limitation: .accessibilityPermissionRequired)
         }
@@ -61,17 +64,16 @@ final class AccessibilityLocalContextProvider: LocalContextProvider {
         case .off:
             return .empty
         case .selectedText:
-            context = with(base, text: bounded(accessibility.selectedText(pid: identity.pid) ?? "", limit: 8_000))
+            context = with(base, text: bounded(accessibility.selectedText(pid: target.processID) ?? "", limit: 8_000))
         case .focusedField:
-            let field = accessibility.focusedField(pid: identity.pid)
+            let field = accessibility.focusedField(pid: target.processID)
             let text = field?.isSecure == false ? field?.text ?? "" : ""
             context = with(base, text: bounded(text, limit: 8_000))
         case .activeWindow:
-            let window = accessibility.activeWindow(pid: identity.pid)
+            let window = accessibility.activeWindow(pid: target.processID)
             context = with(base, windowTitle: window?.title, text: bounded(window?.visibleText ?? "", limit: 12_000))
         case .windowOCR:
-            let metadata = accessibility.activeWindowMetadata(pid: identity.pid)
-            context = with(base, windowTitle: metadata?.title)
+            context = base
         }
         return ContextCapture(context: context, limitation: nil)
     }

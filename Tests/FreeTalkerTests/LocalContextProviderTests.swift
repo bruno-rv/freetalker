@@ -8,7 +8,7 @@ import Testing
         let adapter = FakeAccessibilityContext()
         let provider = AccessibilityLocalContextProvider(accessibility: adapter)
 
-        let capture = provider.capture(scope: .off)
+        let capture = provider.capture(scope: .off, target: .test)
 
         #expect(capture == .empty)
         #expect(adapter.calls.isEmpty)
@@ -16,84 +16,82 @@ import Testing
 
     @Test func selectedTextCapturesOnlyTheSelection() {
         let adapter = FakeAccessibilityContext(
-            identity: .init(appName: "Mail", bundleID: "com.apple.mail"),
             selectedText: "selected words",
             focusedField: .init(text: "entire draft", isSecure: false),
             activeWindow: .init(title: "Reply", visibleText: "whole window")
         )
         let provider = AccessibilityLocalContextProvider(accessibility: adapter)
 
-        let capture = provider.capture(scope: .selectedText)
+        let capture = provider.capture(scope: .selectedText, target: .test)
 
         #expect(capture.context == .init(appName: "Mail", bundleID: "com.apple.mail", windowTitle: nil, text: "selected words"))
-        #expect(adapter.calls == [.identity, .permission, .selectedText])
+        #expect(adapter.calls == [.permission, .selectedText])
     }
 
     @Test func focusedFieldCapturesEditableValueCappedAtEightThousandCharacters() {
         let adapter = FakeAccessibilityContext(
-            identity: .init(appName: "Notes", bundleID: "com.apple.Notes"),
             focusedField: .init(text: String(repeating: "a", count: 8_001), isSecure: false)
         )
         let provider = AccessibilityLocalContextProvider(accessibility: adapter)
 
-        let capture = provider.capture(scope: .focusedField)
+        let capture = provider.capture(scope: .focusedField, target: .test)
 
         #expect(capture.context.text.count == 8_000)
-        #expect(adapter.calls == [.identity, .permission, .focusedField])
+        #expect(adapter.calls == [.permission, .focusedField])
     }
 
     @Test func secureFocusedFieldYieldsNoText() {
         let adapter = FakeAccessibilityContext(
-            identity: .init(appName: "Browser", bundleID: "example.browser"),
             focusedField: .init(text: "secret", isSecure: true)
         )
         let provider = AccessibilityLocalContextProvider(accessibility: adapter)
 
-        let capture = provider.capture(scope: .focusedField)
+        let capture = provider.capture(scope: .focusedField, target: .test)
 
         #expect(capture.context.text.isEmpty)
     }
 
     @Test func activeWindowCapturesWindowTitleAndVisibleTextCappedAtTwelveThousandCharacters() {
         let adapter = FakeAccessibilityContext(
-            identity: .init(appName: "Xcode", bundleID: "com.apple.dt.Xcode"),
             activeWindow: .init(title: "Editor", visibleText: String(repeating: "b", count: 12_001))
         )
         let provider = AccessibilityLocalContextProvider(accessibility: adapter)
 
-        let capture = provider.capture(scope: .activeWindow)
+        let capture = provider.capture(scope: .activeWindow, target: .test)
 
         #expect(capture.context.windowTitle == "Editor")
         #expect(capture.context.text.count == 12_000)
-        #expect(adapter.calls == [.identity, .permission, .activeWindow])
+        #expect(adapter.calls == [.permission, .activeWindow])
     }
 
-    @Test func windowOCRCapturesMetadataButDoesNotReadAXText() {
+    @Test func windowOCRNeedsNoAccessibilityPermissionOrAXRead() {
         let adapter = FakeAccessibilityContext(
-            identity: .init(appName: "Preview", bundleID: "com.apple.Preview"),
+            trusted: false,
             activeWindow: .init(title: "Document", visibleText: "must not be read")
         )
         let provider = AccessibilityLocalContextProvider(accessibility: adapter)
 
-        let capture = provider.capture(scope: .windowOCR)
+        let target = ContextTargetSnapshot(appName: "Preview", bundleID: "com.apple.Preview", processID: 41, windowID: 77, windowTitle: nil)
+        let capture = provider.capture(scope: .windowOCR, target: target)
 
-        #expect(capture.context == .init(appName: "Preview", bundleID: "com.apple.Preview", windowTitle: "Document", text: ""))
-        #expect(adapter.calls == [.identity, .permission, .windowMetadata])
+        #expect(capture.context == .init(appName: "Preview", bundleID: "com.apple.Preview", windowTitle: nil, text: ""))
+        #expect(capture.limitation == nil)
+        #expect(adapter.calls.isEmpty)
     }
 
     @Test func missingPermissionReturnsAppIdentityAndTypedLimitationWithoutAXReads() {
         let adapter = FakeAccessibilityContext(
             trusted: false,
-            identity: .init(appName: "Mail", bundleID: "com.apple.mail"),
             selectedText: "must not be read"
         )
         let provider = AccessibilityLocalContextProvider(accessibility: adapter)
 
-        let capture = provider.capture(scope: .selectedText)
+        let target = ContextTargetSnapshot(appName: "Mail", bundleID: "com.apple.mail", processID: 41, windowID: nil, windowTitle: nil)
+        let capture = provider.capture(scope: .selectedText, target: target)
 
         #expect(capture.context == .init(appName: "Mail", bundleID: "com.apple.mail", windowTitle: nil, text: ""))
         #expect(capture.limitation == .accessibilityPermissionRequired)
-        #expect(adapter.calls == [.identity, .permission])
+        #expect(adapter.calls == [.permission])
     }
 
     @Test func contextScopePersistsAndDefaultsOff() {
@@ -120,21 +118,23 @@ import Testing
         #expect(defaults.string(forKey: "localContextScope") == LocalContextScope.off.rawValue)
     }
 
-    @Test func captureUsesOneApplicationSnapshotPIDForAllAXReads() {
+    @Test func captureRootsAllAXReadsToPassedSnapshotPID() {
         let adapter = FakeAccessibilityContext(
-            identity: .init(appName: "Original", bundleID: "original.app", pid: 41),
             activeWindow: .init(title: "Original window", visibleText: "Original content")
         )
-        adapter.identityAfterFirstRead = .init(appName: "Changed", bundleID: "changed.app", pid: 99)
         let provider = AccessibilityLocalContextProvider(accessibility: adapter)
 
-        let capture = provider.capture(scope: .activeWindow)
+        let target = ContextTargetSnapshot(appName: "Original", bundleID: "original.app", processID: 41, windowID: 77, windowTitle: "Original window")
+        let capture = provider.capture(scope: .activeWindow, target: target)
 
         #expect(capture.context.appName == "Original")
         #expect(capture.context.text == "Original content")
         #expect(adapter.requestedPIDs == [41])
-        #expect(adapter.calls.filter { $0 == .identity }.count == 1)
     }
+}
+
+private extension ContextTargetSnapshot {
+    static let test = ContextTargetSnapshot(appName: "Mail", bundleID: "com.apple.mail", processID: 41, windowID: 77, windowTitle: "Reply")
 }
 
 @MainActor
@@ -207,11 +207,9 @@ import Testing
 
 @MainActor
 private final class FakeAccessibilityContext: AccessibilityContextProviding {
-    enum Call: Equatable { case identity, permission, selectedText, focusedField, activeWindow, windowMetadata }
+    enum Call: Equatable { case permission, selectedText, focusedField, activeWindow, windowMetadata }
 
     let trusted: Bool
-    var identityValue: AccessibilityAppIdentity
-    var identityAfterFirstRead: AccessibilityAppIdentity?
     let selectedTextValue: String?
     let focusedFieldValue: AccessibilityFocusedField?
     let activeWindowValue: AccessibilityWindow?
@@ -220,28 +218,21 @@ private final class FakeAccessibilityContext: AccessibilityContextProviding {
 
     init(
         trusted: Bool = true,
-        identity: AccessibilityAppIdentity = .init(appName: nil, bundleID: nil, pid: 0),
         selectedText: String? = nil,
         focusedField: AccessibilityFocusedField? = nil,
         activeWindow: AccessibilityWindow? = nil
     ) {
         self.trusted = trusted
-        identityValue = identity
         selectedTextValue = selectedText
         focusedFieldValue = focusedField
         activeWindowValue = activeWindow
     }
 
-    func frontmostAppIdentity() -> AccessibilityAppIdentity {
-        calls.append(.identity)
-        defer { if let identityAfterFirstRead { identityValue = identityAfterFirstRead } }
-        return identityValue
-    }
     func isTrusted() -> Bool { calls.append(.permission); return trusted }
     func selectedText(pid: pid_t) -> String? { calls.append(.selectedText); requestedPIDs.append(pid); return selectedTextValue }
     func focusedField(pid: pid_t) -> AccessibilityFocusedField? { calls.append(.focusedField); requestedPIDs.append(pid); return focusedFieldValue }
     func activeWindow(pid: pid_t) -> AccessibilityWindow? { calls.append(.activeWindow); requestedPIDs.append(pid); return activeWindowValue }
-    func activeWindowMetadata(pid: pid_t) -> AccessibilityWindowMetadata? {
+    func focusedWindowMetadata(pid: pid_t) -> AccessibilityWindowMetadata? {
         calls.append(.windowMetadata)
         requestedPIDs.append(pid)
         return activeWindowValue.map { .init(title: $0.title) }

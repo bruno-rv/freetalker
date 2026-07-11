@@ -110,7 +110,7 @@ private struct GeneralSettingsView: View {
     @State private var accessibilityTrusted = Permissions.isAccessibilityTrusted()
     @State private var microphoneAuthorized = Permissions.isMicrophoneAuthorized()
     @State private var inputMonitoringAuthorized = Permissions.isInputMonitoringAuthorized()
-    @State private var screenRecordingAuthorized = Permissions.isScreenRecordingAuthorized()
+    @State private var screenRecordingAuthorization = Permissions.screenRecordingAuthorization()
     @State private var capturingHotKey = false
     @State private var captureSession: HotKeyCapture.Session?
     /// Set when re-recording the PTT key is refused because it would collide with, or
@@ -186,13 +186,14 @@ private struct GeneralSettingsView: View {
                 }
                 HStack {
                     Circle()
-                        .fill(screenRecordingAuthorized ? .green : .red)
+                        .fill(screenRecordingAuthorization == .authorized ? .green : .red)
                         .frame(width: 8, height: 8)
-                    Text(screenRecordingAuthorized ? "Screen Recording granted" : "Screen Recording not granted")
+                    Text(screenRecordingPermissionLabel)
                     Spacer()
-                    if !screenRecordingAuthorized {
+                    if screenRecordingAuthorization != .authorized {
                         Button("Request") {
-                            screenRecordingAuthorized = Permissions.requestScreenRecording()
+                            _ = Permissions.requestScreenRecording()
+                            screenRecordingAuthorization = Permissions.screenRecordingAuthorization()
                         }
                         Button("Open System Settings") { Permissions.openScreenRecordingSettings() }
                     }
@@ -209,7 +210,7 @@ private struct GeneralSettingsView: View {
                 Text("Captured once when dictation stops and used only by Apple's on-device Foundation Model. Window + local OCR uses Apple Vision and requires Screen Recording permission.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                if settings.localContextScope == .windowOCR, !screenRecordingAuthorized {
+                if settings.localContextScope == .windowOCR, screenRecordingAuthorization != .authorized {
                     Label("Screen Recording permission is required; processing will fall back to app identity only.", systemImage: "exclamationmark.triangle")
                         .font(.caption)
                         .foregroundStyle(.orange)
@@ -515,7 +516,15 @@ private struct GeneralSettingsView: View {
             accessibilityTrusted = Permissions.isAccessibilityTrusted()
             microphoneAuthorized = Permissions.isMicrophoneAuthorized()
             inputMonitoringAuthorized = Permissions.isInputMonitoringAuthorized()
-            screenRecordingAuthorized = Permissions.isScreenRecordingAuthorized()
+            screenRecordingAuthorization = Permissions.screenRecordingAuthorization()
+        }
+    }
+
+    private var screenRecordingPermissionLabel: String {
+        switch screenRecordingAuthorization {
+        case .authorized: "Screen Recording granted"
+        case .notDetermined: "Screen Recording not requested"
+        case .denied: "Screen Recording denied"
         }
     }
 
