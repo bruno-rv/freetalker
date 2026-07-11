@@ -132,6 +132,10 @@ OCR requires Screen Recording permission only; Accessibility can improve its win
 is not required for capture or OCR. If the exact stopped window is no longer available, FreeTalker
 continues without OCR instead of capturing another window.
 
+macOS exposes Screen Recording preflight as granted or not granted. Settings reflects that current
+state directly and offers explicit **Request Access** and **Open System Settings** actions when it
+is not granted; FreeTalker does not infer whether access was never requested or previously denied.
+
 **Local-only privacy boundary:** accessibility text, screenshots, and OCR output stay in memory
 and are supplied only to Apple's on-device Foundation Model. Screenshot bytes are released
 immediately after local OCR. Local context is never persisted, logged, or included in cloud/BYOK

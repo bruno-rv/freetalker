@@ -2,14 +2,12 @@ import CoreGraphics
 import ScreenCaptureKit
 
 enum ScreenRecordingAuthorization: Equatable, Sendable {
-    case authorized
-    case notDetermined
-    case denied
+    case granted
+    case notGranted
 }
 
 enum ActiveWindowScreenshotError: Error, Equatable {
-    case permissionNotDetermined
-    case permissionDenied
+    case permissionNotGranted
     case targetUnavailable
     case captureFailed
 }
@@ -62,7 +60,7 @@ struct ActiveWindowScreenshotService: ActiveWindowScreenshotCapturing {
     private let backend: any ActiveWindowScreenshotBackend
 
     init(
-        authorization: @escaping @Sendable () -> ScreenRecordingAuthorization = Permissions.screenRecordingAuthorization,
+        authorization: @escaping @Sendable () -> ScreenRecordingAuthorization = { Permissions.screenRecordingAuthorization() },
         backend: any ActiveWindowScreenshotBackend = ScreenCaptureKitScreenshotBackend()
     ) {
         self.authorization = authorization
@@ -71,9 +69,8 @@ struct ActiveWindowScreenshotService: ActiveWindowScreenshotCapturing {
 
     func capture(target: ContextTargetSnapshot) async throws -> CGImage {
         switch authorization() {
-        case .notDetermined: throw ActiveWindowScreenshotError.permissionNotDetermined
-        case .denied: throw ActiveWindowScreenshotError.permissionDenied
-        case .authorized: break
+        case .notGranted: throw ActiveWindowScreenshotError.permissionNotGranted
+        case .granted: break
         }
         guard let targetWindowID = target.windowID else { throw ActiveWindowScreenshotError.targetUnavailable }
         let windows: [ScreenshotWindow]

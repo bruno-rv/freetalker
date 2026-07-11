@@ -44,8 +44,7 @@ import Testing
     }
 
     @Test(arguments: [
-        (ContextCaptureLimitation.screenRecordingPermissionNotDetermined, "Allow Screen Recording in Settings for Window + local OCR"),
-        (.screenRecordingPermissionDenied, "Screen Recording permission denied for Window + local OCR"),
+        (ContextCaptureLimitation.screenRecordingPermissionNotGranted, "Screen Recording not granted for Window + local OCR"),
         (.screenCaptureTargetUnavailable, "Stopped window is no longer available for local OCR"),
         (.screenCaptureFailed, "Window capture failed; continuing without local OCR")
     ])

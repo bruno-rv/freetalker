@@ -102,6 +102,21 @@ struct SettingsView: View {
     }
 }
 
+struct ScreenRecordingPermissionPresentation: Equatable {
+    let label: String
+    let showsRequestAccess: Bool
+    let showsOpenSystemSettings: Bool
+
+    static func make(status: ScreenRecordingAuthorization) -> Self {
+        let granted = status == .granted
+        return Self(
+            label: granted ? "Screen Recording granted" : "Screen Recording not granted",
+            showsRequestAccess: !granted,
+            showsOpenSystemSettings: !granted
+        )
+    }
+}
+
 private struct GeneralSettingsView: View {
     @ObservedObject private var settings = AppSettings.shared
     @ObservedObject private var coordinator = AppCoordinator.shared
@@ -186,15 +201,16 @@ private struct GeneralSettingsView: View {
                 }
                 HStack {
                     Circle()
-                        .fill(screenRecordingAuthorization == .authorized ? .green : .red)
+                        .fill(screenRecordingAuthorization == .granted ? .green : .red)
                         .frame(width: 8, height: 8)
                     Text(screenRecordingPermissionLabel)
                     Spacer()
-                    if screenRecordingAuthorization != .authorized {
-                        Button("Request") {
-                            _ = Permissions.requestScreenRecording()
-                            screenRecordingAuthorization = Permissions.screenRecordingAuthorization()
+                    if screenRecordingPresentation.showsRequestAccess {
+                        Button("Request Access") {
+                            screenRecordingAuthorization = Permissions.requestScreenRecording()
                         }
+                    }
+                    if screenRecordingPresentation.showsOpenSystemSettings {
                         Button("Open System Settings") { Permissions.openScreenRecordingSettings() }
                     }
                 }
@@ -210,7 +226,7 @@ private struct GeneralSettingsView: View {
                 Text("Captured once when dictation stops and used only by Apple's on-device Foundation Model. Window + local OCR uses Apple Vision and requires Screen Recording permission.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                if settings.localContextScope == .windowOCR, screenRecordingAuthorization != .authorized {
+                if settings.localContextScope == .windowOCR, screenRecordingAuthorization != .granted {
                     Label("Screen Recording permission is required; processing will fall back to app identity only.", systemImage: "exclamationmark.triangle")
                         .font(.caption)
                         .foregroundStyle(.orange)
@@ -521,11 +537,11 @@ private struct GeneralSettingsView: View {
     }
 
     private var screenRecordingPermissionLabel: String {
-        switch screenRecordingAuthorization {
-        case .authorized: "Screen Recording granted"
-        case .notDetermined: "Screen Recording not requested"
-        case .denied: "Screen Recording denied"
-        }
+        screenRecordingPresentation.label
+    }
+
+    private var screenRecordingPresentation: ScreenRecordingPermissionPresentation {
+        .make(status: screenRecordingAuthorization)
     }
 
     @ViewBuilder

@@ -494,9 +494,8 @@ final class AppCoordinator: ObservableObject {
         let contextPermissionHint: String?
         if contextScope == .windowOCR {
             contextPermissionHint = switch Permissions.screenRecordingAuthorization() {
-            case .authorized: nil
-            case .notDetermined: "Allow Screen Recording for Window + local OCR"
-            case .denied: "Screen Recording denied for Window + local OCR"
+            case .granted: nil
+            case .notGranted: "Screen Recording not granted for Window + local OCR"
             }
         } else if contextScope != .off, !Permissions.isAccessibilityTrusted() {
             contextPermissionHint = "Accessibility permission required"
@@ -656,10 +655,8 @@ final class AppCoordinator: ObservableObject {
                 ),
                 limitation: nil
             )
-        } catch ActiveWindowScreenshotError.permissionNotDetermined {
-            return ContextCapture(context: capture.context, limitation: .screenRecordingPermissionNotDetermined)
-        } catch ActiveWindowScreenshotError.permissionDenied {
-            return ContextCapture(context: capture.context, limitation: .screenRecordingPermissionDenied)
+        } catch ActiveWindowScreenshotError.permissionNotGranted {
+            return ContextCapture(context: capture.context, limitation: .screenRecordingPermissionNotGranted)
         } catch ActiveWindowScreenshotError.targetUnavailable {
             return ContextCapture(context: capture.context, limitation: .screenCaptureTargetUnavailable)
         } catch {
@@ -731,10 +728,8 @@ final class AppCoordinator: ObservableObject {
         switch limitation {
         case .accessibilityPermissionRequired:
             "Accessibility permission required for Local context"
-        case .screenRecordingPermissionNotDetermined:
-            "Allow Screen Recording in Settings for Window + local OCR"
-        case .screenRecordingPermissionDenied:
-            "Screen Recording permission denied for Window + local OCR"
+        case .screenRecordingPermissionNotGranted:
+            "Screen Recording not granted for Window + local OCR"
         case .screenCaptureTargetUnavailable:
             "Stopped window is no longer available for local OCR"
         case .screenCaptureFailed:
