@@ -132,3 +132,36 @@ make test && DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift buil
 
 Result: exit 0; 81 tests in 8 suites passed, the release build completed, and
 `git diff --check` produced no output.
+
+## Final P2 follow-up: bound cross-process AX child materialization
+
+### RED
+
+```text
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter AccessibilityTreeReaderTests
+```
+
+Result: exit 1 because the production adapter still required the unbounded
+`children(of:)` API while the fake implemented the required `children(of:maxCount:)` contract.
+
+### GREEN
+
+The focused command exited 0 with 5 tree-reader tests passing. The new lazy-wide-tree test
+advertises 1,000,000 children without constructing them, verifies the root request is exactly
+4,999 (the remaining budget after scheduling the root), and verifies the adapter reply and
+pending traversal remain within the 5,000-node total ceiling.
+
+The real adapter now calls `AXUIElementCopyAttributeValues` with the remaining-node limit,
+bounding the cross-process reply itself. Traversal tracks the identities of every visited or
+pending node in one scheduled set, subtracts that set from the node budget before each child
+request, filters duplicate identities before enqueue, and defensively prefixes an adapter reply
+to the requested limit.
+
+### Full verification
+
+```text
+make test && DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build -c release && git diff --check
+```
+
+Result: exit 0; 82 tests in 8 suites passed, the release build completed, and
+`git diff --check` produced no output.

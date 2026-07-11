@@ -45,7 +45,7 @@ protocol AccessibilityNodeAdapting: AnyObject {
     func identity(of node: Node) -> Identity
     func isSecure(_ node: Node) -> Bool
     func visibleText(of node: Node) -> String?
-    func children(of node: Node) -> [Node]
+    func children(of node: Node, maxCount: Int) -> [Node]
 }
 
 @MainActor
@@ -58,14 +58,12 @@ struct AccessibilityTreeReader<Adapter: AccessibilityNodeAdapting> {
 
     func visibleText(root: Adapter.Node) -> String {
         var result = ""
-        var visited: Set<Adapter.Identity> = []
+        var scheduled: Set<Adapter.Identity> = [adapter.identity(of: root)]
         var stack: [(node: Adapter.Node, depth: Int)] = [(root, 0)]
         var nodesRead = 0
 
         while let current = stack.popLast(), result.count < Self.maxCharacters, nodesRead < Self.maxNodes {
             guard current.depth <= Self.maxDepth else { continue }
-            let identity = adapter.identity(of: current.node)
-            guard visited.insert(identity).inserted else { continue }
             nodesRead += 1
             guard !adapter.isSecure(current.node) else { continue }
 
@@ -73,9 +71,17 @@ struct AccessibilityTreeReader<Adapter: AccessibilityNodeAdapting> {
                 if !result.isEmpty { result.append("\n") }
                 result.append(contentsOf: text.prefix(Self.maxCharacters - result.count))
             }
-            guard result.count < Self.maxCharacters, current.depth < Self.maxDepth, nodesRead < Self.maxNodes else { continue }
-            let children = adapter.children(of: current.node)
-            stack.append(contentsOf: children.reversed().map { ($0, current.depth + 1) })
+            let remainingNodeBudget = Self.maxNodes - scheduled.count
+            guard result.count < Self.maxCharacters, current.depth < Self.maxDepth, remainingNodeBudget > 0 else { continue }
+            let children = adapter.children(of: current.node, maxCount: remainingNodeBudget)
+            var newChildren: [Adapter.Node] = []
+            newChildren.reserveCapacity(min(children.count, remainingNodeBudget))
+            for child in children.prefix(remainingNodeBudget) {
+                guard scheduled.insert(adapter.identity(of: child)).inserted else { continue }
+                newChildren.append(child)
+                if scheduled.count == Self.maxNodes { break }
+            }
+            stack.append(contentsOf: newChildren.reversed().map { ($0, current.depth + 1) })
         }
         return result
     }
@@ -162,8 +168,20 @@ final class SystemAccessibilityNodeAdapter: AccessibilityNodeAdapting {
         return stringAttribute(kAXValueAttribute, from: node)
     }
 
-    func children(of node: AXUIElement) -> [AXUIElement] {
-        elementArrayAttribute(kAXChildrenAttribute, from: node)
+    func children(of node: AXUIElement, maxCount: Int) -> [AXUIElement] {
+        guard maxCount > 0 else { return [] }
+        var values: CFArray?
+        guard AXUIElementCopyAttributeValues(
+            node,
+            kAXChildrenAttribute as CFString,
+            0,
+            maxCount,
+            &values
+        ) == .success, let values = values as? [AnyObject] else { return [] }
+        return values.compactMap { value in
+            guard CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+            return unsafeDowncast(value, to: AXUIElement.self)
+        }
     }
 
     func focusedElement(pid: pid_t) -> AXUIElement? {
@@ -195,13 +213,4 @@ final class SystemAccessibilityNodeAdapter: AccessibilityNodeAdapting {
         return unsafeDowncast(value, to: AXUIElement.self)
     }
 
-    private func elementArrayAttribute(_ name: String, from element: AXUIElement) -> [AXUIElement] {
-        var value: AnyObject?
-        guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success,
-              let values = value as? [AnyObject] else { return [] }
-        return values.compactMap { value in
-            guard CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
-            return unsafeDowncast(value, to: AXUIElement.self)
-        }
-    }
 }
