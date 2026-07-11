@@ -920,7 +920,12 @@ final class AppCoordinator: ObservableObject {
                 return .transcribing
             }
         )
-        let runner = LocalJobRunner(store: recoveryStore, kind: .recovery, executorFinalizesJob: true) { job, token in
+        let runner = LocalJobRunner(
+            store: recoveryStore,
+            kind: .recovery,
+            executorFinalizesJob: true,
+            finalizationFailure: pipeline.failFinalization
+        ) { job, token in
             try await pipeline.execute(jobID: job.id, configuration: nil, cancellation: token)
         }
         recoveryRunner = runner

@@ -16,6 +16,7 @@ protocol RecoveryRetryStoring: Sendable {
     func finishAttempt(_ id: Int64, result: AttemptResult) async throws
     func latestUnfinishedAttempt(jobID: UUID) async throws -> JobAttempt?
     func completeAttemptAndMarkJobReady(jobID: UUID, attemptID: Int64) async throws
+    func failAttemptAndMarkJobFailed(jobID: UUID, attemptID: Int64, failure: JobFailure) async throws
     func recordSourceCleanupError(jobID: UUID, message: String) async throws
     func completeSourceCleanup(jobID: UUID) async throws
     func jobsNeedingSourceCleanup() async throws -> [TranscriptionJob]
@@ -81,6 +82,12 @@ struct RecoveryRetryPipeline: Sendable {
     func retryPendingSourceCleanup() async {
         guard let jobs = try? await store.jobsNeedingSourceCleanup() else { return }
         for job in jobs { await cleanSource(for: job) }
+    }
+
+    func failFinalization(jobID: UUID, error: any Error) async throws {
+        guard let attempt = try await store.latestUnfinishedAttempt(jobID: jobID) else { return }
+        let failure = JobFailure(stage: errorStage(error), message: error.localizedDescription)
+        try await store.failAttemptAndMarkJobFailed(jobID: jobID, attemptID: attempt.id, failure: failure)
     }
 
     private func cleanSource(for job: TranscriptionJob) async {
