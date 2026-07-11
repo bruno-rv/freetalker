@@ -62,21 +62,32 @@ import Testing
         #expect(!coordinator.hasSensitiveContent)
     }
 
-    @Test func cancelInvalidatesSuspendedGenerationAndClearsSensitiveState() async {
-        let editor = SuspendingLocalEditService()
+    @Test func cancelCancelsSuspendedGenerationAndClearsSensitiveState() async {
+        let editor = CancellationAwareLocalEditService()
         let coordinator = makeCoordinator(editor: editor)
         let task = Task { await coordinator.begin() }
         await editor.waitUntilRequested()
 
         #expect(coordinator.hasSensitiveContent)
         coordinator.cancel()
-        editor.resume(returning: "late result")
         await task.value
 
+        #expect(editor.cancellationObserved)
         #expect(coordinator.preview == nil)
         #expect(coordinator.snippetChoices.isEmpty)
         #expect(coordinator.error == nil)
         #expect(!coordinator.hasSensitiveContent)
+    }
+
+    @Test func failedSystemClipboardWriteRestoresPriorContents() throws {
+        let old = VoiceEditPasteboardItem(values: [.string: Data("old".utf8)])
+        let pasteboard = StubVoiceEditPasteboard(snapshot: [old], writeResult: .success(false))
+
+        #expect(throws: VoiceEditClipboardError.writeFailed) {
+            try VoiceEditClipboard.copy("new", pasteboard: pasteboard)
+        }
+
+        #expect(pasteboard.restored == [[old]])
     }
 
     @Test func confirmUsesSelectionAccessAndStaleConfirmationPerformsNoWrite() async throws {
@@ -214,27 +225,38 @@ private final class StubCoordinatorSelectionAccess: SelectionAccessing {
 }
 
 @MainActor
-private final class SuspendingLocalEditService: LocalEditServicing {
-    private var requestContinuation: CheckedContinuation<Void, Never>?
-    private var responseContinuation: CheckedContinuation<String, Never>?
+private final class CancellationAwareLocalEditService: LocalEditServicing {
     private var requested = false
+    private(set) var cancellationObserved = false
 
     func edit(selectedText: String, instruction: String) async throws -> String {
         requested = true
-        requestContinuation?.resume()
-        requestContinuation = nil
-        return await withCheckedContinuation { responseContinuation = $0 }
+        do {
+            try await Task.sleep(for: .seconds(60))
+            return "unexpected"
+        } catch is CancellationError {
+            cancellationObserved = true
+            throw CancellationError()
+        }
     }
 
     func waitUntilRequested() async {
-        if requested { return }
-        await withCheckedContinuation { requestContinuation = $0 }
+        while !requested { await Task.yield() }
     }
+}
 
-    func resume(returning result: String) {
-        responseContinuation?.resume(returning: result)
-        responseContinuation = nil
+@MainActor
+private final class StubVoiceEditPasteboard: VoiceEditPasteboardAdapting {
+    let storedSnapshot: [VoiceEditPasteboardItem]
+    let writeResult: Result<Bool, Error>
+    var restored: [[VoiceEditPasteboardItem]] = []
+    init(snapshot: [VoiceEditPasteboardItem], writeResult: Result<Bool, Error>) {
+        storedSnapshot = snapshot
+        self.writeResult = writeResult
     }
+    func snapshot() -> [VoiceEditPasteboardItem] { storedSnapshot }
+    func write(_ text: String) throws -> Bool { try writeResult.get() }
+    func restore(_ items: [VoiceEditPasteboardItem]) { restored.append(items) }
 }
 
 @MainActor

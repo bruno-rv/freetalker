@@ -10,6 +10,7 @@ struct LocalEditService: LocalEditServicing {
     enum EditError: Error, Equatable { case unavailable }
 
     func edit(selectedText: String, instruction: String) async throws -> String {
+        try Task.checkCancellation()
         guard case .available = SystemLanguageModel.default.availability else {
             throw EditError.unavailable
         }
@@ -21,6 +22,7 @@ struct LocalEditService: LocalEditServicing {
         <selected-text>\(escaped(selectedText))</selected-text>
         <edit-instruction>\(escaped(instruction))</edit-instruction>
         """)
+        try Task.checkCancellation()
         return response.content
     }
 

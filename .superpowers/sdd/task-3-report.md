@@ -45,7 +45,7 @@ make app
 git diff --check
 ```
 
-The final full suite passed with 157 tests in 16 suites. The release executable and ad-hoc signed app
+The final full suite passed with 158 tests in 16 suites. The release executable and ad-hoc signed app
 bundle built successfully. Diff whitespace validation passed.
 
 ## Concerns
@@ -72,3 +72,21 @@ bundle built successfully. Diff whitespace validation passed.
 The focused RED build failed on the missing sensitive-state, fallible-copy, invalidation, and typed
 confirmation-error contracts. The focused GREEN run passed 11 tests, including five parameterized
 selection-error cases.
+
+## Second review follow-up
+
+- The coordinator now owns the actual generation `Task`, cancels it on cancel, restart, every
+  terminal cleanup, and propagation from a cancelled `begin()` caller. Publication tokens remain as
+  a second guard, but cancellation now reaches the suspended edit service and Foundation Models
+  request. `LocalEditService` checks cancellation immediately before and after `session.respond`.
+- Generation no longer carries a full `SelectionSnapshot` across snippet lookup; it extracts only
+  the selected string at the point local generation needs it.
+- The default pasteboard path snapshots every data-backed type, attempts `writeObjects`, and restores
+  the prior supported items when that write fails or throws.
+- Added a cancellation-aware suspended-service regression that exits through `CancellationError`
+  without manual resumption, plus an injectable failed-pasteboard restoration regression.
+
+### Second review TDD evidence
+
+The focused RED build failed on the missing pasteboard adapter/item/copy types. The focused GREEN
+run passed 12 tests, including the owned-task cancellation observation and clipboard restoration.
