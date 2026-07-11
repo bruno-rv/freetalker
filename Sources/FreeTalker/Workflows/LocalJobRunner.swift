@@ -38,6 +38,7 @@ final class CancellationToken: @unchecked Sendable {
 
 actor LocalJobRunner {
     typealias Executor = @Sendable (TranscriptionJob, CancellationToken) async throws -> Void
+    typealias FinalizationFailure = @Sendable (UUID, any Error) async throws -> Void
 
     enum CancellationOutcome: Sendable, Equatable {
         case accepted
@@ -60,6 +61,7 @@ actor LocalJobRunner {
     private let executor: Executor
     private let executorFinalizesJob: Bool
     private let kind: JobKind?
+    private let finalizationFailure: FinalizationFailure?
     private var queue: [UUID] = []
     private var worker: Task<Void, Never>?
     private var current: CurrentExecution?
@@ -68,11 +70,13 @@ actor LocalJobRunner {
         store: any TranscriptionJobStoring,
         kind: JobKind? = nil,
         executorFinalizesJob: Bool = false,
+        finalizationFailure: FinalizationFailure? = nil,
         executor: @escaping Executor
     ) {
         self.store = store
         self.kind = kind
         self.executorFinalizesJob = executorFinalizesJob
+        self.finalizationFailure = finalizationFailure
         self.executor = executor
     }
 
@@ -156,9 +160,32 @@ actor LocalJobRunner {
         } catch is CancellationError {
             try? await store.transition(id, from: .processing, to: .cancelled)
         } catch {
-            if current?.phase == .finalizing { return }
+            if current?.phase == .finalizing {
+                await handleFinalizationFailure(id: id, error: error)
+                return
+            }
             let stage = try? await store.job(id: id)?.state.processingStage
             let failure = JobFailure(stage: stage ?? .preparing, message: error.localizedDescription)
+            try? await store.transition(id, from: .processing, to: .failed(failure))
+        }
+    }
+
+    private func handleFinalizationFailure(id: UUID, error: any Error) async {
+        guard let job = try? await store.job(id: id) else { return }
+        switch job.state {
+        case .ready, .failed, .cancelled:
+            return
+        case .queued:
+            return
+        case .processing(let stage):
+            if let finalizationFailure {
+                try? await finalizationFailure(id, error)
+                if let refreshed = try? await store.job(id: id),
+                   refreshed.state.kind != .processing {
+                    return
+                }
+            }
+            let failure = JobFailure(stage: stage, message: error.localizedDescription)
             try? await store.transition(id, from: .processing, to: .failed(failure))
         }
     }

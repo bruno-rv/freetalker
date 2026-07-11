@@ -120,3 +120,27 @@ produced no output.
 ### Concerns
 
 None.
+
+## Final review follow-up: deterministic finalization failure
+
+The runner previously returned immediately from every error after the finalization handshake.
+That was correct only when a completion write had actually committed. If the atomic recovery
+completion transaction or the default runner's ready transition failed, the row remained in
+`processing` until a later restart.
+
+The runner now reads persisted state after a finalization error:
+
+- `ready` and other terminal states are preserved because completion already won.
+- `processing` is transitioned immediately to a visible failed state with the finalization
+  error.
+- Pipeline-owned recovery finalization uses one store transaction to fail the unfinished attempt
+  and the processing job together, preserving the same consistency guarantee as successful
+  completion.
+- If an injected pipeline failure handler cannot terminalize the row, the runner performs the
+  processing-to-failed fallback itself.
+
+TDD regressions cover both an injected recovery ready-transaction rollback and an injected
+default runner ready-transition failure. Neither leaves indefinite processing state.
+
+Focused `RecoveryRetryTests|LocalJobRunnerTests` verification passed 22 tests. Full
+`make test` passed 52 tests in 5 suites; the release build and `git diff --check` also exited 0.

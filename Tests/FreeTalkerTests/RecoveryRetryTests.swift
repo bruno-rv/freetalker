@@ -143,6 +143,41 @@ import Testing
         #expect(outcome == .tooLate)
         #expect(try await fixture.store.job(id: fixture.job.id)?.state == .ready)
     }
+
+    @Test func pipelineReadyRollbackImmediatelyFailsJobAndUnfinishedAttempt() async throws {
+        let fixture = try await RetryFixture()
+        try await fixture.store.transition(
+            fixture.job.id,
+            from: .processing,
+            to: .failed(JobFailure(stage: .preparing, message: "retry"))
+        )
+        try await fixture.store.transition(fixture.job.id, from: .failed, to: .queued)
+        let retryStore = FailingReadyStore(base: fixture.store)
+        let pipeline = RecoveryRetryPipeline(
+            directory: fixture.directory,
+            store: retryStore,
+            loadSamples: { _ in [0.1] },
+            processDictation: RetryProbe().process
+        )
+        let runner = LocalJobRunner(
+            store: fixture.store,
+            kind: .recovery,
+            executorFinalizesJob: true,
+            finalizationFailure: pipeline.failFinalization
+        ) { job, token in
+            try await pipeline.execute(jobID: job.id, configuration: .init(), cancellation: token)
+        }
+
+        await runner.enqueue(fixture.job.id)
+        await runner.waitUntilIdle()
+
+        #expect(try await fixture.store.job(id: fixture.job.id)?.state == .failed(
+            JobFailure(stage: .persisting, message: "database")
+        ))
+        #expect(try await fixture.store.attempts(jobID: fixture.job.id).last?.result == .failed(
+            JobFailure(stage: .persisting, message: "database")
+        ))
+    }
 }
 
 private enum RetryTestError: Error, LocalizedError {
@@ -232,6 +267,7 @@ private struct FailingReadyStore: RecoveryRetryStoring {
     func finishAttempt(_ id: Int64, result: AttemptResult) async throws { try await base.finishAttempt(id, result: result) }
     func latestUnfinishedAttempt(jobID: UUID) async throws -> JobAttempt? { try await base.latestUnfinishedAttempt(jobID: jobID) }
     func completeAttemptAndMarkJobReady(jobID: UUID, attemptID: Int64) async throws { throw RetryTestError.database }
+    func failAttemptAndMarkJobFailed(jobID: UUID, attemptID: Int64, failure: JobFailure) async throws { try await base.failAttemptAndMarkJobFailed(jobID: jobID, attemptID: attemptID, failure: failure) }
     func recordSourceCleanupError(jobID: UUID, message: String) async throws { try await base.recordSourceCleanupError(jobID: jobID, message: message) }
     func completeSourceCleanup(jobID: UUID) async throws { try await base.completeSourceCleanup(jobID: jobID) }
     func jobsNeedingSourceCleanup() async throws -> [TranscriptionJob] { try await base.jobsNeedingSourceCleanup() }
@@ -256,6 +292,7 @@ private actor SuspendedReadyRetryStore: RecoveryRetryStoring, TranscriptionJobSt
         await withCheckedContinuation { readyContinuation = $0 }
         try await base.completeAttemptAndMarkJobReady(jobID: jobID, attemptID: attemptID)
     }
+    func failAttemptAndMarkJobFailed(jobID: UUID, attemptID: Int64, failure: JobFailure) async throws { try await base.failAttemptAndMarkJobFailed(jobID: jobID, attemptID: attemptID, failure: failure) }
     func recordSourceCleanupError(jobID: UUID, message: String) async throws { try await base.recordSourceCleanupError(jobID: jobID, message: message) }
     func completeSourceCleanup(jobID: UUID) async throws { try await base.completeSourceCleanup(jobID: jobID) }
     func jobsNeedingSourceCleanup() async throws -> [TranscriptionJob] { try await base.jobsNeedingSourceCleanup() }

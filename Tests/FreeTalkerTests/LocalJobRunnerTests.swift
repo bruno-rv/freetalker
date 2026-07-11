@@ -137,6 +137,20 @@ import Testing
         #expect(try await fixture.store.job(id: job.id)?.state == .ready)
     }
 
+    @Test func failedDefaultReadyTransitionLeavesJobVisiblyFailed() async throws {
+        let fixture = try RunnerFixture()
+        let job = try await fixture.makeJob(.recovery, "ready-fails.wav")
+        let store = FailingReadyTransitionStore(base: fixture.store)
+        let runner = LocalJobRunner(store: store) { _, _ in }
+
+        await runner.enqueue(job.id)
+        await runner.waitUntilIdle()
+
+        #expect(try await fixture.store.job(id: job.id)?.state == .failed(
+            JobFailure(stage: .preparing, message: "ready transition failed")
+        ))
+    }
+
     @Test func cancellationDuringInitialReadPreventsExecutorStart() async throws {
         let fixture = try RunnerFixture()
         let job = try await fixture.makeJob(.recovery, "claimed.wav")
@@ -296,6 +310,25 @@ private actor SuspendedReadyTransitionStore: TranscriptionJobStoring {
         readyContinuation?.resume()
         readyContinuation = nil
     }
+}
+
+private actor FailingReadyTransitionStore: TranscriptionJobStoring {
+    let base: TranscriptionJobStore
+
+    init(base: TranscriptionJobStore) { self.base = base }
+
+    func job(id: UUID) async throws -> TranscriptionJob? { try await base.job(id: id) }
+    func jobs(kind: JobKind?) async throws -> [TranscriptionJob] { try await base.jobs(kind: kind) }
+    func recoverInterruptedJobs(kind: JobKind?) async throws -> Int { try await base.recoverInterruptedJobs(kind: kind) }
+    func transition(_ id: UUID, from: JobState.Kind, to state: JobState) async throws {
+        if state == .ready { throw RunnerFinalizationError.ready }
+        try await base.transition(id, from: from, to: state)
+    }
+}
+
+private enum RunnerFinalizationError: LocalizedError {
+    case ready
+    var errorDescription: String? { "ready transition failed" }
 }
 
 private actor SuspendedInitialReadStore: TranscriptionJobStoring {

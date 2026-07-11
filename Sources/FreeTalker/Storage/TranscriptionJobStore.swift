@@ -345,6 +345,48 @@ actor TranscriptionJobStore {
         }
     }
 
+    func failAttemptAndMarkJobFailed(jobID: UUID, attemptID: Int64, failure: JobFailure) throws {
+        try execute("BEGIN IMMEDIATE;")
+        do {
+            do {
+                let attempt = try prepare("""
+                UPDATE job_attempts
+                SET completed_at = ?, result = 'failed', failure_stage = ?, failure_message = ?
+                WHERE id = ? AND job_id = ? AND completed_at IS NULL;
+                """)
+                defer { sqlite3_finalize(attempt) }
+                sqlite3_bind_double(attempt, 1, clock.now.timeIntervalSince1970)
+                bind(failure.stage.rawValue, to: 2, in: attempt)
+                bind(failure.message, to: 3, in: attempt)
+                sqlite3_bind_int64(attempt, 4, attemptID)
+                bind(jobID.uuidString, to: 5, in: attempt)
+                try stepDone(attempt)
+                guard sqlite3_changes(handle) == 1 else { throw JobStoreError.attemptNotFound }
+            }
+            do {
+                let job = try prepare("""
+                UPDATE transcription_jobs
+                SET state = 'failed', failure_stage = ?, failure_message = ?,
+                    updated_at = ?, completed_at = ?
+                WHERE id = ? AND kind = 'recovery' AND state = 'processing'
+                  AND purge_claimed_at IS NULL;
+                """)
+                defer { sqlite3_finalize(job) }
+                bind(failure.stage.rawValue, to: 1, in: job)
+                bind(failure.message, to: 2, in: job)
+                sqlite3_bind_double(job, 3, clock.now.timeIntervalSince1970)
+                sqlite3_bind_double(job, 4, clock.now.timeIntervalSince1970)
+                bind(jobID.uuidString, to: 5, in: job)
+                try stepDone(job)
+                guard sqlite3_changes(handle) == 1 else { throw JobStoreError.invalidTransition }
+            }
+            try execute("COMMIT;")
+        } catch {
+            try? execute("ROLLBACK;")
+            throw error
+        }
+    }
+
     func recordSourceCleanupError(jobID: UUID, message: String) throws {
         let statement = try prepare("""
         UPDATE transcription_jobs SET needs_source_cleanup = 1, source_cleanup_error = ?
