@@ -1,13 +1,27 @@
 import Foundation
 
-actor CancellationToken {
+protocol TranscriptionJobStoring: Sendable {
+    func job(id: UUID) async throws -> TranscriptionJob?
+    func jobs(kind: JobKind?) async throws -> [TranscriptionJob]
+    func transition(_ id: UUID, from: JobState.Kind, to state: JobState) async throws
+    func recoverInterruptedJobs() async throws -> Int
+}
+
+extension TranscriptionJobStore: TranscriptionJobStoring {}
+
+final class CancellationToken: @unchecked Sendable {
+    private let lock = NSLock()
     private var isCancelled = false
 
     func cancel() {
+        lock.lock()
+        defer { lock.unlock() }
         isCancelled = true
     }
 
     func checkCancellation() throws {
+        lock.lock()
+        defer { lock.unlock() }
         if isCancelled { throw CancellationError() }
     }
 }
@@ -15,13 +29,30 @@ actor CancellationToken {
 actor LocalJobRunner {
     typealias Executor = @Sendable (TranscriptionJob, CancellationToken) async throws -> Void
 
-    private let store: TranscriptionJobStore
+    enum CancellationOutcome: Sendable, Equatable {
+        case accepted
+        case tooLate
+        case notRunning
+    }
+
+    private enum ExecutionPhase {
+        case executing
+        case finalizing
+    }
+
+    private struct CurrentExecution {
+        let id: UUID
+        let token: CancellationToken
+        var phase: ExecutionPhase
+    }
+
+    private let store: any TranscriptionJobStoring
     private let executor: Executor
     private var queue: [UUID] = []
     private var worker: Task<Void, Never>?
-    private var current: (id: UUID, token: CancellationToken)?
+    private var current: CurrentExecution?
 
-    init(store: TranscriptionJobStore, executor: @escaping Executor) {
+    init(store: any TranscriptionJobStoring, executor: @escaping Executor) {
         self.store = store
         self.executor = executor
     }
@@ -32,20 +63,27 @@ actor LocalJobRunner {
         startWorkerIfNeeded()
     }
 
-    func cancel(_ id: UUID) async {
-        if current?.id == id, let token = current?.token {
-            await token.cancel()
-            return
+    /// Cancellation is accepted through executor completion. Once finalization starts,
+    /// completion owns the terminal state and cancellation is reported as too late.
+    @discardableResult
+    func cancel(_ id: UUID) async -> CancellationOutcome {
+        if let current, current.id == id {
+            guard current.phase == .executing else { return .tooLate }
+            current.token.cancel()
+            return .accepted
         }
 
-        guard queue.contains(id) else { return }
+        guard queue.contains(id) else { return .notRunning }
         queue.removeAll { $0 == id }
         try? await store.transition(id, from: .queued, to: .cancelled)
+        return .accepted
     }
 
     func resumeQueuedJobs() async {
-        _ = try? await store.recoverInterruptedJobs()
-        guard let jobs = try? await store.jobs() else { return }
+        if worker == nil, current == nil {
+            _ = try? await store.recoverInterruptedJobs()
+        }
+        guard let jobs = try? await store.jobs(kind: nil) else { return }
         for job in jobs where job.state == .queued {
             if current?.id != job.id, !queue.contains(job.id) {
                 queue.append(job.id)
@@ -75,7 +113,7 @@ actor LocalJobRunner {
         guard let job = try? await store.job(id: id), job.state == .queued else { return }
 
         let token = CancellationToken()
-        current = (id, token)
+        current = CurrentExecution(id: id, token: token, phase: .executing)
         defer { current = nil }
 
         do {
@@ -85,10 +123,11 @@ actor LocalJobRunner {
         }
 
         do {
-            try await token.checkCancellation()
+            try token.checkCancellation()
             let currentJob = try await store.job(id: id) ?? job
             try await executor(currentJob, token)
-            try await token.checkCancellation()
+            try token.checkCancellation()
+            current?.phase = .finalizing
             try await store.transition(id, from: .processing, to: .ready)
         } catch is CancellationError {
             try? await store.transition(id, from: .processing, to: .cancelled)

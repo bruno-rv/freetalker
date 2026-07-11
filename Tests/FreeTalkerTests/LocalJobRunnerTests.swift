@@ -54,10 +54,11 @@ import Testing
 
         await runner.enqueue(job.id)
         await probe.waitUntilStarted(job.id)
-        await runner.cancel(job.id)
+        let outcome = await runner.cancel(job.id)
         await probe.resume(job.id)
         await runner.waitUntilIdle()
 
+        #expect(outcome == .accepted)
         #expect(try await fixture.store.job(id: job.id)?.state == .cancelled)
     }
 
@@ -77,6 +78,46 @@ import Testing
         await runner.waitUntilIdle()
 
         #expect(await probe.started == [first.id, second.id])
+    }
+
+    @Test func resumeDuringExecutionDoesNotRecoverTheRunningJob() async throws {
+        let fixture = try RunnerFixture()
+        let current = try await fixture.makeJob(.recovery, "current.wav")
+        let follower = try await fixture.makeJob(.mediaImport, "follower.wav")
+        let probe = SuspendedExecutorProbe()
+        let runner = LocalJobRunner(store: fixture.store, executor: probe.execute)
+
+        await runner.enqueue(current.id)
+        await probe.waitUntilStarted(current.id)
+        await runner.resumeQueuedJobs()
+
+        #expect(try await fixture.store.job(id: current.id)?.state == .processing(stage: .preparing))
+        await probe.resume(current.id)
+        await probe.waitUntilStarted(follower.id)
+        await probe.resume(follower.id)
+        await runner.waitUntilIdle()
+
+        #expect(await probe.started == [current.id, follower.id])
+        #expect(try await fixture.store.job(id: current.id)?.state == .ready)
+        #expect(try await fixture.store.job(id: follower.id)?.state == .ready)
+    }
+
+    @Test func cancellationAfterFinalizationStartsIsTooLate() async throws {
+        let fixture = try RunnerFixture()
+        let job = try await fixture.makeJob(.recovery, "finalizing.wav")
+        let store = SuspendedReadyTransitionStore(base: fixture.store)
+        let runner = LocalJobRunner(store: store) { _, token in
+            try token.checkCancellation()
+        }
+
+        await runner.enqueue(job.id)
+        await store.waitUntilReadyTransitionStarts()
+        let outcome = await runner.cancel(job.id)
+
+        #expect(outcome == .tooLate)
+        await store.resumeReadyTransition()
+        await runner.waitUntilIdle()
+        #expect(try await fixture.store.job(id: job.id)?.state == .ready)
     }
 
     @Test @MainActor func libraryFacadeRefreshesKindSpecificArrays() async throws {
@@ -131,7 +172,7 @@ private actor SuspendedExecutorProbe {
         maximumConcurrentExecutions = max(maximumConcurrentExecutions, active)
         await withCheckedContinuation { continuations[job.id] = $0 }
         active -= 1
-        try await token.checkCancellation()
+        try token.checkCancellation()
     }
 
     func waitUntilStarted(_ id: UUID) async {
@@ -140,5 +181,44 @@ private actor SuspendedExecutorProbe {
 
     func resume(_ id: UUID) {
         continuations.removeValue(forKey: id)?.resume()
+    }
+}
+
+private actor SuspendedReadyTransitionStore: TranscriptionJobStoring {
+    private let base: TranscriptionJobStore
+    private var readyTransitionStarted = false
+    private var readyContinuation: CheckedContinuation<Void, Never>?
+
+    init(base: TranscriptionJobStore) {
+        self.base = base
+    }
+
+    func job(id: UUID) async throws -> TranscriptionJob? {
+        try await base.job(id: id)
+    }
+
+    func jobs(kind: JobKind?) async throws -> [TranscriptionJob] {
+        try await base.jobs(kind: kind)
+    }
+
+    func recoverInterruptedJobs() async throws -> Int {
+        try await base.recoverInterruptedJobs()
+    }
+
+    func transition(_ id: UUID, from: JobState.Kind, to state: JobState) async throws {
+        if state == .ready {
+            readyTransitionStarted = true
+            await withCheckedContinuation { readyContinuation = $0 }
+        }
+        try await base.transition(id, from: from, to: state)
+    }
+
+    func waitUntilReadyTransitionStarts() async {
+        while !readyTransitionStarted { await Task.yield() }
+    }
+
+    func resumeReadyTransition() {
+        readyContinuation?.resume()
+        readyContinuation = nil
     }
 }
