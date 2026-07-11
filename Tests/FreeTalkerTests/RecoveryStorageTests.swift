@@ -37,6 +37,25 @@ import Testing
         #expect(try FileManager.default.contentsOfDirectory(atPath: directory.url.path).isEmpty)
     }
 
+    @Test func captureExposesPersistenceAndRollbackErrorsWhenFinalRemovalFails() async throws {
+        let directory = try TemporaryDirectory()
+        let service = RecoveryCaptureService(
+            directory: directory.url,
+            store: FailingRecoveryStore(),
+            fileRemover: AlwaysFailingRemover()
+        )
+
+        do {
+            _ = try await service.preserve(samples: [0.25], metadata: .init(
+                capturedAt: Date(), failure: .init(stage: .persisting, message: "database failed")
+            ))
+            Issue.record("Expected compound capture failure")
+        } catch let error as RecoveryCaptureRollbackError {
+            #expect(error.persistenceError is RecoveryTestError)
+            #expect(error.rollbackError is CocoaError)
+        }
+    }
+
     @Test(arguments: [
         (RecoveryRetention.oneDay, 1), (.sevenDays, 7), (.thirtyDays, 30), (.ninetyDays, 90)
     ]) func purgesAtEveryConfiguredRetentionBoundary(retention: RecoveryRetention, days: Int) async throws {
@@ -90,14 +109,140 @@ import Testing
         #expect(result.deletedJobIDs.isEmpty)
         for id in ids { #expect(try await fixture.store.job(id: id) != nil) }
     }
+
+    @Test func databaseClaimRejectsAJobThatBecameActiveAfterDiscovery() async throws {
+        let fixture = try RecoveryFixture()
+        let id = try await fixture.failedRecovery(createdAt: .distantPast)
+        try await fixture.store.transition(id, from: .failed, to: .queued)
+
+        #expect(try await fixture.store.claimExpiredRecoveries(cutoff: .distantFuture, claimedAt: Date()) == [])
+        #expect(try await fixture.store.job(id: id)?.state == .queued)
+    }
+
+    @Test func claimedRecoveryCannotBeRetriedOrActivated() async throws {
+        let fixture = try RecoveryFixture()
+        let id = try await fixture.failedRecovery(createdAt: .distantPast)
+        #expect(try await fixture.store.claimExpiredRecoveries(cutoff: .distantFuture, claimedAt: Date()).map(\.id) == [id])
+
+        await #expect(throws: JobStoreError.invalidTransition) {
+            try await fixture.store.transition(id, from: .failed, to: .queued)
+        }
+        await #expect(throws: JobStoreError.invalidTransition) {
+            _ = try await fixture.store.beginAttempt(jobID: id, configuration: .init())
+        }
+    }
+
+    @Test func purgeReconcilesClaimedJobWithExistingFileAfterCrash() async throws {
+        let fixture = try RecoveryFixture()
+        let id = try await fixture.failedRecovery(createdAt: .distantPast)
+        let source = try #require(try await fixture.store.job(id: id)).source.reference
+        _ = try await fixture.store.claimExpiredRecoveries(cutoff: .distantFuture, claimedAt: Date())
+        let restarted = try TranscriptionJobStore(
+            databaseURL: fixture.temp.url.appendingPathComponent("jobs.sqlite"),
+            clock: SystemJobClock()
+        )
+
+        let result = try await RecoveryRetentionService(directory: fixture.directory, store: restarted)
+            .purgeExpired(now: Date(), retention: .never)
+
+        #expect(result.deletedJobIDs == [id])
+        #expect(!FileManager.default.fileExists(atPath: source))
+        #expect(try await restarted.job(id: id) == nil)
+    }
+
+    @Test func purgeReconcilesClaimedJobWithMissingFileAfterCrash() async throws {
+        let fixture = try RecoveryFixture()
+        let id = try await fixture.failedRecovery(createdAt: .distantPast)
+        let source = try #require(try await fixture.store.job(id: id)).source.reference
+        _ = try await fixture.store.claimExpiredRecoveries(cutoff: .distantFuture, claimedAt: Date())
+        try FileManager.default.removeItem(atPath: source)
+
+        let result = try await RecoveryRetentionService(directory: fixture.directory, store: fixture.store)
+            .purgeExpired(now: Date(), retention: .never)
+
+        #expect(result.deletedJobIDs == [id])
+        #expect(try await fixture.store.job(id: id) == nil)
+    }
+
+    @Test func removalFailureKeepsClaimAndVisibleCleanupError() async throws {
+        let fixture = try RecoveryFixture()
+        let job = try await fixture.failedRecovery(createdAt: .distantPast)
+
+        await #expect(throws: Error.self) {
+            _ = try await RecoveryRetentionService(
+                directory: fixture.directory,
+                store: fixture.store,
+                fileRemover: AlwaysFailingRemover()
+            )
+                .purgeExpired(now: .distantFuture, retention: .oneDay)
+        }
+
+        let claim = try #require(try await fixture.store.claimedRecoveries().first { $0.id == job })
+        #expect(claim.cleanupError != nil)
+        #expect(try await fixture.store.job(id: job) != nil)
+    }
+
+    @Test func unsafeDotDotNestedAndSymlinkSourcesNeverDeleteOutsideFiles() async throws {
+        let fixture = try RecoveryFixture()
+        let outside = fixture.temp.url.appendingPathComponent("outside.wav")
+        try Data("outside".utf8).write(to: outside)
+        let nestedDirectory = fixture.directory.appendingPathComponent("nested", isDirectory: true)
+        try FileManager.default.createDirectory(at: nestedDirectory, withIntermediateDirectories: false)
+        let nested = nestedDirectory.appendingPathComponent("\(UUID().uuidString).wav")
+        try Data("nested".utf8).write(to: nested)
+        let symlink = fixture.directory.appendingPathComponent("\(UUID().uuidString).wav")
+        try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: outside)
+        let references = [
+            fixture.directory.appendingPathComponent("../outside.wav").path,
+            nested.path,
+            symlink.path
+        ]
+        for reference in references {
+            _ = try await fixture.failedRecovery(createdAt: .distantPast, sourceReference: reference)
+        }
+
+        _ = try? await RecoveryRetentionService(directory: fixture.directory, store: fixture.store)
+            .purgeExpired(now: .distantFuture, retention: .oneDay)
+
+        #expect(try Data(contentsOf: outside) == Data("outside".utf8))
+        #expect(FileManager.default.fileExists(atPath: nested.path))
+        #expect(FileManager.default.fileExists(atPath: symlink.path))
+        #expect(try await fixture.store.claimedRecoveries().count == 3)
+    }
+
+    @Test func symlinkRootAllowsOwnedChildButNeverOutsideSymlinkTarget() async throws {
+        let temp = try TemporaryDirectory()
+        let realRoot = temp.url.appendingPathComponent("real", isDirectory: true)
+        let linkedRoot = temp.url.appendingPathComponent("linked", isDirectory: true)
+        try FileManager.default.createDirectory(at: realRoot, withIntermediateDirectories: false)
+        try FileManager.default.createSymbolicLink(at: linkedRoot, withDestinationURL: realRoot)
+        let store = try TranscriptionJobStore(databaseURL: temp.url.appendingPathComponent("jobs.sqlite"), clock: SystemJobClock())
+        let owned = linkedRoot.appendingPathComponent("\(UUID().uuidString).wav")
+        try Data("owned".utf8).write(to: owned)
+        let job = try await store.createRecovery(source: .init(reference: owned.path), metadata: .init(capturedAt: .distantPast, failure: .init(stage: .transcribing, message: "x")))
+
+        _ = try await RecoveryRetentionService(directory: linkedRoot, store: store)
+            .purgeExpired(now: .distantFuture, retention: .oneDay)
+
+        #expect(!FileManager.default.fileExists(atPath: owned.path))
+        #expect(try await store.job(id: job.id) == nil)
+    }
 }
 
 private enum RecoveryTestError: Error { case databaseFailure }
 
 private actor FailingRecoveryStore: RecoveryJobStoring {
     func createRecovery(source: JobSource, metadata: RecoveryMetadata) throws -> TranscriptionJob { throw RecoveryTestError.databaseFailure }
-    func recoveryJobs() throws -> [TranscriptionJob] { [] }
-    func deleteRecovery(id: UUID, expectedSourceReference: String) throws -> Bool { false }
+    func claimExpiredRecoveries(cutoff: Date, claimedAt: Date) throws -> [RecoveryPurgeClaim] { [] }
+    func claimedRecoveries() throws -> [RecoveryPurgeClaim] { [] }
+    func recordPurgeError(id: UUID, message: String) throws {}
+    func deleteClaimedRecovery(id: UUID, expectedSourceReference: String) throws -> Bool { false }
+}
+
+private struct AlwaysFailingRemover: RecoveryFileRemoving {
+    func removeItem(at url: URL) throws {
+        throw CocoaError(.fileWriteNoPermission)
+    }
 }
 
 private final class RecoveryFixture: @unchecked Sendable {
@@ -114,6 +259,17 @@ private final class RecoveryFixture: @unchecked Sendable {
 
     func failedRecovery(createdAt: Date) async throws -> UUID {
         try await job(kind: .recovery, state: .failed(.init(stage: .transcribing, message: "failed")), createdAt: createdAt)
+    }
+
+    func failedRecovery(createdAt: Date, source: URL) async throws -> UUID {
+        try await failedRecovery(createdAt: createdAt, sourceReference: source.path)
+    }
+
+    func failedRecovery(createdAt: Date, sourceReference: String) async throws -> UUID {
+        let created = try await store.create(kind: .recovery, source: .init(reference: sourceReference), now: createdAt)
+        try await store.transition(created.id, from: .queued, to: .processing(stage: .preparing))
+        try await store.transition(created.id, from: .processing, to: .failed(.init(stage: .transcribing, message: "failed")))
+        return created.id
     }
 
     func job(kind: JobKind, state: JobState, createdAt: Date) async throws -> UUID {

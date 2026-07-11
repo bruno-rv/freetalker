@@ -6,10 +6,34 @@ struct RecoveryMetadata: Sendable, Equatable {
     let failure: JobFailure
 }
 
+struct RecoveryCaptureRollbackError: Error {
+    let persistenceError: any Error
+    let rollbackError: any Error
+}
+
+struct RecoveryPurgeClaim: Sendable, Equatable {
+    let id: UUID
+    let sourceReference: String
+    let claimedAt: Date
+    let cleanupError: String?
+}
+
+protocol RecoveryFileRemoving: Sendable {
+    func removeItem(at url: URL) throws
+}
+
+struct SystemRecoveryFileRemover: RecoveryFileRemoving {
+    func removeItem(at url: URL) throws {
+        try FileManager.default.removeItem(at: url)
+    }
+}
+
 protocol RecoveryJobStoring: Sendable {
     func createRecovery(source: JobSource, metadata: RecoveryMetadata) async throws -> TranscriptionJob
-    func recoveryJobs() async throws -> [TranscriptionJob]
-    func deleteRecovery(id: UUID, expectedSourceReference: String) async throws -> Bool
+    func claimExpiredRecoveries(cutoff: Date, claimedAt: Date) async throws -> [RecoveryPurgeClaim]
+    func claimedRecoveries() async throws -> [RecoveryPurgeClaim]
+    func recordPurgeError(id: UUID, message: String) async throws
+    func deleteClaimedRecovery(id: UUID, expectedSourceReference: String) async throws -> Bool
 }
 
 extension TranscriptionJobStore: RecoveryJobStoring {}
@@ -17,10 +41,16 @@ extension TranscriptionJobStore: RecoveryJobStoring {}
 struct RecoveryCaptureService: Sendable {
     private let directory: URL
     private let store: any RecoveryJobStoring
+    private let fileRemover: any RecoveryFileRemoving
 
-    init(directory: URL, store: any RecoveryJobStoring) {
+    init(
+        directory: URL,
+        store: any RecoveryJobStoring,
+        fileRemover: any RecoveryFileRemoving = SystemRecoveryFileRemover()
+    ) {
         self.directory = directory.standardizedFileURL
         self.store = store
+        self.fileRemover = fileRemover
     }
 
     func preserve(samples: [Float], metadata: RecoveryMetadata) async throws -> UUID {
@@ -33,9 +63,16 @@ struct RecoveryCaptureService: Sendable {
             try FileManager.default.moveItem(at: temporaryURL, to: finalURL)
             do {
                 return try await store.createRecovery(source: JobSource(reference: finalURL.path), metadata: metadata).id
-            } catch {
-                try? FileManager.default.removeItem(at: finalURL)
-                throw error
+            } catch let persistenceError {
+                do {
+                    try fileRemover.removeItem(at: finalURL)
+                } catch let rollbackError {
+                    throw RecoveryCaptureRollbackError(
+                        persistenceError: persistenceError,
+                        rollbackError: rollbackError
+                    )
+                }
+                throw persistenceError
             }
         } catch {
             try? FileManager.default.removeItem(at: temporaryURL)

@@ -14,6 +14,7 @@ import Testing
         ])
         #expect(try db.indexNames() == [
             "idx_transcription_jobs_state_expires_at",
+            "idx_transcription_jobs_purge_claimed_at",
             "idx_job_attempts_job_id"
         ])
         #expect(try db.migrationVersions() == Array(1...DatabaseMigrator.latestVersion))
@@ -51,7 +52,7 @@ import Testing
 
         try DatabaseMigrator.migrate(db.handle)
 
-        #expect(try db.migrationVersions() == [1, 2])
+        #expect(try db.migrationVersions() == [1, 2, 3])
         #expect(try db.integer("SELECT COUNT(*) FROM transcription_jobs WHERE id = 'job-1';") == 1)
         #expect(try db.integer("SELECT COUNT(*) FROM job_attempts WHERE id = 7 AND failure_message = 'old failure';") == 1)
         #expect(try db.integer("SELECT COUNT(*) FROM speaker_segments WHERE id = 8 AND transcript = 'hello';") == 1)
@@ -67,6 +68,7 @@ import Testing
         SELECT language || '|' || speech_model || '|' || template || '|' || result
         FROM job_attempts WHERE id = 7;
         """) == "pt|small|clean|failed")
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('transcription_jobs') WHERE name IN ('purge_claimed_at', 'purge_error');") == 2)
     }
 
     @Test func rollsBackEntireMigrationWhenSchemaCreationFails() throws {
