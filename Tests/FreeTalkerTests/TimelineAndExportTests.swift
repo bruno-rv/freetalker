@@ -31,6 +31,32 @@ import Testing
         #expect(result.first?.speakerID == "longer")
     }
 
+    @Test func mathematicallyEqualFragmentedDurationsTieAtMillisecondPrecision() {
+        let result = joiner.join(
+            transcript: [.init(start: 0, end: 0.7, text: "Floating point tie")],
+            speakers: [
+                .init(speakerID: "fragmented", start: 0, end: 0.1),
+                .init(speakerID: "fragmented", start: 0.2, end: 0.4),
+                .init(speakerID: "contiguous", start: 0.4, end: 0.7)
+            ]
+        )
+
+        #expect(result.first?.speakerID == nil)
+    }
+
+    @Test func oneMillisecondDurationAdvantageChoosesUniqueWinner() {
+        let result = joiner.join(
+            transcript: [.init(start: 0, end: 0.7, text: "One millisecond")],
+            speakers: [
+                .init(speakerID: "winner", start: 0, end: 0.101),
+                .init(speakerID: "winner", start: 0.2, end: 0.4),
+                .init(speakerID: "other", start: 0.4, end: 0.7)
+            ]
+        )
+
+        #expect(result.first?.speakerID == "winner")
+    }
+
     @Test func sequentialEqualSpeakerDurationsAreAmbiguous() {
         let transcript = [TranscriptSegment(start: 0, end: 4, text: "Tie")]
         let speakers = [
