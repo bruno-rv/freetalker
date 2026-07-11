@@ -21,6 +21,10 @@ let package = Package(
                 "CSQLite"
             ]
         ),
-        .testTarget(name: "FreeTalkerTests", dependencies: ["FreeTalker"])
+        .testTarget(
+            name: "FreeTalkerTests",
+            dependencies: ["FreeTalker"],
+            resources: [.copy("Fixtures")]
+        )
     ]
 )
