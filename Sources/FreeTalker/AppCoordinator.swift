@@ -89,6 +89,16 @@ final class AppCoordinator: ObservableObject {
         speechModelStore = modelStore
         whisperEngine = WhisperKitEngine(downloadCoordinator: downloadCoordinator)
         whisperEngine.setEventReceiver(modelStore)
+        modelStore.onAutomaticSelection = { [weak whisperEngine] target in
+            guard let whisperEngine else { return }
+            Task {
+                await Self.routeAutomaticSpeechModelSelection(
+                    target,
+                    preload: { await whisperEngine.preload() },
+                    reload: { await whisperEngine.reload(to: $0) }
+                )
+            }
+        }
         // Forward engine status changes (e.g. WhisperKit download progress) so the menu bar
         // and Settings, which observe `AppCoordinator`, actually re-render live — not just
         // when the menu happens to reopen.
@@ -153,6 +163,15 @@ final class AppCoordinator: ObservableObject {
         reload: (String) async -> Void
     ) async {
         setFromUser(variant)
+        await reload(variant)
+    }
+
+    static func routeAutomaticSpeechModelSelection(
+        _ variant: String,
+        preload: () async -> Void,
+        reload: (String) async -> Void
+    ) async {
+        await preload()
         await reload(variant)
     }
 
