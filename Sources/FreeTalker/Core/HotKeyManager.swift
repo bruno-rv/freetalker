@@ -124,13 +124,30 @@ final class HotKeyManager {
         }
     }
 
-    nonisolated static func consumeSwallowedKeyUpTombstone(
+    enum TombstoneEventOutcome: Equatable {
+        case dispatch
+        case swallowWithoutDispatch
+    }
+
+    nonisolated static func handleSwallowedKeyUpTombstone(
         kind: KeyEventKind,
         keyCode: UInt16,
+        isAutorepeat: Bool,
         tombstones: inout Set<UInt16>
-    ) -> Bool {
-        guard case .keyUp = kind else { return false }
-        return tombstones.remove(keyCode) != nil
+    ) -> TombstoneEventOutcome {
+        guard tombstones.contains(keyCode) else { return .dispatch }
+        switch kind {
+        case .keyUp:
+            tombstones.remove(keyCode)
+            return .swallowWithoutDispatch
+        case .keyDown where isAutorepeat:
+            return .swallowWithoutDispatch
+        case .keyDown:
+            tombstones.remove(keyCode)
+            return .dispatch
+        case .flagsChanged:
+            return .dispatch
+        }
     }
 
     @MainActor
@@ -264,19 +281,15 @@ final class HotKeyManager {
         case .keyUp: kind = .keyUp
         default: return Unmanaged.passUnretained(event)
         }
-        if Self.consumeSwallowedKeyUpTombstone(
+        let isAutorepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
+        if Self.handleSwallowedKeyUpTombstone(
             kind: kind,
             keyCode: keyCode,
+            isAutorepeat: isAutorepeat,
             tombstones: &swallowedKeyUpTombstones
-        ) {
+        ) == .swallowWithoutDispatch {
             return nil
         }
-        if case .keyDown = kind {
-            // A new down starts a new physical cycle; any old unmatched tombstone for this key
-            // can no longer safely claim its eventual key-up.
-            swallowedKeyUpTombstones.remove(keyCode)
-        }
-        let isAutorepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
         let outcome = Self.dispatch(kind: kind, keyCode: keyCode, flags: event.flags.rawValue, isAutorepeat: isAutorepeat, matcher: &matcher, redoMatcher: &redoMatcher, voiceEditMatcher: &voiceEditMatcher)
         // CGEventTimestamp is nanoseconds since system startup (excluding sleep) — converted to
         // seconds here, at the tap callback, so `AppCoordinator`'s tap-vs-hold elapsed-time
