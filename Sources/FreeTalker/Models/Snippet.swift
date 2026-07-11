@@ -1,5 +1,15 @@
 import Foundation
 
+enum TriggerNormalizer {
+    static func normalize(_ trigger: String) -> String {
+        let folded = trigger.folding(options: [.caseInsensitive], locale: Locale(identifier: "und"))
+        let collapsed = folded.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        return collapsed
+            .trimmingCharacters(in: .punctuationCharacters.union(.whitespacesAndNewlines))
+            .precomposedStringWithCanonicalMapping
+    }
+}
+
 struct Snippet: Identifiable, Equatable, Sendable {
     let id: String
     var name: String

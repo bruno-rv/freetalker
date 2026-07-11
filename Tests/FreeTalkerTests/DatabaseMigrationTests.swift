@@ -16,8 +16,9 @@ import Testing
             "idx_transcription_jobs_state_expires_at",
             "idx_transcription_jobs_purge_claimed_at",
             "idx_transcription_jobs_needs_source_cleanup",
-            "idx_job_attempts_job_id"
+            "idx_job_attempts_job_id", "idx_snippet_triggers_normalized_unique"
         ])
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_foreign_key_list('snippet_triggers') WHERE \"table\" = 'snippets' AND \"from\" = 'snippet_id' AND on_delete = 'CASCADE';") == 1)
         #expect(try db.migrationVersions() == Array(1...DatabaseMigrator.latestVersion))
     }
 
@@ -60,6 +61,7 @@ import Testing
         #expect(try db.integer("SELECT COUNT(*) FROM speaker_names WHERE name = 'Alice';") == 1)
         #expect(try db.integer("SELECT COUNT(*) FROM snippets WHERE replacement = 'be right back';") == 1)
         #expect(try db.integer("SELECT COUNT(*) FROM snippet_triggers WHERE trigger = 'brb';") == 1)
+        #expect(try db.integer("SELECT is_legacy FROM snippet_triggers WHERE trigger = 'brb';") == 1)
 
         try db.execute("""
         UPDATE job_attempts
@@ -100,6 +102,18 @@ import Testing
         }
 
         #expect(try db.tableNames() == ["job_attempts"])
+    }
+
+    @Test func rollsBackVersionFiveUpgradeAndLedgerWhenTriggerTableCreationFails() throws {
+        let db = try TemporaryDatabase()
+        try db.createVersionFourSchema()
+        try db.execute("CREATE TABLE snippet_triggers (collision INTEGER);")
+
+        #expect(throws: DatabaseError.self) { try DatabaseMigrator.migrate(db.handle) }
+
+        #expect(try db.migrationVersions() == [1, 2, 3, 4])
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('snippets') WHERE name = 'trigger';") == 1)
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('snippets') WHERE name = 'name';") == 0)
     }
 
     @Test func rejectsSchemaVersionNewerThanMigrator() throws {
@@ -227,6 +241,16 @@ private final class TemporaryDatabase {
         CREATE INDEX idx_transcription_jobs_purge_claimed_at
             ON transcription_jobs (purge_claimed_at);
         INSERT INTO schema_migrations (version) VALUES (3);
+        """)
+    }
+
+    func createVersionFourSchema() throws {
+        try createVersionThreeSchema()
+        try execute("""
+        ALTER TABLE transcription_jobs ADD COLUMN needs_source_cleanup INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE transcription_jobs ADD COLUMN source_cleanup_error TEXT;
+        CREATE INDEX idx_transcription_jobs_needs_source_cleanup ON transcription_jobs (needs_source_cleanup);
+        INSERT INTO schema_migrations (version) VALUES (4);
         """)
     }
 
