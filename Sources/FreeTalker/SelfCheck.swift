@@ -80,6 +80,24 @@ private actor OneShotSignal {
     }
 }
 
+private actor FakeDownloadProbe {
+    private(set) var attempts = 0
+    private var progress: (@Sendable (Double) -> Void)?
+
+    func start(progress: @escaping @Sendable (Double) -> Void) {
+        attempts += 1
+        self.progress = progress
+    }
+
+    func sendProgress(_ value: Double) {
+        progress?(value)
+    }
+}
+
+private enum FakeDownloadError: Error {
+    case failed
+}
+
 enum SelfCheck {
     static func runAndExit() -> Never {
         // `AppCoordinator.processDictation` is `@MainActor`, so the check below must run on the
@@ -2694,10 +2712,15 @@ enum SelfCheck {
                 try fm.createDirectory(at: deleteDirectory.appendingPathComponent(artifact), withIntermediateDirectories: true)
             }
             let deleteRelease = OneShotSignal()
+            let blockedDownload = FakeDownloadProbe()
             let deleteStore = SpeechModelStore(
                 baseURL: base,
                 coordinator: coordinator,
                 fallbackSupport: [variant, deleteVariant],
+                manualDownloader: { _, progress in
+                    await blockedDownload.start(progress: progress)
+                    return base
+                },
                 deleteOperation: { _, _ in
                     await deleteRelease.wait()
                 }
@@ -2707,6 +2730,10 @@ enum SelfCheck {
             for _ in 0..<20 where deleteStore.states[deleteVariant]?.phase != .busy(reloadTarget: deleteVariant) { await Task.yield() }
             if deleteStore.states[deleteVariant]?.phase != .busy(reloadTarget: deleteVariant) {
                 failures.append("speech model deletion: row was not reserved busy before await")
+            }
+            await deleteStore.download(deleteVariant)
+            if await blockedDownload.attempts != 0 {
+                failures.append("speech model deletion: manual downloader started for reserved row")
             }
             deleteStore.receiveEngineEvent(.downloading(progress: 0.4), for: deleteVariant)
             if deleteStore.states[deleteVariant]?.phase != .busy(reloadTarget: deleteVariant) {
@@ -2725,6 +2752,52 @@ enum SelfCheck {
         }
         if timedResult != nil || ContinuousClock.now - timeoutStart > .milliseconds(250) {
             failures.append("speech model remote support: timeout waited for noncooperative child")
+        }
+
+        // Progress delivery is asynchronous; callbacks arriving after terminal success/failure
+        // must not resurrect the row as downloading.
+        let successBase = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? fm.removeItem(at: successBase) }
+        let successProbe = FakeDownloadProbe()
+        let successStore = SpeechModelStore(
+            baseURL: successBase,
+            coordinator: SpeechModelDownloadCoordinator(),
+            fallbackSupport: [variant],
+            manualDownloader: { downloadedVariant, progress in
+                await successProbe.start(progress: progress)
+                let target = SpeechModelStore.variantDirectory(for: downloadedVariant, baseURL: successBase)
+                for artifact in SpeechModelStore.requiredArtifacts {
+                    try FileManager.default.createDirectory(at: target.appendingPathComponent(artifact), withIntermediateDirectories: true)
+                }
+                return target
+            }
+        )
+        await successStore.download(variant)
+        await successProbe.sendProgress(0.9)
+        for _ in 0..<20 { await Task.yield() }
+        if successStore.states[variant]?.phase != .downloaded {
+            failures.append("speech model download: late progress overwrote terminal success")
+        }
+
+        let failureBase = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? fm.removeItem(at: failureBase) }
+        let failureProbe = FakeDownloadProbe()
+        let failureStore = SpeechModelStore(
+            baseURL: failureBase,
+            coordinator: SpeechModelDownloadCoordinator(),
+            fallbackSupport: [variant],
+            manualDownloader: { _, progress in
+                await failureProbe.start(progress: progress)
+                throw FakeDownloadError.failed
+            }
+        )
+        await failureStore.download(variant)
+        await failureProbe.sendProgress(0.7)
+        for _ in 0..<20 { await Task.yield() }
+        if case .failed = failureStore.states[variant]?.phase {
+            // expected
+        } else {
+            failures.append("speech model download: late progress overwrote terminal failure")
         }
         return failures
     }

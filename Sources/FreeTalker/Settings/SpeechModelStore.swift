@@ -105,12 +105,14 @@ final class SpeechModelStore: ObservableObject, SpeechModelEngineEventReceiving 
     private let baseURL: URL
     private let coordinator: SpeechModelDownloadCoordinator
     private let settings: AppSettings
+    private let manualDownloader: SpeechModelDownloadCoordinator.Downloader?
     private let deleteOperation: @Sendable (String, URL) async throws -> Void
     private let remoteSupportFetcher: @Sendable () async -> Set<String>
     private let remoteSupportTimeout: Duration
     private var remoteRefreshStarted = false
     private var coordinatorActivityTask: Task<Void, Never>?
     private var deletingVariants: Set<String> = []
+    private var manualDownloadOperations: [String: UUID] = [:]
 
     init(
         baseURL: URL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0],
@@ -121,6 +123,7 @@ final class SpeechModelStore: ObservableObject, SpeechModelEngineEventReceiving 
         remoteSupportFetcher: @escaping @Sendable () async -> Set<String> = {
             Set((await WhisperKit.recommendedRemoteModels()).supported)
         },
+        manualDownloader: SpeechModelDownloadCoordinator.Downloader? = nil,
         deleteOperation: @escaping @Sendable (String, URL) async throws -> Void = {
             let variant = $0
             let baseURL = $1
@@ -132,6 +135,7 @@ final class SpeechModelStore: ObservableObject, SpeechModelEngineEventReceiving 
         self.baseURL = baseURL
         self.coordinator = coordinator
         self.settings = settings
+        self.manualDownloader = manualDownloader
         self.deleteOperation = deleteOperation
         self.remoteSupportFetcher = remoteSupportFetcher
         self.remoteSupportTimeout = remoteSupportTimeout
@@ -201,6 +205,16 @@ final class SpeechModelStore: ObservableObject, SpeechModelEngineEventReceiving 
         return false
     }
 
+    static func canStartManualDownload(phase: Phase, reserved: Bool) -> Bool {
+        guard !reserved else { return false }
+        switch phase {
+        case .notDownloaded, .failed:
+            return true
+        case .downloading, .downloaded, .busy:
+            return false
+        }
+    }
+
     static func merging(inspection: Inspection, into state: State) -> State {
         switch state.phase {
         case .failed, .downloading, .busy:
@@ -240,16 +254,32 @@ final class SpeechModelStore: ObservableObject, SpeechModelEngineEventReceiving 
     }
 
     func download(_ variant: String) async {
-        guard states[variant] != nil else { return }
-        await connectCoordinatorActivity()
+        guard let state = states[variant],
+              Self.canStartManualDownload(
+                phase: state.phase,
+                reserved: deletingVariants.contains(variant) || manualDownloadOperations[variant] != nil
+              ) else { return }
+        let operationID = UUID()
+        manualDownloadOperations[variant] = operationID
         states[variant]?.phase = .downloading(0)
+        await connectCoordinatorActivity()
         do {
-            _ = try await coordinator.download(variant: variant, downloadBase: baseURL) { progress in
-                Task { @MainActor [weak self] in self?.states[variant]?.phase = .downloading(progress) }
+            let progress: @Sendable (Double) -> Void = { progress in
+                Task { @MainActor [weak self] in
+                    self?.receiveManualProgress(progress, for: variant, operationID: operationID)
+                }
             }
+            if let manualDownloader {
+                _ = try await coordinator.download(variant: variant, progress: progress, using: manualDownloader)
+            } else {
+                _ = try await coordinator.download(variant: variant, downloadBase: baseURL, progress: progress)
+            }
+            manualDownloadOperations.removeValue(forKey: variant)
         } catch SpeechModelDownloadCoordinator.Error.busy(let active) {
+            manualDownloadOperations.removeValue(forKey: variant)
             states[variant]?.phase = .failed("waiting for current download: \(active)")
         } catch {
+            manualDownloadOperations.removeValue(forKey: variant)
             states[variant]?.phase = .failed(error.localizedDescription)
         }
         if case .failed = states[variant]?.phase {
@@ -258,6 +288,12 @@ final class SpeechModelStore: ObservableObject, SpeechModelEngineEventReceiving 
             states[variant]?.phase = .notDownloaded
         }
         await refresh()
+    }
+
+    private func receiveManualProgress(_ progress: Double, for variant: String, operationID: UUID) {
+        guard manualDownloadOperations[variant] == operationID,
+              case .downloading = states[variant]?.phase else { return }
+        states[variant]?.phase = .downloading(progress)
     }
 
     func delete(_ variant: String) async throws {
