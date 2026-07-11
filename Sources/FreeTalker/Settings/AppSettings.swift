@@ -84,6 +84,21 @@ final class AppSettings: ObservableObject {
     @Published var cloudSTTBaseURL: String {
         didSet { defaults.set(cloudSTTBaseURL, forKey: Keys.cloudSTTBaseURL) }
     }
+    @Published private(set) var whisperModel: String {
+        didSet { defaults.set(whisperModel, forKey: Keys.whisperModel) }
+    }
+    @Published var whisperModelChosen: Bool {
+        didSet { defaults.set(whisperModelChosen, forKey: Keys.whisperModelChosen) }
+    }
+
+    func setWhisperModelFromUser(_ model: String) {
+        whisperModel = SpeechModelCatalog.normalize(model)
+        whisperModelChosen = true
+    }
+
+    func applyAutomaticWhisperModel(_ model: String) {
+        whisperModel = SpeechModelCatalog.normalize(model)
+    }
 
     /// Whether the HUD shows a live rolling transcript while push-to-talk is held. Default ON.
     /// See PLAN 3 "Settings" — `AppCoordinator.isLivePreviewEnabled` combines this with the
@@ -433,6 +448,8 @@ final class AppSettings: ObservableObject {
         static let legacyHotKeyDeviceMask = "hotKeyDeviceMask"
         static let sttEngine = "sttEngine"
         static let cloudSTTBaseURL = "cloudSTTBaseURL"
+        static let whisperModel = "whisperModel"
+        static let whisperModelChosen = "whisperModelChosen"
         static let livePreviewEnabled = "livePreviewEnabled"
         static let llmProvider = "llmProvider"
         static let cloudLLMBaseURL = "cloudLLMBaseURL"
@@ -463,6 +480,13 @@ final class AppSettings: ObservableObject {
         }
         sttEngine = STTEngineKind(rawValue: defaults.string(forKey: Keys.sttEngine) ?? "") ?? .whisperKit
         cloudSTTBaseURL = defaults.string(forKey: Keys.cloudSTTBaseURL) ?? "https://api.openai.com/v1"
+        let storedWhisperModel = defaults.string(forKey: Keys.whisperModel) ?? SpeechModelCatalog.defaultID
+        let normalizedWhisperModel = SpeechModelCatalog.normalize(storedWhisperModel)
+        whisperModel = normalizedWhisperModel
+        whisperModelChosen = defaults.object(forKey: Keys.whisperModelChosen) as? Bool ?? false
+        if normalizedWhisperModel != storedWhisperModel {
+            defaults.set(normalizedWhisperModel, forKey: Keys.whisperModel)
+        }
         // Default ON — `.object(forKey:)` (not `.bool(forKey:)`) so an unset key is distinguished
         // from an explicit `false`, which `.bool(forKey:)` can't do (it returns false for both).
         livePreviewEnabled = defaults.object(forKey: Keys.livePreviewEnabled) as? Bool ?? true
