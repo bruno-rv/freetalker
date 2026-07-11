@@ -16,7 +16,7 @@ import Testing
             "idx_transcription_jobs_state_expires_at",
             "idx_job_attempts_job_id"
         ])
-        #expect(try db.migrationVersions() == [DatabaseMigrator.latestVersion])
+        #expect(try db.migrationVersions() == Array(1...DatabaseMigrator.latestVersion))
     }
 
     @Test func migratingLatestSchemaAgainMakesNoChanges() throws {
@@ -27,7 +27,7 @@ import Testing
         try DatabaseMigrator.migrate(db.handle)
 
         #expect(try db.schema() == schema)
-        #expect(try db.migrationVersions() == [DatabaseMigrator.latestVersion])
+        #expect(try db.migrationVersions() == Array(1...DatabaseMigrator.latestVersion))
     }
 
     @Test func rollsBackEntireMigrationWhenSchemaCreationFails() throws {

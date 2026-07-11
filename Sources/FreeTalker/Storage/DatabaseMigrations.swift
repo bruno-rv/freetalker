@@ -1,7 +1,7 @@
 import CSQLite
 
 enum DatabaseMigrator {
-    static let latestVersion = 1
+    static let latestVersion = 2
 
     static func migrate(_ db: OpaquePointer) throws {
         try execute(db, "BEGIN IMMEDIATE;")
@@ -91,7 +91,14 @@ enum DatabaseMigrator {
         ON job_attempts (job_id);
     """
 
-    private static let migrations = [migration1]
+    private static let migration2 = """
+    ALTER TABLE job_attempts ADD COLUMN language TEXT;
+    ALTER TABLE job_attempts ADD COLUMN speech_model TEXT;
+    ALTER TABLE job_attempts ADD COLUMN template TEXT;
+    ALTER TABLE job_attempts ADD COLUMN result TEXT;
+    """
+
+    private static let migrations = [migration1, migration2]
 
     private static func appliedVersions(_ db: OpaquePointer) throws -> [Int] {
         var statement: OpaquePointer?
