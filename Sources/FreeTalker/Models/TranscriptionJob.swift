@@ -1,11 +1,11 @@
 import Foundation
 
-enum JobKind: String, Sendable, Equatable {
+enum JobKind: String, CaseIterable, Sendable, Equatable {
     case recovery = "recovery"
     case mediaImport = "media_import"
 }
 
-enum JobStage: String, Sendable, Equatable {
+enum JobStage: String, CaseIterable, Sendable, Equatable {
     case preparing = "preparing"
     case transcribing = "transcribing"
     case postProcessing = "post_processing"
@@ -18,8 +18,12 @@ struct JobFailure: Sendable, Equatable {
 }
 
 enum JobState: Sendable, Equatable {
-    enum Kind: String, Sendable, Equatable {
-        case queued, processing, ready, failed, cancelled
+    enum Kind: String, CaseIterable, Sendable, Equatable {
+        case queued = "queued"
+        case processing = "processing"
+        case ready = "ready"
+        case failed = "failed"
+        case cancelled = "cancelled"
     }
 
     case queued

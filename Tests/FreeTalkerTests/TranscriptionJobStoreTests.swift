@@ -3,6 +3,20 @@ import Testing
 @testable import FreeTalker
 
 @Suite struct TranscriptionJobStoreTests {
+    @Test func persistedEnumsHaveExactStableEncodings() {
+        #expect(Dictionary(uniqueKeysWithValues: JobKind.allCases.map { ($0, $0.rawValue) }) == [
+            .recovery: "recovery", .mediaImport: "media_import"
+        ])
+        #expect(Dictionary(uniqueKeysWithValues: JobState.Kind.allCases.map { ($0, $0.rawValue) }) == [
+            .queued: "queued", .processing: "processing", .ready: "ready",
+            .failed: "failed", .cancelled: "cancelled"
+        ])
+        #expect(Dictionary(uniqueKeysWithValues: JobStage.allCases.map { ($0, $0.rawValue) }) == [
+            .preparing: "preparing", .transcribing: "transcribing",
+            .postProcessing: "post_processing", .persisting: "persisting"
+        ])
+    }
+
     @Test func createsAndReadsAJob() async throws {
         let database = try TemporaryJobDatabase()
         let now = Date(timeIntervalSince1970: 1_000)

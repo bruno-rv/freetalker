@@ -30,6 +30,45 @@ import Testing
         #expect(try db.migrationVersions() == Array(1...DatabaseMigrator.latestVersion))
     }
 
+    @Test func migratesPopulatedVersionOneDatabaseWithoutDataLoss() throws {
+        let db = try TemporaryDatabase()
+        try db.createVersionOneSchema()
+        try db.execute("""
+        INSERT INTO transcription_jobs
+            (id, kind, source_reference, state, created_at, updated_at)
+        VALUES ('job-1', 'recovery', '/tmp/audio.wav', 'failed', 100, 101);
+        INSERT INTO job_attempts
+            (id, job_id, attempt_number, started_at, completed_at, failure_stage, failure_message)
+        VALUES (7, 'job-1', 1, 100, 101, 'transcribing', 'old failure');
+        INSERT INTO speaker_segments
+            (id, job_id, speaker_id, start_time, end_time, transcript)
+        VALUES (8, 'job-1', 'speaker-1', 0, 1.5, 'hello');
+        INSERT INTO speaker_names (job_id, speaker_id, name)
+        VALUES ('job-1', 'speaker-1', 'Alice');
+        INSERT INTO snippets (id, trigger, replacement, created_at, updated_at)
+        VALUES ('snippet-1', 'brb', 'be right back', 100, 101);
+        """)
+
+        try DatabaseMigrator.migrate(db.handle)
+
+        #expect(try db.migrationVersions() == [1, 2])
+        #expect(try db.integer("SELECT COUNT(*) FROM transcription_jobs WHERE id = 'job-1';") == 1)
+        #expect(try db.integer("SELECT COUNT(*) FROM job_attempts WHERE id = 7 AND failure_message = 'old failure';") == 1)
+        #expect(try db.integer("SELECT COUNT(*) FROM speaker_segments WHERE id = 8 AND transcript = 'hello';") == 1)
+        #expect(try db.integer("SELECT COUNT(*) FROM speaker_names WHERE name = 'Alice';") == 1)
+        #expect(try db.integer("SELECT COUNT(*) FROM snippets WHERE replacement = 'be right back';") == 1)
+
+        try db.execute("""
+        UPDATE job_attempts
+        SET language = 'pt', speech_model = 'small', template = 'clean', result = 'failed'
+        WHERE id = 7;
+        """)
+        #expect(try db.string("""
+        SELECT language || '|' || speech_model || '|' || template || '|' || result
+        FROM job_attempts WHERE id = 7;
+        """) == "pt|small|clean|failed")
+    }
+
     @Test func rollsBackEntireMigrationWhenSchemaCreationFails() throws {
         let db = try TemporaryDatabase()
         try db.execute("CREATE TABLE job_attempts (collision INTEGER);")
@@ -115,6 +154,44 @@ private final class TemporaryDatabase {
         }
     }
 
+    func createVersionOneSchema() throws {
+        try execute("""
+        CREATE TABLE schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at REAL NOT NULL DEFAULT (unixepoch())
+        );
+        INSERT INTO schema_migrations (version) VALUES (1);
+        CREATE TABLE transcription_jobs (
+            id TEXT PRIMARY KEY, kind TEXT NOT NULL, source_reference TEXT NOT NULL,
+            source_bookmark BLOB, state TEXT NOT NULL, progress REAL NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL, updated_at REAL NOT NULL, started_at REAL,
+            completed_at REAL, expires_at REAL, language TEXT, speech_model TEXT,
+            template TEXT, failure_stage TEXT, failure_message TEXT, result TEXT
+        );
+        CREATE TABLE job_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL,
+            attempt_number INTEGER NOT NULL, started_at REAL NOT NULL, completed_at REAL,
+            failure_stage TEXT, failure_message TEXT
+        );
+        CREATE TABLE speaker_segments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL,
+            speaker_id TEXT NOT NULL, start_time REAL NOT NULL, end_time REAL NOT NULL,
+            transcript TEXT NOT NULL
+        );
+        CREATE TABLE speaker_names (
+            job_id TEXT NOT NULL, speaker_id TEXT NOT NULL, name TEXT NOT NULL,
+            PRIMARY KEY (job_id, speaker_id)
+        );
+        CREATE TABLE snippets (
+            id TEXT PRIMARY KEY, trigger TEXT NOT NULL UNIQUE, replacement TEXT NOT NULL,
+            created_at REAL NOT NULL, updated_at REAL NOT NULL
+        );
+        CREATE INDEX idx_transcription_jobs_state_expires_at
+            ON transcription_jobs (state, expires_at);
+        CREATE INDEX idx_job_attempts_job_id ON job_attempts (job_id);
+        """)
+    }
+
     func execute(_ sql: String) throws {
         var errorMessage: UnsafeMutablePointer<CChar>?
         guard sqlite3_exec(handle, sql, nil, nil, &errorMessage) == SQLITE_OK else {
@@ -122,6 +199,14 @@ private final class TemporaryDatabase {
             sqlite3_free(errorMessage)
             throw DatabaseError.sqlFailed(message)
         }
+    }
+
+    func integer(_ sql: String) throws -> Int {
+        try integers(sql).first ?? 0
+    }
+
+    func string(_ sql: String) throws -> String? {
+        try strings(sql).first
     }
 
     private func strings(_ sql: String) throws -> Set<String> {
