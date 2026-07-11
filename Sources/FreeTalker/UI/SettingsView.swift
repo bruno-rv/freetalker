@@ -110,6 +110,7 @@ private struct GeneralSettingsView: View {
     @State private var accessibilityTrusted = Permissions.isAccessibilityTrusted()
     @State private var microphoneAuthorized = Permissions.isMicrophoneAuthorized()
     @State private var inputMonitoringAuthorized = Permissions.isInputMonitoringAuthorized()
+    @State private var screenRecordingAuthorized = Permissions.isScreenRecordingAuthorized()
     @State private var capturingHotKey = false
     @State private var captureSession: HotKeyCapture.Session?
     /// Set when re-recording the PTT key is refused because it would collide with, or
@@ -182,6 +183,40 @@ private struct GeneralSettingsView: View {
                     if !inputMonitoringAuthorized {
                         Button("Open System Settings") { Permissions.openInputMonitoringSettings() }
                     }
+                }
+                HStack {
+                    Circle()
+                        .fill(screenRecordingAuthorized ? .green : .red)
+                        .frame(width: 8, height: 8)
+                    Text(screenRecordingAuthorized ? "Screen Recording granted" : "Screen Recording not granted")
+                    Spacer()
+                    if !screenRecordingAuthorized {
+                        Button("Request") {
+                            screenRecordingAuthorized = Permissions.requestScreenRecording()
+                        }
+                        Button("Open System Settings") { Permissions.openScreenRecordingSettings() }
+                    }
+                }
+            }
+
+            Section("Local context") {
+                Picker("Scope", selection: $settings.localContextScope) {
+                    ForEach(LocalContextScope.allCases, id: \.rawValue) { scope in
+                        Text(scope.displayName).tag(scope)
+                    }
+                }
+                Toggle("Automatic local style", isOn: $settings.automaticStyleEnabled)
+                Text("Captured once when dictation stops and used only by Apple's on-device Foundation Model. Window + local OCR uses Apple Vision and requires Screen Recording permission.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if settings.localContextScope == .windowOCR, !screenRecordingAuthorized {
+                    Label("Screen Recording permission is required; processing will fall back to app identity only.", systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                } else if settings.localContextScope != .off, !accessibilityTrusted {
+                    Label("Accessibility permission is required; processing will fall back to app identity only.", systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
                 }
             }
 
@@ -480,6 +515,7 @@ private struct GeneralSettingsView: View {
             accessibilityTrusted = Permissions.isAccessibilityTrusted()
             microphoneAuthorized = Permissions.isMicrophoneAuthorized()
             inputMonitoringAuthorized = Permissions.isInputMonitoringAuthorized()
+            screenRecordingAuthorized = Permissions.isScreenRecordingAuthorized()
         }
     }
 

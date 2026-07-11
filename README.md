@@ -122,6 +122,16 @@ when no rule's Template half matches; see "Language" below for how the language 
 the pin and the Recording Panel. The frontmost app's identity is also passed to the
 post-processor as context, so refined output can account for where it's headed.
 
+Settings → General → **Local context** can optionally capture selected text, the focused field,
+the active window's accessibility text, or a one-time active-window screenshot read by Apple
+Vision OCR. The scope defaults to Off and is captured exactly once when dictation stops. Manual
+App Rules always take precedence over the optional automatic local style.
+
+**Local-only privacy boundary:** accessibility text, screenshots, and OCR output stay in memory
+and are supplied only to Apple's on-device Foundation Model. Screenshot bytes are released
+immediately after local OCR. Local context is never persisted, logged, or included in cloud/BYOK
+post-processing requests; when cloud post-processing is configured, FreeTalker omits it entirely.
+
 ### Custom vocabulary
 
 Settings → Templates → **Vocabulary** takes a list of names, jargon, or acronyms your dictation
