@@ -18,6 +18,7 @@ let package = Package(
                 .product(name: "WhisperKit", package: "WhisperKit"),
                 "CSQLite"
             ]
-        )
+        ),
+        .testTarget(name: "FreeTalkerTests", dependencies: ["FreeTalker"])
     ]
 )
