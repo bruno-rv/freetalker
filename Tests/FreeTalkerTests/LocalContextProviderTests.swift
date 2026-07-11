@@ -191,6 +191,18 @@ import Testing
         #expect(adapter.identityReads == 1)
         #expect(adapter.childrenReads == 0)
     }
+
+    @Test func wideLazyTreeMaterializesAndEnqueuesOnlyRemainingNodeBudget() {
+        let adapter = FakeNodeAdapter(nodes: [
+            0: .init(text: nil, children: [], lazyChildCount: 1_000_000)
+        ])
+        let reader = AccessibilityTreeReader(adapter: adapter)
+
+        #expect(reader.visibleText(root: 0).isEmpty)
+        #expect(adapter.childLimits == [AccessibilityTreeReader<FakeNodeAdapter>.maxNodes - 1])
+        #expect(adapter.totalChildrenReturned == AccessibilityTreeReader<FakeNodeAdapter>.maxNodes - 1)
+        #expect(adapter.largestChildrenReply <= AccessibilityTreeReader<FakeNodeAdapter>.maxNodes - 1)
+    }
 }
 
 @MainActor
@@ -240,14 +252,37 @@ private final class FakeAccessibilityContext: AccessibilityContextProviding {
 private final class FakeNodeAdapter: AccessibilityNodeAdapting {
     typealias Node = Int
     typealias Identity = Int
-    struct Record { let text: String?; let children: [Int] }
+    struct Record {
+        let text: String?
+        let children: [Int]
+        let lazyChildCount: Int
+
+        init(text: String?, children: [Int], lazyChildCount: Int = 0) {
+            self.text = text
+            self.children = children
+            self.lazyChildCount = lazyChildCount
+        }
+    }
     let nodes: [Int: Record]
     var identityReads = 0
     var childrenReads = 0
+    var childLimits: [Int] = []
+    var totalChildrenReturned = 0
+    var largestChildrenReply = 0
 
     init(nodes: [Int: Record]) { self.nodes = nodes }
     func identity(of node: Int) -> Int { identityReads += 1; return node }
     func isSecure(_ node: Int) -> Bool { false }
     func visibleText(of node: Int) -> String? { nodes[node]?.text }
-    func children(of node: Int) -> [Int] { childrenReads += 1; return nodes[node]?.children ?? [] }
+    func children(of node: Int, maxCount: Int) -> [Int] {
+        childrenReads += 1
+        childLimits.append(maxCount)
+        guard let record = nodes[node] else { return [] }
+        let children = record.lazyChildCount > 0
+            ? Array(1...min(record.lazyChildCount, maxCount))
+            : Array(record.children.prefix(maxCount))
+        totalChildrenReturned += children.count
+        largestChildrenReply = max(largestChildrenReply, children.count)
+        return children
+    }
 }
