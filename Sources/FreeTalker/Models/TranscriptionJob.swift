@@ -113,4 +113,5 @@ enum JobStoreError: Error, Equatable {
     case jobNotFound
     case attemptNotFound
     case corruptData(String)
+    case leaseLost
 }

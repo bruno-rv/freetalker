@@ -14,6 +14,9 @@ actor TranscriptionJobStore {
             throw DatabaseError.openFailed(message)
         }
         do {
+            guard sqlite3_exec(database, "PRAGMA foreign_keys = ON;", nil, nil, nil) == SQLITE_OK else {
+                throw DatabaseError.sqlFailed(String(cString: sqlite3_errmsg(database)))
+            }
             try DatabaseMigrator.migrate(database)
         } catch {
             sqlite3_close(database)
@@ -527,17 +530,20 @@ actor TranscriptionJobStore {
             statement = try prepare("""
             UPDATE transcription_jobs
             SET state = 'queued', failure_stage = NULL, failure_message = NULL,
-                updated_at = ?, completed_at = NULL
-            WHERE state = 'processing' AND kind = ?;
+                updated_at = ?, completed_at = NULL, lease_owner = NULL, lease_expires_at = NULL
+            WHERE state = 'processing' AND kind = ?
+              AND (lease_owner IS NULL OR lease_expires_at <= ?);
             """)
             bind(kind.rawValue, to: 2, in: statement)
+            sqlite3_bind_double(statement, 3, clock.now.timeIntervalSince1970)
         } else {
             statement = try prepare("""
             UPDATE transcription_jobs
             SET state = 'queued', failure_stage = NULL, failure_message = NULL,
-                updated_at = ?, completed_at = NULL
-            WHERE state = 'processing';
+                updated_at = ?, completed_at = NULL, lease_owner = NULL, lease_expires_at = NULL
+            WHERE state = 'processing' AND (lease_owner IS NULL OR lease_expires_at <= ?);
             """)
+            sqlite3_bind_double(statement, 2, clock.now.timeIntervalSince1970)
         }
         defer { sqlite3_finalize(statement) }
         sqlite3_bind_double(statement, 1, clock.now.timeIntervalSince1970)
