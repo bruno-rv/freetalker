@@ -569,6 +569,44 @@ struct CloudLLMSettingsSnapshot {
     /// a key is present. nil/empty both mean "no key".
     let key: String?
     let vocabulary: [String]
+
+    var eligibility: CloudLLMEligibility {
+        let trimmedBaseURL = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard
+            !trimmedModel.isEmpty,
+            let components = URLComponents(string: trimmedBaseURL),
+            let scheme = components.scheme?.lowercased(),
+            scheme == "http" || scheme == "https",
+            let host = components.host?.lowercased(),
+            !host.isEmpty
+        else {
+            return .invalidConfiguration
+        }
+
+        let trimmedKey = key?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !trimmedKey.isEmpty {
+            return .eligible(apiKey: trimmedKey)
+        }
+
+        let normalizedHost = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        let loopbackHosts: Set<String> = ["localhost", "127.0.0.1", "::1"]
+        if provider == .openAICompatible, scheme == "http", loopbackHosts.contains(normalizedHost) {
+            return .eligible(apiKey: nil)
+        }
+        return .missingAPIKey
+    }
+}
+
+enum CloudLLMEligibility {
+    case eligible(apiKey: String?)
+    case invalidConfiguration
+    case missingAPIKey
+
+    var isEligible: Bool {
+        if case .eligible = self { return true }
+        return false
+    }
 }
 
 extension AppSettings {

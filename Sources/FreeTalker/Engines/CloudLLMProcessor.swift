@@ -14,6 +14,18 @@ import Foundation
 struct CloudLLMProcessor: PostProcessor {
     let snapshot: CloudLLMSettingsSnapshot
 
+    static func openAICompatibleHeaders(apiKey: String?) -> [String: String] {
+        var headers = ["Content-Type": "application/json"]
+        if let apiKey { headers["Authorization"] = "Bearer \(apiKey)" }
+        return headers
+    }
+
+    private static func applyOpenAICompatibleHeaders(apiKey: String?, to request: inout URLRequest) {
+        for (field, value) in openAICompatibleHeaders(apiKey: apiKey) {
+            request.setValue(value, forHTTPHeaderField: field)
+        }
+    }
+
     enum CloudLLMError: LocalizedError {
         case missingAPIKey(provider: String)
         case missingConfiguration(provider: String)
@@ -38,13 +50,13 @@ struct CloudLLMProcessor: PostProcessor {
         let baseURL = snapshot.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         let model = snapshot.model.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        // All three providers require a model; base URL is likewise always required. See
-        // PLAN.md step 2, Round 3 Codex finding 1.
-        guard !baseURL.isEmpty, !model.isEmpty else {
+        let apiKey: String?
+        switch snapshot.eligibility {
+        case .eligible(let eligibleKey):
+            apiKey = eligibleKey
+        case .invalidConfiguration:
             throw CloudLLMError.missingConfiguration(provider: providerLabel)
-        }
-
-        guard let apiKey = snapshot.key?.trimmingCharacters(in: .whitespacesAndNewlines), !apiKey.isEmpty else {
+        case .missingAPIKey:
             throw CloudLLMError.missingAPIKey(provider: providerLabel)
         }
 
@@ -57,7 +69,7 @@ struct CloudLLMProcessor: PostProcessor {
 
         switch snapshot.provider {
         case .anthropic:
-            return try await callAnthropic(apiKey: apiKey, baseURL: baseURL, model: model, instructions: instructions, transcript: transcript, providerLabel: providerLabel)
+            return try await callAnthropic(apiKey: apiKey!, baseURL: baseURL, model: model, instructions: instructions, transcript: transcript, providerLabel: providerLabel)
         case .ollama, .openAICompatible:
             return try await callOpenAICompatible(apiKey: apiKey, baseURL: baseURL, model: model, instructions: instructions, transcript: transcript, providerLabel: providerLabel)
         }
@@ -92,14 +104,13 @@ struct CloudLLMProcessor: PostProcessor {
         return decoded.content.compactMap(\.text).joined()
     }
 
-    private func callOpenAICompatible(apiKey: String, baseURL: String, model: String, instructions: String, transcript: String, providerLabel: String) async throws -> String {
+    private func callOpenAICompatible(apiKey: String?, baseURL: String, model: String, instructions: String, transcript: String, providerLabel: String) async throws -> String {
         guard let url = URL(string: baseURL)?.appendingPathComponent("chat/completions") else {
             throw CloudLLMError.missingConfiguration(provider: providerLabel)
         }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        Self.applyOpenAICompatibleHeaders(apiKey: apiKey, to: &request)
 
         let body: [String: Any] = [
             "model": model,
@@ -140,10 +151,13 @@ struct CloudLLMProcessor: PostProcessor {
         let providerLabel = snapshot.provider.rawValue
         let baseURL = snapshot.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         let model = snapshot.model.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !baseURL.isEmpty, !model.isEmpty else {
+        let apiKey: String?
+        switch snapshot.eligibility {
+        case .eligible(let eligibleKey):
+            apiKey = eligibleKey
+        case .invalidConfiguration:
             throw CloudLLMError.missingConfiguration(provider: providerLabel)
-        }
-        guard let apiKey = snapshot.key?.trimmingCharacters(in: .whitespacesAndNewlines), !apiKey.isEmpty else {
+        case .missingAPIKey:
             throw CloudLLMError.missingAPIKey(provider: providerLabel)
         }
 
@@ -155,7 +169,7 @@ struct CloudLLMProcessor: PostProcessor {
             }
             request = URLRequest(url: url)
             request.httpMethod = "POST"
-            request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+            request.setValue(apiKey!, forHTTPHeaderField: "x-api-key")
             request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             let body: [String: Any] = [
@@ -170,8 +184,7 @@ struct CloudLLMProcessor: PostProcessor {
             }
             request = URLRequest(url: url)
             request.httpMethod = "POST"
-            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            Self.applyOpenAICompatibleHeaders(apiKey: apiKey, to: &request)
             let body: [String: Any] = [
                 "model": model,
                 "max_tokens": 8,

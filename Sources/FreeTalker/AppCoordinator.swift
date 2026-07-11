@@ -724,16 +724,13 @@ final class AppCoordinator: ObservableObject {
 
     /// Pure global routing rule (Amendment A1, replacing the removed per-Template
     /// `Template.useCloud` toggle): the Cloud Post-Processor is used for every Template — never
-    /// selected per Template — iff the active provider's config is complete: trimmed base URL
-    /// non-empty, trimmed model non-empty, and a non-empty provider-scoped Keychain key present.
-    /// Any one missing falls back to the on-device `AppleFMProcessor`. Takes the same
+    /// selected per Template — iff the shared snapshot eligibility rule accepts the URL, model,
+    /// and credentials. An empty key is accepted only for an OpenAI-compatible loopback HTTP
+    /// endpoint; any other incomplete or invalid config falls back to `AppleFMProcessor`. Takes the same
     /// `CloudLLMSettingsSnapshot` passed into `CloudLLMProcessor.process`, so the routing decision
     /// and the request it drives can never disagree. See PLAN.md Amendment A.
     nonisolated static func isCloudLLMConfigured(snapshot: CloudLLMSettingsSnapshot) -> Bool {
-        let baseURL = snapshot.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        let model = snapshot.model.trimmingCharacters(in: .whitespacesAndNewlines)
-        let key = snapshot.key?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return !baseURL.isEmpty && !model.isEmpty && !key.isEmpty
+        snapshot.eligibility.isEligible
     }
 
     /// Same shape as `isCloudLLMConfigured` for Cloud STT's config: trimmed base URL and trimmed
