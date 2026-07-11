@@ -58,6 +58,7 @@ final class AppCoordinator: ObservableObject {
     private let audioCapture = AudioCapture()
     private let hud = HUDController()
     private let recoveryStore: TranscriptionJobStore?
+    let jobLibraryStore: JobLibraryStore?
     private var recoveryRunner: LocalJobRunner?
     private var cancellables = Set<AnyCancellable>()
     private var permissionPollTimer: Timer?
@@ -78,7 +79,9 @@ final class AppCoordinator: ObservableObject {
         speechModelDownloadCoordinator = downloadCoordinator
         speechModelStore = modelStore
         whisperEngine = WhisperKitEngine(downloadCoordinator: downloadCoordinator)
-        recoveryStore = try? Self.makeRecoveryStore()
+        let recoveryStore = try? Self.makeRecoveryStore()
+        self.recoveryStore = recoveryStore
+        jobLibraryStore = recoveryStore.map { JobLibraryStore(store: $0, recoveryDirectory: Self.recoveryDirectory) }
         whisperEngine.setEventReceiver(modelStore)
         modelStore.onAutomaticSelection = { [weak whisperEngine] target in
             guard let whisperEngine else { return }
@@ -929,11 +932,13 @@ final class AppCoordinator: ObservableObject {
             try await pipeline.execute(jobID: job.id, configuration: nil, cancellation: token)
         }
         recoveryRunner = runner
+        jobLibraryStore?.configureRetry { [weak runner] id in await runner?.enqueue(id) }
         await pipeline.retryPendingSourceCleanup()
         _ = try? await recoveryStore.recoverInterruptedJobs(kind: .recovery)
         _ = try? await RecoveryRetentionService(directory: Self.recoveryDirectory, store: recoveryStore)
             .purgeExpired(now: Date(), retention: AppSettings.shared.recoveryRetention)
         await runner.resumeQueuedJobs()
+        try? await jobLibraryStore?.refresh()
     }
 
     private func processRecoveredDictation(
