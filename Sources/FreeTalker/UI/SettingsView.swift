@@ -239,6 +239,17 @@ private struct GeneralSettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
+            Section("Recovery") {
+                Picker("Keep failed dictation audio", selection: $settings.recoveryRetention) {
+                    ForEach(RecoveryRetention.allCases, id: \.rawValue) { value in
+                        Text(RecoveryPresentation.retentionLabel(value)).tag(value)
+                    }
+                }
+                Text("Recovery audio stays on this Mac and is removed automatically after the selected period. Choose Never to delete it yourself from Library → Recoveries.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Microphone") {
                 Picker("Input device", selection: $settings.microphoneDeviceUID) {
                     Text("System default").tag(nil as String?)

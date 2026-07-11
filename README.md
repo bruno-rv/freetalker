@@ -84,6 +84,11 @@ Settings (menu bar → "Settings…") shows live permission status.
   re-run a stored transcript through a different Template. Each entry can be deleted
   individually, or wiped entirely with **Delete All** — which also purges any saved debug audio
   (`last-dictation.wav`, failed-transcription recordings) alongside the database rows.
+- **Library → Recoveries** keeps failed dictation audio locally on this Mac so you can listen,
+  retry with optional language/model/template overrides, or permanently delete it. Recovery
+  audio is never uploaded by the recovery library itself. Settings → General → Recovery controls
+  automatic deletion after 1, 7 (default), 30, or 90 days, or keeps it until you delete it.
+- **Library → Imports** is a placeholder; media import is not part of the recovery workflow yet.
 - An optional **Redo-last key** (Settings → General, unbound by default) re-inserts the newest
   Library entry at your cursor without re-recording — handy when a paste got dismissed or
   overwritten.

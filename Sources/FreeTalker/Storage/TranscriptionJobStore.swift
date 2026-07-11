@@ -104,6 +104,25 @@ actor TranscriptionJobStore {
         return try decodeClaims(statement)
     }
 
+    func claimRecoveryForDeletion(id: UUID, claimedAt: Date) throws -> Bool {
+        let statement = try prepare("""
+        UPDATE transcription_jobs
+        SET purge_claimed_at = ?, purge_error = NULL, updated_at = ?
+        WHERE id = ? AND kind = 'recovery' AND state = 'failed'
+          AND purge_claimed_at IS NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM job_attempts
+              WHERE job_id = transcription_jobs.id AND completed_at IS NULL
+          );
+        """)
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_double(statement, 1, claimedAt.timeIntervalSince1970)
+        sqlite3_bind_double(statement, 2, claimedAt.timeIntervalSince1970)
+        bind(id.uuidString, to: 3, in: statement)
+        try stepDone(statement)
+        return sqlite3_changes(handle) == 1
+    }
+
     func recordPurgeError(id: UUID, message: String) throws {
         let statement = try prepare("""
         UPDATE transcription_jobs SET purge_error = ?
