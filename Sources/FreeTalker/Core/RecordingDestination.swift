@@ -20,6 +20,13 @@ struct RecordingProcessingContext: Equatable, Sendable {
         guard spokenLanguage == "en" || spokenLanguage == "pt" else { return nil }
         return spokenLanguage
     }
+
+    var recoverySafe: Self {
+        Self(
+            destination: destination, spokenLanguage: spokenLanguage,
+            outputLanguage: outputLanguage, template: template, cloudSnapshot: nil
+        )
+    }
 }
 
 struct RecordingProcessingResult {
@@ -37,15 +44,18 @@ struct OutputTranslationFailure: Error, LocalizedError {
     let id: UUID
     let source: String
     let context: RecordingProcessingContext
+    let engineName: String
     let underlyingError: Error
 
     init(
         id: UUID = UUID(), source: String, context: RecordingProcessingContext,
+        engineName: String,
         underlyingError: Error
     ) {
         self.id = id
         self.source = source
-        self.context = context
+        self.context = context.recoverySafe
+        self.engineName = engineName
         self.underlyingError = underlyingError
     }
 

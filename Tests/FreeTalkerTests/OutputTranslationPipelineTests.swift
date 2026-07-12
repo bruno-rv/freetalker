@@ -80,7 +80,7 @@ struct OutputTranslationPipelineTests {
             Issue.record("Expected unresolved translation failure")
         } catch let failure as OutputTranslationFailure {
             #expect(failure.source == "raw source")
-            #expect(failure.context == context)
+            #expect(failure.context == context.recoverySafe)
         } catch {
             Issue.record("Unexpected error: \(error)")
         }
@@ -95,11 +95,34 @@ struct OutputTranslationPipelineTests {
             template: Self.template, cloudSnapshot: Self.snapshot()
         )
         let failure = OutputTranslationFailure(
-            source: "raw source", context: context, underlyingError: PipelineStubError.failed
+            source: "raw source", context: context, engineName: "Spy",
+            underlyingError: PipelineStubError.failed
         )
 
         #expect(AppCoordinator.pipelineFailureKind(failure) == .translation)
         #expect(AppCoordinator.pipelineFailureKind(AppCoordinator.PipelineError.emptyTranscript) == .transcription)
+    }
+
+    @Test func translationFailureAndCoordinatorQueueNeverRetainCloudCredentials() {
+        let coordinator = AppCoordinator.shared
+        while coordinator.consumeNextPendingOutputTranslationFailure() != nil {}
+        let context = RecordingProcessingContext(
+            destination: .external, spokenLanguage: "en", outputLanguage: .german,
+            template: Self.template,
+            cloudSnapshot: CloudLLMSettingsSnapshot(
+                provider: .anthropic, baseURL: "https://example.com", model: "model",
+                key: "super-secret", vocabulary: []
+            )
+        )
+        let failure = OutputTranslationFailure(
+            source: "raw", context: context, engineName: "Cloud STT",
+            underlyingError: PipelineStubError.failed
+        )
+
+        #expect(failure.context.cloudSnapshot == nil)
+        coordinator.enqueueOutputTranslationFailure(failure)
+        #expect(coordinator.pendingOutputTranslationFailures().first?.context.cloudSnapshot == nil)
+        #expect(coordinator.consumeNextPendingOutputTranslationFailure()?.engineName == "Cloud STT")
     }
 
     @Test func coordinatorRetainsUnresolvedTranslationsFIFOAndConsumesExactID() async throws {
@@ -120,7 +143,9 @@ struct OutputTranslationPipelineTests {
         for (source, context) in [("fonte", externalContext), ("source", scratchpadContext)] {
             do {
                 _ = try await coordinator.processDictation(
-                    samples: [0.5], engine: PipelineEngineSpy(output: .init(text: source, language: "en")),
+                    samples: [0.5], engine: PipelineEngineSpy(output: .init(
+                        text: source, language: context.spokenLanguage ?? "en"
+                    )),
                     engineName: "Spy", context: context,
                     translator: PipelineTranslationSpy(error: PipelineStubError.failed),
                     insert: { _, _ in insertCount += 1; return true },
@@ -139,7 +164,7 @@ struct OutputTranslationPipelineTests {
         let ids = pending.map(\.id)
         #expect(Set(ids).count == 2)
         #expect(pending.map(\.source) == ["fonte", "source"])
-        #expect(pending.map(\.context) == [externalContext, scratchpadContext])
+        #expect(pending.map(\.context) == [externalContext.recoverySafe, scratchpadContext.recoverySafe])
         #expect(insertCount == 0)
         #expect(recordCount == 0)
         #expect(coordinator.consumePendingOutputTranslationFailure(id: ids[1])?.id == ids[1])
@@ -166,7 +191,7 @@ struct OutputTranslationPipelineTests {
                 Issue.record("Expected translation failure")
             } catch let failure as OutputTranslationFailure {
                 #expect(failure.source == "raw")
-                #expect(failure.context == context)
+                #expect(failure.context == context.recoverySafe)
             } catch {
                 Issue.record("Unexpected error: \(error)")
             }

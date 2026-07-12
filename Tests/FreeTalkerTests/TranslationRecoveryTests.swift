@@ -201,7 +201,10 @@ struct TranslationRecoveryTests {
     @Test func pendingRecoveryRetainsImmutableFailureInputs() {
         let token = ScratchpadInsertionToken(id: UUID())
         let context = Self.context(destination: .scratchpad(token))
-        let failure = OutputTranslationFailure(source: "raw source", context: context, underlyingError: ProbeError.failed)
+        let failure = OutputTranslationFailure(
+            source: "raw source", context: context, engineName: "Cloud STT",
+            underlyingError: ProbeError.failed
+        )
 
         let recovery = PendingTranslationRecovery(failure: failure)
 
@@ -334,6 +337,71 @@ struct TranslationRecoveryTests {
         #expect(TranslationRecoveryPresentation.retryTitle == "Retry translation")
     }
 
+    @Test func externalRetryRecordsResolvedHistoryExactlyOnce() async {
+        var records: [TranslationRecoveryHistoryRecord] = []
+        var deliveries = 0
+        let failure = Self.failure(source: "raw source")
+        let controller = PendingTranslationRecoveryController(
+            snapshot: { Self.snapshot(model: "fresh") },
+            translate: { _, _, _, _ in "translated" },
+            deliver: { _, _, _ in deliveries += 1; return true },
+            recordResolved: { records.append($0) }
+        )
+        controller.enqueue(failure)
+
+        await controller.retryTranslation(id: failure.id)
+
+        #expect(deliveries == 1)
+        #expect(records == [.init(
+            rawTranscript: "raw source", finalOutput: "translated",
+            sourceLanguage: SourceLanguage("en"), requestedOutputLanguage: .german,
+            templateName: "Plain", engineName: "Cloud STT"
+        )])
+        #expect(controller.pendingRecoveries.isEmpty)
+    }
+
+    @Test func externalSourceRecoveryRecordsSourceAsFinalExactlyOnce() {
+        var records: [TranslationRecoveryHistoryRecord] = []
+        var deliveries = 0
+        let failure = Self.failure(source: "raw source")
+        let controller = PendingTranslationRecoveryController(
+            snapshot: { Self.snapshot() },
+            translate: { _, _, _, _ in "unused" },
+            deliver: { _, _, _ in deliveries += 1; return true },
+            recordResolved: { records.append($0) }
+        )
+        controller.enqueue(failure)
+
+        controller.insertSourceText(id: failure.id)
+
+        #expect(deliveries == 1)
+        #expect(records.first?.rawTranscript == "raw source")
+        #expect(records.first?.finalOutput == "raw source")
+        #expect(records.first?.requestedOutputLanguage == .german)
+        #expect(controller.pendingRecoveries.isEmpty)
+    }
+
+    @Test func historyFailureAfterDeliveryDoesNotRedeliverOrRetainRecovery() async {
+        var deliveries = 0
+        var historyErrors: [String] = []
+        let failure = Self.failure(source: "raw")
+        let controller = PendingTranslationRecoveryController(
+            snapshot: { Self.snapshot() },
+            translate: { _, _, _, _ in "translated" },
+            deliver: { _, _, _ in deliveries += 1; return true },
+            recordResolved: { _ in throw ProbeError.failed },
+            onHistoryFailure: { historyErrors.append($0) }
+        )
+        controller.enqueue(failure)
+
+        await controller.retryTranslation(id: failure.id)
+        await controller.retryTranslation(id: failure.id)
+
+        #expect(deliveries == 1)
+        #expect(controller.pendingRecoveries.isEmpty)
+        #expect(historyErrors == ["Library save failed"])
+    }
+
     private static let template = Template(id: "plain", name: "Plain", prompt: "Clean")
 
     private static func context(destination: RecordingDestination = .external) -> RecordingProcessingContext {
@@ -342,7 +410,7 @@ struct TranslationRecoveryTests {
     }
 
     private static func failure(source: String, destination: RecordingDestination = .external) -> OutputTranslationFailure {
-        .init(source: source, context: context(destination: destination), underlyingError: ProbeError.failed)
+        .init(source: source, context: context(destination: destination), engineName: "Cloud STT", underlyingError: ProbeError.failed)
     }
 
     private static func snapshot(model: String = "model") -> CloudLLMSettingsSnapshot {
