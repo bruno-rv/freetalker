@@ -10,8 +10,11 @@ struct FreeTalkerApp: App {
         let claim = AppLifecycleWindowPolicy.claimInstance(
             path: AppLifecycleWindowPolicy.instanceLeasePath,
             maxAttempts: 10,
-            activateExistingOwner: {
-                if let existingApplication = AppLifecycleWindowPolicy.existingOwner(for: currentApplication) {
+            activateExistingOwner: { ownerPID in
+                if let existingApplication = AppLifecycleWindowPolicy.existingOwner(
+                    processIdentifier: ownerPID,
+                    for: currentApplication
+                ) {
                     existingApplication.activate(options: [.activateAllWindows])
                     return true
                 }

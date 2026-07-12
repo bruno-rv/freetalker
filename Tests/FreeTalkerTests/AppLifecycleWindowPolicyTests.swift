@@ -5,25 +5,6 @@ import Testing
 
 @MainActor
 struct AppLifecycleWindowPolicyTests {
-    @Test func oldestProcessOwnsGlobalHotKeys() {
-        let launches = [
-            AppLaunchCandidate(processIdentifier: 220, launchDate: Date(timeIntervalSince1970: 20)),
-            AppLaunchCandidate(processIdentifier: 110, launchDate: Date(timeIntervalSince1970: 10))
-        ]
-
-        #expect(AppLifecycleWindowPolicy.owner(in: launches)?.processIdentifier == 110)
-    }
-
-    @Test func processIdentifierBreaksLaunchDateTiesDeterministically() {
-        let launchDate = Date(timeIntervalSince1970: 10)
-        let launches = [
-            AppLaunchCandidate(processIdentifier: 220, launchDate: launchDate),
-            AppLaunchCandidate(processIdentifier: 110, launchDate: launchDate)
-        ]
-
-        #expect(AppLifecycleWindowPolicy.owner(in: launches)?.processIdentifier == 110)
-    }
-
     @Test func settingsWindowAppearsAcrossSpacesAndAboveFullScreenApps() {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 500, height: 500),
@@ -49,6 +30,17 @@ struct AppLifecycleWindowPolicyTests {
         withExtendedLifetime(first) {}
     }
 
+    @Test func leasePublishesItsActualOwnerProcessIdentifier() throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("freetalker-lease-\(UUID().uuidString)").path
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        let lease = try #require(AppInstanceLease.acquire(path: path, ownerPID: 220))
+
+        #expect(AppInstanceLease.ownerPID(path: path) == 220)
+        withExtendedLifetime(lease) {}
+    }
+
     @Test func releasedLifetimeClaimAllowsTakeover() {
         let path = FileManager.default.temporaryDirectory
             .appendingPathComponent("freetalker-lease-\(UUID().uuidString)").path
@@ -68,20 +60,76 @@ struct AppLifecycleWindowPolicyTests {
         let path = FileManager.default.temporaryDirectory
             .appendingPathComponent("freetalker-lease-\(UUID().uuidString)").path
         defer { try? FileManager.default.removeItem(atPath: path) }
-        let first = try #require(AppInstanceLease.acquire(path: path))
-        var activations = 0
+        let first = try #require(AppInstanceLease.acquire(path: path, ownerPID: 220))
+        var activatedPIDs: [pid_t] = []
 
         let result = AppLifecycleWindowPolicy.claimInstance(
             path: path,
             maxAttempts: 2,
-            activateExistingOwner: { activations += 1; return true },
+            activateExistingOwner: { activatedPIDs.append($0); return true },
             wait: {}
         )
 
         #expect(result.lease == nil)
         #expect(result.shouldTerminate)
-        #expect(activations == 2)
+        #expect(activatedPIDs == [220, 220])
         withExtendedLifetime(first) {}
+    }
+
+    @Test func newerLockWinnerIsActivatedInsteadOfOlderCandidate() throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("freetalker-lease-\(UUID().uuidString)").path
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let newerOwner = try #require(AppInstanceLease.acquire(path: path, ownerPID: 220))
+        var activatedPID: pid_t?
+
+        _ = AppLifecycleWindowPolicy.claimInstance(
+            path: path,
+            maxAttempts: 1,
+            activateExistingOwner: { activatedPID = $0; return true },
+            wait: {}
+        )
+
+        #expect(activatedPID == 220)
+        withExtendedLifetime(newerOwner) {}
+    }
+
+    @Test(arguments: ["", "not-a-pid", "0", "-1", "999999999999999999999"])
+    func invalidOwnerRecordDoesNotActivate(_ contents: String) throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("freetalker-lease-\(UUID().uuidString)").path
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let owner = try #require(AppInstanceLease.acquire(path: path, ownerPID: 220))
+        try contents.write(toFile: path, atomically: false, encoding: .utf8)
+        var activations = 0
+
+        _ = AppLifecycleWindowPolicy.claimInstance(
+            path: path,
+            maxAttempts: 1,
+            activateExistingOwner: { _ in activations += 1; return true },
+            wait: {}
+        )
+
+        #expect(activations == 0)
+        withExtendedLifetime(owner) {}
+    }
+
+    @Test func currentProcessOwnerRecordDoesNotActivateSelf() throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("freetalker-lease-\(UUID().uuidString)").path
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let owner = try #require(AppInstanceLease.acquire(path: path))
+        var activations = 0
+
+        _ = AppLifecycleWindowPolicy.claimInstance(
+            path: path,
+            maxAttempts: 1,
+            activateExistingOwner: { _ in activations += 1; return true },
+            wait: {}
+        )
+
+        #expect(activations == 0)
+        withExtendedLifetime(owner) {}
     }
 
     @Test func claimTakesOverWhenExitingOwnerReleasesLeaseDuringRetry() {
@@ -98,7 +146,7 @@ struct AppLifecycleWindowPolicyTests {
         let result = AppLifecycleWindowPolicy.claimInstance(
             path: path,
             maxAttempts: 2,
-            activateExistingOwner: { true },
+            activateExistingOwner: { _ in true },
             wait: { first = nil }
         )
 
