@@ -79,6 +79,42 @@ struct RecordingDestinationTests {
         #expect(lifecycle.pending(for: token) == nil)
     }
 
+    @MainActor @Test func pendingScratchpadCompletionsRemainKeyedAndFIFO() throws {
+        let lifecycle = RecordingDestinationLifecycle()
+        let first = ScratchpadInsertionToken(id: UUID())
+        let second = ScratchpadInsertionToken(id: UUID())
+        _ = try lifecycle.complete("first", destination: .scratchpad(first)) {}
+        _ = try lifecycle.complete("second", destination: .scratchpad(second)) {}
+        lifecycle.storePending("must not overwrite", for: first)
+
+        let pending = lifecycle.pendingRecordings()
+        #expect(pending.map(\.token) == [first, second])
+        #expect(pending.map(\.text) == ["first", "second"])
+        #expect(lifecycle.consumePending(for: first) == "first")
+        #expect(lifecycle.pendingRecordings().map(\.token) == [second])
+    }
+
+    @MainActor @Test func failureWhileRouterIsAbsentIsRetainedButCancellationIsNot() async {
+        let lifecycle = RecordingDestinationLifecycle()
+        let failed = ScratchpadInsertionToken(id: UUID())
+        do {
+            _ = try await lifecycle.runAsync(
+                destination: .scratchpad(failed), process: { throw ProbeError.failed },
+                text: { $0 as String }, external: { _ in }
+            )
+        } catch {}
+        #expect(lifecycle.consumePendingFailure() == "failed")
+
+        let cancelled = ScratchpadInsertionToken(id: UUID())
+        do {
+            _ = try await lifecycle.runAsync(
+                destination: .scratchpad(cancelled), process: { throw CancellationError() },
+                text: { $0 as String }, external: { _ in }
+            )
+        } catch {}
+        #expect(lifecycle.consumePendingFailure() == nil)
+    }
+
     @MainActor @Test func lifecycleCancellationNotifiesAndClearsRecovery() throws {
         let token = ScratchpadInsertionToken(id: UUID())
         let router = RouterProbe(acceptCompletion: false)

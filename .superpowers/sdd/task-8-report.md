@@ -55,3 +55,57 @@ Result: exit 0; all suites passed.
 ## Concerns
 
 None. Stop means “stop capture and begin transcription,” matching the existing coordinator API. Recovery is explicit through the visible preserved transcription and its insert button.
+
+## Review-fix wave
+
+### RED
+
+Added failing coverage for:
+
+- multiple keyed coordinator recoveries retaining FIFO order;
+- consuming only the displayed recovery's originating token after successful insertion;
+- close during scratchpad capture stopping capture before router removal;
+- completion, cancellation, and error terminal events while the window/router is absent;
+- repeated and coordinator-busy starts preserving the original session;
+- dynamic Dictate/Stop accessibility help and recovery-button help.
+
+The initial focused run could not compile because the keyed pending-recovery enumeration,
+terminal-failure consumption, busy-state callback, and recovery-button presentation APIs did
+not exist. Two normal-build attempts were blocked by stale `swift-test` PID 75287; the parent
+confirmed and terminated that stale process before normal verification resumed.
+
+### GREEN
+
+```text
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  swift test --filter 'ScratchpadRecordingTests|RecordingDestinationTests|ScratchpadEditorTests'
+```
+
+Result: exit 0; all 39 focused test declarations passed across 3 suites.
+
+```text
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
+```
+
+Result: exit 0; the full suite passed in the one required review-fix run.
+
+### Review-fix implementation
+
+- Task 5 lifecycle recoveries now retain unique token-keyed entries in FIFO order and never
+  overwrite an unrecovered token.
+- Reopening enumerates every pending completion without consuming it. Explicit insertion uses
+  a fresh valid editor token and real text-view undo, then consumes exactly that recovery token
+  and advances the visible queue.
+- Closing during owned capture invokes the existing stop-and-transcribe callback before weak
+  router removal, then clears local token, recording, preview, and status state.
+- Closed-window failures use a narrow in-memory terminal-failure queue; cancellation retains no
+  fake processing or stale error state.
+- Scratchpad start checks local session and coordinator recording/processing state before token
+  creation.
+- Dictate/Stop accessibility label, help, and tooltip now change together; the recovery action
+  also exposes accessibility help.
+
+### Review-fix concerns
+
+None. Recoveries and terminal errors remain process-memory lifecycle state, matching Task 5;
+they do not use pasteboard, Library, or scratchpad document persistence.

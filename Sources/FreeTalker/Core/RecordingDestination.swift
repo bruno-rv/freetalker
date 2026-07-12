@@ -26,8 +26,15 @@ protocol ScratchpadRecordingRouting: AnyObject {
 
 @MainActor
 final class RecordingDestinationLifecycle {
+    struct PendingRecording: Equatable {
+        let token: ScratchpadInsertionToken
+        let text: String
+    }
+
     private(set) var currentDestination: RecordingDestination?
     private var recoveries: [ScratchpadInsertionToken: String] = [:]
+    private var recoveryOrder: [ScratchpadInsertionToken] = []
+    private var pendingFailures: [String] = []
     weak var router: (any ScratchpadRecordingRouting)?
 
     init(router: (any ScratchpadRecordingRouting)? = nil) { self.router = router }
@@ -49,7 +56,10 @@ final class RecordingDestinationLifecycle {
 
     func failStart(_ destination: RecordingDestination, message: String) {
         currentDestination = nil
-        if case .scratchpad(let token) = destination { router?.failRecording(message, for: token) }
+        if case .scratchpad(let token) = destination {
+            if let router { router.failRecording(message, for: token) }
+            else { pendingFailures.append(message) }
+        }
     }
 
     func cancel(stop: () -> Void) {
@@ -57,7 +67,7 @@ final class RecordingDestinationLifecycle {
         stop()
         if case .scratchpad(let token) = destination {
             router?.cancelRecording(for: token)
-            recoveries.removeValue(forKey: token)
+            clearPending(for: token)
         }
     }
 
@@ -72,8 +82,8 @@ final class RecordingDestinationLifecycle {
             return true
         case .scratchpad(let token):
             let accepted = router?.completeRecording(text, for: token) ?? false
-            if accepted { recoveries.removeValue(forKey: token) }
-            else { recoveries[token] = text }
+            if accepted { clearPending(for: token) }
+            else { storePending(text, for: token) }
             return accepted
         }
     }
@@ -94,9 +104,10 @@ final class RecordingDestinationLifecycle {
             if case .scratchpad(let token) = destination {
                 if error is CancellationError {
                     router?.cancelRecording(for: token)
-                    recoveries.removeValue(forKey: token)
+                    clearPending(for: token)
                 } else {
-                    router?.failRecording(error.localizedDescription, for: token)
+                    if let router { router.failRecording(error.localizedDescription, for: token) }
+                    else { pendingFailures.append(error.localizedDescription) }
                 }
             }
             throw error
@@ -104,7 +115,27 @@ final class RecordingDestinationLifecycle {
     }
 
     func pending(for token: ScratchpadInsertionToken) -> String? { recoveries[token] }
-    func consumePending(for token: ScratchpadInsertionToken) -> String? { recoveries.removeValue(forKey: token) }
-    func storePending(_ text: String, for token: ScratchpadInsertionToken) { recoveries[token] = text }
-    func clearPending(for token: ScratchpadInsertionToken) { recoveries.removeValue(forKey: token) }
+    func pendingRecordings() -> [PendingRecording] {
+        recoveryOrder.compactMap { token in
+            recoveries[token].map { PendingRecording(token: token, text: $0) }
+        }
+    }
+    func consumePending(for token: ScratchpadInsertionToken) -> String? {
+        defer { recoveryOrder.removeAll { $0 == token } }
+        return recoveries.removeValue(forKey: token)
+    }
+    func storePending(_ text: String, for token: ScratchpadInsertionToken) {
+        guard recoveries[token] == nil else { return }
+        recoveryOrder.append(token)
+        recoveries[token] = text
+    }
+    func clearPending(for token: ScratchpadInsertionToken) {
+        recoveries.removeValue(forKey: token)
+        recoveryOrder.removeAll { $0 == token }
+    }
+    func consumePendingFailure() -> String? {
+        guard !pendingFailures.isEmpty else { return nil }
+        return pendingFailures.removeFirst()
+    }
+    func storePendingFailure(_ message: String) { pendingFailures.append(message) }
 }
