@@ -43,6 +43,7 @@ final class AppCoordinator: ObservableObject {
     @Published private(set) var isRecording = false
     @Published private(set) var isProcessing = false
     @Published private(set) var lastError: String?
+    private var deferredOutputTranslationFailure: OutputTranslationFailure?
     /// Set while the global hotkey listener couldn't be started (missing Accessibility
     /// permission) and we're waiting for the user to grant it. See Round 1 Codex finding 8.
     @Published private(set) var hotKeyStatusText: String?
@@ -612,6 +613,15 @@ final class AppCoordinator: ObservableObject {
         destinationLifecycle.clearPending(for: token)
     }
 
+    func deferOutputTranslationFailure(_ failure: OutputTranslationFailure) {
+        deferredOutputTranslationFailure = failure
+    }
+
+    func takeDeferredOutputTranslationFailure() -> OutputTranslationFailure? {
+        defer { deferredOutputTranslationFailure = nil }
+        return deferredOutputTranslationFailure
+    }
+
     @discardableResult
     func deliverScratchpadCompletion(_ text: String, for token: ScratchpadInsertionToken) -> Bool {
         (try? destinationLifecycle.complete(text, destination: .scratchpad(token)) {}) ?? false
@@ -841,6 +851,7 @@ final class AppCoordinator: ObservableObject {
         // exactly what produces Whisper's silent-audio hallucination ("Thank you" for real
         // speech). See live-mic silence investigation, root cause H1.
         guard micStatus == .authorized else {
+            recordingOutputSelection.resolveTerminal()
             let message = "Microphone not authorized — check System Settings › Privacy & Security › Microphone"
             hud.flash(message)
             _ = destinationLifecycle.begin(destination, start: { false }, failureMessage: { message })
@@ -860,11 +871,13 @@ final class AppCoordinator: ObservableObject {
             }
         }, failureMessage: { failureMessage })
         if started {
+            _ = recordingOutputSelection.start(default: AppSettings.shared.defaultOutputLanguage)
             captureOwner = .dictation
             recordingGeneration += 1
             startLivePreviewIfNeeded()
             return true
         } else {
+            recordingOutputSelection.resolveTerminal()
             lastError = failureMessage
             hud.flash(failureMessage)
             return false
@@ -969,12 +982,21 @@ final class AppCoordinator: ObservableObject {
     /// not lifecycle, so it isn't part of the state machine.
     private func stopAndTranscribe(preSnapshotted: (app: NSRunningApplication?, target: InsertionTarget?, contextTarget: ContextTargetSnapshot)? = nil, skipPostProcessing: Bool = false) {
         let capturedOneShotLanguage = oneShotLanguage
-        defer { oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .clear) }
+        let capturedOutputLanguage = recordingOutputSelection.current ?? AppSettings.shared.defaultOutputLanguage
+        let capturedCloudSnapshot = AppSettings.shared.cloudLLMSnapshot
+        defer {
+            oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .clear)
+            recordingOutputSelection.resolveTerminal()
+        }
 
         let destination = destinationLifecycle.take()
 
         if case .scratchpad(let token) = destination {
-            stopAndTranscribeToScratchpad(token: token, forcedLanguage: capturedOneShotLanguage, skipPostProcessing: skipPostProcessing)
+            stopAndTranscribeToScratchpad(
+                token: token, forcedLanguage: capturedOneShotLanguage,
+                outputLanguage: capturedOutputLanguage, cloudSnapshot: capturedCloudSnapshot,
+                skipPostProcessing: skipPostProcessing
+            )
             return
         }
 
@@ -1036,7 +1058,7 @@ final class AppCoordinator: ObservableObject {
         let appRules = AppSettings.shared.appRules
         let activeTemplateID = AppSettings.shared.activeTemplateID
         let automaticStyleEnabled = AppSettings.shared.automaticStyleEnabled
-        let processor = resolveActiveProcessor()
+        let processor = capturedOutputLanguage == .sameAsSpoken ? resolveActiveProcessor() : nil
         let forcedLanguage = Self.resolveLanguage(
             oneShot: capturedOneShotLanguage,
             bundleID: bundleID,
@@ -1070,6 +1092,8 @@ final class AppCoordinator: ObservableObject {
                 appName: appName,
                 target: insertionTarget,
                 forcedLanguage: forcedLanguage,
+                outputLanguage: capturedOutputLanguage,
+                cloudSnapshot: capturedCloudSnapshot,
                 skipPostProcessing: skipPostProcessing,
                 processor: processor,
                 localContext: Self.localContextForProcessor(
@@ -1118,6 +1142,7 @@ final class AppCoordinator: ObservableObject {
 
     private func cancelRecording() {
         oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .clear)
+        recordingOutputSelection.resolveTerminal()
         captureOwner = .none
         destinationLifecycle.cancel {
             Self.performCancelRecording(
@@ -1373,11 +1398,17 @@ final class AppCoordinator: ObservableObject {
         updateRecordingPanel()
     }
 
-    private func runPipeline(samples: [Float], engine: any TranscriptionEngine, engineName: String, template: Template, appName: String?, target: InsertionTarget?, forcedLanguage: String?, skipPostProcessing: Bool, processor: (any PostProcessor)? = nil, localContext: LocalProcessingContext? = nil) async {
+    private func runPipeline(samples: [Float], engine: any TranscriptionEngine, engineName: String, template: Template, appName: String?, target: InsertionTarget?, forcedLanguage: String?, outputLanguage: OutputLanguage, cloudSnapshot: CloudLLMSettingsSnapshot, skipPostProcessing: Bool, processor: (any PostProcessor)? = nil, localContext: LocalProcessingContext? = nil) async {
         defer { isProcessing = false }
 
         do {
-            let result = try await processDictation(samples: samples, engine: engine, engineName: engineName, template: template, appName: appName, target: target, forcedLanguage: forcedLanguage, skipPostProcessing: skipPostProcessing, processor: processor, localContext: localContext)
+            let result = try await processDictation(
+                samples: samples, engine: engine, engineName: engineName, template: template,
+                appName: appName, target: target, forcedLanguage: forcedLanguage,
+                skipPostProcessing: skipPostProcessing, outputLanguage: outputLanguage,
+                cloudSnapshot: cloudSnapshot.eligibility.isEligible ? cloudSnapshot : nil,
+                processor: processor, localContext: localContext
+            )
             if let fallbackReason = result.fallbackReason {
                 logPostProcessingFallback(fallbackReason)
             }
@@ -1397,6 +1428,10 @@ final class AppCoordinator: ObservableObject {
             hud.flash(saved ? "Transcription failed — audio saved" : "Transcription failed — audio could NOT be saved")
         } catch PipelineError.recordFailed(_) {
             hud.flash("Library save failed")
+        } catch let failure as OutputTranslationFailure {
+            deferOutputTranslationFailure(failure)
+            lastError = failure.localizedDescription
+            hud.flash(failure.localizedDescription)
         } catch {
             lastError = "Transcription failed: \(error.localizedDescription)"
             let saved = await preserveFailedAudio(samples, failure: JobFailure(stage: .transcribing, message: error.localizedDescription))
@@ -1407,6 +1442,8 @@ final class AppCoordinator: ObservableObject {
     private func stopAndTranscribeToScratchpad(
         token: ScratchpadInsertionToken,
         forcedLanguage oneShotLanguage: String?,
+        outputLanguage: OutputLanguage,
+        cloudSnapshot: CloudLLMSettingsSnapshot,
         skipPostProcessing: Bool
     ) {
         invalidateCapTimer()
@@ -1431,7 +1468,6 @@ final class AppCoordinator: ObservableObject {
         let engineName = engine.name
         let template = TemplateStore.shared.template(id: AppSettings.shared.activeTemplateID)
             ?? Template.builtIns.first!
-        let processor = resolveActiveProcessor()
         let forcedLanguage = Self.resolveLanguage(
             oneShot: oneShotLanguage,
             bundleID: nil,
@@ -1440,6 +1476,12 @@ final class AppCoordinator: ObservableObject {
         )
         isProcessing = true
         hud.show(text: "Processing…")
+        let context = RecordingProcessingContext(
+            destination: .scratchpad(token), spokenLanguage: forcedLanguage,
+            outputLanguage: outputLanguage, template: template,
+            cloudSnapshot: cloudSnapshot.eligibility.isEligible ? cloudSnapshot : nil
+        )
+        let processor = outputLanguage == .sameAsSpoken ? resolveActiveProcessor() : nil
 
         Task {
             defer { isProcessing = false }
@@ -1449,9 +1491,9 @@ final class AppCoordinator: ObservableObject {
                     process: {
                         try await transcribeAndRefine(
                             samples: samples, engine: engine, engineName: engineName,
-                            template: template, appName: nil, forcedLanguage: forcedLanguage,
+                            context: context, appName: nil,
                             skipPostProcessing: skipPostProcessing, processor: processor,
-                            localContext: nil
+                            translator: TranslationService(), localContext: nil
                         )
                     },
                     text: { $0.refined },
@@ -1465,6 +1507,11 @@ final class AppCoordinator: ObservableObject {
                 } else {
                     hud.flash("Dictation ready — reopen Scratchpad to recover it")
                 }
+            } catch let failure as OutputTranslationFailure {
+                deferOutputTranslationFailure(failure)
+                let message = failure.localizedDescription
+                lastError = message
+                hud.flash(message)
             } catch {
                 let message = error is PipelineError ? "Transcription failed" : "Transcription failed: \(error.localizedDescription)"
                 lastError = message
@@ -1476,6 +1523,15 @@ final class AppCoordinator: ObservableObject {
     enum PipelineError: Error {
         case emptyTranscript
         case recordFailed(Error)
+    }
+
+    enum PipelineFailureKind: Equatable {
+        case transcription
+        case translation
+    }
+
+    nonisolated static func pipelineFailureKind(_ error: Error) -> PipelineFailureKind {
+        error is OutputTranslationFailure ? .translation : .transcription
     }
 
     enum PostProcessingFallbackReason {
@@ -1520,49 +1576,107 @@ final class AppCoordinator: ObservableObject {
         target: InsertionTarget? = nil,
         forcedLanguage: String? = nil,
         skipPostProcessing: Bool = false,
+        outputLanguage: OutputLanguage = .sameAsSpoken,
+        cloudSnapshot: CloudLLMSettingsSnapshot? = nil,
         processor: (any PostProcessor)? = nil,
+        translator: any Translating = TranslationService(),
         localContext: LocalProcessingContext? = nil,
         insert: (String, InsertionTarget?) -> Bool = { Insertion.insert($0, target: $1) },
-        record: (_ language: String, _ template: String, _ transcript: String, _ refined: String, _ engine: String) throws -> Void = { language, template, transcript, refined, engine in
-            try LibraryStore.shared.record(language: language, template: template, transcript: transcript, refined: refined, engine: engine)
+        record: (RecordingProcessingResult) throws -> Void = { result in
+            try LibraryStore.shared.record(
+                language: result.sourceLanguage.rawValue,
+                requestedOutputLanguage: result.requestedOutputLanguage,
+                template: result.templateName,
+                transcript: result.rawTranscript,
+                refined: result.finalOutput,
+                engine: result.engineName
+            )
         }
-    ) async throws -> (transcript: String, refined: String, posted: Bool, fallbackReason: PostProcessingFallbackReason?) {
+    ) async throws -> RecordingProcessingResult {
+        let context = RecordingProcessingContext(
+            destination: .external,
+            spokenLanguage: forcedLanguage,
+            outputLanguage: outputLanguage,
+            template: template,
+            cloudSnapshot: cloudSnapshot
+        )
+        return try await processDictation(
+            samples: samples, engine: engine, engineName: engineName, context: context,
+            appName: appName, target: target, skipPostProcessing: skipPostProcessing,
+            processor: processor, translator: translator, localContext: localContext,
+            insert: insert, record: record
+        )
+    }
+
+    @discardableResult
+    func processDictation(
+        samples: [Float],
+        engine: any TranscriptionEngine,
+        engineName: String,
+        context: RecordingProcessingContext,
+        appName: String? = nil,
+        target: InsertionTarget? = nil,
+        skipPostProcessing: Bool = false,
+        processor: (any PostProcessor)? = nil,
+        translator: any Translating = TranslationService(),
+        localContext: LocalProcessingContext? = nil,
+        insert: (String, InsertionTarget?) -> Bool = { Insertion.insert($0, target: $1) },
+        record: (RecordingProcessingResult) throws -> Void = { result in
+            try LibraryStore.shared.record(
+                language: result.sourceLanguage.rawValue,
+                requestedOutputLanguage: result.requestedOutputLanguage,
+                template: result.templateName,
+                transcript: result.rawTranscript,
+                refined: result.finalOutput,
+                engine: result.engineName
+            )
+        }
+    ) async throws -> RecordingProcessingResult {
         var posted = false
         let (result, _) = try await destinationLifecycle.runAsync(
-            destination: .external,
+            destination: context.destination,
             process: {
                 try await transcribeAndRefine(
                     samples: samples, engine: engine, engineName: engineName,
-                    template: template, appName: appName, forcedLanguage: forcedLanguage,
-                    skipPostProcessing: skipPostProcessing, processor: processor,
-                    localContext: localContext
+                    context: context, appName: appName, skipPostProcessing: skipPostProcessing,
+                    processor: processor, translator: translator, localContext: localContext
                 )
             },
             text: { $0.refined },
             external: { result in
-            posted = insert(result.refined, target)
-            do {
-                try record(result.language, result.recordedTemplateName, result.transcript, result.refined, result.engineName)
-            } catch {
-                throw PipelineError.recordFailed(error)
-            }
+                posted = insert(result.refined, target)
+                let delivered = RecordingProcessingResult(
+                    rawTranscript: result.transcript, finalOutput: result.refined,
+                    sourceLanguage: SourceLanguage(result.language),
+                    requestedOutputLanguage: context.outputLanguage,
+                    templateName: result.recordedTemplateName, engineName: result.engineName,
+                    posted: posted, fallbackReason: result.fallbackReason
+                )
+                do { try record(delivered) }
+                catch { throw PipelineError.recordFailed(error) }
             }
         )
-        return (result.transcript, result.refined, posted, result.fallbackReason)
+        return RecordingProcessingResult(
+            rawTranscript: result.transcript, finalOutput: result.refined,
+            sourceLanguage: SourceLanguage(result.language),
+            requestedOutputLanguage: context.outputLanguage,
+            templateName: result.recordedTemplateName, engineName: result.engineName,
+            posted: posted, fallbackReason: result.fallbackReason
+        )
     }
 
     private func transcribeAndRefine(
         samples: [Float],
         engine: any TranscriptionEngine,
         engineName: String,
-        template: Template,
+        context: RecordingProcessingContext,
         appName: String?,
-        forcedLanguage: String?,
         skipPostProcessing: Bool,
         processor: (any PostProcessor)?,
+        translator: any Translating,
         localContext: LocalProcessingContext?
     ) async throws -> DictationProcessingResult {
-        let transcription = try await engine.transcribe(samples: samples, forcedLanguage: forcedLanguage)
+        let transcription = try await engine.transcribe(samples: samples, forcedLanguage: context.transcriptionLanguage)
         guard !transcription.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw PipelineError.emptyTranscript
         }
@@ -1573,13 +1687,31 @@ final class AppCoordinator: ObservableObject {
         if skipPostProcessing {
             refined = transcription.text
             recordedTemplateName = TemplateStore.rawTranscriptTemplateName
+        } else if case .translate = context.outputLanguage.processingPolicy {
+            guard let snapshot = context.cloudSnapshot else {
+                throw OutputTranslationFailure(
+                    source: transcription.text, context: context,
+                    underlyingError: TranslationService.Error.unavailable(.invalidConfiguration)
+                )
+            }
+            do {
+                refined = try await translator.process(
+                    source: transcription.text,
+                    template: context.template,
+                    policy: context.outputLanguage.processingPolicy,
+                    snapshot: snapshot
+                )
+            } catch {
+                throw OutputTranslationFailure(source: transcription.text, context: context, underlyingError: error)
+            }
+            recordedTemplateName = context.template.name
         } else {
             let activeProcessor: any PostProcessor = processor ?? resolveActiveProcessor()
             do {
                 let processed: String
                 let request = PostProcessingRequest(
                     transcript: transcription.text,
-                    template: template,
+                    template: context.template,
                     appName: appName,
                     languagePolicy: .preserveSource
                 )
@@ -1604,7 +1736,7 @@ final class AppCoordinator: ObservableObject {
                 refined = transcription.text
                 fallbackReason = .error(error)
             }
-            recordedTemplateName = template.name
+            recordedTemplateName = context.template.name
         }
 
         return DictationProcessingResult(

@@ -4,6 +4,26 @@ import Testing
 
 @Suite("Recording destinations")
 struct RecordingDestinationTests {
+    @Test func processingContextCapturesDestinationLanguageTemplateAndEligibleCloudSettings() {
+        let token = ScratchpadInsertionToken(id: UUID())
+        let template = Template(id: "captured", name: "Captured", prompt: "Captured prompt")
+        let snapshot = CloudLLMSettingsSnapshot(
+            provider: .anthropic, baseURL: "https://example.com", model: "captured",
+            key: "secret", vocabulary: ["FreeTalker"]
+        )
+
+        let context = RecordingProcessingContext(
+            destination: .scratchpad(token), spokenLanguage: "pt", outputLanguage: .spanish,
+            template: template, cloudSnapshot: snapshot
+        )
+
+        #expect(context.destination == .scratchpad(token))
+        #expect(context.transcriptionLanguage == "pt")
+        #expect(context.outputLanguage == .spanish)
+        #expect(context.template == template)
+        #expect(context.cloudSnapshot == snapshot)
+    }
+
     @Test func scratchpadDestinationKeepsItsInsertionToken() {
         let token = ScratchpadInsertionToken(id: UUID())
 
