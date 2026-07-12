@@ -63,3 +63,35 @@ Results: destination tests passed 7/7; automatic-style/context-routing passed
 - The launcher callback does not activate FreeTalker and its copy already says
   “Start dictation,” so no presentation-copy change was needed.
 - No dependency or unrelated source change was introduced.
+
+## Follow-up privacy and recovery review
+
+RED evidence:
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  swift test --filter RecordingDestinationTests
+```
+
+Compilation failed on the absent production snapshot gate and pending-recovery
+APIs. A second focused RED failed on the absent
+`deliverScratchpadCompletion(_:for:)` production delivery path.
+
+The real pill-click and panel-finish handlers now gate their stop-time
+`NSWorkspace`, insertion-target, and context-target reads by destination.
+External dictation still captures all three synchronously before the click is
+processed; scratchpad dictation performs zero such reads on every stop path.
+
+Rejected completion or a missing weak router stores refined text in a
+token-keyed in-memory recovery slot. Task 8 can query or consume it without
+pasteboard insertion or Library recording. Successful delivery and explicit
+consumption clear it; cancellation clears the matching token. The HUD reports
+“Dictation ready — reopen Scratchpad to recover it” rather than hiding as if
+delivery succeeded.
+
+Fresh GREEN evidence:
+
+- `RecordingDestinationTests|RecordingStateMachine`: 10 destination tests
+  passed (the repository has no separately named RecordingStateMachine suite).
+- `AutomaticStyle|ContextRouting`: 26 tests passed.
+- Full `swift test`: 348 tests across 33 suites passed.
