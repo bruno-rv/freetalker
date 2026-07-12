@@ -3,8 +3,111 @@ import Testing
 @testable import FreeTalker
 
 @MainActor
-@Suite("Translation failure recovery")
+@Suite("Translation failure recovery", .serialized)
 struct TranslationRecoveryTests {
+    @Test func coordinatorNotifiesOpenScratchpadWhenFailureIsEnqueued() {
+        let coordinator = AppCoordinator.shared
+        Self.clearCoordinator(coordinator)
+        let router = RecoveryPresentationRouterSpy(coordinator: coordinator)
+        coordinator.translationRecoveryPresentationRouter = router
+        defer {
+            coordinator.translationRecoveryPresentationRouter = nil
+            Self.clearCoordinator(coordinator)
+        }
+
+        _ = coordinator.handleOutputTranslationFailure(Self.failure(source: "new failure"))
+
+        #expect(router.presentations.count == 1)
+        #expect(router.presentations.last??.recoverableText == "new failure")
+        #expect(router.presentations.last??.actionsEnabled == true)
+    }
+
+    @Test func coordinatorPublishesRetryInFlightThenAdvancesFIFOOnSuccess() async {
+        let coordinator = AppCoordinator.shared
+        Self.clearCoordinator(coordinator)
+        let translator = SuspendedTranslationProbe()
+        let router = RecoveryPresentationRouterSpy(coordinator: coordinator)
+        coordinator.translationRecoveryPresentationRouter = router
+        coordinator.configureTranslationRecoveryForTesting(
+            snapshot: { Self.snapshot() },
+            translate: translator.process,
+            deliver: { _, _, _ in true }
+        )
+        defer {
+            coordinator.resetTranslationRecoveryTestingConfiguration()
+            coordinator.translationRecoveryPresentationRouter = nil
+            Self.clearCoordinator(coordinator)
+        }
+        _ = coordinator.handleOutputTranslationFailure(Self.failure(source: "first"))
+        _ = coordinator.handleOutputTranslationFailure(Self.failure(source: "second"))
+
+        coordinator.retryNextTranslation()
+        await translator.waitUntilCalled()
+        await Self.waitUntil { router.presentations.last??.isRetrying == true }
+        #expect(router.presentations.last??.actionsEnabled == false)
+
+        await translator.resume(returning: "translated first")
+        await Self.waitUntil { coordinator.nextTranslationRecoveryPresentation?.recoverableText == "second" }
+
+        #expect(router.presentations.contains { $0?.isRetrying == true })
+        #expect(router.presentations.last??.recoverableText == "second")
+        #expect(router.presentations.last??.actionsEnabled == true)
+        #expect(coordinator.pendingOutputTranslationFailures().map(\.source) == ["second"])
+    }
+
+    @Test func failedCoordinatorRetryKeepsSameActionableItemAndPublishesError() async {
+        let coordinator = AppCoordinator.shared
+        Self.clearCoordinator(coordinator)
+        let router = RecoveryPresentationRouterSpy(coordinator: coordinator)
+        coordinator.translationRecoveryPresentationRouter = router
+        coordinator.configureTranslationRecoveryForTesting(
+            snapshot: { Self.snapshot() },
+            translate: TranslationProbe(error: ProbeError.failed).process,
+            deliver: { _, _, _ in Issue.record("Must not deliver"); return true }
+        )
+        defer {
+            coordinator.resetTranslationRecoveryTestingConfiguration()
+            coordinator.translationRecoveryPresentationRouter = nil
+            Self.clearCoordinator(coordinator)
+        }
+        let failure = Self.failure(source: "still here")
+        _ = coordinator.handleOutputTranslationFailure(failure)
+
+        coordinator.retryNextTranslation()
+        await Self.waitUntil { coordinator.nextTranslationRecoveryPresentation?.errorText != nil }
+
+        #expect(coordinator.pendingOutputTranslationFailures().map(\.id) == [failure.id])
+        #expect(router.presentations.last??.recoverableText == "still here")
+        #expect(router.presentations.last??.actionsEnabled == true)
+        #expect(router.presentations.last??.errorText == "Translation failed. Try again.")
+    }
+
+    @Test func exactConsumeAndFinalSourceSuccessPublishAdvanceThenClear() async {
+        let coordinator = AppCoordinator.shared
+        Self.clearCoordinator(coordinator)
+        let router = RecoveryPresentationRouterSpy(coordinator: coordinator)
+        coordinator.translationRecoveryPresentationRouter = router
+        coordinator.configureTranslationRecoveryForTesting(
+            snapshot: { Self.snapshot() }, translate: TranslationProbe(output: "unused").process,
+            deliver: { _, _, _ in true }
+        )
+        defer {
+            coordinator.resetTranslationRecoveryTestingConfiguration()
+            coordinator.translationRecoveryPresentationRouter = nil
+            Self.clearCoordinator(coordinator)
+        }
+        let first = Self.failure(source: "first")
+        let second = Self.failure(source: "second")
+        _ = coordinator.handleOutputTranslationFailure(first)
+        _ = coordinator.handleOutputTranslationFailure(second)
+
+        _ = coordinator.consumePendingOutputTranslationFailure(id: first.id)
+        #expect(router.presentations.last??.recoverableText == "second")
+
+        coordinator.insertNextTranslationSource()
+        await Self.waitUntil { coordinator.nextTranslationRecoveryPresentation == nil }
+        #expect(router.presentations.last! == nil)
+    }
     @Test func pendingRecoveryRetainsImmutableFailureInputs() {
         let token = ScratchpadInsertionToken(id: UUID())
         let context = Self.context(destination: .scratchpad(token))
@@ -158,6 +261,33 @@ struct TranslationRecoveryTests {
 
     private static func ineligibleSnapshot() -> CloudLLMSettingsSnapshot {
         .init(provider: .anthropic, baseURL: "", model: "", key: "", vocabulary: [])
+    }
+
+    private static func clearCoordinator(_ coordinator: AppCoordinator) {
+        while coordinator.consumeNextPendingOutputTranslationFailure() != nil {}
+    }
+
+    private static func waitUntil(
+        _ condition: @escaping @MainActor () -> Bool,
+        attempts: Int = 200
+    ) async {
+        for _ in 0..<attempts {
+            if condition() { return }
+            await Task.yield()
+        }
+        Issue.record("Condition was not reached")
+    }
+}
+
+@MainActor
+private final class RecoveryPresentationRouterSpy: TranslationRecoveryPresentationRouting {
+    private unowned let coordinator: AppCoordinator
+    private(set) var presentations: [TranslationRecoveryPresentation?] = []
+
+    init(coordinator: AppCoordinator) { self.coordinator = coordinator }
+
+    func translationRecoveryPresentationDidChange() {
+        presentations.append(coordinator.nextTranslationRecoveryPresentation)
     }
 }
 

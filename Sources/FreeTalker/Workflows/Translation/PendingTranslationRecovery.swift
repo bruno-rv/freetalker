@@ -1,5 +1,10 @@
 import Foundation
 
+@MainActor
+protocol TranslationRecoveryPresentationRouting: AnyObject {
+    func translationRecoveryPresentationDidChange()
+}
+
 struct PendingTranslationRecovery {
     let failureID: UUID
     let sourceTranscript: String
@@ -57,6 +62,8 @@ struct TranslationRecoveryPresentation: Equatable {
     let insertSourceTitle: String
     let recoverableText: String
     let isRetrying: Bool
+    let actionsEnabled: Bool
+    let errorText: String?
 
     static func sourceActionTitle(outputLanguage: OutputLanguage) -> String {
         if case .translate = outputLanguage.processingPolicy { return "Use source text" }
@@ -82,13 +89,21 @@ final class PendingTranslationRecoveryController {
     private let snapshot: Snapshot
     private let translate: Translate
     private let deliver: Deliver
+    private let onChange: () -> Void
     private var recoveries: [PendingTranslationRecovery] = []
     private var inFlightIDs: Set<UUID> = []
+    private var errors: [UUID: String] = [:]
 
-    init(snapshot: @escaping Snapshot, translate: @escaping Translate, deliver: @escaping Deliver) {
+    init(
+        snapshot: @escaping Snapshot,
+        translate: @escaping Translate,
+        deliver: @escaping Deliver,
+        onChange: @escaping () -> Void = {}
+    ) {
         self.snapshot = snapshot
         self.translate = translate
         self.deliver = deliver
+        self.onChange = onChange
     }
 
     var pendingRecoveries: [PendingTranslationRecovery] { recoveries }
@@ -96,6 +111,7 @@ final class PendingTranslationRecoveryController {
     func enqueue(_ failure: OutputTranslationFailure, externalTarget: InsertionTarget? = nil) {
         guard !recoveries.contains(where: { $0.failureID == failure.id }) else { return }
         recoveries.append(PendingTranslationRecovery(failure: failure, capturedExternalTarget: externalTarget))
+        onChange()
     }
 
     func presentation(for id: UUID) -> TranslationRecoveryPresentation? {
@@ -105,7 +121,9 @@ final class PendingTranslationRecoveryController {
                 retryTitle: Self.retryTitle,
                 insertSourceTitle: TranslationRecoveryPresentation.insertSourceTitle,
                 recoverableText: $0.recoverableText,
-                isRetrying: inFlightIDs.contains(id)
+                isRetrying: inFlightIDs.contains(id),
+                actionsEnabled: !inFlightIDs.contains(id),
+                errorText: errors[id]
             )
         }
     }
@@ -120,11 +138,20 @@ final class PendingTranslationRecoveryController {
         guard let index = recoveries.firstIndex(where: { $0.failureID == id }),
               !inFlightIDs.contains(id) else { return }
         let eligibleSnapshot = snapshot()
-        guard eligibleSnapshot.eligibility.isEligible else { return }
+        guard eligibleSnapshot.eligibility.isEligible else {
+            errors[id] = "Translation unavailable. Check cloud settings."
+            onChange()
+            return
+        }
         let attempt = recoveries[index].replacingGeneration()
         recoveries[index] = attempt
+        errors[id] = nil
         inFlightIDs.insert(id)
-        defer { inFlightIDs.remove(id) }
+        onChange()
+        defer {
+            inFlightIDs.remove(id)
+            onChange()
+        }
 
         do {
             let output = try await translate(
@@ -141,39 +168,48 @@ final class PendingTranslationRecoveryController {
                 remove(id: id, generation: attempt.generation)
             } else {
                 retain(output, id: id, generation: attempt.generation)
+                errors[id] = "The original destination changed. Copy the preserved text or try again."
             }
         } catch is CancellationError {
+            errors[id] = "Translation cancelled. Try again."
             return
         } catch {
+            errors[id] = "Translation failed. Try again."
             return
         }
     }
 
     func insertSourceText(id: UUID) {
-        guard let recovery = recoveries.first(where: { $0.failureID == id }) else { return }
+        guard !inFlightIDs.contains(id),
+              let recovery = recoveries.first(where: { $0.failureID == id }) else { return }
         invalidateAttempt(id: id)
         if deliver(recovery.sourceTranscript, recovery.destination, recovery.capturedExternalTarget) {
             remove(id: id)
         } else {
             retain(recovery.sourceTranscript, id: id)
+            errors[id] = "The original destination changed. Copy the preserved text or try again."
         }
+        onChange()
     }
 
     func invalidateAttempt(id: UUID) {
         guard let index = recoveries.firstIndex(where: { $0.failureID == id }) else { return }
         recoveries[index] = recoveries[index].replacingGeneration()
         inFlightIDs.remove(id)
+        onChange()
     }
 
     func discard(id: UUID) {
         inFlightIDs.remove(id)
         remove(id: id)
+        onChange()
     }
 
     private func remove(id: UUID, generation: UUID? = nil) {
         recoveries.removeAll {
             $0.failureID == id && (generation == nil || $0.generation == generation)
         }
+        if !recoveries.contains(where: { $0.failureID == id }) { errors[id] = nil }
     }
 
     private func retain(_ text: String, id: UUID, generation: UUID? = nil) {
