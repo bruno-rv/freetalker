@@ -35,7 +35,9 @@ final class ScratchpadDocument: NSObject, ObservableObject, @preconcurrency NSTe
         guard selectedRange.location != NSNotFound,
               selectedRange.location <= string.length,
               selectedRange.length <= string.length - selectedRange.location,
-              selectedRange.length == 0 || string.rangeOfComposedCharacterSequences(for: selectedRange) == selectedRange
+              selectedRange.length == 0
+                ? isComposedCharacterBoundary(selectedRange.location, in: string)
+                : string.rangeOfComposedCharacterSequences(for: selectedRange) == selectedRange
         else { return token }
 
         insertionTargets[token.id] = InsertionTarget(
@@ -44,6 +46,11 @@ final class ScratchpadDocument: NSObject, ObservableObject, @preconcurrency NSTe
             originalText: string.substring(with: selectedRange)
         )
         return token
+    }
+
+    private func isComposedCharacterBoundary(_ location: Int, in string: NSString) -> Bool {
+        location == string.length
+            || string.rangeOfComposedCharacterSequence(at: location).location == location
     }
 
     func replaceIfValid(

@@ -68,3 +68,25 @@ Result: exit 0; 357 tests passed in 34 suites.
 
 None blocking. Task 7 should pass the real `NSTextView` undo manager to
 `replaceIfValid`; callers without a view can omit it.
+
+## P1 Follow-up: Caret Boundary Safety
+
+### RED
+
+Added `caretTokenRequiresAComposedCharacterBoundary`, covering an invalid caret
+inside the emoji in `A😀B` plus valid carets at the start and end. The focused
+command exited 1 with 3 issues: the split-surrogate token was accepted, the
+replacement returned `true`, and the text was corrupted to `A�invalid�B`.
+
+### GREEN
+
+Zero-length ranges now require the UTF-16 location to be the start of a composed
+character sequence or the end of the string. Existing nonempty-range validation
+is unchanged.
+
+```bash
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  swift test --filter ScratchpadPersistenceTests
+```
+
+Result: exit 0; 9 tests passed in 1 suite.
