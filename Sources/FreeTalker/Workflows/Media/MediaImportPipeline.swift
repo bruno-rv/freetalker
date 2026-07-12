@@ -153,7 +153,7 @@ struct MediaImportPipeline: Sendable {
             try cancellation.checkCancellation()
             try await store.advanceMediaStage(jobID: job.id, owner: owner, stage: .diarizing)
             await changes?.stage(job.id)
-            let turns = try await diarizer.diarizeFile(at: inferenceAudio.url) { value in
+            let diarization = try await diarizer.diarizeFile(at: inferenceAudio.url) { value in
                 let progress = 0.5 + 0.25 * normalized(value)
                 Task {
                     try? await changes?.progress(job.id, value: progress) {
@@ -164,7 +164,7 @@ struct MediaImportPipeline: Sendable {
             }
             try cancellation.checkCancellation()
             try ownedDirectory.revalidateIdentity()
-            try await store.persistSpeakerTurns(jobID: job.id, owner: owner, turns: turns)
+            try await store.persistSpeakerTurns(jobID: job.id, owner: owner, turns: diarization.turns)
             try await store.updateMediaProgress(jobID: job.id, owner: owner, progress: 0.75)
             await changes?.progress(job.id, value: 0.75) {}
         }

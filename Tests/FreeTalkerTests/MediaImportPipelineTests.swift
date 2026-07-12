@@ -1,7 +1,9 @@
 @preconcurrency import AVFoundation
 import Darwin
+import CSQLite
 import Foundation
 import Testing
+import VoiceProfileCore
 @testable import FreeTalker
 
 @Suite struct MediaImportPipelineTests {
@@ -253,6 +255,37 @@ import Testing
         try await fixture.store.replaceSpeakerName(jobID: job.id, speakerID: "backend-cluster-7", name: "Alice")
         #expect(try await fixture.store.speakerTurns(jobID: job.id) == raw)
         #expect(try await fixture.store.speakerNames(jobID: job.id) == ["backend-cluster-7": "Alice"])
+    }
+
+    @Test func richerDiarizationPersistsOnlyTurnsAndCreatesNoIdentityOrEmbeddingTables() async throws {
+        let fixture = try MediaPipelineFixture()
+        let job = try await fixture.store.create(
+            kind: .mediaImport,
+            source: .init(reference: fixture.source.path),
+            now: .now
+        )
+        var values = Array(repeating: Float(0), count: 256)
+        values[0] = 1
+        let sample = try SpeakerEmbeddingSample(
+            embedding: VoiceEmbedding(validating: values), start: 0, end: 1, quality: nil
+        )
+        let diarizer = RichPipelineDiarizeProbe(
+            speaker: SpeakerRepresentation(speakerID: "raw-0", samples: [sample], cleanSpeechSeconds: 1)
+        )
+
+        let runner = fixture.pipeline(diarizer: diarizer).localJobRunner()
+        await runner.enqueue(job.id)
+        await runner.waitUntilIdle()
+
+        #expect(try await fixture.store.speakerTurns(jobID: job.id) == [
+            .init(speakerID: "raw-0", start: 0, end: 1)
+        ])
+        let tables = try sqliteTableNames(at: fixture.databaseURL)
+        #expect(tables.allSatisfy { name in
+            !name.localizedCaseInsensitiveContains("identity")
+                && !name.localizedCaseInsensitiveContains("embedding")
+                && !name.localizedCaseInsensitiveContains("voice_profile")
+        })
     }
 
     @Test func transcriptTransactionRollsBackWhenAStoredSegmentIsInvalid() async throws {
@@ -517,9 +550,62 @@ private actor PipelineTranscribeProbe: TimestampedTranscribing {
 private actor PipelineDiarizeProbe: SpeakerDiarizing {
     let error: Error?
     init(error: Error? = nil) { self.error = error }
-    func diarizeFile(at url: URL, progress: @escaping @Sendable (Double) -> Void) async throws -> [SpeakerTurn] {
-        if let error { throw error }; progress(1); return [.init(speakerID: "raw-0", start: 0, end: 1)]
+    func diarizeFile(at url: URL, progress: @escaping @Sendable (Double) -> Void) async throws -> SpeakerDiarizationResult {
+        if let error { throw error }
+        progress(1)
+        return SpeakerDiarizationResult(
+            turns: [.init(speakerID: "raw-0", start: 0, end: 1)],
+            speakers: [],
+            fingerprint: .init(
+                provider: "test", modelID: "test", modelRevision: "test",
+                preprocessingRevision: "test", dimension: 256
+            )
+        )
     }
+}
+
+private struct RichPipelineDiarizeProbe: SpeakerDiarizing {
+    let speaker: SpeakerRepresentation
+
+    func diarizeFile(
+        at url: URL,
+        progress: @escaping @Sendable (Double) -> Void
+    ) async throws -> SpeakerDiarizationResult {
+        progress(1)
+        return SpeakerDiarizationResult(
+            turns: [.init(speakerID: speaker.speakerID, start: 0, end: 1)],
+            speakers: [speaker],
+            fingerprint: .init(
+                provider: "test", modelID: "test", modelRevision: "test",
+                preprocessingRevision: "test", dimension: 256
+            )
+        )
+    }
+}
+
+private func sqliteTableNames(at url: URL) throws -> [String] {
+    var database: OpaquePointer?
+    guard sqlite3_open_v2(url.path, &database, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+        defer { sqlite3_close(database) }
+        throw PipelineTestError.failed
+    }
+    defer { sqlite3_close(database) }
+    var statement: OpaquePointer?
+    guard sqlite3_prepare_v2(
+        database, "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name", -1,
+        &statement, nil
+    ) == SQLITE_OK else {
+        sqlite3_finalize(statement)
+        throw PipelineTestError.failed
+    }
+    defer { sqlite3_finalize(statement) }
+    var names: [String] = []
+    while sqlite3_step(statement) == SQLITE_ROW {
+        if let text = sqlite3_column_text(statement, 0) {
+            names.append(String(cString: text))
+        }
+    }
+    return names
 }
 
 private actor LeaseExecutionGate {

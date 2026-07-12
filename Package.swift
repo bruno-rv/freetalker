@@ -18,8 +18,8 @@ let package = Package(
             name: "FreeTalker",
             dependencies: [
                 .product(name: "WhisperKit", package: "WhisperKit"),
-                .product(name: "FluidAudio", package: "FluidAudio"),
                 "VoiceProfileCore",
+                "VoiceProfileFluidAudio",
                 "CSQLite"
             ]
         ),
@@ -32,6 +32,17 @@ let package = Package(
         .testTarget(
             name: "VoiceProfileCoreTests",
             dependencies: ["VoiceProfileCore"]
+        ),
+        .target(
+            name: "VoiceProfileFluidAudio",
+            dependencies: [
+                "VoiceProfileCore",
+                .product(name: "FluidAudio", package: "FluidAudio")
+            ]
+        ),
+        .testTarget(
+            name: "VoiceProfileFluidAudioTests",
+            dependencies: ["VoiceProfileFluidAudio"]
         )
     ]
 )

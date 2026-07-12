@@ -1,5 +1,7 @@
 import Foundation
 import Testing
+import VoiceProfileCore
+import VoiceProfileFluidAudio
 @testable import FreeTalker
 
 @Suite struct MediaAdapterTests {
@@ -75,29 +77,67 @@ import Testing
     }
 
     @Test func diarizerMapsSpeakerIDsTimestampsAndMonotonicProgress() async throws {
-        let backend = DiarizerBackendProbe(result: .success([
-            .init(speakerID: "S2", start: 2, end: 3),
-            .init(speakerID: "S1", start: 0, end: 2)
-        ]), progressValues: [0.4, 0.2, 1])
+        let backend = DiarizerBackendProbe(result: .success(.init(
+            turns: [
+                .init(speakerID: "S2", start: 2, end: 3),
+                .init(speakerID: "S1", start: 0, end: 2)
+            ],
+            speakers: [],
+            fingerprint: testFingerprint
+        )), progressValues: [0.4, 0.2, 1])
         let progress = LockedValues<Double>()
         let url = URL(fileURLWithPath: "/tmp/job.wav")
 
         let result = try await FluidAudioDiarizer(backend: backend).diarizeFile(at: url) { progress.append($0) }
 
-        #expect(result == [
+        #expect(result.turns == [
             .init(speakerID: "S2", start: 2, end: 3),
             .init(speakerID: "S1", start: 0, end: 2)
         ])
+        #expect(result.fingerprint == testFingerprint)
         #expect(await backend.url == url)
         #expect(progress.values == [0, 0.4, 0.4, 1])
     }
 
     @Test func diarizerAllowsEmptyOutputAndRejectsMalformedTurns() async throws {
-        #expect(try await FluidAudioDiarizer(backend: DiarizerBackendProbe(result: .success([]))).diarizeFile(at: URL(fileURLWithPath: "/tmp/silence.wav")) { _ in }.isEmpty)
+        let empty = RawSpeakerDiarizationResult(turns: [], speakers: [], fingerprint: testFingerprint)
+        #expect(try await FluidAudioDiarizer(backend: DiarizerBackendProbe(result: .success(empty))).diarizeFile(at: URL(fileURLWithPath: "/tmp/silence.wav")) { _ in }.turns.isEmpty)
         let malformed = RawSpeakerTurn(speakerID: "", start: 0, end: 1)
         await #expect(throws: MediaAdapterError.invalidSpeakerTurn(index: 0)) {
-            try await FluidAudioDiarizer(backend: DiarizerBackendProbe(result: .success([malformed]))).diarizeFile(at: URL(fileURLWithPath: "/tmp/bad.wav")) { _ in }
+            let raw = RawSpeakerDiarizationResult(turns: [malformed], speakers: [], fingerprint: testFingerprint)
+            _ = try await FluidAudioDiarizer(backend: DiarizerBackendProbe(result: .success(raw))).diarizeFile(at: URL(fileURLWithPath: "/tmp/bad.wav")) { _ in }
         }
+    }
+
+    @Test func diarizerNormalizesAndDeterministicallyGroupsValidRepresentationSamples() async throws {
+        var threeFour = Array(repeating: Float(0), count: 256)
+        threeFour[0] = 3; threeFour[1] = 4
+        var unit = Array(repeating: Float(0), count: 256)
+        unit[2] = 1
+        let raw = RawSpeakerDiarizationResult(
+            turns: [.init(speakerID: "S2", start: 0, end: 4)],
+            speakers: [
+                .init(speakerID: "S2", samples: [
+                    .init(values: unit, start: 2, end: 4, quality: 0.7),
+                    .init(values: [1], start: 5, end: 6, quality: nil)
+                ]),
+                .init(speakerID: "S2", samples: [
+                    .init(values: threeFour, start: 0, end: 3, quality: nil)
+                ]),
+                .init(speakerID: "S1", samples: [.init(values: unit, start: 4, end: 5, quality: 1)])
+            ],
+            fingerprint: testFingerprint
+        )
+
+        let result = try await FluidAudioDiarizer(backend: DiarizerBackendProbe(result: .success(raw)))
+            .diarizeFile(at: URL(fileURLWithPath: "/tmp/a.wav")) { _ in }
+
+        #expect(result.speakers.map(\.speakerID) == ["S1", "S2"])
+        #expect(result.speakers[1].samples.map(\.start) == [0, 2])
+        #expect(abs(result.speakers[1].samples[0].embedding.values[0] - 0.6) < 0.000_001)
+        #expect(abs(result.speakers[1].samples[0].embedding.values[1] - 0.8) < 0.000_001)
+        #expect(result.speakers[1].cleanSpeechSeconds == 4)
+        #expect(result.turns == [.init(speakerID: "S2", start: 0, end: 4)])
     }
 
     @Test func diarizerPropagatesModelDownloadFailureAndCancellation() async throws {
@@ -136,7 +176,11 @@ import Testing
         #expect(progress.values == [0, 0.25])
         #expect(!release.wasReleased)
 
-        backend.drain(returning: [.init(speakerID: "S1", start: 0, end: 1)])
+        backend.drain(returning: .init(
+            turns: [.init(speakerID: "S1", start: 0, end: 1)],
+            speakers: [],
+            fingerprint: testFingerprint
+        ))
         await #expect(throws: CancellationError.self) { try await task.value }
         #expect(completion.isComplete)
         #expect(release.wasReleased)
@@ -171,6 +215,14 @@ import Testing
 
 private enum AdapterProbeError: Error, Equatable { case modelUnavailable(String) }
 
+private let testFingerprint = EmbeddingModelFingerprint(
+    provider: "FluidAudio",
+    modelID: "Embedding.mlmodelc",
+    modelRevision: "0.15.5",
+    preprocessingRevision: "FBank.mlmodelc/community-1",
+    dimension: 256
+)
+
 private actor WhisperBackendProbe: WhisperFileTranscriptionBackend {
     enum Result: Sendable { case success([RawTranscriptSegment]); case failure(AdapterProbeError); case suspend }
     let result: Result
@@ -193,21 +245,21 @@ private actor WhisperBackendProbe: WhisperFileTranscriptionBackend {
 }
 
 private actor DiarizerBackendProbe: SpeakerDiarizationBackend {
-    enum Result: Sendable { case success([RawSpeakerTurn]); case failure(AdapterProbeError); case suspend }
+    enum Result: Sendable { case success(RawSpeakerDiarizationResult); case failure(AdapterProbeError); case suspend }
     let result: Result
     let progressValues: [Double]
     private(set) var url: URL?
     private(set) var cancelled = false
     private var started = false
     init(result: Result, progressValues: [Double] = []) { self.result = result; self.progressValues = progressValues }
-    func diarizeFile(at url: URL, progress: @escaping @Sendable (Double) -> Void) async throws -> [RawSpeakerTurn] {
+    func diarizeFile(at url: URL, progress: @escaping @Sendable (Double) -> Void) async throws -> RawSpeakerDiarizationResult {
         self.url = url; started = true
         for value in progressValues { progress(value) }
         switch result {
         case .success(let value): return value
         case .failure(let error): throw error
         case .suspend:
-            do { try await Task.sleep(for: .seconds(60)); return [] }
+            do { try await Task.sleep(for: .seconds(60)); return .init(turns: [], speakers: [], fingerprint: testFingerprint) }
             catch { cancelled = true; throw error }
         }
     }
@@ -245,14 +297,14 @@ private final class HeldResource: @unchecked Sendable {
 private final class UncancellableDiarizerBackend: SpeakerDiarizationBackend, @unchecked Sendable {
     private struct State {
         var started = false
-        var continuation: CheckedContinuation<[RawSpeakerTurn], Never>?
+        var continuation: CheckedContinuation<RawSpeakerDiarizationResult, Never>?
         var progress: (@Sendable (Double) -> Void)?
     }
     private let state = NSLock()
     private var storage = State()
     private let release: ReleaseProbe
     init(release: ReleaseProbe) { self.release = release }
-    func diarizeFile(at url: URL, progress: @escaping @Sendable (Double) -> Void) async throws -> [RawSpeakerTurn] {
+    func diarizeFile(at url: URL, progress: @escaping @Sendable (Double) -> Void) async throws -> RawSpeakerDiarizationResult {
         let resource = HeldResource(release: release)
         defer { _fixLifetime(resource) }
         return await withCheckedContinuation { continuation in
@@ -265,12 +317,12 @@ private final class UncancellableDiarizerBackend: SpeakerDiarizationBackend, @un
     }
     func waitUntilStarted() async { while !state.withLock({ storage.started }) { await Task.yield() } }
     func report(_ value: Double) { state.withLock { storage.progress }?(value) }
-    func drain(returning turns: [RawSpeakerTurn]) {
-        let continuation = state.withLock { () -> CheckedContinuation<[RawSpeakerTurn], Never>? in
+    func drain(returning result: RawSpeakerDiarizationResult) {
+        let continuation = state.withLock { () -> CheckedContinuation<RawSpeakerDiarizationResult, Never>? in
             defer { storage.continuation = nil; storage.progress = nil }
             return storage.continuation
         }
-        continuation?.resume(returning: turns)
+        continuation?.resume(returning: result)
     }
 }
 
