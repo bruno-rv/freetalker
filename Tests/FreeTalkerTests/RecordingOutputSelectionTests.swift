@@ -45,19 +45,56 @@ struct RecordingOutputSelectionTests {
         #expect(selection.effective == .french)
     }
 
-    @Test(arguments: [
-        "success", "cancellation", "transcription failure",
-        "translation resolution", "explicit source insertion",
-    ])
-    func terminalResolutionClearsOverrideState(terminal: String) {
+    @Test func translationFailureReturnsCurrentHUDOverrideForRecoveryAndClearsState() {
+        var selection = RecordingOutputSelection()
+        selection.select(.german, isRecording: false)
+        _ = selection.start(default: .portuguese)
+        selection.select(.french, isRecording: true)
+
+        let recoveryOutput = selection.resolveTranslationFailure()
+
+        #expect(recoveryOutput == .french)
+        #expect(selection.pending == nil)
+        #expect(selection.current == nil)
+        #expect(selection.effective == nil)
+    }
+
+    @Test func translationFailureWithoutActiveRecordingCreatesNoRecovery() {
+        var selection = RecordingOutputSelection()
+        selection.select(.german, isRecording: false)
+
+        let recoveryOutput = selection.resolveTranslationFailure()
+
+        #expect(recoveryOutput == nil)
+        #expect(selection.pending == nil)
+        #expect(selection.current == nil)
+    }
+
+    @Test func successClearsWithoutTranslationRecovery() {
+        assertNonRecoveryTerminalClearsState()
+    }
+
+    @Test func cancellationClearsWithoutTranslationRecovery() {
+        assertNonRecoveryTerminalClearsState()
+    }
+
+    @Test func transcriptionFailureClearsWithoutTranslationRecovery() {
+        assertNonRecoveryTerminalClearsState()
+    }
+
+    @Test func sourceInsertionClearsWithoutTranslationRecovery() {
+        assertNonRecoveryTerminalClearsState()
+    }
+
+    private func assertNonRecoveryTerminalClearsState() {
         var selection = RecordingOutputSelection()
         selection.select(.german, isRecording: false)
         _ = selection.start(default: .portuguese)
 
         selection.resolveTerminal()
 
-        #expect(selection.pending == nil, Comment(rawValue: terminal))
-        #expect(selection.current == nil, Comment(rawValue: terminal))
-        #expect(selection.effective == nil, Comment(rawValue: terminal))
+        #expect(selection.pending == nil)
+        #expect(selection.current == nil)
+        #expect(selection.effective == nil)
     }
 }

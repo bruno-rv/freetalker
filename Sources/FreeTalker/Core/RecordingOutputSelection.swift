@@ -26,4 +26,10 @@ struct RecordingOutputSelection: Equatable, Sendable {
         pending = nil
         current = nil
     }
+
+    mutating func resolveTranslationFailure() -> OutputLanguage? {
+        let recoveryOutput = current
+        resolveTerminal()
+        return recoveryOutput
+    }
 }
