@@ -119,7 +119,9 @@ import VoiceProfileFluidAudio
             speakers: [
                 .init(speakerID: "S2", samples: [
                     .init(values: unit, start: 2, end: 4, quality: 0.7),
-                    .init(values: [1], start: 5, end: 6, quality: nil)
+                    .init(values: [1], start: 5, end: 6, quality: nil),
+                    .init(values: unit, start: 6, end: 7, quality: .nan),
+                    .init(values: unit, start: 7, end: 8, quality: .infinity)
                 ]),
                 .init(speakerID: "S2", samples: [
                     .init(values: threeFour, start: 0, end: 3, quality: nil)
@@ -138,6 +140,29 @@ import VoiceProfileFluidAudio
         #expect(abs(result.speakers[1].samples[0].embedding.values[1] - 0.8) < 0.000_001)
         #expect(result.speakers[1].cleanSpeechSeconds == 4)
         #expect(result.turns == [.init(speakerID: "S2", start: 0, end: 4)])
+    }
+
+    @Test func diarizerSampleOrderingIsTotalAcrossQualityPermutations() async throws {
+        var values = Array(repeating: Float(0), count: 256); values[0] = 1
+        let samples = [
+            RawSpeakerEmbeddingSample(values: values, start: 0, end: 1, quality: 0.8),
+            RawSpeakerEmbeddingSample(values: values, start: 0, end: 1, quality: nil),
+            RawSpeakerEmbeddingSample(values: values, start: 0, end: 1, quality: 0.2)
+        ]
+        func result(_ samples: [RawSpeakerEmbeddingSample]) async throws -> SpeakerDiarizationResult {
+            let raw = RawSpeakerDiarizationResult(
+                turns: [], speakers: [.init(speakerID: "S1", samples: samples)],
+                fingerprint: testFingerprint
+            )
+            return try await FluidAudioDiarizer(backend: DiarizerBackendProbe(result: .success(raw)))
+                .diarizeFile(at: URL(fileURLWithPath: "/tmp/a.wav")) { _ in }
+        }
+
+        let forward = try await result(samples)
+        let reverse = try await result(samples.reversed())
+
+        #expect(forward == reverse)
+        #expect(forward.speakers[0].samples.map(\.quality) == [nil, 0.2, 0.8])
     }
 
     @Test func diarizerPropagatesModelDownloadFailureAndCancellation() async throws {

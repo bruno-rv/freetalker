@@ -121,7 +121,15 @@ struct FluidAudioDiarizer<Backend: SpeakerDiarizationBackend>: SpeakerDiarizing 
                     if ($0.start, $0.end) != ($1.start, $1.end) {
                         return ($0.start, $0.end) < ($1.start, $1.end)
                     }
-                    return $0.embedding.values.lexicographicallyPrecedes($1.embedding.values)
+                    if $0.embedding.values != $1.embedding.values {
+                        return $0.embedding.values.lexicographicallyPrecedes($1.embedding.values)
+                    }
+                    switch ($0.quality, $1.quality) {
+                    case (nil, .some): return true
+                    case (.some, nil): return false
+                    case (.some(let lhs), .some(let rhs)): return lhs < rhs
+                    case (nil, nil): return false
+                    }
                 }
                 guard !samples.isEmpty else { return nil }
                 return SpeakerRepresentation(

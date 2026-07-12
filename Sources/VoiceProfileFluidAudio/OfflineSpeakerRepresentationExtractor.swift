@@ -1,3 +1,4 @@
+import CryptoKit
 import FluidAudio
 import Foundation
 import os
@@ -33,6 +34,14 @@ public struct OfflineVoiceRepresentationResult: Sendable, Equatable {
 
 public enum OfflineSpeakerRepresentationError: Error, Equatable, Sendable {
     case invalidTurn(index: Int)
+    case missingModelArtifact(ModelArtifact)
+    case invalidModelArtifact(ModelArtifact)
+    case unreadableModelArtifact(ModelArtifact)
+
+    public enum ModelArtifact: String, Equatable, Sendable {
+        case embedding
+        case fbank
+    }
 }
 
 public actor FluidAudioModelPreparationCoordinator<Model: Sendable> {
@@ -95,22 +104,43 @@ private final class ProgressGate: @unchecked Sendable {
 }
 
 public struct OfflineSpeakerRepresentationExtractor: Sendable {
-    private static let modelCoordinator = FluidAudioModelPreparationCoordinator<OfflineDiarizerModels>()
+    private struct PreparedModels: Sendable {
+        let models: OfflineDiarizerModels
+        let fingerprint: EmbeddingModelFingerprint
+    }
 
-    /// FluidAudio 0.15.5's community-1 offline stack: `Embedding.mlmodelc`
-    /// over `FBank.mlmodelc`, returning the 256-dimensional `embedding256`.
-    public static let fingerprint = EmbeddingModelFingerprint(
-        provider: "FluidAudio",
-        modelID: "community-1/Embedding.mlmodelc:embedding256",
-        modelRevision: "FluidAudio-0.15.5",
-        preprocessingRevision: "community-1/FBank.mlmodelc:16kHz-v0.15.5",
-        dimension: VoiceEmbedding.dimension
-    )
+    typealias Operation = @Sendable (
+        URL, @escaping @Sendable (Double) -> Void
+    ) async throws -> (DiarizationResult, EmbeddingModelFingerprint)
 
-    private let modelsDirectory: URL
+    private static let modelCoordinator = FluidAudioModelPreparationCoordinator<PreparedModels>()
+    private let operation: Operation
 
     public init(modelsDirectory: URL) {
-        self.modelsDirectory = modelsDirectory
+        operation = { url, progress in
+            let config = Self.diarizerConfig
+            let prepared = try await Self.modelCoordinator.model(for: modelsDirectory) {
+                let models = try await OfflineDiarizerModels.load(from: modelsDirectory) { update in
+                    progress(update.fractionCompleted * 0.5)
+                }
+                return PreparedModels(
+                    models: models,
+                    fingerprint: try Self.fingerprint(modelsDirectory: modelsDirectory, config: config)
+                )
+            }
+            try Task.checkCancellation()
+            let manager = OfflineDiarizerManager(config: config)
+            manager.initialize(models: prepared.models)
+            let result = try await manager.process(url) { completed, total in
+                guard total > 0 else { return }
+                progress(0.5 + 0.5 * Double(completed) / Double(total))
+            }
+            return (result, prepared.fingerprint)
+        }
+    }
+
+    init(operation: @escaping Operation) {
+        self.operation = operation
     }
 
     public func process(
@@ -119,29 +149,25 @@ public struct OfflineSpeakerRepresentationExtractor: Sendable {
     ) async throws -> OfflineVoiceRepresentationResult {
         let gate = ProgressGate(sink: progress)
         return try await withTaskCancellationHandler {
-            try Task.checkCancellation()
-            let config = OfflineDiarizerConfig(exposeChunkEmbeddings: true)
-            let manager = OfflineDiarizerManager(config: config)
-            let models = try await Self.modelCoordinator.model(for: modelsDirectory) {
-                try await OfflineDiarizerModels.load(from: modelsDirectory) { update in
-                    gate.report(update.fractionCompleted * 0.5)
-                }
+            do {
+                try Task.checkCancellation()
+                let (result, fingerprint) = try await operation(url) { gate.report($0) }
+                if gate.isCancelled { throw CancellationError() }
+                gate.report(1)
+                return try Self.map(result, fingerprint: fingerprint)
+            } catch {
+                if gate.isCancelled { throw CancellationError() }
+                throw error
             }
-            try Task.checkCancellation()
-            manager.initialize(models: models)
-            let result = try await manager.process(url) { completed, total in
-                guard total > 0 else { return }
-                gate.report(0.5 + 0.5 * Double(completed) / Double(total))
-            }
-            if gate.isCancelled { throw CancellationError() }
-            gate.report(1)
-            return try Self.map(result)
         } onCancel: {
             gate.cancel()
         }
     }
 
-    static func map(_ result: DiarizationResult) throws -> OfflineVoiceRepresentationResult {
+    static func map(
+        _ result: DiarizationResult,
+        fingerprint: EmbeddingModelFingerprint
+    ) throws -> OfflineVoiceRepresentationResult {
         let turns = try result.segments.enumerated().map { index, segment in
             let start = TimeInterval(segment.startTimeSeconds)
             let end = TimeInterval(segment.endTimeSeconds)
@@ -184,6 +210,111 @@ public struct OfflineSpeakerRepresentationExtractor: Sendable {
         }
         return OfflineVoiceRepresentationResult(turns: turns, speakers: speakers, fingerprint: fingerprint)
     }
+
+    static func fingerprint(modelsDirectory: URL) throws -> EmbeddingModelFingerprint {
+        try fingerprint(modelsDirectory: modelsDirectory, config: diarizerConfig)
+    }
+
+    private static let diarizerConfig = OfflineDiarizerConfig(exposeChunkEmbeddings: true)
+
+    private static func fingerprint(
+        modelsDirectory: URL,
+        config: OfflineDiarizerConfig
+    ) throws -> EmbeddingModelFingerprint {
+        let repo = modelsDirectory.appendingPathComponent(Repo.diarizer.folderName, isDirectory: true)
+        let embeddingDigest = try artifactDigest(
+            repo.appendingPathComponent(ModelNames.OfflineDiarizer.embeddingPath, isDirectory: true),
+            artifact: .embedding
+        )
+        let fbankDigest = try artifactDigest(
+            repo.appendingPathComponent(ModelNames.OfflineDiarizer.fbankPath, isDirectory: true),
+            artifact: .fbank
+        )
+        let skipStrategy: String
+        switch config.embedding.skipStrategy {
+        case .none: skipStrategy = "none"
+        case .maskSimilarity(let threshold): skipStrategy = "maskSimilarity(\(threshold))"
+        }
+        let preprocessing = [
+            "sampleRate=\(config.segmentation.sampleRate)",
+            "embeddingBatchSize=\(config.embedding.batchSize)",
+            "excludeOverlap=\(config.embedding.excludeOverlap)",
+            "minSegmentDuration=\(config.embedding.minSegmentDurationSeconds)",
+            "skipStrategy=\(skipStrategy)",
+            "exposeChunkEmbeddings=\(config.exposeChunkEmbeddings)"
+        ].joined(separator: ";")
+        return EmbeddingModelFingerprint(
+            provider: "FluidAudio",
+            modelID: "\(Repo.diarizer.folderName)/\(ModelNames.OfflineDiarizer.embeddingPath):embedding256",
+            modelRevision: "tree-sha256-v1;Embedding.mlmodelc=\(embeddingDigest);FBank.mlmodelc=\(fbankDigest)",
+            preprocessingRevision: preprocessing,
+            dimension: VoiceEmbedding.dimension
+        )
+    }
+}
+
+private func artifactDigest(
+    _ root: URL,
+    artifact: OfflineSpeakerRepresentationError.ModelArtifact
+) throws -> String {
+    let fileManager = FileManager.default
+    guard fileManager.fileExists(atPath: root.path) else {
+        throw OfflineSpeakerRepresentationError.missingModelArtifact(artifact)
+    }
+    do {
+        let rootValues = try root.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard rootValues.isDirectory == true, rootValues.isSymbolicLink != true else {
+            throw OfflineSpeakerRepresentationError.invalidModelArtifact(artifact)
+        }
+        var files: [(path: Data, url: URL)] = []
+        func collect(_ directory: URL, prefix: String) throws {
+            let children = try fileManager.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
+            )
+            for url in children {
+                let values = try url.resourceValues(
+                    forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
+                )
+                guard values.isSymbolicLink != true else {
+                    throw OfflineSpeakerRepresentationError.invalidModelArtifact(artifact)
+                }
+                let relative = prefix.isEmpty ? url.lastPathComponent : "\(prefix)/\(url.lastPathComponent)"
+                if values.isDirectory == true {
+                    try collect(url, prefix: relative)
+                    continue
+                }
+                guard values.isRegularFile == true, !relative.isEmpty else {
+                    throw OfflineSpeakerRepresentationError.invalidModelArtifact(artifact)
+                }
+                files.append((Data(relative.utf8), url))
+            }
+        }
+        try collect(root, prefix: "")
+        guard !files.isEmpty else {
+            throw OfflineSpeakerRepresentationError.invalidModelArtifact(artifact)
+        }
+        files.sort { $0.path.lexicographicallyPrecedes($1.path) }
+        var hasher = SHA256()
+        hasher.update(data: Data("artifact-tree-sha256-v1\0".utf8))
+        for file in files {
+            let contents = try Data(contentsOf: file.url, options: [.mappedIfSafe])
+            hasher.update(data: encodedLength(file.path.count))
+            hasher.update(data: file.path)
+            hasher.update(data: encodedLength(contents.count))
+            hasher.update(data: contents)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    } catch let error as OfflineSpeakerRepresentationError {
+        throw error
+    } catch {
+        throw OfflineSpeakerRepresentationError.unreadableModelArtifact(artifact)
+    }
+}
+
+private func encodedLength(_ value: Int) -> Data {
+    var length = UInt64(value).bigEndian
+    return withUnsafeBytes(of: &length) { Data($0) }
 }
 
 private func unionDuration(_ intervals: [(TimeInterval, TimeInterval)]) -> TimeInterval {
