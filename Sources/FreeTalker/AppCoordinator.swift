@@ -98,6 +98,8 @@ final class AppCoordinator: ObservableObject {
     private var voiceEditWindow: NSWindow?
     private var voiceEditWindowDelegate: VoiceEditWindowDelegate?
     private var captureOwner: CaptureOwner = .none
+    private var recordingDestination: RecordingDestination?
+    weak var scratchpadRecordingRouter: (any ScratchpadRecordingRouting)?
 
     private let hotKeyManager = HotKeyManager()
     private let audioCapture = AudioCapture()
@@ -518,6 +520,61 @@ final class AppCoordinator: ObservableObject {
     // decides *whether* something happens (e.g. a keyDown while already `pttRecording` is a
     // no-op); these methods only ever perform the side effect the returned action names.
 
+    nonisolated static func launcherStartDecision(isRecording: Bool, isProcessing: Bool) -> Bool {
+        !isRecording && !isProcessing
+    }
+
+    nonisolated static func destinationAfterCaptureStart(
+        started: Bool,
+        destination: RecordingDestination
+    ) -> RecordingDestination? {
+        started ? destination : nil
+    }
+
+    nonisolated static func takeTerminalDestination(
+        _ destination: inout RecordingDestination?
+    ) -> RecordingDestination {
+        defer { destination = nil }
+        return destination ?? .external
+    }
+
+    static func routeDestinationEvent(
+        _ event: RecordingDestinationEvent,
+        destination: RecordingDestination,
+        router: (any ScratchpadRecordingRouting)?,
+        externalCompletion: () throws -> Void
+    ) throws -> Bool {
+        switch destination {
+        case .external:
+            if case .completion = event { try externalCompletion() }
+            return true
+        case .scratchpad(let token):
+            guard let router else { return false }
+            switch event {
+            case .preview(let text): router.updatePreview(text, for: token)
+            case .completion(let text): return router.completeRecording(text, for: token)
+            case .cancellation: router.cancelRecording(for: token)
+            case .failure(let message): router.failRecording(message, for: token)
+            }
+            return true
+        }
+    }
+
+    @discardableResult
+    func startHandsFreeRecording(destination: RecordingDestination = .external) -> Bool {
+        guard Self.launcherStartDecision(isRecording: isRecording, isProcessing: isProcessing),
+              beginCapture(destination: destination) else { return false }
+        recordingState = .locked(ignoreNextKeyUp: false)
+        enterLockedMode()
+        return true
+    }
+
+    func stopCurrentRecording() {
+        guard recordingState != .idle else { return }
+        recordingState = .idle
+        stopAndTranscribe()
+    }
+
     private func handleKeyDown(eventSeconds: TimeInterval) {
         // A held-down previous recording still finishing (`isProcessing`) must not start a new
         // one — mirrors the pre-Amendment-B `!isProcessing` guard. `recordingState` is already
@@ -528,7 +585,7 @@ final class AppCoordinator: ObservableObject {
         switch action {
         case .startCapture:
             keyDownTimestamp = eventSeconds
-            if beginCapture() {
+            if beginCapture(destination: .external) {
                 recordingState = newState
                 updateRecordingPanel()
             }
@@ -690,10 +747,11 @@ final class AppCoordinator: ObservableObject {
     /// capture. Returns false — leaving `recordingState` at `.idle` — on a mic-authorization or
     /// capture-start failure, so the caller never commits the state transition for a recording
     /// that never actually started.
-    private func beginCapture() -> Bool {
+    private func beginCapture(destination: RecordingDestination) -> Bool {
         guard Self.captureStartDecision(current: captureOwner, requested: .dictation) == .start else {
             return false
         }
+        recordingDestination = nil
         oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .clear)
         let micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
         Self.logger.log("key down: micAuthorizationStatus=\(micStatus.rawValue, privacy: .public)")
@@ -702,7 +760,9 @@ final class AppCoordinator: ObservableObject {
         // exactly what produces Whisper's silent-audio hallucination ("Thank you" for real
         // speech). See live-mic silence investigation, root cause H1.
         guard micStatus == .authorized else {
-            hud.flash("Microphone not authorized — check System Settings › Privacy & Security › Microphone")
+            let message = "Microphone not authorized — check System Settings › Privacy & Security › Microphone"
+            hud.flash(message)
+            _ = try? Self.routeDestinationEvent(.failure(message), destination: destination, router: scratchpadRecordingRouter) {}
             return false
         }
         do {
@@ -711,13 +771,16 @@ final class AppCoordinator: ObservableObject {
                 noiseSuppression: AppSettings.shared.noiseSuppressionEnabled
             )
             captureOwner = .dictation
+            recordingDestination = Self.destinationAfterCaptureStart(started: true, destination: destination)
             recordingGeneration += 1
             startLivePreviewIfNeeded()
             return true
         } catch {
+            recordingDestination = nil
             let message = Self.captureStartFailureMessage(errorDescription: error.localizedDescription)
             lastError = message
             hud.flash(message)
+            _ = try? Self.routeDestinationEvent(.failure(message), destination: destination, router: scratchpadRecordingRouter) {}
             return false
         }
     }
@@ -820,6 +883,13 @@ final class AppCoordinator: ObservableObject {
     private func stopAndTranscribe(preSnapshotted: (app: NSRunningApplication?, target: InsertionTarget?, contextTarget: ContextTargetSnapshot)? = nil, skipPostProcessing: Bool = false) {
         let capturedOneShotLanguage = oneShotLanguage
         defer { oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .clear) }
+
+        let destination = Self.takeTerminalDestination(&recordingDestination)
+
+        if case .scratchpad(let token) = destination {
+            stopAndTranscribeToScratchpad(token: token, forcedLanguage: capturedOneShotLanguage, skipPostProcessing: skipPostProcessing)
+            return
+        }
 
         // The destination and context target are the first stop-time reads. Keep this before
         // audio teardown, logging, file I/O, and every async boundary so later focus changes
@@ -962,12 +1032,14 @@ final class AppCoordinator: ObservableObject {
     private func cancelRecording() {
         oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .clear)
         captureOwner = .none
+        let destination = Self.takeTerminalDestination(&recordingDestination)
         Self.performCancelRecording(
             stopCapture: { _ = self.audioCapture.stop() },
             cancelLivePreview: { self.stopLivePreview() },
             invalidateCapTimer: { self.invalidateCapTimer() },
             clearHUD: { self.hud.flash("Cancelled") }
         )
+        _ = try? Self.routeDestinationEvent(.cancellation, destination: destination, router: scratchpadRecordingRouter) {}
     }
 
     nonisolated static func performCancelRecording(
@@ -1205,6 +1277,9 @@ final class AppCoordinator: ObservableObject {
         let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, text != lastLivePreviewText else { return }
         lastLivePreviewText = text
+        if let destination = recordingDestination {
+            _ = try? Self.routeDestinationEvent(.preview(text), destination: destination, router: scratchpadRecordingRouter) {}
+        }
         // Recording Panel (Feature 3): the preview text is embedded inside the panel's own row
         // layout in both recording states — a tick must never replace that layout with a bare
         // text pill.
@@ -1242,6 +1317,72 @@ final class AppCoordinator: ObservableObject {
         }
     }
 
+    private func stopAndTranscribeToScratchpad(
+        token: ScratchpadInsertionToken,
+        forcedLanguage oneShotLanguage: String?,
+        skipPostProcessing: Bool
+    ) {
+        invalidateCapTimer()
+        stopLivePreview()
+        _ = try? Self.routeDestinationEvent(.preview(nil), destination: .scratchpad(token), router: scratchpadRecordingRouter) {}
+        captureOwner = .none
+        let samples = audioCapture.stop()
+        let (peak, rms) = AudioLevel.peakAndRMS(samples)
+        if let issue = Self.capturedAudioIssue(sampleCount: samples.count, peak: peak, rms: rms) {
+            lastError = issue
+            hud.flash(issue)
+            _ = try? Self.routeDestinationEvent(.failure(issue), destination: .scratchpad(token), router: scratchpadRecordingRouter) {}
+            return
+        }
+
+        let engine = activeSTTEngine
+        let engineName = engine.name
+        let template = TemplateStore.shared.template(id: AppSettings.shared.activeTemplateID)
+            ?? Template.builtIns.first!
+        let processor = resolveActiveProcessor()
+        let forcedLanguage = Self.resolveLanguage(
+            oneShot: oneShotLanguage,
+            bundleID: nil,
+            appLanguageRules: [:],
+            pin: AppSettings.shared.languagePin
+        )
+        isProcessing = true
+        hud.show(text: "Processing…")
+
+        Task {
+            defer { isProcessing = false }
+            do {
+                let result = try await transcribeAndRefine(
+                    samples: samples,
+                    engine: engine,
+                    engineName: engineName,
+                    template: template,
+                    appName: nil,
+                    forcedLanguage: forcedLanguage,
+                    skipPostProcessing: skipPostProcessing,
+                    processor: processor,
+                    localContext: nil
+                )
+                if let fallbackReason = result.fallbackReason {
+                    logPostProcessingFallback(fallbackReason)
+                }
+                let accepted = try Self.routeDestinationEvent(
+                    .completion(result.refined), destination: .scratchpad(token), router: scratchpadRecordingRouter
+                ) {}
+                if accepted {
+                    hud.hide()
+                } else {
+                    hud.flash("Scratchpad changed — dictated text kept for recovery")
+                }
+            } catch {
+                let message = error is PipelineError ? "Transcription failed" : "Transcription failed: \(error.localizedDescription)"
+                lastError = message
+                _ = try? Self.routeDestinationEvent(.failure(message), destination: .scratchpad(token), router: scratchpadRecordingRouter) {}
+                hud.flash(message)
+            }
+        }
+    }
+
     enum PipelineError: Error {
         case emptyTranscript
         case recordFailed(Error)
@@ -1250,6 +1391,15 @@ final class AppCoordinator: ObservableObject {
     enum PostProcessingFallbackReason {
         case error(Error)
         case emptyOutput
+    }
+
+    private struct DictationProcessingResult {
+        let transcript: String
+        let refined: String
+        let language: String
+        let recordedTemplateName: String
+        let engineName: String
+        let fallbackReason: PostProcessingFallbackReason?
     }
 
     private func logPostProcessingFallback(_ reason: PostProcessingFallbackReason) {
@@ -1287,6 +1437,41 @@ final class AppCoordinator: ObservableObject {
             try LibraryStore.shared.record(language: language, template: template, transcript: transcript, refined: refined, engine: engine)
         }
     ) async throws -> (transcript: String, refined: String, posted: Bool, fallbackReason: PostProcessingFallbackReason?) {
+        let result = try await transcribeAndRefine(
+            samples: samples,
+            engine: engine,
+            engineName: engineName,
+            template: template,
+            appName: appName,
+            forcedLanguage: forcedLanguage,
+            skipPostProcessing: skipPostProcessing,
+            processor: processor,
+            localContext: localContext
+        )
+
+        var posted = false
+        _ = try Self.routeDestinationEvent(.completion(result.refined), destination: .external, router: nil) {
+            posted = insert(result.refined, target)
+            do {
+                try record(result.language, result.recordedTemplateName, result.transcript, result.refined, result.engineName)
+            } catch {
+                throw PipelineError.recordFailed(error)
+            }
+        }
+        return (result.transcript, result.refined, posted, result.fallbackReason)
+    }
+
+    private func transcribeAndRefine(
+        samples: [Float],
+        engine: any TranscriptionEngine,
+        engineName: String,
+        template: Template,
+        appName: String?,
+        forcedLanguage: String?,
+        skipPostProcessing: Bool,
+        processor: (any PostProcessor)?,
+        localContext: LocalProcessingContext?
+    ) async throws -> DictationProcessingResult {
         let transcription = try await engine.transcribe(samples: samples, forcedLanguage: forcedLanguage)
         guard !transcription.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw PipelineError.emptyTranscript
@@ -1328,15 +1513,14 @@ final class AppCoordinator: ObservableObject {
             recordedTemplateName = template.name
         }
 
-        let posted = insert(refined, target)
-
-        do {
-            try record(transcription.language, recordedTemplateName, transcription.text, refined, engineName)
-        } catch {
-            throw PipelineError.recordFailed(error)
-        }
-
-        return (transcription.text, refined, posted, fallbackReason)
+        return DictationProcessingResult(
+            transcript: transcription.text,
+            refined: refined,
+            language: transcription.language,
+            recordedTemplateName: recordedTemplateName,
+            engineName: engineName,
+            fallbackReason: fallbackReason
+        )
     }
 
     private static let applicationSupportDirectory: URL = {

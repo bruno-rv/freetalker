@@ -54,8 +54,9 @@ struct FreeTalkerApp: App {
         AppCoordinator.shared.ensureHotKeyListening()
 
         let floatingControlsController = FloatingControlsController(callbacks: .init(
-            // Task 5 replaces this safe placeholder with the coordinator's launcher entry point.
-            onDictation: {},
+            onDictation: {
+                AppCoordinator.shared.startHandsFreeRecording(destination: .external)
+            },
             // Task 8 replaces this safe placeholder with the scratchpad controller.
             onScratchpad: {
                 NSApplication.shared.activate(ignoringOtherApps: true)
