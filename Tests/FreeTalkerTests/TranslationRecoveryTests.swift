@@ -171,6 +171,33 @@ struct TranslationRecoveryTests {
 
         #expect(coordinator.translationRecoveryHUDOwner == .recording)
     }
+
+    @Test(arguments: [
+        AppCoordinator.RecordingHUDEarlyTerminal.voiceEditEscape,
+        .externalDeadAudio,
+        .scratchpadDeadAudio,
+    ])
+    func earlyRecordingTerminalReleasesHUDAndNotifiesRecoveryRouter(
+        terminal: AppCoordinator.RecordingHUDEarlyTerminal
+    ) {
+        let coordinator = AppCoordinator.shared
+        Self.clearCoordinator(coordinator)
+        let router = RecoveryPresentationRouterSpy(coordinator: coordinator)
+        coordinator.translationRecoveryPresentationRouter = router
+        defer {
+            coordinator.translationRecoveryPresentationRouter = nil
+            coordinator.recordingHUDDidReachTerminalState()
+            Self.clearCoordinator(coordinator)
+        }
+        _ = coordinator.handleOutputTranslationFailure(Self.failure(source: "recover after terminal"))
+        let generation = coordinator.recordingHUDWillPresent()
+
+        coordinator.recordingHUDDidEndEarly(terminal, generation: generation)
+
+        #expect(coordinator.translationRecoveryHUDOwner == .recovery)
+        #expect(coordinator.nextTranslationRecoveryPresentation?.recoverableText == "recover after terminal")
+        #expect(router.presentations.last??.recoverableText == "recover after terminal")
+    }
     @Test func pendingRecoveryRetainsImmutableFailureInputs() {
         let token = ScratchpadInsertionToken(id: UUID())
         let context = Self.context(destination: .scratchpad(token))

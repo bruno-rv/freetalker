@@ -151,3 +151,46 @@ exit 0.
 The production regressions cover a visible recovery followed by newer
 recording ownership while a retry completes, late enqueue during recording,
 safe terminal re-presentation, and stale terminal generation rejection.
+
+## Ownership Leak Corrections
+
+Three early terminal paths now release recording HUD ownership through the
+same generation-checked seam:
+
+- Voice Edit Escape after its recording HUD claim.
+- External dictation dead-audio rejection before pipeline creation.
+- Scratchpad dictation dead-audio rejection before pipeline creation.
+
+Each path is represented by a typed `RecordingHUDEarlyTerminal` case and calls
+`recordingHUDDidReachTerminalState(generation:)`. Queue state remains intact,
+the pending recovery reclaims the HUD, and the weak Scratchpad presentation
+router is notified. The existing stale-generation test remains green, so an
+older early terminal cannot release a newer HUD owner.
+
+RED:
+
+```text
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  swift test --filter TranslationRecoveryTests
+exit 1: RecordingHUDEarlyTerminal and recordingHUDDidEndEarly were missing.
+```
+
+GREEN:
+
+```text
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  swift test --filter TranslationRecoveryTests
+16 tests in 1 serialized suite passed, including 3 early-terminal arguments.
+
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter \
+  'TranslationRecoveryTests|HUDWarningPresentationTests|RecordingDestinationTests|ScratchpadRecordingTests|ScratchpadPersistenceTests|VoiceEditCoordinatorTests|VoiceEditTargetTests|VoiceEditPresentationTests|PermissionAndCapturePresentationTests'
+exit 0.
+
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
+exit 0.
+```
+
+The claim/return audit found no additional demonstrated leaks: normal external,
+Scratchpad, and Voice Edit processing release in generation-checked `defer`
+blocks; dictation cancellation and Voice Edit dead/no-selection terminals
+already release ownership.
