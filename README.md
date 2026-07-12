@@ -62,10 +62,19 @@ On first launch, grant (System Settings → Privacy & Security):
    refined text at your cursor. The menu bar shows a warning with an "Open System Settings"
    button if this isn't granted; find FreeTalker in Privacy & Security → Accessibility and
    enable it, then relaunch.
-3. **Input Monitoring** — macOS will prompt for this automatically the first time the app
-   creates its global key listener (a consequence of Accessibility + CGEventTap).
+3. **Input Monitoring** — macOS will prompt for this automatically the first
+   time the app creates its global key listener (a consequence of Accessibility
+   + CGEventTap). Settings considers Input Monitoring available when the global
+   shortcut listener is operational, because that confirms FreeTalker can
+   receive the shortcuts it needs.
 
 Settings (menu bar → "Settings…") shows live permission status.
+
+Local builds use ad-hoc signing, so rebuilding the app can invalidate
+permissions that macOS previously granted. Relaunch the current
+`FreeTalker.app` first. If a permission still appears unavailable, remove
+FreeTalker from the relevant Privacy & Security list, add the current app
+bundle again, enable it, and relaunch.
 
 ## Running the app
 
@@ -74,6 +83,11 @@ Settings (menu bar → "Settings…") shows live permission status.
 - Hold **Right-⌥**, speak (English or Portuguese, auto-detected), release. A small pill HUD
   shows "Recording…" then "Processing…". Turn on **Live preview while recording** in
   Settings → General and the HUD streams the transcript as you speak, before refinement.
+- **Reduce background noise** uses macOS voice processing with the
+  system-default microphone. Choosing a specific input device uses verified raw
+  capture instead; the HUD reports that noise suppression is unavailable. If
+  voice-processed capture with the system default fails, FreeTalker retries once
+  with raw microphone audio.
 - Tap the key instead (under 0.4s) to start **hands-free recording**: it keeps going until you
   tap the key again, click the HUD pill, or press Esc to cancel. Holding the key down is still
   classic push-to-talk. An auto-stop cap (default 5 minutes, configurable 1–60 in Settings →
@@ -133,9 +147,12 @@ OCR requires Screen Recording permission only; Accessibility can improve its win
 is not required for capture or OCR. If the exact stopped window is no longer available, FreeTalker
 continues without OCR instead of capturing another window.
 
-macOS exposes Screen Recording preflight as granted or not granted. Settings reflects that current
-state directly and offers explicit **Request Access** and **Open System Settings** actions when it
-is not granted; FreeTalker does not infer whether access was never requested or previously denied.
+macOS exposes Screen Recording preflight as granted or not granted. Settings
+reflects that current state directly and offers explicit **Request Access** and
+**Open System Settings** actions when it is not granted. After you grant access,
+macOS may require FreeTalker to relaunch before preflight reports it as
+available. If it remains unavailable, remove and re-add the current app bundle
+in Privacy & Security, then relaunch it.
 
 **Local-only privacy boundary:** accessibility text, screenshots, and OCR output stay in memory
 and are supplied only to Apple's on-device Foundation Model. Screenshot bytes are released
