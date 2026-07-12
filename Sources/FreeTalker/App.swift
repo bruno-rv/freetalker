@@ -4,6 +4,7 @@ import SwiftUI
 @main
 struct FreeTalkerApp: App {
     private static var instanceLease: AppInstanceLease?
+    private static var floatingControlsController: FloatingControlsController?
 
     init() {
         let currentApplication = NSRunningApplication.current
@@ -51,6 +52,24 @@ struct FreeTalkerApp: App {
         // One unified entry point: creates the tap, or (on failure) starts the 2s retry poll
         // and status text — the same path also used by app activation and hotkey reassignment.
         AppCoordinator.shared.ensureHotKeyListening()
+
+        let floatingControlsController = FloatingControlsController(callbacks: .init(
+            // Task 5 replaces this safe placeholder with the coordinator's launcher entry point.
+            onDictation: {},
+            // Task 8 replaces this safe placeholder with the scratchpad controller.
+            onScratchpad: {
+                NSApplication.shared.activate(ignoringOtherApps: true)
+            },
+            onOpenSettings: {
+                NSApplication.shared.activate(ignoringOtherApps: true)
+                NSApplication.shared.windows
+                    .first { $0.title == "Settings" }?
+                    .makeKeyAndOrderFront(nil)
+            },
+            onLanguage: { AppSettings.shared.languagePin = $0 }
+        ))
+        Self.floatingControlsController = floatingControlsController
+        floatingControlsController.start()
     }
 
     var body: some Scene {
