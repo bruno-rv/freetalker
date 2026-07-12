@@ -20,13 +20,9 @@ import Testing
     }
 
     @Test func automaticTemplateHelpNamesPriorityChoicesAndFallback() {
-        let help = SettingsView.automaticTemplateHelp
-
-        #expect(help.contains("App Rule"))
-        #expect(help.contains("Email"))
-        #expect(help.contains("Refined Message"))
-        #expect(help.contains("Clean Dictation"))
-        #expect(help.contains("Refined Prompt"))
-        #expect(help.contains("Active Template"))
+        #expect(
+            SettingsView.automaticTemplateHelp
+                == "When no App Rule matches, FreeTalker chooses Email, Refined Message, Clean Dictation, or Refined Prompt. Turn this off to keep the Active Template."
+        )
     }
 }
