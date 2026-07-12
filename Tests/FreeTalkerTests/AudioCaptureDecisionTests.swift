@@ -65,6 +65,33 @@ struct AudioCaptureDecisionTests {
         #expect(AudioCapture.captureFailureAction(effectiveVoiceProcessing: false) == .propagate)
     }
 
+    @Test func configuredDeviceVerificationAcceptsMatchingEffectiveDevice() {
+        #expect(
+            AudioCapture.configuredDeviceVerificationAction(
+                expectedDeviceID: 42,
+                effectiveDeviceID: 42
+            ) == .accept
+        )
+    }
+
+    @Test func configuredDeviceVerificationAbortsForMismatchedEffectiveDevice() {
+        #expect(
+            AudioCapture.configuredDeviceVerificationAction(
+                expectedDeviceID: 42,
+                effectiveDeviceID: 7
+            ) == .abortMismatch
+        )
+    }
+
+    @Test func configuredDeviceVerificationAbortsWhenEffectiveDeviceCannotBeQueried() {
+        #expect(
+            AudioCapture.configuredDeviceVerificationAction(
+                expectedDeviceID: 42,
+                effectiveDeviceID: nil
+            ) == .abortQueryFailure
+        )
+    }
+
     @Test func unchangedStateNeedsNoTransition() {
         #expect(AudioCapture.voiceProcessingAction(requested: true, current: true, transitionFailed: false) == .keepCurrent)
         #expect(AudioCapture.voiceProcessingAction(requested: false, current: false, transitionFailed: false) == .keepCurrent)
