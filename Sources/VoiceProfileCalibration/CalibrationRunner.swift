@@ -54,11 +54,20 @@ public struct CalibrationRunner: Sendable {
                 let enrollment = records.filter {
                     $0.participantID == participantID && $0.sessionID != query.sessionID
                 }
-                let values = enrollment.flatMap(\ .representation.samples).flatMap { prototype in
-                    query.representation.samples.map { $0.embedding.cosineDistance(to: prototype.embedding) }
+                let prototypes = enrollment.flatMap(\ .representation.samples).map { sample in
+                    EnrollmentPrototype(
+                        participantID: participantID,
+                        embedding: sample.embedding,
+                        fingerprint: fingerprint
+                    )
                 }
-                guard !values.isEmpty else { continue }
-                perParticipant.append((participantID, values.reduce(0, +) / Double(values.count)))
+                guard !prototypes.isEmpty else { continue }
+                perParticipant.append((
+                    participantID,
+                    try ParticipantPrototypeScorer.score(
+                        speaker: query.representation, prototypes: prototypes
+                    )
+                ))
             }
             let qualityValues = query.representation.samples.compactMap(\ .quality)
             let quality = qualityValues.isEmpty ? nil : qualityValues.reduce(0, +) / Double(qualityValues.count)

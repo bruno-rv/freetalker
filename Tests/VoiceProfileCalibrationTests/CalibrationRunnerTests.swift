@@ -103,6 +103,34 @@ struct CalibrationRunnerTests {
         #expect(report.qualityBins.reduce(0) { $0 + $1.count } == 5)
     }
 
+    @Test func threeSessionCalibrationUsesSharedMinimumOfPrototypeMeansDeterministically() async throws {
+        let fixture = try ExactRunnerFixture(
+            participantCount: 2, sessionCount: 3, multiPrototypeContrast: true
+        )
+        defer { fixture.remove() }
+        let report = try await CalibrationRunner(extract: fixture.extractor).run(manifest: fixture.manifest)
+        let expectedSame = (2 - 2 * cos(Double.pi / 4)) / 3
+        let expectedMargin = 1 - expectedSame
+        #expect(report.samePerson.count == 6)
+        #expect(abs(report.samePerson.quantiles["p95"]! - expectedSame) < 0.000_001)
+        #expect(report.differentPerson.count == 6)
+        #expect(report.differentPerson.quantiles.values.allSatisfy { abs($0 - 1) < 0.000_001 })
+        #expect(report.runnerUpMargins.count == 6)
+        #expect(abs(report.runnerUpMargins.quantiles["p05"]! - expectedMargin) < 0.000_001)
+        let below = report.thresholdMetrics.first { abs($0.threshold - 0.15) < 0.000_001 }!
+        #expect(below.trueMatchCount == 3)
+        #expect(below.missedMatchCount == 3)
+        let accepting = report.thresholdMetrics.first { abs($0.threshold - 0.2) < 0.000_001 }!
+        #expect(accepting.trueMatchCount == 6)
+        #expect(accepting.missedMatchCount == 0)
+        #expect(accepting.falseMatchCount == 0)
+        #expect(accepting.trueRejectCount == 6)
+
+        let reversed = CalibrationManifest(version: 1, samples: fixture.manifest.samples.reversed())
+        let repeated = try await CalibrationRunner(extract: fixture.extractor).run(manifest: reversed)
+        #expect(try report.jsonData() == repeated.jsonData())
+    }
+
     @Test func producesPrivateAggregateDeterministicReportsFromShuffledInput() async throws {
         let fixture = try RunnerFixture()
         defer { fixture.remove() }
@@ -333,8 +361,10 @@ private final class ExactRunnerFixture: @unchecked Sendable {
 
     init(
         participantCount: Int,
+        sessionCount: Int = 2,
         crossSessionContrast: Bool = false,
-        missingQualityToken: String? = nil
+        missingQualityToken: String? = nil,
+        multiPrototypeContrast: Bool = false
     ) throws {
         root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
@@ -345,7 +375,7 @@ private final class ExactRunnerFixture: @unchecked Sendable {
         var samples: [CalibrationSample] = []
         var mapped: [String: OfflineVoiceRepresentationResult] = [:]
         for participant in 1...participantCount {
-            for session in 1...2 {
+            for session in 1...sessionCount {
                 let token = "p\(participant)s\(session)"
                 let url = root.appendingPathComponent("\(token).wav")
                 try Data(token.utf8).write(to: url)
@@ -354,15 +384,24 @@ private final class ExactRunnerFixture: @unchecked Sendable {
                     mediaPath: url.path, microphone: "m", environment: "e",
                     expectedSpeakerID: "expected", consentConfirmed: true
                 ))
-                var raw = Array(repeating: Float(0), count: 256)
-                let index = crossSessionContrast && participant == 1 ? session - 1 : participant + 1
-                raw[index] = 1
+                let embeddings: [VoiceEmbedding]
+                if multiPrototypeContrast && participant == 1 {
+                    embeddings = try [
+                        Self.unitVector(0), Self.unitVector(1),
+                        Self.angledVector(Double.pi / 4)
+                    ]
+                } else {
+                    var raw = Array(repeating: Float(0), count: 256)
+                    let index = crossSessionContrast && participant == 1 ? session - 1 : participant + 1
+                    raw[index] = 1
+                    embeddings = [try VoiceEmbedding(validating: raw)]
+                }
                 let representation = SpeakerRepresentation(
                     speakerID: "expected",
-                    samples: [.init(
-                        embedding: try VoiceEmbedding(validating: raw), start: 0, end: 3,
+                    samples: embeddings.enumerated().map { index, embedding in .init(
+                        embedding: embedding, start: Double(index), end: Double(index + 1),
                         quality: token == missingQualityToken ? nil : 0.8
-                    )],
+                    ) },
                     cleanSpeechSeconds: 3
                 )
                 mapped[token] = .init(turns: [], speakers: [representation], fingerprint: fingerprint)
@@ -383,4 +422,17 @@ private final class ExactRunnerFixture: @unchecked Sendable {
     }
 
     func remove() { try? FileManager.default.removeItem(at: root) }
+
+    private static func unitVector(_ index: Int) throws -> VoiceEmbedding {
+        var raw = Array(repeating: Float(0), count: 256)
+        raw[index] = 1
+        return try VoiceEmbedding(validating: raw)
+    }
+
+    private static func angledVector(_ angle: Double) throws -> VoiceEmbedding {
+        var raw = Array(repeating: Float(0), count: 256)
+        raw[0] = Float(cos(angle))
+        raw[1] = Float(sin(angle))
+        return try VoiceEmbedding(validating: raw)
+    }
 }

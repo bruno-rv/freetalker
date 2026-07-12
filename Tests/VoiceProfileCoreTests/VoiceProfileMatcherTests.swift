@@ -39,6 +39,67 @@ struct VoiceProfileMatcherTests {
         #expect(abs(result[0].distance - 0.5) < 0.000_001)
     }
 
+    @Test func participantScorerUsesMinimumPrototypeMeanAndIsInputOrderDeterministic() throws {
+        let mixed = SpeakerRepresentation(
+            speakerID: "speaker",
+            samples: [
+                .init(embedding: vector(angle: 0), start: 0, end: 1, quality: nil),
+                .init(embedding: vector(angle: .pi / 2), start: 1, end: 2, quality: nil)
+            ],
+            cleanSpeechSeconds: 2
+        )
+        let prototypes = [
+            prototype("alice", angle: 0),
+            prototype("alice", angle: .pi / 4)
+        ]
+        let expected = 1 - cos(Double.pi / 4)
+        let score = try ParticipantPrototypeScorer.score(
+            speaker: mixed, prototypes: prototypes
+        )
+        #expect(abs(score - expected) < 0.000_001)
+        #expect(abs(score - 0.5 * (0.5 + expected)) > 0.05)
+        let reversedSpeaker = SpeakerRepresentation(
+            speakerID: mixed.speakerID,
+            samples: mixed.samples.reversed(),
+            cleanSpeechSeconds: mixed.cleanSpeechSeconds
+        )
+        #expect(try ParticipantPrototypeScorer.score(
+            speaker: reversedSpeaker, prototypes: prototypes.reversed()
+        ) == score)
+    }
+
+    @Test func participantScorerRejectsEmptyAndMixedPrototypeCohorts() throws {
+        let populated = speaker("speaker", vector(0), seconds: 1)
+        let empty = SpeakerRepresentation(speakerID: "speaker", samples: [], cleanSpeechSeconds: 0)
+        #expect(throws: ParticipantPrototypeScorerError.emptySpeakerSamples) {
+            try ParticipantPrototypeScorer.score(
+                speaker: empty, prototypes: [prototype("alice", vector(0))]
+            )
+        }
+        #expect(throws: ParticipantPrototypeScorerError.emptyPrototypes) {
+            try ParticipantPrototypeScorer.score(speaker: populated, prototypes: [])
+        }
+        #expect(throws: ParticipantPrototypeScorerError.mixedParticipantIDs) {
+            try ParticipantPrototypeScorer.score(
+                speaker: populated,
+                prototypes: [prototype("alice", vector(0)), prototype("bob", vector(0))]
+            )
+        }
+        let other = EmbeddingModelFingerprint(
+            provider: "other", modelID: "model", modelRevision: "1",
+            preprocessingRevision: "1", dimension: 256
+        )
+        #expect(throws: ParticipantPrototypeScorerError.mixedFingerprints) {
+            try ParticipantPrototypeScorer.score(
+                speaker: populated,
+                prototypes: [
+                    prototype("alice", vector(0)),
+                    .init(participantID: "alice", embedding: vector(0), fingerprint: other)
+                ]
+            )
+        }
+    }
+
     @Test func rejectsDistanceAtAboveThresholdButAcceptsEquality() throws {
         let matcher = try VoiceProfileMatcher(parameters: parameters(maximumDistance: 1))
         let speaker = speaker("speaker", vector(0), seconds: 3)

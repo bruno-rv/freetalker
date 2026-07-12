@@ -115,9 +115,12 @@ public struct VoiceProfileMatcher: Sendable {
         let participantIDs = grouped.keys.sorted()
         guard !participantIDs.isEmpty else { return [] }
 
-        let distances = speakers.map { speaker in
-            participantIDs.map { participantID in
-                participantDistance(speaker, grouped[participantID, default: []])
+        let distances = try speakers.map { speaker in
+            try participantIDs.map { participantID in
+                try ParticipantPrototypeScorer.score(
+                    speaker: speaker,
+                    prototypes: grouped[participantID, default: []]
+                )
             }
         }
         let margins = distances.map { row in
@@ -159,19 +162,6 @@ public struct VoiceProfileMatcher: Sendable {
                 runnerUpMargin: margins[speakerIndex][participantIndex]
             )
         }
-    }
-
-    private func participantDistance(
-        _ speaker: SpeakerRepresentation,
-        _ prototypes: [EnrollmentPrototype]
-    ) -> Double {
-        guard !speaker.samples.isEmpty else { return .infinity }
-        return prototypes.map { prototype in
-            let sum = speaker.samples.reduce(into: 0.0) { result, sample in
-                result += sample.embedding.cosineDistance(to: prototype.embedding)
-            }
-            return sum / Double(speaker.samples.count)
-        }.min() ?? .infinity
     }
 
     // Hungarian algorithm for rows <= columns, O(rows² * columns).
