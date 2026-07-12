@@ -1,7 +1,7 @@
 import CSQLite
 
 enum DatabaseMigrator {
-    static let latestVersion = 9
+    static let latestVersion = 10
 
     static func migrate(_ db: OpaquePointer) throws {
         try execute(db, "BEGIN IMMEDIATE;")
@@ -19,7 +19,11 @@ enum DatabaseMigrator {
             for (offset, migration) in migrations.enumerated() {
                 let version = offset + 1
                 guard version > appliedVersions.count else { continue }
-                try execute(db, migration)
+                if version == 10 {
+                    try migrateLibraryV10(db)
+                } else {
+                    try execute(db, migration)
+                }
                 if version == 5 {
                     try migrateLegacySnippetRows(db)
                 }
@@ -221,7 +225,25 @@ enum DatabaseMigrator {
     WHERE EXISTS (SELECT 1 FROM transcription_jobs AS job WHERE job.id = attempt.job_id);
     """
 
-    private static let migrations = [migration1, migration2, migration3, migration4, migration5, migration6, migration7, migration8, migration9]
+    private static let migration10 = ""
+
+    private static let migrations = [migration1, migration2, migration3, migration4, migration5, migration6, migration7, migration8, migration9, migration10]
+
+    private static func migrateLibraryV10(_ db: OpaquePointer) throws {
+        guard try tableExists("dictations", db: db) else { return }
+        try execute(db, """
+        ALTER TABLE dictations ADD COLUMN requested_output_language TEXT NOT NULL DEFAULT 'same';
+        CREATE TABLE dictation_translation_variants (
+          parent_id TEXT NOT NULL,
+          target_language TEXT NOT NULL,
+          text TEXT NOT NULL,
+          created_at REAL NOT NULL,
+          updated_at REAL NOT NULL,
+          PRIMARY KEY (parent_id, target_language),
+          FOREIGN KEY (parent_id) REFERENCES dictations(id) ON DELETE CASCADE
+        );
+        """)
+    }
 
     private static func migrateAttemptTriggersV9(_ db: OpaquePointer) throws {
         if try tableExists("job_attempt_triggers", db: db) {
