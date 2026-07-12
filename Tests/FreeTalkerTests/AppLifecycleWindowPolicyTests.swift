@@ -1,4 +1,5 @@
 import AppKit
+import Foundation
 import Testing
 @testable import FreeTalker
 
@@ -36,5 +37,92 @@ struct AppLifecycleWindowPolicyTests {
         #expect(window.collectionBehavior.contains(.canJoinAllSpaces))
         #expect(window.collectionBehavior.contains(.fullScreenAuxiliary))
         #expect(window.level == .floating)
+    }
+
+    @Test func firstLifetimeClaimSucceedsAndSecondClaimFails() throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("freetalker-lease-\(UUID().uuidString)").path
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        let first = try #require(AppInstanceLease.acquire(path: path))
+        #expect(AppInstanceLease.acquire(path: path) == nil)
+        withExtendedLifetime(first) {}
+    }
+
+    @Test func releasedLifetimeClaimAllowsTakeover() {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("freetalker-lease-\(UUID().uuidString)").path
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        var first = AppInstanceLease.acquire(path: path)
+        guard first != nil else {
+            Issue.record("Initial lease acquisition failed")
+            return
+        }
+        #expect(AppInstanceLease.acquire(path: path) == nil)
+        first = nil
+        #expect(AppInstanceLease.acquire(path: path) != nil)
+    }
+
+    @Test func claimActivatesExistingOwnerBeforeGivingUp() throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("freetalker-lease-\(UUID().uuidString)").path
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let first = try #require(AppInstanceLease.acquire(path: path))
+        var activations = 0
+
+        let result = AppLifecycleWindowPolicy.claimInstance(
+            path: path,
+            maxAttempts: 2,
+            activateExistingOwner: { activations += 1; return true },
+            wait: {}
+        )
+
+        #expect(result.lease == nil)
+        #expect(result.shouldTerminate)
+        #expect(activations == 2)
+        withExtendedLifetime(first) {}
+    }
+
+    @Test func claimTakesOverWhenExitingOwnerReleasesLeaseDuringRetry() {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("freetalker-lease-\(UUID().uuidString)").path
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        var first = AppInstanceLease.acquire(path: path)
+        guard first != nil else {
+            Issue.record("Initial lease acquisition failed")
+            return
+        }
+        #expect(first != nil)
+
+        let result = AppLifecycleWindowPolicy.claimInstance(
+            path: path,
+            maxAttempts: 2,
+            activateExistingOwner: { true },
+            wait: { first = nil }
+        )
+
+        #expect(result.lease != nil)
+        #expect(!result.shouldTerminate)
+    }
+
+    @Test func soleInstanceClaimIsSafe() {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("freetalker-lease-\(UUID().uuidString)").path
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        #expect(AppInstanceLease.acquire(path: path) != nil)
+    }
+
+    @Test func activationPreservesHealthyHotKeyListener() {
+        var recoveries = 0
+        AppCoordinator.recoverHotKeyListeningIfNeeded(isListening: true) { recoveries += 1 }
+        #expect(recoveries == 0)
+    }
+
+    @Test func activationRecoversDeadHotKeyListener() {
+        var recoveries = 0
+        AppCoordinator.recoverHotKeyListeningIfNeeded(isListening: false) { recoveries += 1 }
+        #expect(recoveries == 1)
     }
 }

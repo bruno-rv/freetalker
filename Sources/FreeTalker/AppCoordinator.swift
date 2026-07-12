@@ -180,7 +180,12 @@ final class AppCoordinator: ObservableObject {
         // just the menu bar popover focusing a window) re-checks the tap — catching
         // permissions granted in System Settings while the app was already running.
         NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.restartHotKeyListening() }
+            Task { @MainActor in
+                guard let self else { return }
+                Self.recoverHotKeyListeningIfNeeded(isListening: self.hotKeyManager.isListening) {
+                    self.ensureHotKeyListening()
+                }
+            }
         }
         // Amendment B3: clicking the HUD pill locks an in-progress PTT recording or stops a
         // locked one — wired once, not per-`ensureHotKeyListening()` call.
@@ -259,6 +264,14 @@ final class AppCoordinator: ObservableObject {
             updateHotKeyStatusText()
             beginHotKeyRetryPollIfNeeded()
         }
+    }
+
+    nonisolated static func recoverHotKeyListeningIfNeeded(
+        isListening: Bool,
+        recover: () -> Void
+    ) {
+        guard !isListening else { return }
+        recover()
     }
 
     static func configureVoiceEditHotKey(manager: HotKeyManager, handler: @escaping @MainActor () -> Void) {

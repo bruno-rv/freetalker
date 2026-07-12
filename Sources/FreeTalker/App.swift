@@ -3,13 +3,29 @@ import SwiftUI
 
 @main
 struct FreeTalkerApp: App {
+    private static var instanceLease: AppInstanceLease?
+
     init() {
         let currentApplication = NSRunningApplication.current
-        if let existingApplication = AppLifecycleWindowPolicy.existingOwner(for: currentApplication) {
-            existingApplication.activate(options: [.activateAllWindows])
+        let claim = AppLifecycleWindowPolicy.claimInstance(
+            path: AppLifecycleWindowPolicy.instanceLeasePath,
+            maxAttempts: 10,
+            activateExistingOwner: {
+                if let existingApplication = AppLifecycleWindowPolicy.existingOwner(for: currentApplication) {
+                    existingApplication.activate(options: [.activateAllWindows])
+                    return true
+                }
+                return false
+            },
+            wait: {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+        )
+        guard let lease = claim.lease else {
             NSApplication.shared.terminate(nil)
             return
         }
+        Self.instanceLease = lease
 
         // One-time migration of the legacy shared BYOK LLM Keychain item into the active
         // provider's scoped account. Deliberately placed here rather than in `AppSettings.init`
