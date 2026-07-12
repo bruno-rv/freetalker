@@ -107,7 +107,10 @@ public struct CalibrationRunner: Sendable {
             differentPerson: .init(different.map(\ .distance)),
             durationBins: CalibrationMetrics.durationBins(queryObservations, boundaries: [2, 5, 10]),
             qualityBins: CalibrationMetrics.qualityBins(queryObservations, boundaries: [0.5, 0.75, 0.9]),
-            thresholdMetrics: CalibrationMetrics.evaluate(distances, thresholds: stride(from: 0.05, through: 0.5, by: 0.05).map { $0 }),
+            thresholdMetrics: CalibrationMetrics.evaluate(
+                distances,
+                thresholds: (0...100).map { Double($0) / 100 }
+            ),
             runnerUpMargins: .init(margins), warnings: warnings.sorted()
         )
         records.removeAll(keepingCapacity: false)

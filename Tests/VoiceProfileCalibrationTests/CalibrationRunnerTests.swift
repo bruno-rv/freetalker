@@ -131,6 +131,31 @@ struct CalibrationRunnerTests {
         #expect(try report.jsonData() == repeated.jsonData())
     }
 
+    @Test func reportSerializesCompleteExactHundredthThresholdGridWithEqualityAcceptance() async throws {
+        let fixture = try ExactRunnerFixture(participantCount: 2)
+        defer { fixture.remove() }
+        let report = try await CalibrationRunner(extract: fixture.extractor).run(manifest: fixture.manifest)
+        try #require(report.thresholdMetrics.count == 101)
+        #expect(report.thresholdMetrics.first?.threshold == 0)
+        #expect(report.thresholdMetrics.last?.threshold == 1)
+        for integer in [1, 50, 51, 99] {
+            #expect(report.thresholdMetrics[integer].threshold == Double(integer) / 100)
+        }
+        let below = report.thresholdMetrics[99]
+        #expect(below.falseMatchCount == 0)
+        #expect(below.trueRejectCount == 4)
+        let equality = report.thresholdMetrics[100]
+        #expect(equality.falseMatchCount == 4)
+        #expect(equality.trueRejectCount == 0)
+
+        let json = try report.jsonData()
+        let decoded = try JSONDecoder().decode(CalibrationReport.self, from: json)
+        #expect(decoded.thresholdMetrics.map(\ .threshold) == report.thresholdMetrics.map(\ .threshold))
+        #expect(decoded.thresholdMetrics.count == 101)
+        let repeatedJSON = try report.jsonData()
+        #expect(json == repeatedJSON)
+    }
+
     @Test func producesPrivateAggregateDeterministicReportsFromShuffledInput() async throws {
         let fixture = try RunnerFixture()
         defer { fixture.remove() }

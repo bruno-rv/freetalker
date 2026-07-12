@@ -71,4 +71,23 @@ import Testing
         #expect(first.cosineDistance(to: same) == 0)
         #expect(first.cosineDistance(to: orthogonal) == 1)
     }
+
+    @Test func float32NormalizationRoundingStillProducesExactBoundedDistances() throws {
+        var positiveRaw = Array(repeating: Float(0), count: 256)
+        for index in 0..<31 { positiveRaw[index] = 1 }
+        let negativeRaw = positiveRaw.map(-)
+        let positive = try VoiceEmbedding(validating: positiveRaw)
+        let negative = try VoiceEmbedding(validating: negativeRaw)
+        let roundedSelfDot = positive.values.reduce(into: 0.0) { sum, value in
+            sum += Double(value) * Double(value)
+        }
+        #expect(roundedSelfDot > 1)
+        #expect(positive.cosineDistance(to: positive) == 0)
+        #expect(positive.cosineDistance(to: negative) == 2)
+        for lhs in [positive, negative] {
+            for rhs in [positive, negative] {
+                #expect((0...2).contains(lhs.cosineDistance(to: rhs)))
+            }
+        }
+    }
 }
