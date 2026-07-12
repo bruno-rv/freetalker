@@ -1,20 +1,48 @@
 import AppKit
 
 @MainActor
-final class ScratchpadView: NSView {
+final class ScratchpadView: NSView, NSTextFieldDelegate {
     let textView: NSTextView
     let editorController: ScratchpadEditorController
     private(set) var formattingButtons: [NSControl] = []
+    private(set) var aiButtons: [NSButton] = []
 
     var onStartDictation: () -> Void = {}
     var onStopDictation: () -> Void = {}
     var onInsertRecovery: () -> Void = {}
+    var onAIAction: (ScratchpadAIAction) -> Void = { _ in }
+    var onCustomAIAction: () -> Void = {}
+    var onCustomInstructionChanged: () -> Void = {}
 
     private let previewLabel = NSTextField(wrappingLabelWithString: "")
     private let statusLabel = NSTextField(wrappingLabelWithString: "")
     private let recoveryLabel = NSTextField(wrappingLabelWithString: "")
     private let dictateButton = NSButton(title: "Dictate", target: nil, action: nil)
     private(set) var recoveryButton = NSButton(title: "Insert Recovered Text", target: nil, action: nil)
+    private let customInstructionField = NSTextField()
+    private let aiProgress = NSProgressIndicator()
+    private let aiErrorLabel = NSTextField(wrappingLabelWithString: "")
+    private var aiWrappers: [NSView] = []
+
+    var customInstruction: String {
+        get { customInstructionField.stringValue }
+        set { customInstructionField.stringValue = newValue }
+    }
+
+    var isAIInFlight = false {
+        didSet {
+            isAIInFlight ? aiProgress.startAnimation(nil) : aiProgress.stopAnimation(nil)
+            aiProgress.isHidden = !isAIInFlight
+        }
+    }
+
+    var aiErrorText: String? {
+        get { aiErrorLabel.isHidden ? nil : aiErrorLabel.stringValue }
+        set {
+            aiErrorLabel.stringValue = newValue ?? ""
+            aiErrorLabel.isHidden = newValue?.isEmpty != false
+        }
+    }
 
     var previewText: String? {
         get { previewLabel.isHidden ? nil : previewLabel.stringValue }
@@ -93,6 +121,32 @@ final class ScratchpadView: NSView {
         recoveryButton.setAccessibilityHelp("Insert the preserved transcription at the current selection")
         recoveryButton.toolTip = "Insert the preserved transcription at the current selection"
 
+        let improve = aiButton("Improve writing", action: #selector(improveWriting))
+        let expand = aiButton("Expand", action: #selector(expandWriting))
+        let condense = aiButton("Condense", action: #selector(condenseWriting))
+        let custom = aiButton("Custom instruction", action: #selector(customWriting))
+        aiButtons = [improve, expand, condense, custom]
+        customInstructionField.placeholderString = "Custom instruction"
+        customInstructionField.delegate = self
+        customInstructionField.setAccessibilityLabel("Custom AI instruction")
+        customInstructionField.widthAnchor.constraint(greaterThanOrEqualToConstant: 180).isActive = true
+        aiProgress.style = .spinning
+        aiProgress.controlSize = .small
+        aiProgress.isHidden = true
+        aiErrorLabel.textColor = .systemRed
+        aiErrorLabel.setAccessibilityLabel("AI transformation error")
+        aiErrorText = nil
+
+        aiWrappers = aiButtons.map { button in
+            let wrapper = NSStackView(views: [button])
+            wrapper.orientation = .horizontal
+            return wrapper
+        }
+        let aiRow = NSStackView(views: aiWrappers + [customInstructionField, aiProgress])
+        aiRow.orientation = .horizontal
+        aiRow.spacing = 8
+        aiRow.alignment = .centerY
+
         formattingButtons = [heading, bold, italic, bullets, numbers, clear, dictateButton]
         let toolbar = NSStackView(views: formattingButtons)
         toolbar.orientation = .horizontal
@@ -119,7 +173,7 @@ final class ScratchpadView: NSView {
         recoveryRow.spacing = 8
         recoveryRow.distribution = .fill
 
-        let root = NSStackView(views: [toolbar, statusLabel, previewLabel, recoveryRow, scrollView])
+        let root = NSStackView(views: [toolbar, aiRow, aiErrorLabel, statusLabel, previewLabel, recoveryRow, scrollView])
         root.orientation = .vertical
         root.alignment = .leading
         root.spacing = 8
@@ -132,6 +186,8 @@ final class ScratchpadView: NSView {
             root.topAnchor.constraint(equalTo: topAnchor, constant: 12),
             root.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -12),
             toolbar.widthAnchor.constraint(equalTo: root.widthAnchor),
+            aiRow.widthAnchor.constraint(equalTo: root.widthAnchor),
+            aiErrorLabel.widthAnchor.constraint(equalTo: root.widthAnchor),
             statusLabel.widthAnchor.constraint(equalTo: root.widthAnchor),
             previewLabel.widthAnchor.constraint(equalTo: root.widthAnchor),
             recoveryRow.widthAnchor.constraint(equalTo: root.widthAnchor),
@@ -144,6 +200,28 @@ final class ScratchpadView: NSView {
         let button = NSButton(title: title, target: self, action: action)
         configure(button, label: label, help: help)
         return button
+    }
+
+    private func aiButton(_ title: String, action: Selector) -> NSButton {
+        let button = NSButton(title: title, target: self, action: action)
+        button.setAccessibilityLabel(title)
+        return button
+    }
+
+    func updateAIAvailability(snapshot: CloudLLMSettingsSnapshot, hasInput: Bool) {
+        for (index, button) in aiButtons.enumerated() {
+            let availability = ScratchpadAIAvailability.make(
+                eligibility: snapshot.eligibility,
+                hasInput: hasInput,
+                isInFlight: isAIInFlight,
+                hasInstruction: index != 3 || !customInstruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                providerName: snapshot.provider.rawValue
+            )
+            button.isEnabled = availability.enabled
+            button.setAccessibilityHelp(availability.accessibilityHelp)
+            aiWrappers[index].toolTip = availability.tooltip
+            aiWrappers[index].setAccessibilityHelp(availability.accessibilityHelp)
+        }
     }
 
     private func configure(_ control: NSControl, label: String, help: String) {
@@ -162,4 +240,12 @@ final class ScratchpadView: NSView {
     @objc private func clearFormatting() { editorController.clearFormatting() }
     @objc private func dictate() { isRecording ? onStopDictation() : onStartDictation() }
     @objc private func insertRecovery() { onInsertRecovery() }
+    @objc private func improveWriting() { onAIAction(.improveWriting) }
+    @objc private func expandWriting() { onAIAction(.expand) }
+    @objc private func condenseWriting() { onAIAction(.condense) }
+    @objc private func customWriting() { onCustomAIAction() }
+
+    func controlTextDidChange(_ notification: Notification) {
+        onCustomInstructionChanged()
+    }
 }

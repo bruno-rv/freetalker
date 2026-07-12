@@ -1,5 +1,9 @@
 import Foundation
 
+extension Notification.Name {
+    static let scratchpadCloudCredentialsDidChange = Notification.Name("ScratchpadCloudCredentialsDidChange")
+}
+
 enum STTEngineKind: String, CaseIterable, Codable {
     case whisperKit
     case cloud

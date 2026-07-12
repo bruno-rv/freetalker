@@ -533,6 +533,9 @@ private struct GeneralSettingsView: View {
                 SecureField("API key", text: $cloudLLMKey)
                     .onChange(of: cloudLLMKey) { _, newValue in
                         cloudLLMKeyError = !Keychain.set(newValue, account: Keychain.Account.cloudLLMKey(for: settings.llmProvider))
+                        if !cloudLLMKeyError {
+                            NotificationCenter.default.post(name: .scratchpadCloudCredentialsDidChange, object: nil)
+                        }
                     }
                 if cloudLLMKeyError {
                     Text("Failed to save key to Keychain")
