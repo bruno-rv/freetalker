@@ -13,7 +13,7 @@ struct AppLifecycleWindowPolicyTests {
             defer: false
         )
 
-        AppLifecycleWindowPolicy.configureSettingsWindow(window)
+        AppLifecycleWindowPolicy.configureFocusableUtilityWindow(window)
 
         #expect(window.collectionBehavior.contains(.canJoinAllSpaces))
         #expect(window.collectionBehavior.contains(.canJoinAllApplications))
@@ -30,7 +30,7 @@ struct AppLifecycleWindowPolicyTests {
         )
         window.collectionBehavior = [.fullScreenAuxiliary]
 
-        AppLifecycleWindowPolicy.configureSettingsWindow(window)
+        AppLifecycleWindowPolicy.configureFocusableUtilityWindow(window)
 
         #expect(!window.collectionBehavior.contains(.fullScreenAuxiliary))
         #expect(window.collectionBehavior.contains(.canJoinAllSpaces))
@@ -46,7 +46,7 @@ struct AppLifecycleWindowPolicyTests {
         )
         window.collectionBehavior = [.fullScreenPrimary]
 
-        AppLifecycleWindowPolicy.configureSettingsWindow(window)
+        AppLifecycleWindowPolicy.configureFocusableUtilityWindow(window)
 
         #expect(!window.collectionBehavior.contains(.fullScreenPrimary))
         #expect(window.collectionBehavior.contains(.canJoinAllSpaces))

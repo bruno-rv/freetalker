@@ -105,7 +105,7 @@ enum AppLifecycleWindowPolicy {
         return owner
     }
 
-    static func configureSettingsWindow(_ window: NSWindow) {
+    static func configureFocusableUtilityWindow(_ window: NSWindow) {
         window.collectionBehavior.subtract([.fullScreenPrimary, .fullScreenAuxiliary])
         window.collectionBehavior.formUnion([.canJoinAllSpaces, .canJoinAllApplications])
         window.level = .normal
