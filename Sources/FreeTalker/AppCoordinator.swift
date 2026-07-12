@@ -98,9 +98,18 @@ final class AppCoordinator: ObservableObject {
     private var voiceEditWindow: NSWindow?
     private var voiceEditWindowDelegate: VoiceEditWindowDelegate?
     private var captureOwner: CaptureOwner = .none
-    private var recordingDestination: RecordingDestination?
-    private var pendingScratchpadRecordings: [ScratchpadInsertionToken: String] = [:]
-    weak var scratchpadRecordingRouter: (any ScratchpadRecordingRouting)?
+    private let destinationLifecycle = RecordingDestinationLifecycle()
+    private var recordingDestination: RecordingDestination? {
+        get { destinationLifecycle.currentDestination }
+        set {
+            if let newValue { destinationLifecycle.install(newValue) }
+            else { _ = destinationLifecycle.take() }
+        }
+    }
+    weak var scratchpadRecordingRouter: (any ScratchpadRecordingRouting)? {
+        get { destinationLifecycle.router }
+        set { destinationLifecycle.router = newValue }
+    }
 
     private let hotKeyManager = HotKeyManager()
     private let audioCapture = AudioCapture()
@@ -525,20 +534,6 @@ final class AppCoordinator: ObservableObject {
         !isRecording && !isProcessing
     }
 
-    nonisolated static func destinationAfterCaptureStart(
-        started: Bool,
-        destination: RecordingDestination
-    ) -> RecordingDestination? {
-        started ? destination : nil
-    }
-
-    nonisolated static func takeTerminalDestination(
-        _ destination: inout RecordingDestination?
-    ) -> RecordingDestination {
-        defer { destination = nil }
-        return destination ?? .external
-    }
-
     nonisolated static func externalStopSnapshot<Value>(
         for destination: RecordingDestination,
         capture: () -> Value
@@ -548,32 +543,24 @@ final class AppCoordinator: ObservableObject {
     }
 
     func pendingScratchpadRecording(for token: ScratchpadInsertionToken) -> String? {
-        pendingScratchpadRecordings[token]
+        destinationLifecycle.pending(for: token)
     }
 
     func consumePendingScratchpadRecording(for token: ScratchpadInsertionToken) -> String? {
-        pendingScratchpadRecordings.removeValue(forKey: token)
+        destinationLifecycle.consumePending(for: token)
     }
 
     func storePendingScratchpadRecording(_ text: String, for token: ScratchpadInsertionToken) {
-        pendingScratchpadRecordings[token] = text
+        destinationLifecycle.storePending(text, for: token)
     }
 
     func clearPendingScratchpadRecording(for token: ScratchpadInsertionToken) {
-        pendingScratchpadRecordings.removeValue(forKey: token)
+        destinationLifecycle.clearPending(for: token)
     }
 
     @discardableResult
     func deliverScratchpadCompletion(_ text: String, for token: ScratchpadInsertionToken) -> Bool {
-        let accepted = (try? Self.routeDestinationEvent(
-            .completion(text), destination: .scratchpad(token), router: scratchpadRecordingRouter
-        ) {}) ?? false
-        if accepted {
-            clearPendingScratchpadRecording(for: token)
-        } else {
-            storePendingScratchpadRecording(text, for: token)
-        }
-        return accepted
+        (try? destinationLifecycle.complete(text, destination: .scratchpad(token)) {}) ?? false
     }
 
     static func routeDestinationEvent(
@@ -802,25 +789,30 @@ final class AppCoordinator: ObservableObject {
         guard micStatus == .authorized else {
             let message = "Microphone not authorized — check System Settings › Privacy & Security › Microphone"
             hud.flash(message)
-            _ = try? Self.routeDestinationEvent(.failure(message), destination: destination, router: scratchpadRecordingRouter) {}
+            _ = destinationLifecycle.begin(destination, start: { false }, failureMessage: { message })
             return false
         }
-        do {
-            try audioCapture.start(
-                deviceUID: AppSettings.shared.microphoneDeviceUID,
-                noiseSuppression: AppSettings.shared.noiseSuppressionEnabled
-            )
+        var failureMessage = "Could not start recording"
+        let started = destinationLifecycle.begin(destination, start: {
+            do {
+                try audioCapture.start(
+                    deviceUID: AppSettings.shared.microphoneDeviceUID,
+                    noiseSuppression: AppSettings.shared.noiseSuppressionEnabled
+                )
+                return true
+            } catch {
+                failureMessage = Self.captureStartFailureMessage(errorDescription: error.localizedDescription)
+                return false
+            }
+        }, failureMessage: { failureMessage })
+        if started {
             captureOwner = .dictation
-            recordingDestination = Self.destinationAfterCaptureStart(started: true, destination: destination)
             recordingGeneration += 1
             startLivePreviewIfNeeded()
             return true
-        } catch {
-            recordingDestination = nil
-            let message = Self.captureStartFailureMessage(errorDescription: error.localizedDescription)
-            lastError = message
-            hud.flash(message)
-            _ = try? Self.routeDestinationEvent(.failure(message), destination: destination, router: scratchpadRecordingRouter) {}
+        } else {
+            lastError = failureMessage
+            hud.flash(failureMessage)
             return false
         }
     }
@@ -924,7 +916,7 @@ final class AppCoordinator: ObservableObject {
         let capturedOneShotLanguage = oneShotLanguage
         defer { oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .clear) }
 
-        let destination = Self.takeTerminalDestination(&recordingDestination)
+        let destination = destinationLifecycle.take()
 
         if case .scratchpad(let token) = destination {
             stopAndTranscribeToScratchpad(token: token, forcedLanguage: capturedOneShotLanguage, skipPostProcessing: skipPostProcessing)
@@ -1072,16 +1064,13 @@ final class AppCoordinator: ObservableObject {
     private func cancelRecording() {
         oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .clear)
         captureOwner = .none
-        let destination = Self.takeTerminalDestination(&recordingDestination)
-        Self.performCancelRecording(
-            stopCapture: { _ = self.audioCapture.stop() },
-            cancelLivePreview: { self.stopLivePreview() },
-            invalidateCapTimer: { self.invalidateCapTimer() },
-            clearHUD: { self.hud.flash("Cancelled") }
-        )
-        _ = try? Self.routeDestinationEvent(.cancellation, destination: destination, router: scratchpadRecordingRouter) {}
-        if case .scratchpad(let token) = destination {
-            clearPendingScratchpadRecording(for: token)
+        destinationLifecycle.cancel {
+            Self.performCancelRecording(
+                stopCapture: { _ = self.audioCapture.stop() },
+                cancelLivePreview: { self.stopLivePreview() },
+                invalidateCapTimer: { self.invalidateCapTimer() },
+                clearHUD: { self.hud.flash("Cancelled") }
+            )
         }
     }
 
@@ -1491,7 +1480,7 @@ final class AppCoordinator: ObservableObject {
         )
 
         var posted = false
-        _ = try Self.routeDestinationEvent(.completion(result.refined), destination: .external, router: nil) {
+        _ = try destinationLifecycle.complete(result.refined, destination: .external) {
             posted = insert(result.refined, target)
             do {
                 try record(result.language, result.recordedTemplateName, result.transcript, result.refined, result.engineName)

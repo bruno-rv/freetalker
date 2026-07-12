@@ -17,14 +17,13 @@ struct RecordingDestinationTests {
         #expect(!AppCoordinator.launcherStartDecision(isRecording: false, isProcessing: true))
     }
 
-    @Test func startFailureAndTerminalPathsResetDestinationState() {
-        let destination = RecordingDestination.scratchpad(.init(id: UUID()))
-        #expect(AppCoordinator.destinationAfterCaptureStart(started: false, destination: destination) == nil)
-        #expect(AppCoordinator.destinationAfterCaptureStart(started: true, destination: destination) == destination)
-
-        var stored: RecordingDestination? = destination
-        #expect(AppCoordinator.takeTerminalDestination(&stored) == destination)
-        #expect(stored == nil)
+    @MainActor @Test func lifecycleStartFailureNotifiesRouterAndResets() {
+        let router = RouterProbe()
+        let lifecycle = RecordingDestinationLifecycle(router: router)
+        let token = ScratchpadInsertionToken(id: UUID())
+        #expect(!lifecycle.begin(.scratchpad(token), start: { false }, failureMessage: { "start failed" }))
+        #expect(lifecycle.currentDestination == nil)
+        #expect(router.events == [.failure("start failed")])
     }
 
     @MainActor
@@ -41,44 +40,16 @@ struct RecordingDestinationTests {
     }
 
     @MainActor
-    @Test func externalCompletionRunsOnlyExternalSideEffects() throws {
+    @Test func lifecycleExternalCompletionRunsOnlyExternalSideEffects() throws {
         var externalCalls = 0
         let router = RouterProbe()
 
-        let accepted = try AppCoordinator.routeDestinationEvent(
-            .completion("external text"), destination: .external, router: router
-        ) { externalCalls += 1 }
+        let lifecycle = RecordingDestinationLifecycle(router: router)
+        let accepted = try lifecycle.complete("external text", destination: .external) { externalCalls += 1 }
 
         #expect(accepted)
         #expect(externalCalls == 1)
         #expect(router.events.isEmpty)
-    }
-
-    @MainActor
-    @Test func scratchpadEventsRunOnlyRouterSideEffects() throws {
-        let token = ScratchpadInsertionToken(id: UUID())
-        let router = RouterProbe()
-        var externalCalls = 0
-
-        _ = try AppCoordinator.routeDestinationEvent(.preview("draft"), destination: .scratchpad(token), router: router) { externalCalls += 1 }
-        let accepted = try AppCoordinator.routeDestinationEvent(.completion("final"), destination: .scratchpad(token), router: router) { externalCalls += 1 }
-        _ = try AppCoordinator.routeDestinationEvent(.cancellation, destination: .scratchpad(token), router: router) { externalCalls += 1 }
-        _ = try AppCoordinator.routeDestinationEvent(.failure("failed"), destination: .scratchpad(token), router: router) { externalCalls += 1 }
-
-        #expect(accepted)
-        #expect(externalCalls == 0)
-        #expect(router.events == [.preview("draft"), .completion("final"), .cancellation, .failure("failed")])
-    }
-
-    @MainActor
-    @Test func rejectedScratchpadCompletionIsNotAccepted() throws {
-        let router = RouterProbe(acceptCompletion: false)
-        let accepted = try AppCoordinator.routeDestinationEvent(
-            .completion("recoverable"),
-            destination: .scratchpad(.init(id: UUID())),
-            router: router
-        ) {}
-        #expect(!accepted)
     }
 
     @Test func scratchpadStopSkipsExternalSnapshotReads() {
@@ -99,23 +70,28 @@ struct RecordingDestinationTests {
         #expect(reads == 1)
     }
 
-    @MainActor
-    @Test func rejectedCompletionCanBeRecoveredAfterWeakRouterDisappears() {
+    @MainActor @Test func lifecycleCompletionRecoversAfterWeakRouterDisappears() throws {
         let token = ScratchpadInsertionToken(id: UUID())
-        AppCoordinator.shared.scratchpadRecordingRouter = nil
-        #expect(!AppCoordinator.shared.deliverScratchpadCompletion("recover me", for: token))
-
-        #expect(AppCoordinator.shared.pendingScratchpadRecording(for: token) == "recover me")
-        #expect(AppCoordinator.shared.consumePendingScratchpadRecording(for: token) == "recover me")
-        #expect(AppCoordinator.shared.pendingScratchpadRecording(for: token) == nil)
+        let lifecycle = RecordingDestinationLifecycle(router: nil)
+        let accepted = try lifecycle.complete("recover me", destination: .scratchpad(token)) {}
+        #expect(!accepted)
+        #expect(lifecycle.consumePending(for: token) == "recover me")
+        #expect(lifecycle.pending(for: token) == nil)
     }
 
-    @MainActor
-    @Test func cancellationClearsPendingScratchpadRecovery() {
+    @MainActor @Test func lifecycleCancellationNotifiesAndClearsRecovery() throws {
         let token = ScratchpadInsertionToken(id: UUID())
-        AppCoordinator.shared.storePendingScratchpadRecording("discard", for: token)
-        AppCoordinator.shared.clearPendingScratchpadRecording(for: token)
-        #expect(AppCoordinator.shared.pendingScratchpadRecording(for: token) == nil)
+        let router = RouterProbe(acceptCompletion: false)
+        let lifecycle = RecordingDestinationLifecycle(router: router)
+        let accepted = try lifecycle.complete("discard", destination: .scratchpad(token)) {}
+        #expect(!accepted)
+        lifecycle.install(.scratchpad(token))
+        var stopped = false
+        lifecycle.cancel { stopped = true }
+        #expect(stopped)
+        #expect(lifecycle.currentDestination == nil)
+        #expect(lifecycle.pending(for: token) == nil)
+        #expect(router.events.last == .cancellation)
     }
 }
 
