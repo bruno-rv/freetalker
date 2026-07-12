@@ -5,7 +5,8 @@ let package = Package(
     name: "FreeTalker",
     platforms: [.macOS(.v26)],
     products: [
-        .executable(name: "FreeTalker", targets: ["FreeTalker"])
+        .executable(name: "FreeTalker", targets: ["FreeTalker"]),
+        .library(name: "VoiceProfileCore", targets: ["VoiceProfileCore"])
     ],
     dependencies: [
         .package(url: "https://github.com/argmaxinc/WhisperKit", from: "0.9.0"),
@@ -18,6 +19,7 @@ let package = Package(
             dependencies: [
                 .product(name: "WhisperKit", package: "WhisperKit"),
                 .product(name: "FluidAudio", package: "FluidAudio"),
+                "VoiceProfileCore",
                 "CSQLite"
             ]
         ),
@@ -25,6 +27,11 @@ let package = Package(
             name: "FreeTalkerTests",
             dependencies: ["FreeTalker"],
             resources: [.copy("Fixtures")]
+        ),
+        .target(name: "VoiceProfileCore"),
+        .testTarget(
+            name: "VoiceProfileCoreTests",
+            dependencies: ["VoiceProfileCore"]
         )
     ]
 )
