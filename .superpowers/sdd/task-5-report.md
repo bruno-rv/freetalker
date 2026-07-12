@@ -95,3 +95,18 @@ Fresh GREEN evidence:
   passed (the repository has no separately named RecordingStateMachine suite).
 - `AutomaticStyle|ContextRouting`: 26 tests passed.
 - Full `swift test`: 348 tests across 33 suites passed.
+
+## Production lifecycle harness follow-up
+
+Replaced test-shaped destination state helpers with
+`RecordingDestinationLifecycle`, the stateful object owned by the real
+`AppCoordinator`. The production capture-start path calls `begin`, the real
+cancel path calls `cancel`, and both external insertion/Library completion and
+scratchpad async completion call `complete`. Tests drive those same methods
+with injected capture, stop, external-side-effect, and router spies; they no
+longer simulate reset or cancellation by calling leaf clear/take helpers.
+
+RED: the focused destination suite failed to compile because
+`RecordingDestinationLifecycle` and its start/cancel/completion APIs did not
+exist. GREEN: destination suite 8/8, context/style regressions 26/26, full suite
+346 tests across 33 suites.
