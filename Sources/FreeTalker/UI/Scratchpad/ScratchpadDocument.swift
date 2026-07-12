@@ -18,13 +18,21 @@ final class ScratchpadDocument: NSObject, ObservableObject, @preconcurrency NSTe
     private var revision: UInt64 = 0
     private var needsSave = false
     private var saveTask: Task<Void, Never>?
+    private let didScheduleSave: () -> Void
+    private let didSave: () -> Void
 
-    init(url: URL) {
+    init(
+        url: URL,
+        didScheduleSave: @escaping () -> Void = {},
+        didSave: @escaping () -> Void = {}
+    ) {
         let persistence = ScratchpadPersistence(url: url)
         let result = persistence.load()
         self.persistence = persistence
         self.warning = result.warning
         self.textStorage = NSTextStorage(attributedString: result.text)
+        self.didScheduleSave = didScheduleSave
+        self.didSave = didSave
         super.init()
         textStorage.delegate = self
     }
@@ -87,6 +95,7 @@ final class ScratchpadDocument: NSObject, ObservableObject, @preconcurrency NSTe
     }
 
     func scheduleSave() {
+        didScheduleSave()
         saveTask?.cancel()
         saveTask = Task { @MainActor [weak self] in
             do {
@@ -107,6 +116,7 @@ final class ScratchpadDocument: NSObject, ObservableObject, @preconcurrency NSTe
         try persistence.save(textStorage)
         needsSave = false
         warning = nil
+        didSave()
     }
 
     func textStorage(

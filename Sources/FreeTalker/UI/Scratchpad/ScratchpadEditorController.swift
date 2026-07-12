@@ -57,13 +57,29 @@ final class ScratchpadEditorController {
         guard range.length > 0 else { return }
         perform(actionName: kind == .bulleted ? "Bulleted List" : "Numbered List", range: range) {
             let marker: NSTextList.MarkerFormat = kind == .bulleted ? .disc : .decimal
+            var allRequestedList = true
+            document.textStorage.enumerateAttribute(.paragraphStyle, in: range) { value, _, stop in
+                let style = value as? NSParagraphStyle
+                if style?.textLists.first?.markerFormat != marker {
+                    allRequestedList = false
+                    stop.pointee = true
+                }
+            }
             document.textStorage.enumerateAttribute(.paragraphStyle, in: range) { value, subrange, _ in
                 let style = ((value as? NSParagraphStyle)?.mutableCopy() as? NSMutableParagraphStyle)
                     ?? NSMutableParagraphStyle()
-                style.textLists = [NSTextList(markerFormat: marker, options: 0)]
-                style.firstLineHeadIndent = 18
-                style.headIndent = 36
-                style.tabStops = [NSTextTab(textAlignment: .left, location: 18)]
+                if allRequestedList {
+                    style.textLists = []
+                    if style.firstLineHeadIndent == 18 { style.firstLineHeadIndent = 0 }
+                    if style.headIndent == 36 { style.headIndent = 0 }
+                    style.tabStops.removeAll { $0.location == 18 }
+                } else {
+                    style.textLists = [NSTextList(markerFormat: marker, options: 0)]
+                    style.firstLineHeadIndent = 18
+                    style.headIndent = 36
+                    style.tabStops.removeAll { $0.location == 18 }
+                    style.addTabStop(NSTextTab(textAlignment: .left, location: 18))
+                }
                 document.textStorage.addAttribute(.paragraphStyle, value: style, range: subrange)
             }
         }
