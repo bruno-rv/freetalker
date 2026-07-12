@@ -6,6 +6,7 @@ let package = Package(
     platforms: [.macOS(.v26)],
     products: [
         .executable(name: "FreeTalker", targets: ["FreeTalker"]),
+        .executable(name: "VoiceProfileCalibration", targets: ["VoiceProfileCalibration"]),
         .library(name: "VoiceProfileCore", targets: ["VoiceProfileCore"])
     ],
     dependencies: [
@@ -43,6 +44,14 @@ let package = Package(
         .testTarget(
             name: "VoiceProfileFluidAudioTests",
             dependencies: ["VoiceProfileFluidAudio"]
+        ),
+        .executableTarget(
+            name: "VoiceProfileCalibration",
+            dependencies: ["VoiceProfileCore", "VoiceProfileFluidAudio"]
+        ),
+        .testTarget(
+            name: "VoiceProfileCalibrationTests",
+            dependencies: ["VoiceProfileCalibration"]
         )
     ]
 )

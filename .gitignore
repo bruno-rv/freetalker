@@ -3,3 +3,5 @@
 FreeTalker.app/
 .DS_Store
 .worktrees/
+calibration-data/
+.codex/sdd/reports/voice-profile-calibration/
