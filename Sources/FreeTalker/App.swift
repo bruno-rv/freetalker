@@ -155,10 +155,7 @@ private struct MenuBarContentView: View {
 
             Divider()
 
-            Button("Library…") {
-                LibraryInsertionDestinationStore.shared.capture()
-                openWindow(id: "library")
-            }
+            Button("Library…") { openWindow(id: "library") }
             Button("Scratchpad…") { ScratchpadWindowController.shared.open() }
             Button("Settings…") {
                 NSApplication.shared.activate(ignoringOtherApps: true)

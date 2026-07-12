@@ -162,7 +162,6 @@ private struct DictationDetailView: View {
     @State private var reprocessing = false
     @State private var actionError: String?
     @StateObject private var translation = LibraryTranslationController()
-    @ObservedObject private var insertionDestinations = LibraryInsertionDestinationStore.shared
 
     private var translationPresentation: LibraryTranslationPresentation {
         LibraryTranslationPresentation(availability: translation.availability)
@@ -243,19 +242,11 @@ private struct DictationDetailView: View {
         }
         .alert(
             "Library Action Failed",
-            isPresented: Binding(
-                get: { actionError != nil || translation.insertionFailureMessage != nil },
-                set: { if !$0 { actionError = nil; translation.dismissInsertionFailure() } }
-            )
+            isPresented: Binding(get: { actionError != nil }, set: { if !$0 { actionError = nil } })
         ) {
-            Button("Copy") {
-                do { try translation.copyDisplayedText(for: dictation) }
-                catch { actionError = error.localizedDescription }
-                translation.dismissInsertionFailure()
-            }
-            Button("OK", role: .cancel) { actionError = nil; translation.dismissInsertionFailure() }
+            Button("OK", role: .cancel) { actionError = nil }
         } message: {
-            Text(actionError ?? translation.insertionFailureMessage ?? "")
+            Text(actionError ?? "")
         }
     }
 
@@ -292,15 +283,6 @@ private struct DictationDetailView: View {
                 } label: {
                     Label("Copy", systemImage: "doc.on.doc")
                 }
-
-                Button {
-                    _ = translation.insertDisplayedText(for: dictation)
-                } label: {
-                    Label("Insert", systemImage: "text.insert")
-                }
-                .disabled(!translation.canInsert)
-                .help(translation.canInsert ? "Insert at the target captured before Library opened" : "No safe insertion target was captured. Use Copy instead.")
-                .accessibilityHint(translation.canInsert ? "Inserts at the captured external target" : "No safe insertion target was captured. Use Copy instead.")
 
                 if translation.isTranslating {
                     ProgressView().controlSize(.small)
