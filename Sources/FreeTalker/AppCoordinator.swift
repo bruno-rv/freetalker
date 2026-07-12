@@ -44,23 +44,8 @@ final class AppCoordinator: ObservableObject {
     @Published private(set) var isProcessing = false
     @Published private(set) var lastError: String?
     private var pendingOutputTranslationFailuresStorage: [OutputTranslationFailure] = []
-    private lazy var translationRecoveryController = PendingTranslationRecoveryController(
-        snapshot: { AppSettings.shared.cloudLLMSnapshot },
-        translate: { source, template, policy, snapshot in
-            try await TranslationService().process(
-                source: source, template: template, policy: policy, snapshot: snapshot
-            )
-        },
-        deliver: { [weak self] text, destination, externalTarget in
-            guard let self else { return false }
-            switch destination {
-            case .external:
-                return Insertion.insert(text, target: externalTarget)
-            case .scratchpad(let token):
-                return self.scratchpadRecordingRouter?.completeTranslationRecovery(text, for: token) ?? false
-            }
-        }
-    )
+    private lazy var translationRecoveryController = makeTranslationRecoveryController()
+    weak var translationRecoveryPresentationRouter: (any TranslationRecoveryPresentationRouting)?
     /// Set while the global hotkey listener couldn't be started (missing Accessibility
     /// permission) and we're waiting for the user to grant it. See Round 1 Codex finding 8.
     @Published private(set) var hotKeyStatusText: String?
@@ -654,32 +639,78 @@ final class AppCoordinator: ObservableObject {
         translationRecoveryController.nextPresentation
     }
 
+    private func makeTranslationRecoveryController(
+        snapshot: @escaping PendingTranslationRecoveryController.Snapshot = { AppSettings.shared.cloudLLMSnapshot },
+        translate: @escaping PendingTranslationRecoveryController.Translate = { source, template, policy, snapshot in
+            try await TranslationService().process(
+                source: source, template: template, policy: policy, snapshot: snapshot
+            )
+        },
+        deliver: PendingTranslationRecoveryController.Deliver? = nil
+    ) -> PendingTranslationRecoveryController {
+        PendingTranslationRecoveryController(
+            snapshot: snapshot,
+            translate: translate,
+            deliver: deliver ?? { [weak self] text, destination, externalTarget in
+                guard let self else { return false }
+                switch destination {
+                case .external:
+                    return Insertion.insert(text, target: externalTarget)
+                case .scratchpad(let token):
+                    return self.scratchpadRecordingRouter?.completeTranslationRecovery(text, for: token) ?? false
+                }
+            },
+            onChange: { [weak self] in self?.presentTranslationRecoveryState() }
+        )
+    }
+
+    func configureTranslationRecoveryForTesting(
+        snapshot: @escaping PendingTranslationRecoveryController.Snapshot,
+        translate: @escaping PendingTranslationRecoveryController.Translate,
+        deliver: @escaping PendingTranslationRecoveryController.Deliver
+    ) {
+        translationRecoveryController = makeTranslationRecoveryController(
+            snapshot: snapshot, translate: translate, deliver: deliver
+        )
+        presentTranslationRecoveryState()
+    }
+
+    func resetTranslationRecoveryTestingConfiguration() {
+        translationRecoveryController = makeTranslationRecoveryController()
+        presentTranslationRecoveryState()
+    }
+
     func retryNextTranslation() {
         guard let id = translationRecoveryController.nextID else { return }
         Task { [weak self] in
             guard let self else { return }
             await translationRecoveryController.retryTranslation(id: id)
-            resolvePresentedTranslationIfNeeded(id: id)
+            resolveTranslationFailureStorageIfNeeded(id: id)
         }
     }
 
     func insertNextTranslationSource() {
         guard let id = translationRecoveryController.nextID else { return }
         translationRecoveryController.insertSourceText(id: id)
-        resolvePresentedTranslationIfNeeded(id: id)
+        resolveTranslationFailureStorageIfNeeded(id: id)
     }
 
-    private func resolvePresentedTranslationIfNeeded(id: UUID) {
+    private func resolveTranslationFailureStorageIfNeeded(id: UUID) {
         if !translationRecoveryController.pendingRecoveries.contains(where: { $0.failureID == id }) {
             if let index = pendingOutputTranslationFailuresStorage.firstIndex(where: { $0.id == id }) {
                 pendingOutputTranslationFailuresStorage.remove(at: index)
             }
         }
+        presentTranslationRecoveryState()
+    }
+
+    private func presentTranslationRecoveryState() {
         if let presentation = translationRecoveryController.nextPresentation {
             hud.showTranslationRecovery(presentation)
         } else {
             hud.hide()
         }
+        translationRecoveryPresentationRouter?.translationRecoveryPresentationDidChange()
     }
 
     func pendingOutputTranslationFailures() -> [OutputTranslationFailure] {

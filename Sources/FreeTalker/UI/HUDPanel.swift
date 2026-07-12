@@ -299,10 +299,16 @@ struct HUDView: View {
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
                         .lineLimit(2)
+                    if let errorText = presentation.errorText {
+                        Text(errorText)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
                     HStack(spacing: 8) {
                         Button(presentation.retryTitle, action: panelCallbacks.onRetryTranslation)
-                            .disabled(presentation.isRetrying)
+                            .disabled(!presentation.actionsEnabled)
                         Button(presentation.insertSourceTitle, action: panelCallbacks.onInsertSourceText)
+                            .disabled(!presentation.actionsEnabled)
                     }
                     .buttonStyle(.plain)
                 }

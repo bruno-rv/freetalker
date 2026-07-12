@@ -63,3 +63,48 @@ exit 0.
 
 `git diff --check` also exited 0. Pre-existing modifications to Task 1, 2, and
 4 reports were left untouched and unstaged.
+
+## P1/P2 Review Fixes
+
+- Added a weak, main-actor `TranslationRecoveryPresentationRouting` channel.
+  Scratchpad registers on initialization/open, unregisters on close, and always
+  re-reads the coordinator's current FIFO presentation when notified.
+- Coordinator notifications now cover enqueue, retry start, retry completion,
+  failure/cancellation, source insertion, exact consume, FIFO advance, and
+  final clear. HUD refreshes through the same state transition path.
+- Recovery presentation exposes `isRetrying`, `actionsEnabled`, and an optional
+  actionable error. Both retry and source actions are disabled for the matching
+  in-flight item; direct source insertion is guarded too.
+- Added production-connected `AppCoordinator` tests using its real failure
+  queue, weak presentation router, controlled translator, and delivery seam.
+  These verify immediate enqueue presentation, in-flight disabling, successful
+  FIFO advance, failure restoration/error copy, exact consumption, and final
+  UI clear.
+
+Review-fix RED:
+
+```text
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  swift test --filter TranslationRecoveryTests
+exit 1: missing TranslationRecoveryPresentationRouting, coordinator routing
+and controlled recovery seams, actionsEnabled, and errorText.
+```
+
+Review-fix GREEN:
+
+```text
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  swift test --filter TranslationRecoveryTests
+12 tests in 1 serialized suite passed.
+
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter \
+  'TranslationRecoveryTests|RecordingDestinationTests|ScratchpadRecordingTests|ScratchpadPersistenceTests|ScratchpadEditorTests|FloatingControlsPresentationTests|HUDWarningPresentationTests'
+exit 0.
+
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
+exit 0.
+```
+
+The recovery suite is serialized because its production-connected tests share
+the application singleton. The first concurrent focused run exposed that test
+isolation requirement and was stopped; the serialized rerun passed.

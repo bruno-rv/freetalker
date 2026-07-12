@@ -78,13 +78,14 @@ final class ScratchpadView: NSView, NSTextFieldDelegate {
     var translationRecovery: TranslationRecoveryPresentation? {
         didSet {
             translationRecoveryLabel.stringValue = translationRecovery.map {
-                "\($0.message)\n\($0.recoverableText)"
+                [$0.message, $0.recoverableText, $0.errorText].compactMap { $0 }.joined(separator: "\n")
             } ?? ""
             let hidden = translationRecovery == nil
             translationRecoveryLabel.isHidden = hidden
             retryTranslationButton.isHidden = hidden
             insertSourceTextButton.isHidden = hidden
-            retryTranslationButton.isEnabled = translationRecovery?.isRetrying == false
+            retryTranslationButton.isEnabled = translationRecovery?.actionsEnabled == true
+            insertSourceTextButton.isEnabled = translationRecovery?.actionsEnabled == true
         }
     }
 

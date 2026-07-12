@@ -2,7 +2,7 @@ import AppKit
 import Combine
 
 @MainActor
-final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, ScratchpadRecordingRouting {
+final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, ScratchpadRecordingRouting, TranslationRecoveryPresentationRouting {
     static let shared = ScratchpadWindowController()
 
     let scratchpadDocument: ScratchpadDocument
@@ -12,6 +12,7 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
     private let recordingIsBusy: () -> Bool
     private let stopRecording: () -> Void
     private let registerRouter: ((any ScratchpadRecordingRouting)?) -> Void
+    private let registerTranslationRecoveryRouter: ((any TranslationRecoveryPresentationRouting)?) -> Void
     private let pendingRecordings: () -> [RecordingDestinationLifecycle.PendingRecording]
     private let consumePendingRecording: (ScratchpadInsertionToken) -> String?
     private let clearPendingRecording: (ScratchpadInsertionToken) -> Void
@@ -44,6 +45,7 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
             recordingIsBusy: { coordinator.isRecording || coordinator.isProcessing },
             stopRecording: { coordinator.stopCurrentRecording() },
             registerRouter: { coordinator.scratchpadRecordingRouter = $0 },
+            registerTranslationRecoveryRouter: { coordinator.translationRecoveryPresentationRouter = $0 },
             pendingRecordings: { coordinator.pendingScratchpadRecordings() },
             consumePendingRecording: { coordinator.consumePendingScratchpadRecording(for: $0) },
             clearPendingRecording: { coordinator.clearPendingScratchpadRecording(for: $0) },
@@ -63,6 +65,7 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
         recordingIsBusy: @escaping () -> Bool,
         stopRecording: @escaping () -> Void,
         registerRouter: @escaping ((any ScratchpadRecordingRouting)?) -> Void,
+        registerTranslationRecoveryRouter: @escaping ((any TranslationRecoveryPresentationRouting)?) -> Void = { _ in },
         pendingRecordings: @escaping () -> [RecordingDestinationLifecycle.PendingRecording],
         consumePendingRecording: @escaping (ScratchpadInsertionToken) -> String?,
         clearPendingRecording: @escaping (ScratchpadInsertionToken) -> Void,
@@ -84,6 +87,7 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
         self.recordingIsBusy = recordingIsBusy
         self.stopRecording = stopRecording
         self.registerRouter = registerRouter
+        self.registerTranslationRecoveryRouter = registerTranslationRecoveryRouter
         self.pendingRecordings = pendingRecordings
         self.consumePendingRecording = consumePendingRecording
         self.clearPendingRecording = clearPendingRecording
@@ -115,11 +119,9 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
         scratchpadView.onInsertRecovery = { [weak self] in self?.insertRecovery() }
         scratchpadView.onRetryTranslation = { [weak self] in
             self?.retryTranslation()
-            self?.refreshTranslationRecoveryPresentation()
         }
         scratchpadView.onInsertSourceText = { [weak self] in
             self?.insertSourceText()
-            self?.refreshTranslationRecoveryPresentation()
         }
         scratchpadView.onAIAction = { [weak self] action in self?.performAIAction(action) }
         scratchpadView.onCustomAIAction = { [weak self] in self?.performCustomAIAction() }
@@ -240,6 +242,10 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
         return accepted
     }
 
+    func translationRecoveryPresentationDidChange() {
+        refreshTranslationRecoveryPresentation()
+    }
+
     func cancelRecording(for token: ScratchpadInsertionToken) {
         guard token == activeToken else { return }
         activeToken = nil
@@ -350,6 +356,7 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
         if activeToken != nil, scratchpadView.isRecording { stopRecording() }
         flushDocument()
         registerRouter(nil)
+        registerTranslationRecoveryRouter(nil)
         activeToken = nil
         scratchpadView.isRecording = false
         scratchpadView.previewText = nil
@@ -358,6 +365,7 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
 
     private func registerAsRouter() {
         registerRouter(self)
+        registerTranslationRecoveryRouter(self)
     }
 
     private func recoverPendingRecordings() {
