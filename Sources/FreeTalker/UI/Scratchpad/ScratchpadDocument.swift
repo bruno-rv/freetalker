@@ -13,7 +13,7 @@ final class ScratchpadDocument: NSObject, ObservableObject, @preconcurrency NSTe
         let originalText: String
     }
 
-    private let persistence: ScratchpadPersistence
+    private let save: (NSAttributedString) throws -> Void
     private var insertionTargets: [UUID: InsertionTarget] = [:]
     private(set) var revision: UInt64 = 0
     private var needsSave = false
@@ -24,11 +24,12 @@ final class ScratchpadDocument: NSObject, ObservableObject, @preconcurrency NSTe
     init(
         url: URL,
         didScheduleSave: @escaping () -> Void = {},
-        didSave: @escaping () -> Void = {}
+        didSave: @escaping () -> Void = {},
+        save: ((NSAttributedString) throws -> Void)? = nil
     ) {
         let persistence = ScratchpadPersistence(url: url)
         let result = persistence.load()
-        self.persistence = persistence
+        self.save = save ?? { try persistence.save($0) }
         self.warning = result.warning
         self.textStorage = NSTextStorage(attributedString: result.text)
         self.didScheduleSave = didScheduleSave
@@ -113,7 +114,7 @@ final class ScratchpadDocument: NSObject, ObservableObject, @preconcurrency NSTe
         saveTask?.cancel()
         saveTask = nil
         guard needsSave else { return }
-        try persistence.save(textStorage)
+        try save(textStorage)
         needsSave = false
         warning = nil
         didSave()

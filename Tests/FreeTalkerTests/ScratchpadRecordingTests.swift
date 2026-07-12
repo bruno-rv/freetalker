@@ -174,6 +174,45 @@ struct ScratchpadRecordingTests {
         #expect(harness.stopCalls == 1)
     }
 
+    @Test func windowControllerAndAppCoordinatorLifecycleCompleteThenRecoverWithoutCapture() {
+        let coordinator = AppCoordinator.shared
+        var recoveryTokenToClear: ScratchpadInsertionToken?
+        defer {
+            if let recoveryTokenToClear { coordinator.clearPendingScratchpadRecording(for: recoveryTokenToClear) }
+            coordinator.scratchpadRecordingRouter = nil
+        }
+        var destination: RecordingDestination?
+        let wired = ScratchpadWindowController(
+            documentURL: temporaryURL(),
+            startRecording: { destination = $0; return true },
+            recordingIsBusy: { false },
+            stopRecording: {},
+            registerRouter: { coordinator.scratchpadRecordingRouter = $0 },
+            pendingRecordings: { coordinator.pendingScratchpadRecordings() },
+            consumePendingRecording: { coordinator.consumePendingScratchpadRecording(for: $0) },
+            clearPendingRecording: { coordinator.clearPendingScratchpadRecording(for: $0) },
+            consumePendingFailure: { coordinator.consumePendingScratchpadFailure() },
+            flushDocument: { try $0.flush() }
+        )
+        wired.scratchpadDocument.textStorage.append(NSAttributedString(string: "Base"))
+        wired.scratchpadView.textView.setSelectedRange(NSRange(location: 4, length: 0))
+        wired.startDictation()
+        guard case .scratchpad(let token) = destination else {
+            Issue.record("Expected a scratchpad destination")
+            return
+        }
+        #expect(coordinator.deliverScratchpadCompletion(" one", for: token))
+        #expect(wired.scratchpadDocument.textStorage.string == "Base one")
+
+        wired.startDictation()
+        guard case .scratchpad(let recoveryToken) = destination else { return }
+        recoveryTokenToClear = recoveryToken
+        wired.scratchpadDocument.textStorage.append(NSAttributedString(string: " changed"))
+        #expect(!coordinator.deliverScratchpadCompletion(" recover", for: recoveryToken))
+        #expect(wired.scratchpadView.recoveryText == " recover")
+        #expect(coordinator.pendingScratchpadRecording(for: recoveryToken) == " recover")
+    }
+
     @Test func windowIsNormalFocusableAndFormattingToolbarIsAccessible() {
         let harness = Harness("Text")
         let window = harness.controller.window
@@ -222,6 +261,38 @@ struct ScratchpadRecordingTests {
         #expect(controller.scratchpadView.statusText?.contains("could not be saved") == true)
     }
 
+    @Test func corruptDocumentWarningIsVisibleOnFirstOpenWithoutOverwritingSource() throws {
+        let url = temporaryURL()
+        let corrupt = Data("not rtf".utf8)
+        try corrupt.write(to: url)
+        let controller = makeController(url: url)
+
+        controller.open(activate: false)
+
+        #expect(controller.scratchpadView.statusText == "The scratchpad could not be opened. Its original file has been preserved.")
+        #expect(try Data(contentsOf: url) == corrupt)
+    }
+
+    @Test func debouncedSaveFailureAppearsWhileOpenAndSuccessfulRetryClearsIt() async throws {
+        var saveAttempts = 0
+        let url = temporaryURL()
+        let controller = makeController(url: url, saveDocument: { text in
+            saveAttempts += 1
+            if saveAttempts == 1 { throw CloseFailure.save }
+            try ScratchpadPersistence(url: url).save(text)
+        })
+        controller.open(activate: false)
+
+        controller.scratchpadDocument.textStorage.append(NSAttributedString(string: "retry me"))
+        try await Task.sleep(for: .milliseconds(500))
+        #expect(controller.scratchpadView.statusText == "The scratchpad could not be saved.")
+
+        controller.scratchpadDocument.scheduleSave()
+        try await Task.sleep(for: .milliseconds(500))
+        #expect(controller.scratchpadView.statusText == nil)
+        #expect(ScratchpadPersistence(url: url).load().text.string == "retry me")
+    }
+
     @Test func synchronousStopFailureAndSaveFailureBothSurviveCloseInOrder() {
         let harness = Harness("Base", flushDocument: { _ in throw CloseFailure.save })
         harness.controller.startDictation()
@@ -247,7 +318,8 @@ struct ScratchpadRecordingTests {
     private func makeController(
         url: URL,
         notificationCenter: NotificationCenter = .default,
-        flushDocument: @escaping (ScratchpadDocument) throws -> Void = { try $0.flush() }
+        flushDocument: @escaping (ScratchpadDocument) throws -> Void = { try $0.flush() },
+        saveDocument: ((NSAttributedString) throws -> Void)? = nil
     ) -> ScratchpadWindowController {
         ScratchpadWindowController(
             documentURL: url,
@@ -260,6 +332,7 @@ struct ScratchpadRecordingTests {
             clearPendingRecording: { _ in },
             consumePendingFailure: { nil },
             flushDocument: flushDocument,
+            saveDocument: saveDocument,
             notificationCenter: notificationCenter
         )
     }

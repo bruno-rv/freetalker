@@ -98,6 +98,23 @@ final class ScratchpadEditorController {
             var attributes = textView.typingAttributes
             Self.clearSupportedAttributes(from: &attributes)
             textView.typingAttributes = attributes
+            let range = paragraphRange()
+            guard range.length > 0 else { return }
+            perform(actionName: "Clear Formatting", range: range) {
+                for key in Self.supportedInlineFormattingAttributes {
+                    document.textStorage.removeAttribute(key, range: range)
+                }
+                document.textStorage.enumerateAttribute(.paragraphStyle, in: range) { value, subrange, _ in
+                    guard let style = (value as? NSParagraphStyle)?.mutableCopy() as? NSMutableParagraphStyle else {
+                        return
+                    }
+                    style.textLists = []
+                    if style.firstLineHeadIndent == 18 { style.firstLineHeadIndent = 0 }
+                    if style.headIndent == 36 { style.headIndent = 0 }
+                    style.tabStops.removeAll { $0.location == 18 }
+                    document.textStorage.addAttribute(.paragraphStyle, value: style, range: subrange)
+                }
+            }
             return
         }
         perform(actionName: "Clear Formatting", range: selected) {
@@ -259,6 +276,10 @@ final class ScratchpadEditorController {
         .kern,
         .baselineOffset,
     ]
+
+    private static let supportedInlineFormattingAttributes = supportedFormattingAttributes.filter {
+        $0 != .paragraphStyle
+    }
 
     private static func clearSupportedAttributes(from attributes: inout [NSAttributedString.Key: Any]) {
         for key in supportedFormattingAttributes {
