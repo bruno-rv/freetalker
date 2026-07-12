@@ -108,6 +108,35 @@ bundle again, enable it, and relaunch.
   Library entry at your cursor without re-recording — handy when a paste got dismissed or
   overwritten.
 
+## Floating controls and scratchpad
+
+The edge launcher is off by default. In Settings → General → **Floating
+controls**, turn on **Show edge launcher**, choose the left, right, top, or
+bottom **Screen edge**, and use **Position along edge** to place it. Choose
+**Auto**, **English**, or **Portuguese** as the default **Dictation language**.
+Hover over the edge tab to reveal controls for dictation, the Scratchpad,
+Settings, and language; the language choice stays synchronized with the menu
+bar.
+
+Drag the recording HUD to keep it out of your way. FreeTalker restores its
+position on the next recording and keeps it visible if the display layout
+changes.
+
+Open **Scratchpad…** from the menu bar or the edge launcher. Type directly, or
+place the insertion point or select text and choose **Dictate**; live speech
+appears as a preview before the final transcript is inserted. Use the toolbar
+for body and heading styles, bold, italic, bulleted and numbered lists, or
+clearing supported formatting. Scratchpad text and formatting are saved
+automatically on this Mac.
+
+Scratchpad AI actions require a configured API-backed Cloud post-processing
+provider under Settings → General. **Improve writing**, **Expand**,
+**Condense**, and **Custom instruction** send the selected text to that
+configured cloud endpoint, or send the entire Scratchpad when nothing is
+selected. These actions don't fall back to Apple's on-device model. If the
+source changes while a request is running, FreeTalker leaves it untouched
+instead of replacing newer edits.
+
 ## Templates
 
 Four built-ins ship with the app: **Clean Dictation** (default), **Refined Message**,
