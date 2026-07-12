@@ -52,14 +52,14 @@ struct FreeTalkerApp: App {
         // One unified entry point: creates the tap, or (on failure) starts the 2s retry poll
         // and status text — the same path also used by app activation and hotkey reassignment.
         AppCoordinator.shared.ensureHotKeyListening()
+        _ = ScratchpadWindowController.shared
 
         let floatingControlsController = FloatingControlsController(callbacks: .init(
             onDictation: {
                 AppCoordinator.shared.startHandsFreeRecording(destination: .external)
             },
-            // Task 8 replaces this safe placeholder with the scratchpad controller.
             onScratchpad: {
-                NSApplication.shared.activate(ignoringOtherApps: true)
+                ScratchpadWindowController.shared.open()
             },
             onOpenSettings: {
                 NSApplication.shared.activate(ignoringOtherApps: true)
@@ -149,6 +149,7 @@ private struct MenuBarContentView: View {
             Divider()
 
             Button("Library…") { openWindow(id: "library") }
+            Button("Scratchpad…") { ScratchpadWindowController.shared.open() }
             Button("Settings…") {
                 NSApplication.shared.activate(ignoringOtherApps: true)
                 openWindow(id: "settings")
