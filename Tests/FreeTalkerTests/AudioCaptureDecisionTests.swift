@@ -2,6 +2,16 @@ import Testing
 @testable import FreeTalker
 
 struct AudioCaptureDecisionTests {
+    @Test func effectiveVoiceProcessingLetsVPIOManageDevices() {
+        #expect(AudioCapture.deviceApplicationPolicy(effectiveVoiceProcessing: true) == .systemManaged)
+        #expect(AudioCapture.deviceApplicationPolicy(effectiveVoiceProcessing: false) == .applyConfiguredInput)
+    }
+
+    @Test func lateVoiceProcessingFailureRetriesOnceWithRawEngine() {
+        #expect(AudioCapture.captureFailureAction(effectiveVoiceProcessing: true) == .retryRaw)
+        #expect(AudioCapture.captureFailureAction(effectiveVoiceProcessing: false) == .propagate)
+    }
+
     @Test func unchangedStateNeedsNoTransition() {
         #expect(AudioCapture.voiceProcessingAction(requested: true, current: true, transitionFailed: false) == .keepCurrent)
         #expect(AudioCapture.voiceProcessingAction(requested: false, current: false, transitionFailed: false) == .keepCurrent)

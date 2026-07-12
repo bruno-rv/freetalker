@@ -4,6 +4,16 @@ import Foundation
 import OSLog
 
 final class AudioCapture {
+    enum DeviceApplicationPolicy: Equatable {
+        case systemManaged
+        case applyConfiguredInput
+    }
+
+    enum CaptureFailureAction: Equatable {
+        case retryRaw
+        case propagate
+    }
+
     enum VoiceProcessingAction: Equatable {
         case keepCurrent
         case setRequested
@@ -36,6 +46,18 @@ final class AudioCapture {
         existing + [warning]
     }
 
+    nonisolated static func deviceApplicationPolicy(
+        effectiveVoiceProcessing: Bool
+    ) -> DeviceApplicationPolicy {
+        effectiveVoiceProcessing ? .systemManaged : .applyConfiguredInput
+    }
+
+    nonisolated static func captureFailureAction(
+        effectiveVoiceProcessing: Bool
+    ) -> CaptureFailureAction {
+        effectiveVoiceProcessing ? .retryRaw : .propagate
+    }
+
     /// Starts capturing. Throws if the mic can't be opened (e.g. permission denied).
     /// - Parameter deviceUID: CoreAudio UID of the input device to pin (AppSettings
     ///   `microphoneDeviceUID`), or nil to use the system default input.
@@ -47,30 +69,60 @@ final class AudioCapture {
         converter = nil
         captureWarnings.removeAll()
 
-        let input = try reconcileVoiceProcessing(requested: noiseSuppression)
-        applyConfiguredInputDevice(uid: deviceUID, to: input)
-        logEffectiveInputDevice(for: input)
-
-        let inputFormat = input.outputFormat(forBus: 0)
-        Self.logger.info("Negotiated input format: \(inputFormat.description, privacy: .public)")
-        guard let negotiatedConverter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
-            throw CaptureError.converterUnavailable(inputFormat.description)
-        }
-        converter = negotiatedConverter
-
-        input.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
-            self?.consume(buffer: buffer, inputFormat: inputFormat)
-        }
-        engine.prepare()
         do {
-            try engine.start()
+            try startCaptureAttempt(deviceUID: deviceUID, requestedVoiceProcessing: noiseSuppression)
         } catch {
-            // Leaving the tap installed while `isCapturing` stays false would make the next
-            // `start()` install a second tap on the same bus. See Round 1 Codex finding 6.
-            input.removeTap(onBus: 0)
-            throw error
+            guard Self.captureFailureAction(
+                effectiveVoiceProcessing: engine.inputNode.isVoiceProcessingEnabled
+            ) == .retryRaw else {
+                throw error
+            }
+
+            Self.logger.error("Voice-processing capture failed: \(error.localizedDescription, privacy: .public)")
+            try replaceWithRawEngine()
+            recordWarning("Voice processing failed — using raw microphone audio")
+            try startCaptureAttempt(deviceUID: deviceUID, requestedVoiceProcessing: false)
         }
         isCapturing = true
+    }
+
+    private func startCaptureAttempt(deviceUID: String?, requestedVoiceProcessing: Bool) throws {
+        var input: AVAudioInputNode?
+        var tapInstalled = false
+        do {
+            let attemptInput = try reconcileVoiceProcessing(requested: requestedVoiceProcessing)
+            input = attemptInput
+            let effectiveVoiceProcessing = attemptInput.isVoiceProcessingEnabled
+
+            switch Self.deviceApplicationPolicy(effectiveVoiceProcessing: effectiveVoiceProcessing) {
+            case .systemManaged:
+                verifySystemManagedInput(uid: deviceUID)
+            case .applyConfiguredInput:
+                applyConfiguredInputDevice(uid: deviceUID, to: attemptInput)
+                logEffectiveInputDevice(for: attemptInput)
+            }
+
+            let inputFormat = attemptInput.outputFormat(forBus: 0)
+            Self.logger.info("Negotiated input format: \(inputFormat.description, privacy: .public)")
+            guard let negotiatedConverter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
+                throw CaptureError.converterUnavailable(inputFormat.description)
+            }
+            converter = negotiatedConverter
+
+            attemptInput.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
+                self?.consume(buffer: buffer, inputFormat: inputFormat)
+            }
+            tapInstalled = true
+            engine.prepare()
+            try engine.start()
+        } catch {
+            if tapInstalled {
+                input?.removeTap(onBus: 0)
+            }
+            engine.stop()
+            converter = nil
+            throw error
+        }
     }
 
     func snapshot() -> [Float] {
@@ -155,6 +207,24 @@ final class AudioCapture {
         return input
     }
 
+    private func replaceWithRawEngine() throws {
+        engine.stop()
+        converter = nil
+        engine = AVAudioEngine()
+        let input = engine.inputNode
+        if input.isVoiceProcessingEnabled {
+            do {
+                try input.setVoiceProcessingEnabled(false)
+            } catch {
+                throw CaptureError.rawFallbackUnavailable(error.localizedDescription)
+            }
+        }
+        guard !input.isVoiceProcessingEnabled else {
+            throw CaptureError.rawFallbackUnavailable("voice processing remained enabled")
+        }
+        Self.logger.warning("Recreated audio engine for raw-capture fallback")
+    }
+
     /// Pins the engine's input to the CoreAudio device identified by `uid`, if any. Must run
     /// before reading `input.outputFormat`/installing the tap: switching devices can change the
     /// native sample rate/channel count. No-op (system default stays in effect) when `uid` is
@@ -187,10 +257,53 @@ final class AudioCapture {
         captureWarnings = Self.captureWarnings(captureWarnings, adding: warning)
     }
 
-    private func logEffectiveInputDevice(for input: AVAudioInputNode) {
+    private func verifySystemManagedInput(uid: String?) {
+        let effectiveDeviceID = systemDefaultInputDeviceID()
+        if let effectiveDeviceID {
+            Self.logger.info("Effective voice-processing input device ID: \(effectiveDeviceID)")
+        } else {
+            Self.logger.error("Effective voice-processing input device unknown: system default input query failed")
+        }
+        guard let uid else { return }
+        guard let configuredDeviceID = AudioInputDevices.resolveID(forUID: uid) else {
+            recordWarning("Configured microphone not found — voice processing is using the system microphone")
+            return
+        }
+        guard let effectiveDeviceID else {
+            recordWarning("Voice processing could not confirm the configured microphone — using system-managed audio")
+            return
+        }
+        guard effectiveDeviceID == configuredDeviceID else {
+            recordWarning("Voice processing is using the system microphone instead of the configured microphone")
+            return
+        }
+    }
+
+    private func systemDefaultInputDeviceID() -> AudioDeviceID? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var deviceID = AudioDeviceID()
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            &size,
+            &deviceID
+        )
+        guard status == noErr else { return nil }
+        return deviceID
+    }
+
+    @discardableResult
+    private func logEffectiveInputDevice(for input: AVAudioInputNode) -> AudioDeviceID? {
         guard let audioUnit = input.audioUnit else {
             Self.logger.error("Effective input device unknown: input audio unit unavailable")
-            return
+            return nil
         }
         var deviceID = AudioDeviceID()
         var size = UInt32(MemoryLayout<AudioDeviceID>.size)
@@ -204,9 +317,10 @@ final class AudioCapture {
         )
         guard status == noErr else {
             Self.logger.error("Effective input device unknown: CurrentDevice property query failed with status \(status)")
-            return
+            return nil
         }
         Self.logger.info("Effective input device ID: \(deviceID)")
+        return deviceID
     }
 
     private func consume(buffer: AVAudioPCMBuffer, inputFormat: AVAudioFormat) {
