@@ -15,10 +15,13 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
     private let consumePendingRecording: (ScratchpadInsertionToken) -> String?
     private let clearPendingRecording: (ScratchpadInsertionToken) -> Void
     private let consumePendingFailure: () -> String?
+    private let flush: (ScratchpadDocument) throws -> Void
     nonisolated private let notificationCenter: NotificationCenter
     nonisolated(unsafe) private var terminationObserver: NSObjectProtocol?
     private var activeToken: ScratchpadInsertionToken?
     private var recoveries: [RecordingDestinationLifecycle.PendingRecording] = []
+    private var retainedWarnings: [String] = []
+    private var closeInProgress = false
 
     convenience init() {
         let coordinator = AppCoordinator.shared
@@ -31,7 +34,8 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
             pendingRecordings: { coordinator.pendingScratchpadRecordings() },
             consumePendingRecording: { coordinator.consumePendingScratchpadRecording(for: $0) },
             clearPendingRecording: { coordinator.clearPendingScratchpadRecording(for: $0) },
-            consumePendingFailure: { coordinator.consumePendingScratchpadFailure() }
+            consumePendingFailure: { coordinator.consumePendingScratchpadFailure() },
+            flushDocument: { try $0.flush() }
         )
     }
 
@@ -45,6 +49,7 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
         consumePendingRecording: @escaping (ScratchpadInsertionToken) -> String?,
         clearPendingRecording: @escaping (ScratchpadInsertionToken) -> Void,
         consumePendingFailure: @escaping () -> String?,
+        flushDocument: @escaping (ScratchpadDocument) throws -> Void,
         notificationCenter: NotificationCenter = .default
     ) {
         scratchpadDocument = ScratchpadDocument(url: documentURL)
@@ -57,6 +62,7 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
         self.consumePendingRecording = consumePendingRecording
         self.clearPendingRecording = clearPendingRecording
         self.consumePendingFailure = consumePendingFailure
+        self.flush = flushDocument
         self.notificationCenter = notificationCenter
 
         let window = NSWindow(
@@ -96,8 +102,9 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
         registerAsRouter()
         recoverPendingRecordings()
         if recoveries.isEmpty, let failure = consumePendingFailure() {
-            scratchpadView.statusText = failure
+            retainWarning(failure)
         }
+        updateStatusPresentation()
         if activate { NSApplication.shared.activate(ignoringOtherApps: true) }
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
@@ -167,18 +174,21 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
         guard token == activeToken else { return }
         activeToken = nil
         scratchpadView.previewText = nil
-        scratchpadView.statusText = message
         scratchpadView.isRecording = false
+        if closeInProgress { retainWarning(message) }
+        else { scratchpadView.statusText = message }
     }
 
     func windowWillClose(_ notification: Notification) {
+        closeInProgress = true
+        scratchpadView.statusText = nil
         if activeToken != nil, scratchpadView.isRecording { stopRecording() }
         flushDocument()
         registerRouter(nil)
         activeToken = nil
         scratchpadView.isRecording = false
         scratchpadView.previewText = nil
-        scratchpadView.statusText = nil
+        closeInProgress = false
     }
 
     private func registerAsRouter() {
@@ -198,13 +208,7 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
 
     private func renderCurrentRecovery() {
         scratchpadView.recoveryText = recoveries.first?.text
-        if recoveries.isEmpty {
-            if scratchpadView.statusText == "The original insertion point changed. The transcription is preserved below." {
-                scratchpadView.statusText = nil
-            }
-        } else {
-            scratchpadView.statusText = "The original insertion point changed. The transcription is preserved below."
-        }
+        updateStatusPresentation()
     }
 
     private func insertRecovery() {
@@ -221,8 +225,23 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
     }
 
     private func flushDocument() {
-        do { try scratchpadDocument.flush() }
-        catch { scratchpadView.statusText = "The scratchpad could not be saved." }
+        do { try flush(scratchpadDocument) }
+        catch {
+            retainWarning("The scratchpad could not be saved.")
+            updateStatusPresentation()
+        }
+    }
+
+    private func retainWarning(_ message: String) {
+        retainedWarnings.append(message)
+    }
+
+    private func updateStatusPresentation() {
+        var messages = retainedWarnings
+        if !recoveries.isEmpty {
+            messages.append("The original insertion point changed. The transcription is preserved below.")
+        }
+        scratchpadView.statusText = messages.isEmpty ? nil : messages.joined(separator: "\n")
     }
 
     private static var defaultDocumentURL: URL {

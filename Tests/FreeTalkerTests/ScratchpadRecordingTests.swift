@@ -208,6 +208,36 @@ struct ScratchpadRecordingTests {
         _ = terminationController
     }
 
+    @Test func closeFlushFailureSurvivesReopenWithInMemoryDocument() {
+        let controller = makeController(
+            url: temporaryURL(),
+            flushDocument: { _ in throw CloseFailure.save }
+        )
+        controller.scratchpadDocument.textStorage.append(NSAttributedString(string: "unsaved"))
+
+        controller.windowWillClose(Notification(name: NSWindow.willCloseNotification))
+        controller.open(activate: false)
+
+        #expect(controller.scratchpadDocument.textStorage.string == "unsaved")
+        #expect(controller.scratchpadView.statusText?.contains("could not be saved") == true)
+    }
+
+    @Test func synchronousStopFailureAndSaveFailureBothSurviveCloseInOrder() {
+        let harness = Harness("Base", flushDocument: { _ in throw CloseFailure.save })
+        harness.controller.startDictation()
+        let token = harness.startedToken
+        harness.probe.onStop = { [weak controller = harness.controller] in
+            controller?.failRecording("stop failed", for: token)
+        }
+
+        harness.controller.windowWillClose(Notification(name: NSWindow.willCloseNotification))
+        harness.controller.open(activate: false)
+
+        #expect(!harness.controller.scratchpadView.isRecording)
+        #expect(harness.controller.scratchpadView.previewText == nil)
+        #expect(harness.controller.scratchpadView.statusText == "stop failed\nThe scratchpad could not be saved.")
+    }
+
     private func temporaryURL() -> URL {
         FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
@@ -216,7 +246,8 @@ struct ScratchpadRecordingTests {
 
     private func makeController(
         url: URL,
-        notificationCenter: NotificationCenter = .default
+        notificationCenter: NotificationCenter = .default,
+        flushDocument: @escaping (ScratchpadDocument) throws -> Void = { try $0.flush() }
     ) -> ScratchpadWindowController {
         ScratchpadWindowController(
             documentURL: url,
@@ -228,6 +259,7 @@ struct ScratchpadRecordingTests {
             consumePendingRecording: { _ in nil },
             clearPendingRecording: { _ in },
             consumePendingFailure: { nil },
+            flushDocument: flushDocument,
             notificationCenter: notificationCenter
         )
     }
@@ -250,7 +282,10 @@ private final class Harness {
         return token
     }
 
-    init(_ text: String) {
+    init(
+        _ text: String,
+        flushDocument: @escaping (ScratchpadDocument) throws -> Void = { try $0.flush() }
+    ) {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
             .appendingPathExtension("rtf")
@@ -264,12 +299,13 @@ private final class Harness {
                 return true
             },
             recordingIsBusy: { probe.isBusy },
-            stopRecording: { probe.stopCalls += 1 },
+            stopRecording: { probe.stopCalls += 1; probe.onStop() },
             registerRouter: { probe.registeredRouter = $0; probe.lifecycle.router = $0 },
             pendingRecordings: { probe.lifecycle.pendingRecordings() },
             consumePendingRecording: { probe.lifecycle.consumePending(for: $0) },
             clearPendingRecording: { probe.lifecycle.clearPending(for: $0) },
-            consumePendingFailure: { probe.lifecycle.consumePendingFailure() }
+            consumePendingFailure: { probe.lifecycle.consumePendingFailure() },
+            flushDocument: flushDocument
         )
         controller.scratchpadDocument.textStorage.append(NSAttributedString(string: text))
     }
@@ -281,6 +317,7 @@ private final class CallbackProbe {
     var startedDestinations: [RecordingDestination] = []
     var stopCalls = 0
     var isBusy = false
+    var onStop: () -> Void = {}
     weak var registeredRouter: (any ScratchpadRecordingRouting)?
     var pending: [ScratchpadInsertionToken: String] {
         Dictionary(uniqueKeysWithValues: lifecycle.pendingRecordings().map { ($0.token, $0.text) })
@@ -292,4 +329,8 @@ private final class CallbackProbe {
 
 private struct ClosedFailure: Error, LocalizedError {
     var errorDescription: String? { "closed failure" }
+}
+
+private enum CloseFailure: Error {
+    case save
 }

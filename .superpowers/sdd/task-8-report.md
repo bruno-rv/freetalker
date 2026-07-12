@@ -109,3 +109,44 @@ Result: exit 0; the full suite passed in the one required review-fix run.
 
 None. Recoveries and terminal errors remain process-memory lifecycle state, matching Task 5;
 they do not use pasteboard, Library, or scratchpad document persistence.
+
+## Remaining close-lifecycle review fixes
+
+### RED
+
+Added focused tests that inject a throwing document flush and a stop callback that
+synchronously calls `failRecording`. The tests require a close/reopen cycle to retain the
+in-memory document and present both errors in deterministic stop-then-save order. The initial
+focused build failed because the controller did not yet expose the narrow injected flush seam.
+
+### GREEN
+
+```text
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  swift test --filter 'ScratchpadRecordingTests|ScratchpadPersistenceTests|RecordingDestinationTests'
+```
+
+Result: exit 0; all selected suites passed.
+
+```text
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
+```
+
+Result: exit 0; the full suite passed.
+
+### Implementation
+
+- Close now marks `closeInProgress` and clears transient status before invoking the existing
+  stop-and-transcribe callback.
+- A synchronous stop failure is retained rather than written into transient session UI.
+- Flush failures enter the same ordered warning presentation instead of being cleared later in
+  `windowWillClose`.
+- Router removal and local token/recording/preview cleanup happen after stop and flush without
+  clearing retained warnings.
+- Reopen deterministically presents retained warnings; simultaneous stop and save failures are
+  shown as `stop failed` followed by the actionable save warning.
+
+### Concerns
+
+None. The warning queue is in-memory UI lifecycle state and does not alter document persistence,
+pasteboard, Library, or external insertion behavior.
