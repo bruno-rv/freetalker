@@ -360,6 +360,7 @@ private struct GeneralSettingsView: View {
             }
 
             Section("Microphone") {
+                Toggle("Reduce background noise", isOn: $settings.noiseSuppressionEnabled)
                 Picker("Input device", selection: $settings.microphoneDeviceUID) {
                     Text("System default").tag(nil as String?)
                     ForEach(inputDevices) { device in

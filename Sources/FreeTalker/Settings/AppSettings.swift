@@ -120,6 +120,10 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(livePreviewEnabled, forKey: Keys.livePreviewEnabled) }
     }
 
+    @Published var noiseSuppressionEnabled: Bool {
+        didSet { defaults.set(noiseSuppressionEnabled, forKey: Keys.noiseSuppressionEnabled) }
+    }
+
     @Published var llmProvider: LLMProviderKind {
         didSet {
             defaults.set(llmProvider.rawValue, forKey: Keys.llmProvider)
@@ -433,6 +437,7 @@ final class AppSettings: ObservableObject {
         static let whisperModel = "whisperModel"
         static let whisperModelChosen = "whisperModelChosen"
         static let livePreviewEnabled = "livePreviewEnabled"
+        static let noiseSuppressionEnabled = "noiseSuppressionEnabled"
         static let llmProvider = "llmProvider"
         static let cloudLLMBaseURL = "cloudLLMBaseURL"
         static let cloudLLMModel = "cloudLLMModel"
@@ -482,6 +487,7 @@ final class AppSettings: ObservableObject {
         // Default ON — `.object(forKey:)` (not `.bool(forKey:)`) so an unset key is distinguished
         // from an explicit `false`, which `.bool(forKey:)` can't do (it returns false for both).
         livePreviewEnabled = defaults.object(forKey: Keys.livePreviewEnabled) as? Bool ?? true
+        noiseSuppressionEnabled = defaults.object(forKey: Keys.noiseSuppressionEnabled) as? Bool ?? true
         // Loaded into locals first, not `self.llmProvider`/`self.cloudLLMBaseURL`/
         // `self.cloudLLMModel` directly: `self` can't be read (even its own not-yet-assigned
         // stored properties) until every stored property is initialized, and
