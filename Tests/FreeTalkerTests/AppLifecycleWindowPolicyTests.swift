@@ -21,6 +21,38 @@ struct AppLifecycleWindowPolicyTests {
         #expect(window.level == .normal)
     }
 
+    @Test func settingsWindowRemovesFullScreenAuxiliaryBeforeJoiningOtherApplications() {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 500, height: 500),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.collectionBehavior = [.fullScreenAuxiliary]
+
+        AppLifecycleWindowPolicy.configureSettingsWindow(window)
+
+        #expect(!window.collectionBehavior.contains(.fullScreenAuxiliary))
+        #expect(window.collectionBehavior.contains(.canJoinAllSpaces))
+        #expect(window.collectionBehavior.contains(.canJoinAllApplications))
+    }
+
+    @Test func settingsWindowRemovesFullScreenPrimaryBeforeJoiningOtherApplications() {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 500, height: 500),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.collectionBehavior = [.fullScreenPrimary]
+
+        AppLifecycleWindowPolicy.configureSettingsWindow(window)
+
+        #expect(!window.collectionBehavior.contains(.fullScreenPrimary))
+        #expect(window.collectionBehavior.contains(.canJoinAllSpaces))
+        #expect(window.collectionBehavior.contains(.canJoinAllApplications))
+    }
+
     @Test func firstLifetimeClaimSucceedsAndSecondClaimFails() throws {
         let path = FileManager.default.temporaryDirectory
             .appendingPathComponent("freetalker-lease-\(UUID().uuidString)").path
