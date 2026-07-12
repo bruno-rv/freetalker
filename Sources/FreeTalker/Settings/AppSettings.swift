@@ -124,6 +124,41 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(noiseSuppressionEnabled, forKey: Keys.noiseSuppressionEnabled) }
     }
 
+    @Published var edgeLauncherEnabled: Bool {
+        didSet { defaults.set(edgeLauncherEnabled, forKey: Keys.edgeLauncherEnabled) }
+    }
+
+    @Published var edgeLauncherEdge: LauncherEdge {
+        didSet { defaults.set(edgeLauncherEdge.rawValue, forKey: Keys.edgeLauncherEdge) }
+    }
+
+    @Published var edgeLauncherPosition: Double {
+        didSet {
+            let clamped = Self.clampNormalizedPosition(edgeLauncherPosition)
+            guard clamped == edgeLauncherPosition else {
+                edgeLauncherPosition = clamped
+                defaults.set(clamped, forKey: Keys.edgeLauncherPosition)
+                return
+            }
+            defaults.set(edgeLauncherPosition, forKey: Keys.edgeLauncherPosition)
+        }
+    }
+
+    @Published var hudPosition: NormalizedWindowPosition? {
+        didSet {
+            if let hudPosition, let data = try? JSONEncoder().encode(hudPosition) {
+                defaults.set(data, forKey: Keys.hudPosition)
+            } else {
+                defaults.removeObject(forKey: Keys.hudPosition)
+            }
+        }
+    }
+
+    nonisolated static func clampNormalizedPosition(_ value: Double) -> Double {
+        guard value.isFinite else { return 0.5 }
+        return min(max(value, 0), 1)
+    }
+
     @Published var llmProvider: LLMProviderKind {
         didSet {
             defaults.set(llmProvider.rawValue, forKey: Keys.llmProvider)
@@ -438,6 +473,10 @@ final class AppSettings: ObservableObject {
         static let whisperModelChosen = "whisperModelChosen"
         static let livePreviewEnabled = "livePreviewEnabled"
         static let noiseSuppressionEnabled = "noiseSuppressionEnabled"
+        static let edgeLauncherEnabled = "edgeLauncherEnabled"
+        static let edgeLauncherEdge = "edgeLauncherEdge"
+        static let edgeLauncherPosition = "edgeLauncherPosition"
+        static let hudPosition = "hudPosition"
         static let llmProvider = "llmProvider"
         static let cloudLLMBaseURL = "cloudLLMBaseURL"
         static let cloudLLMModel = "cloudLLMModel"
@@ -488,6 +527,17 @@ final class AppSettings: ObservableObject {
         // from an explicit `false`, which `.bool(forKey:)` can't do (it returns false for both).
         livePreviewEnabled = defaults.object(forKey: Keys.livePreviewEnabled) as? Bool ?? true
         noiseSuppressionEnabled = defaults.object(forKey: Keys.noiseSuppressionEnabled) as? Bool ?? true
+        edgeLauncherEnabled = defaults.object(forKey: Keys.edgeLauncherEnabled) as? Bool ?? false
+        edgeLauncherEdge = LauncherEdge(rawValue: defaults.string(forKey: Keys.edgeLauncherEdge) ?? "") ?? .right
+        let storedEdgeLauncherPosition = defaults.object(forKey: Keys.edgeLauncherPosition) as? Double ?? 0.5
+        edgeLauncherPosition = Self.clampNormalizedPosition(storedEdgeLauncherPosition)
+        if let data = defaults.data(forKey: Keys.hudPosition),
+           let position = try? JSONDecoder().decode(NormalizedWindowPosition.self, from: data),
+           position.x.isFinite, position.y.isFinite {
+            hudPosition = position
+        } else {
+            hudPosition = nil
+        }
         // Loaded into locals first, not `self.llmProvider`/`self.cloudLLMBaseURL`/
         // `self.cloudLLMModel` directly: `self` can't be read (even its own not-yet-assigned
         // stored properties) until every stored property is initialized, and
