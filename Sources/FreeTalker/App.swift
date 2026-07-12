@@ -3,9 +3,14 @@ import SwiftUI
 
 @main
 struct FreeTalkerApp: App {
-    @ObservedObject private var coordinator = AppCoordinator.shared
-
     init() {
+        let currentApplication = NSRunningApplication.current
+        if let existingApplication = AppLifecycleWindowPolicy.existingOwner(for: currentApplication) {
+            existingApplication.activate(options: [.activateAllWindows])
+            NSApplication.shared.terminate(nil)
+            return
+        }
+
         // One-time migration of the legacy shared BYOK LLM Keychain item into the active
         // provider's scoped account. Deliberately placed here rather than in `AppSettings.init`
         // so it runs once during app startup against the real Keychain.
@@ -45,6 +50,7 @@ struct FreeTalkerApp: App {
 
         Window("Settings", id: "settings") {
             SettingsView()
+                .background(SettingsWindowConfigurator())
         }
         .windowResizability(.contentSize)
     }
@@ -104,7 +110,10 @@ private struct MenuBarContentView: View {
             Divider()
 
             Button("Library…") { openWindow(id: "library") }
-            Button("Settings…") { openWindow(id: "settings") }
+            Button("Settings…") {
+                NSApplication.shared.activate(ignoringOtherApps: true)
+                openWindow(id: "settings")
+            }
 
             Divider()
 
@@ -119,4 +128,22 @@ private struct MenuBarContentView: View {
         ("en", "English"),
         ("pt", "Portuguese")
     ]
+}
+
+private struct SettingsWindowConfigurator: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        SettingsWindowObserverView()
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
+}
+
+private final class SettingsWindowObserverView: NSView {
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard let window else { return }
+        AppLifecycleWindowPolicy.configureSettingsWindow(window)
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
+    }
 }
