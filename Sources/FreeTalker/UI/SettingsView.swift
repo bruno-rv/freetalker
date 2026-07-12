@@ -397,6 +397,31 @@ private struct GeneralSettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
+            Section("Floating controls") {
+                Toggle("Show edge launcher", isOn: $settings.edgeLauncherEnabled)
+                Picker("Screen edge", selection: $settings.edgeLauncherEdge) {
+                    ForEach(LauncherEdge.allCases, id: \.rawValue) { edge in
+                        Text(edge.displayName)
+                            .help(edge.explanation)
+                            .tag(edge)
+                    }
+                }
+                .disabled(!settings.edgeLauncherEnabled)
+                Text(settings.edgeLauncherEdge.explanation)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Slider(value: $settings.edgeLauncherPosition, in: 0...1) {
+                    Text("Position along edge")
+                }
+                .disabled(!settings.edgeLauncherEnabled)
+                Picker("Dictation language", selection: $settings.languagePin) {
+                    Text("Auto").tag("auto")
+                    Text("English").tag("en")
+                    Text("Portuguese").tag("pt")
+                }
+                .disabled(!settings.edgeLauncherEnabled)
+            }
+
             Section("Recovery") {
                 Picker("Keep failed dictation audio", selection: $settings.recoveryRetention) {
                     ForEach(RecoveryRetention.allCases, id: \.rawValue) { value in
