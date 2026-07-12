@@ -139,11 +139,11 @@ struct ScratchpadAIActionTests {
 
     @Test func availabilityReasonPriorityAndSharedPresentation() {
         let cases: [(ScratchpadAIAvailability, String)] = [
-            (.make(eligibility: .missingAPIKey, hasInput: false, isInFlight: true, hasInstruction: false, providerName: "Anthropic"), "Enter text"),
-            (.make(eligibility: .missingAPIKey, hasInput: true, isInFlight: true, hasInstruction: false, providerName: "Anthropic"), "in progress"),
-            (.make(eligibility: .missingAPIKey, hasInput: true, hasInstruction: false, providerName: "Anthropic"), "instruction"),
-            (.make(eligibility: .invalidConfiguration, hasInput: true, hasInstruction: true, providerName: "Anthropic"), "configuration"),
-            (.make(eligibility: .missingAPIKey, hasInput: true, hasInstruction: true, providerName: "Anthropic"), "API key"),
+            (.make(eligibility: .missingAPIKey, hasInput: false, isInFlight: true, hasInstruction: false, provider: .anthropic), "Enter text"),
+            (.make(eligibility: .missingAPIKey, hasInput: true, isInFlight: true, hasInstruction: false, provider: .anthropic), "in progress"),
+            (.make(eligibility: .missingAPIKey, hasInput: true, hasInstruction: false, provider: .anthropic), "instruction"),
+            (.make(eligibility: .invalidConfiguration, hasInput: true, hasInstruction: true, provider: .anthropic), "configuration"),
+            (.make(eligibility: .missingAPIKey, hasInput: true, hasInstruction: true, provider: .anthropic), "API key"),
         ]
         for (availability, fragment) in cases {
             #expect(availability.enabled == false)
@@ -152,10 +152,38 @@ struct ScratchpadAIActionTests {
         }
     }
 
+    @Test func apiDisabledReasonExactlyReusesCanonicalAvailability() {
+        for eligibility in [CloudLLMEligibility.invalidConfiguration, .missingAPIKey] {
+            let scratchpad = ScratchpadAIAvailability.make(
+                eligibility: eligibility, hasInput: true, hasInstruction: true,
+                provider: .anthropic
+            )
+            let canonical = CloudFeatureAvailability.make(
+                eligibility: eligibility, provider: .anthropic
+            )
+            #expect(scratchpad.tooltip == canonical.tooltip)
+            #expect(scratchpad.accessibilityHelp == canonical.accessibilityHelp)
+        }
+    }
+
+    @MainActor @Test func scratchpadVisiblyUsesSharedPrivacyDisclosure() {
+        let harness = ScratchpadAIWindowHarness(outcome: .success("result"))
+        #expect(harness.controller.scratchpadView.aiPrivacyText == CloudPrivacyDisclosure.scratchpad)
+    }
+
+    @MainActor @Test func typedInFlightUnavailableReasonIsSurfacedExactly() async {
+        let harness = ScratchpadAIWindowHarness(outcome: .unavailable(.missingAPIKey))
+        harness.controller.scratchpadDocument.textStorage.append(NSAttributedString(string: "text"))
+        harness.controller.performAIAction(.expand)
+        await harness.waitForCompletion()
+        let canonical = CloudFeatureAvailability.make(eligibility: .missingAPIKey, provider: .openAICompatible)
+        #expect(harness.controller.scratchpadView.aiErrorText == canonical.tooltip)
+    }
+
     @Test func eligibleAvailabilityHasNoDisabledReason() {
         let availability = ScratchpadAIAvailability.make(
             eligibility: .eligible(apiKey: nil), hasInput: true,
-            hasInstruction: true, providerName: "Local API")
+            hasInstruction: true, provider: .openAICompatible)
         #expect(availability.enabled)
         #expect(availability.tooltip == nil)
         #expect(availability.accessibilityHelp == nil)
@@ -428,6 +456,7 @@ private enum ScratchpadTransformOutcome {
     case failure
     case cancellation
     case empty
+    case unavailable(CloudLLMEligibility)
 
     static let failureCases: [Self] = [.failure, .cancellation, .empty]
     var isCancellation: Bool { if case .cancellation = self { true } else { false } }
@@ -446,6 +475,7 @@ private actor ScratchpadTransformSpy: ScratchpadTransforming {
         case .failure: throw ScratchpadTransformationTestError.failed
         case .cancellation: throw CancellationError()
         case .empty: return " \n "
+        case .unavailable(let eligibility): throw ScratchpadTransformationError.unavailable(eligibility)
         }
     }
 }

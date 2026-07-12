@@ -24,6 +24,13 @@ struct CloudFeatureAvailability: Equatable, Sendable {
     }
 }
 
+enum CloudPrivacyDisclosure {
+    static let liveOutputTranslation = "Output translation sends the live transcript to the configured Cloud post-processing endpoint."
+    static let scratchpad = "Scratchpad AI actions send the selected text, or the whole Scratchpad when nothing is selected, to the configured Cloud post-processing endpoint."
+    static let library = "Library translation sends the chosen Library text to the configured Cloud post-processing endpoint."
+    static let settings = "Cloud post-processing sends live transcripts selected for output translation, Scratchpad AI text, and chosen Library text to the configured endpoint."
+}
+
 private extension LLMProviderKind {
     var settingsName: String {
         switch self {

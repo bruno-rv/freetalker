@@ -121,6 +121,17 @@ import Testing
         #expect(TranslationTarget(rawValue: OutputLanguage.sameAsSpoken.rawValue) == nil)
     }
 
+    @Test func persistedVariantShapeContainsNoCloudConfigurationOrPrompt() {
+        let variant = DictationTranslationVariant(
+            parentID: 1, target: .french, text: "résultat",
+            createdAt: Date(timeIntervalSince1970: 1),
+            updatedAt: Date(timeIntervalSince1970: 2)
+        )
+        let persistedFields = Set(Mirror(reflecting: variant).children.compactMap(\.label))
+        #expect(persistedFields == ["parentID", "target", "text", "createdAt", "updatedAt"])
+        #expect(persistedFields.isDisjoint(with: ["endpoint", "apiKey", "headers", "snapshot", "prompt"]))
+    }
+
     @Test func conditionalInsertNeverOverwritesAConcurrentVariant() throws {
         let fixture = try Fixture()
         let id = try fixture.insert()

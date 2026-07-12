@@ -127,7 +127,7 @@ struct ScratchpadAIAvailability: Equatable, Sendable {
         hasInput: Bool,
         isInFlight: Bool = false,
         hasInstruction: Bool,
-        providerName: String
+        provider: LLMProviderKind
     ) -> Self {
         let reason: String?
         if !hasInput {
@@ -137,14 +137,9 @@ struct ScratchpadAIAvailability: Equatable, Sendable {
         } else if !hasInstruction {
             reason = "Enter a custom instruction."
         } else {
-            switch eligibility {
-            case .invalidConfiguration:
-                reason = "Complete the API configuration in Settings."
-            case .missingAPIKey:
-                reason = "Add an API key for \(providerName) in Settings."
-            case .eligible:
-                reason = nil
-            }
+            reason = CloudFeatureAvailability.make(
+                eligibility: eligibility, provider: provider
+            ).tooltip
         }
         return Self(enabled: reason == nil, tooltip: reason, accessibilityHelp: reason)
     }

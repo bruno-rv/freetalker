@@ -4,12 +4,11 @@ import Foundation
 
 struct LibraryTranslationPresentation: Equatable {
     enum TextAction: Equatable { case copy }
-    static let privacyDisclosure = "Translation sends this text to the API endpoint configured under Cloud post-processing."
     let availability: CloudFeatureAvailability
     var isEnabled: Bool { availability.enabled }
     var tooltip: String? { availability.tooltip }
     var accessibilityHelp: String? { availability.accessibilityHelp }
-    var privacyDisclosure: String { Self.privacyDisclosure }
+    var privacyDisclosure: String { CloudPrivacyDisclosure.library }
     var targets: [TranslationTarget] { TranslationTarget.allCases }
     var textActions: [TextAction] { [.copy] }
 }

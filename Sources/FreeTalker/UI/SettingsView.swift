@@ -117,6 +117,7 @@ struct OutputLanguageSettingsPresentation: Equatable, Sendable {
 
     var tooltip: String? { translationAvailability.tooltip }
     var accessibilityHelp: String? { translationAvailability.accessibilityHelp }
+    var privacyDisclosure: String { CloudPrivacyDisclosure.liveOutputTranslation }
 
     static func make(snapshot: CloudLLMSettingsSnapshot) -> Self {
         Self(translationAvailability: .make(
@@ -575,6 +576,9 @@ private struct GeneralSettingsView: View {
                 Text("Used for all templates whenever provider, model, and required API key are configured. OpenAI-compatible loopback HTTP endpoints can be used without a key.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                Text(CloudPrivacyDisclosure.settings)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section("Vocabulary") {
@@ -712,6 +716,9 @@ private struct GeneralSettingsView: View {
                 }
             }
             Text("Translation requires Cloud post-processing; Same as spoken does not.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(presentation.privacyDisclosure)
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

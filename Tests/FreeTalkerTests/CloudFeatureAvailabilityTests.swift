@@ -41,4 +41,11 @@ struct CloudFeatureAvailabilityTests {
             #expect(availability.accessibilityHelp == availability.tooltip)
         }
     }
+
+    @Test func privacyDisclosuresAreCentralizedAndExact() {
+        #expect(CloudPrivacyDisclosure.liveOutputTranslation == "Output translation sends the live transcript to the configured Cloud post-processing endpoint.")
+        #expect(CloudPrivacyDisclosure.scratchpad == "Scratchpad AI actions send the selected text, or the whole Scratchpad when nothing is selected, to the configured Cloud post-processing endpoint.")
+        #expect(CloudPrivacyDisclosure.library == "Library translation sends the chosen Library text to the configured Cloud post-processing endpoint.")
+        #expect(CloudPrivacyDisclosure.settings == "Cloud post-processing sends live transcripts selected for output translation, Scratchpad AI text, and chosen Library text to the configured endpoint.")
+    }
 }
