@@ -9,14 +9,51 @@ final class AppInstanceLease {
         self.descriptor = descriptor
     }
 
-    static func acquire(path: String) -> AppInstanceLease? {
+    static func acquire(path: String, ownerPID: pid_t = getpid()) -> AppInstanceLease? {
+        guard ownerPID > 0 else { return nil }
         let descriptor = open(path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, S_IRUSR | S_IWUSR)
         guard descriptor >= 0 else { return nil }
         guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
             close(descriptor)
             return nil
         }
+        guard publish(ownerPID: ownerPID, to: descriptor) else {
+            flock(descriptor, LOCK_UN)
+            close(descriptor)
+            return nil
+        }
         return AppInstanceLease(descriptor: descriptor)
+    }
+
+    static func ownerPID(path: String) -> pid_t? {
+        let descriptor = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        guard descriptor >= 0 else { return nil }
+        defer { close(descriptor) }
+
+        var buffer = [UInt8](repeating: 0, count: 64)
+        let count = read(descriptor, &buffer, buffer.count)
+        guard count > 0, count < buffer.count else { return nil }
+        let value = String(decoding: buffer.prefix(Int(count)), as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let parsed = Int64(value), parsed > 0, parsed <= Int64(Int32.max) else { return nil }
+        return pid_t(parsed)
+    }
+
+    private static func publish(ownerPID: pid_t, to descriptor: Int32) -> Bool {
+        guard ftruncate(descriptor, 0) == 0, lseek(descriptor, 0, SEEK_SET) == 0 else { return false }
+        let bytes = Array("\(ownerPID)\n".utf8)
+        let wroteAll = bytes.withUnsafeBytes { rawBuffer -> Bool in
+            guard var address = rawBuffer.baseAddress else { return false }
+            var remaining = rawBuffer.count
+            while remaining > 0 {
+                let written = write(descriptor, address, remaining)
+                guard written > 0 else { return false }
+                remaining -= written
+                address = address.advanced(by: written)
+            }
+            return true
+        }
+        return wroteAll && fsync(descriptor) == 0
     }
 
     deinit {
@@ -30,11 +67,6 @@ struct AppInstanceClaimResult {
     let shouldTerminate: Bool
 }
 
-struct AppLaunchCandidate: Equatable {
-    let processIdentifier: pid_t
-    let launchDate: Date
-}
-
 @MainActor
 enum AppLifecycleWindowPolicy {
     static var instanceLeasePath: String {
@@ -46,7 +78,7 @@ enum AppLifecycleWindowPolicy {
     static func claimInstance(
         path: String,
         maxAttempts: Int,
-        activateExistingOwner: () -> Bool,
+        activateExistingOwner: (pid_t) -> Bool,
         wait: () -> Void
     ) -> AppInstanceClaimResult {
         precondition(maxAttempts > 0)
@@ -54,7 +86,9 @@ enum AppLifecycleWindowPolicy {
             if let lease = AppInstanceLease.acquire(path: path) {
                 return AppInstanceClaimResult(lease: lease, shouldTerminate: false)
             }
-            _ = activateExistingOwner()
+            if let ownerPID = AppInstanceLease.ownerPID(path: path), ownerPID != getpid() {
+                _ = activateExistingOwner(ownerPID)
+            }
             if attempt < maxAttempts - 1 {
                 wait()
             }
@@ -62,30 +96,13 @@ enum AppLifecycleWindowPolicy {
         return AppInstanceClaimResult(lease: nil, shouldTerminate: true)
     }
 
-    static func owner(in candidates: [AppLaunchCandidate]) -> AppLaunchCandidate? {
-        candidates.min {
-            if $0.launchDate != $1.launchDate {
-                return $0.launchDate < $1.launchDate
-            }
-            return $0.processIdentifier < $1.processIdentifier
-        }
-    }
-
-    static func existingOwner(for currentApplication: NSRunningApplication) -> NSRunningApplication? {
-        guard let bundleIdentifier = currentApplication.bundleIdentifier else { return nil }
-
-        let applications = NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier)
-        let candidates = applications.map {
-            AppLaunchCandidate(
-                processIdentifier: $0.processIdentifier,
-                launchDate: $0.launchDate ?? .distantFuture
-            )
-        }
-        guard let owner = owner(in: candidates),
-              owner.processIdentifier != currentApplication.processIdentifier else {
-            return nil
-        }
-        return applications.first { $0.processIdentifier == owner.processIdentifier }
+    static func existingOwner(processIdentifier: pid_t, for currentApplication: NSRunningApplication) -> NSRunningApplication? {
+        guard processIdentifier > 0,
+              processIdentifier != currentApplication.processIdentifier,
+              let bundleIdentifier = currentApplication.bundleIdentifier,
+              let owner = NSRunningApplication(processIdentifier: processIdentifier),
+              owner.bundleIdentifier == bundleIdentifier else { return nil }
+        return owner
     }
 
     static func configureSettingsWindow(_ window: NSWindow) {
