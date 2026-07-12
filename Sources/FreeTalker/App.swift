@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 @main
@@ -54,7 +55,12 @@ struct FreeTalkerApp: App {
         AppCoordinator.shared.ensureHotKeyListening()
         _ = ScratchpadWindowController.shared
 
-        let floatingControlsController = FloatingControlsController(callbacks: .init(
+        let floatingControlsController = FloatingControlsController(
+            outputSelection: { AppCoordinator.shared.recordingOutputSelection },
+            outputUpdates: AppCoordinator.shared.objectWillChange
+                .map { _ in () }
+                .eraseToAnyPublisher(),
+            callbacks: .init(
             onDictation: {
                 AppCoordinator.shared.startHandsFreeRecording(destination: .external)
             },
@@ -67,7 +73,8 @@ struct FreeTalkerApp: App {
                     .first { $0.title == "Settings" }?
                     .makeKeyAndOrderFront(nil)
             },
-            onLanguage: { AppSettings.shared.languagePin = $0 }
+            onLanguage: { AppSettings.shared.languagePin = $0 },
+            onOutput: { AppCoordinator.shared.selectRecordingOutput($0) }
         ))
         Self.floatingControlsController = floatingControlsController
         floatingControlsController.start()

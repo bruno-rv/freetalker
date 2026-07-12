@@ -18,6 +18,7 @@ final class HUDController {
     var onPanelDone: (() -> Void)?
     var onPanelRaw: (() -> Void)?
     var onPanelLanguage: ((String) -> Void)?
+    var onPanelOutput: ((OutputLanguage) -> Void)?
     var onPanelCycleTemplate: (() -> Void)?
     var onPanelLock: (() -> Void)?
 
@@ -55,6 +56,7 @@ final class HUDController {
         var localContextPermissionHint: String?
         /// nil / "en" / "pt" — which one-shot choice (if any) is currently highlighted.
         var oneShotLanguage: String?
+        var translationState: TranslationControlsState
     }
 
     /// Bundles the Recording Panel's button callbacks for `HUDView` — closures aren't Equatable,
@@ -64,6 +66,7 @@ final class HUDController {
         var onDone: () -> Void = {}
         var onRaw: () -> Void = {}
         var onLanguage: (String) -> Void = { _ in }
+        var onOutput: (OutputLanguage) -> Void = { _ in }
         var onCycleTemplate: () -> Void = {}
         var onLock: () -> Void = {}
     }
@@ -121,6 +124,7 @@ final class HUDController {
             onDone: { [weak self] in self?.onPanelDone?() },
             onRaw: { [weak self] in self?.onPanelRaw?() },
             onLanguage: { [weak self] code in self?.onPanelLanguage?(code) },
+            onOutput: { [weak self] language in self?.onPanelOutput?(language) },
             onCycleTemplate: { [weak self] in self?.onPanelCycleTemplate?() },
             onLock: { [weak self] in self?.onPanelLock?() }
         )
@@ -323,12 +327,12 @@ struct HUDView: View {
                 .font(.caption)
                 .help("Finish without post-processing")
 
-            Button("EN") { panelCallbacks.onLanguage("en") }
-                .font(.caption)
-                .foregroundStyle(state.oneShotLanguage == "en" ? Color.accentColor : Color.primary)
-            Button("PT") { panelCallbacks.onLanguage("pt") }
-                .font(.caption)
-                .foregroundStyle(state.oneShotLanguage == "pt" ? Color.accentColor : Color.primary)
+            TranslationControls(
+                languagePin: state.oneShotLanguage ?? "auto",
+                state: state.translationState,
+                onLanguage: panelCallbacks.onLanguage,
+                onOutput: panelCallbacks.onOutput
+            )
 
             Button(action: panelCallbacks.onCycleTemplate) {
                 Text(state.activeTemplateName)

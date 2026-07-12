@@ -40,10 +40,12 @@ final class FloatingControlsController {
         var onScratchpad: () -> Void
         var onOpenSettings: () -> Void
         var onLanguage: (String) -> Void
+        var onOutput: (OutputLanguage) -> Void
     }
 
     private let settings: AppSettings
     private let callbacks: Callbacks
+    private let outputSelection: () -> RecordingOutputSelection
     private var panel: NSPanel?
     private var hostingView: FloatingControlsHostingView?
     private var state = FloatingControlsHoverState.collapsed
@@ -51,11 +53,34 @@ final class FloatingControlsController {
     private var cancellables: Set<AnyCancellable> = []
     private var screenObserver: FloatingControlsObserverToken?
     private(set) var presentedLanguagePin: String?
+    private(set) var presentedTranslationState: TranslationControlsState
 
-    init(settings: AppSettings = .shared, callbacks: Callbacks) {
+    init(
+        settings: AppSettings = .shared,
+        outputSelection: @escaping () -> RecordingOutputSelection = { RecordingOutputSelection() },
+        outputUpdates: AnyPublisher<Void, Never> = Empty().eraseToAnyPublisher(),
+        callbacks: Callbacks
+    ) {
         self.settings = settings
+        self.outputSelection = outputSelection
         self.callbacks = callbacks
         presentedLanguagePin = settings.languagePin
+        presentedTranslationState = Self.translationState(
+            settings: settings,
+            selection: outputSelection()
+        )
+        outputUpdates
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] in
+                DispatchQueue.main.async { self?.refreshOutputPresentation() }
+            }
+            .store(in: &cancellables)
+        settings.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] in
+                DispatchQueue.main.async { self?.refreshOutputPresentation() }
+            }
+            .store(in: &cancellables)
     }
 
     deinit {
@@ -78,6 +103,7 @@ final class FloatingControlsController {
                 guard let self else { return }
                 let (enabled, _, _) = launcherSettings
                 self.presentedLanguagePin = languagePin
+                self.refreshTranslationState()
                 if enabled { self.show() } else { self.hideForDisabledSetting() }
             }
             .store(in: &cancellables)
@@ -101,6 +127,35 @@ final class FloatingControlsController {
         guard settings.edgeLauncherEnabled else { return }
         renderAndPosition()
         hostingView?.reinstallTrackingArea()
+    }
+
+    func selectOutput(_ language: OutputLanguage) {
+        callbacks.onOutput(language)
+        refreshOutputPresentation()
+    }
+
+    private static func translationState(
+        settings: AppSettings,
+        selection: RecordingOutputSelection
+    ) -> TranslationControlsState {
+        let snapshot = settings.cloudLLMSnapshot
+        return TranslationControlsState(
+            effectiveOutput: selection.effective ?? settings.defaultOutputLanguage,
+            override: selection.effective,
+            availability: .make(eligibility: snapshot.eligibility, provider: snapshot.provider)
+        )
+    }
+
+    private func refreshTranslationState() {
+        presentedTranslationState = Self.translationState(
+            settings: settings,
+            selection: outputSelection()
+        )
+    }
+
+    private func refreshOutputPresentation() {
+        refreshTranslationState()
+        if settings.edgeLauncherEnabled { renderAndPosition() }
     }
 
     static func makePanel(size: NSSize) -> NSPanel {
@@ -158,11 +213,14 @@ final class FloatingControlsController {
 
     private func renderAndPosition() {
         guard let panel else { return }
+        var viewCallbacks = callbacks
+        viewCallbacks.onOutput = { [weak self] language in self?.selectOutput(language) }
         let view = FloatingControlsView(
             state: state,
             edge: settings.edgeLauncherEdge,
             languagePin: presentedLanguagePin ?? settings.languagePin,
-            callbacks: callbacks
+            translationState: presentedTranslationState,
+            callbacks: viewCallbacks
         )
         let hosting = FloatingControlsHostingView(rootView: view)
         hosting.onPointerEntered = { [weak self] in self?.pointerEntered() }
