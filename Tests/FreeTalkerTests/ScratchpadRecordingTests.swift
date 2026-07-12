@@ -257,6 +257,19 @@ struct ScratchpadRecordingTests {
         #expect(coordinator.pendingScratchpadRecording(for: token) == nil)
     }
 
+    @Test func scratchpadOuterTaskHandlerTreatsCancellationAsSilentCleanup() async {
+        var events: [String] = []
+
+        await AppCoordinator.runScratchpadPipelineTask(
+            operation: { () async throws -> Int in throw CancellationError() },
+            onSuccess: { _ in events.append("success") },
+            onTranslationFailure: { _ in events.append("translation") },
+            onFailure: { _ in events.append("failure") }
+        )
+
+        #expect(events.isEmpty)
+    }
+
     @Test func windowIsNormalFocusableAndFormattingToolbarIsAccessible() {
         let harness = Harness("Text")
         let window = harness.controller.window

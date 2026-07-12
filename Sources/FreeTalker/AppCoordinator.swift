@@ -1415,45 +1415,97 @@ final class AppCoordinator: ObservableObject {
         updateRecordingPanel()
     }
 
+    static func runExternalPipelineTask<Result>(
+        operation: () async throws -> Result,
+        onSuccess: (Result) async -> Void,
+        onEmptyTranscript: () async -> Void,
+        onRecordFailure: () async -> Void,
+        onTranslationFailure: (OutputTranslationFailure) async -> Void,
+        onFailure: (Error) async -> Void
+    ) async {
+        do {
+            await onSuccess(try await operation())
+        } catch is CancellationError {
+            return
+        } catch where Task.isCancelled {
+            return
+        } catch PipelineError.emptyTranscript {
+            await onEmptyTranscript()
+        } catch PipelineError.recordFailed(_) {
+            await onRecordFailure()
+        } catch let failure as OutputTranslationFailure {
+            await onTranslationFailure(failure)
+        } catch {
+            await onFailure(error)
+        }
+    }
+
+    static func runScratchpadPipelineTask<Result>(
+        operation: () async throws -> Result,
+        onSuccess: (Result) async -> Void,
+        onTranslationFailure: (OutputTranslationFailure) async -> Void,
+        onFailure: (Error) async -> Void
+    ) async {
+        do {
+            await onSuccess(try await operation())
+        } catch is CancellationError {
+            return
+        } catch where Task.isCancelled {
+            return
+        } catch let failure as OutputTranslationFailure {
+            await onTranslationFailure(failure)
+        } catch {
+            await onFailure(error)
+        }
+    }
+
     private func runPipeline(samples: [Float], engine: any TranscriptionEngine, engineName: String, template: Template, appName: String?, target: InsertionTarget?, forcedLanguage: String?, outputLanguage: OutputLanguage, cloudSnapshot: CloudLLMSettingsSnapshot, skipPostProcessing: Bool, processor: (any PostProcessor)? = nil, localContext: LocalProcessingContext? = nil) async {
         defer { isProcessing = false }
 
-        do {
-            let result = try await processDictation(
-                samples: samples, engine: engine, engineName: engineName, template: template,
-                appName: appName, target: target, forcedLanguage: forcedLanguage,
-                skipPostProcessing: skipPostProcessing, outputLanguage: outputLanguage,
-                cloudSnapshot: cloudSnapshot.eligibility.isEligible ? cloudSnapshot : nil,
-                processor: processor, localContext: localContext
-            )
-            if let fallbackReason = result.fallbackReason {
-                logPostProcessingFallback(fallbackReason)
+        await Self.runExternalPipelineTask(
+            operation: {
+                try await processDictation(
+                    samples: samples, engine: engine, engineName: engineName, template: template,
+                    appName: appName, target: target, forcedLanguage: forcedLanguage,
+                    skipPostProcessing: skipPostProcessing, outputLanguage: outputLanguage,
+                    cloudSnapshot: cloudSnapshot.eligibility.isEligible ? cloudSnapshot : nil,
+                    processor: processor, localContext: localContext
+                )
+            },
+            onSuccess: { result in
+                if let fallbackReason = result.fallbackReason {
+                    logPostProcessingFallback(fallbackReason)
+                }
+                if !result.posted, result.fallbackReason != nil {
+                    hud.flash("Post-processing failed — raw transcript copied, paste manually (check API key/model in Settings)")
+                } else if !result.posted {
+                    hud.flash(skipPostProcessing ? "Copied (raw) — paste manually" : "Copied — paste manually")
+                } else if result.fallbackReason != nil {
+                    hud.flash("Cloud post-processing failed — used raw transcript (check API key/model in Settings)")
+                } else if skipPostProcessing {
+                    hud.flash("Pasted (raw)")
+                } else {
+                    hud.hide()
+                }
+            },
+            onEmptyTranscript: {
+                let saved = await preserveFailedAudio(samples, failure: JobFailure(stage: .transcribing, message: "Empty transcript"))
+                hud.flash(saved ? "Transcription failed — audio saved" : "Transcription failed — audio could NOT be saved")
+            },
+            onRecordFailure: {
+                hud.flash("Library save failed")
+            },
+            onTranslationFailure: { failure in
+                let message = handleOutputTranslationFailure(failure)
+                lastError = message
+                hud.flash(message)
+            },
+            onFailure: { error in
+                lastError = "Transcription failed: \(error.localizedDescription)"
+                let saved = await preserveFailedAudio(samples, failure: JobFailure(stage: .transcribing, message: error.localizedDescription))
+                hud.flash(saved ? "Transcription failed — audio saved" : "Transcription failed — audio could NOT be saved")
             }
-            if !result.posted, result.fallbackReason != nil {
-                hud.flash("Post-processing failed — raw transcript copied, paste manually (check API key/model in Settings)")
-            } else if !result.posted {
-                hud.flash(skipPostProcessing ? "Copied (raw) — paste manually" : "Copied — paste manually")
-            } else if result.fallbackReason != nil {
-                hud.flash("Cloud post-processing failed — used raw transcript (check API key/model in Settings)")
-            } else if skipPostProcessing {
-                hud.flash("Pasted (raw)")
-            } else {
-                hud.hide()
-            }
-        } catch PipelineError.emptyTranscript {
-            let saved = await preserveFailedAudio(samples, failure: JobFailure(stage: .transcribing, message: "Empty transcript"))
-            hud.flash(saved ? "Transcription failed — audio saved" : "Transcription failed — audio could NOT be saved")
-        } catch PipelineError.recordFailed(_) {
-            hud.flash("Library save failed")
-        } catch let failure as OutputTranslationFailure {
-            let message = handleOutputTranslationFailure(failure)
-            lastError = message
-            hud.flash(message)
-        } catch {
-            lastError = "Transcription failed: \(error.localizedDescription)"
-            let saved = await preserveFailedAudio(samples, failure: JobFailure(stage: .transcribing, message: error.localizedDescription))
-            hud.flash(saved ? "Transcription failed — audio saved" : "Transcription failed — audio could NOT be saved")
-        }
+        )
     }
 
     private func stopAndTranscribeToScratchpad(
@@ -1502,37 +1554,43 @@ final class AppCoordinator: ObservableObject {
 
         Task {
             defer { isProcessing = false }
-            do {
-                let (result, accepted) = try await destinationLifecycle.runAsync(
-                    destination: .scratchpad(token),
-                    process: {
-                        try await transcribeAndRefine(
-                            samples: samples, engine: engine, engineName: engineName,
-                            context: context, appName: nil,
-                            skipPostProcessing: skipPostProcessing, processor: processor,
-                            translator: TranslationService(), localContext: nil
-                        )
-                    },
-                    text: { $0.refined },
-                    external: { _ in }
-                )
-                if let fallbackReason = result.fallbackReason {
-                    logPostProcessingFallback(fallbackReason)
+            await Self.runScratchpadPipelineTask(
+                operation: {
+                    try await destinationLifecycle.runAsync(
+                        destination: .scratchpad(token),
+                        process: {
+                            try await transcribeAndRefine(
+                                samples: samples, engine: engine, engineName: engineName,
+                                context: context, appName: nil,
+                                skipPostProcessing: skipPostProcessing, processor: processor,
+                                translator: TranslationService(), localContext: nil
+                            )
+                        },
+                        text: { $0.refined },
+                        external: { _ in }
+                    )
+                },
+                onSuccess: { result, accepted in
+                    if let fallbackReason = result.fallbackReason {
+                        logPostProcessingFallback(fallbackReason)
+                    }
+                    if accepted {
+                        hud.hide()
+                    } else {
+                        hud.flash("Dictation ready — reopen Scratchpad to recover it")
+                    }
+                },
+                onTranslationFailure: { failure in
+                    let message = handleOutputTranslationFailure(failure)
+                    lastError = message
+                    hud.flash(message)
+                },
+                onFailure: { error in
+                    let message = error is PipelineError ? "Transcription failed" : "Transcription failed: \(error.localizedDescription)"
+                    lastError = message
+                    hud.flash(message)
                 }
-                if accepted {
-                    hud.hide()
-                } else {
-                    hud.flash("Dictation ready — reopen Scratchpad to recover it")
-                }
-            } catch let failure as OutputTranslationFailure {
-                let message = handleOutputTranslationFailure(failure)
-                lastError = message
-                hud.flash(message)
-            } catch {
-                let message = error is PipelineError ? "Transcription failed" : "Transcription failed: \(error.localizedDescription)"
-                lastError = message
-                hud.flash(message)
-            }
+            )
         }
     }
 
