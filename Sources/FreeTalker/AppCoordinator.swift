@@ -19,6 +19,10 @@ final class AppCoordinator: ObservableObject {
         return captureStartDecision(current: current, requested: pressed)
     }
 
+    nonisolated static func voiceEditRecordingHUDText(captureWarnings: [String]) -> String {
+        (["Speak the edit instruction, then press Voice Edit again"] + captureWarnings).joined(separator: "\n")
+    }
+
     static let shared = AppCoordinator()
 
     @Published private(set) var isRecording = false
@@ -290,11 +294,14 @@ final class AppCoordinator: ObservableObject {
             return
         }
         do {
-            try audioCapture.start(deviceUID: AppSettings.shared.microphoneDeviceUID)
+            try audioCapture.start(
+                deviceUID: AppSettings.shared.microphoneDeviceUID,
+                noiseSuppression: AppSettings.shared.noiseSuppressionEnabled
+            )
             captureOwner = .voiceEdit
             isRecording = true
             hotKeyManager.isRecording = true
-            hud.show(text: "Speak the edit instruction, then press Voice Edit again")
+            hud.show(text: Self.voiceEditRecordingHUDText(captureWarnings: audioCapture.captureWarnings))
         } catch {
             pendingVoiceEditSelection = nil
             lastError = "Mic error: \(error.localizedDescription)"
@@ -477,7 +484,10 @@ final class AppCoordinator: ObservableObject {
         switch action {
         case .startCapture:
             keyDownTimestamp = eventSeconds
-            if beginCapture() { recordingState = newState }
+            if beginCapture() {
+                recordingState = newState
+                updateRecordingPanel()
+            }
         case .stopAndTranscribe:
             recordingState = newState
             stopAndTranscribe()
@@ -652,17 +662,13 @@ final class AppCoordinator: ObservableObject {
             return false
         }
         do {
-            try audioCapture.start(deviceUID: AppSettings.shared.microphoneDeviceUID)
+            try audioCapture.start(
+                deviceUID: AppSettings.shared.microphoneDeviceUID,
+                noiseSuppression: AppSettings.shared.noiseSuppressionEnabled
+            )
             captureOwner = .dictation
             recordingGeneration += 1
             startLivePreviewIfNeeded()
-            // startLivePreviewIfNeeded() just reset lastLivePreviewText to nil — seed it with the
-            // device-fallback note (if any) so it's visible in the panel until real preview text
-            // arrives.
-            if let note = audioCapture.deviceFallbackNote {
-                lastLivePreviewText = note
-            }
-            updateRecordingPanel()
             return true
         } catch {
             lastError = "Mic error: \(error.localizedDescription)"
@@ -739,6 +745,7 @@ final class AppCoordinator: ObservableObject {
             elapsed: elapsed,
             cap: cap,
             previewText: lastLivePreviewText.map { HUDController.tailTruncate($0, maxCharacters: 60) },
+            warnings: audioCapture.captureWarnings,
             activeTemplateName: activeTemplateName,
             localContextScopeName: contextScope.displayName,
             localContextPermissionHint: contextPermissionHint,

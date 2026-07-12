@@ -30,6 +30,7 @@ final class HUDController {
         var elapsed: TimeInterval
         var cap: TimeInterval
         var previewText: String?
+        var warnings: [String]
         var activeTemplateName: String
         var localContextScopeName: String
         var localContextPermissionHint: String?
@@ -166,9 +167,18 @@ struct HUDView: View {
                     .frame(maxWidth: 320, alignment: .leading)
                     .onTapGesture(perform: onPillClick)
             case .recordingPanel(let state):
-                ViewThatFits(in: .horizontal) {
-                    panelRow(state, includePreview: true)
-                    panelRow(state, includePreview: false)
+                VStack(alignment: .leading, spacing: 4) {
+                    ViewThatFits(in: .horizontal) {
+                        panelRow(state, includePreview: true)
+                        panelRow(state, includePreview: false)
+                    }
+                    ForEach(Array(state.warnings.enumerated()), id: \.offset) { _, warning in
+                        Text(warning)
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .lineLimit(2)
+                            .accessibilityLabel("Capture warning: \(warning)")
+                    }
                 }
                 .frame(maxWidth: 460, alignment: .leading)
             }
