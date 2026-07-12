@@ -11,7 +11,7 @@ struct VoiceProfileMatcherTests {
 
     @Test func acceptsExactMatchAndReportsMargin() throws {
         let matcher = try VoiceProfileMatcher(parameters: parameters())
-        let result = matcher.candidates(
+        let result = try matcher.candidates(
             speakers: [speaker("speaker", vector(0), seconds: 3)],
             speakerFingerprint: fingerprint,
             prototypes: [prototype("alice", vector(0)), prototype("bob", vector(1))]
@@ -31,7 +31,7 @@ struct VoiceProfileMatcherTests {
             ],
             cleanSpeechSeconds: 2
         )
-        let result = matcher.candidates(
+        let result = try matcher.candidates(
             speakers: [mixed], speakerFingerprint: fingerprint,
             prototypes: [prototype("alice", vector(0))]
         )
@@ -42,13 +42,13 @@ struct VoiceProfileMatcherTests {
     @Test func rejectsDistanceAtAboveThresholdButAcceptsEquality() throws {
         let matcher = try VoiceProfileMatcher(parameters: parameters(maximumDistance: 1))
         let speaker = speaker("speaker", vector(0), seconds: 3)
-        #expect(matcher.candidates(
+        #expect(try matcher.candidates(
             speakers: [speaker], speakerFingerprint: fingerprint,
             prototypes: [prototype("alice", vector(1))]
         ).count == 1)
 
         let strict = try VoiceProfileMatcher(parameters: parameters(maximumDistance: 0.99))
-        #expect(strict.candidates(
+        #expect(try strict.candidates(
             speakers: [speaker], speakerFingerprint: fingerprint,
             prototypes: [prototype("alice", vector(1))]
         ).isEmpty)
@@ -57,13 +57,13 @@ struct VoiceProfileMatcherTests {
     @Test func rejectsAmbiguousAndShortSpeakers() throws {
         let ambiguous = try VoiceProfileMatcher(parameters: parameters(minimumMargin: 0.1))
         let prototypes = [prototype("alice", vector(0)), prototype("bob", vector(0))]
-        #expect(ambiguous.candidates(
+        #expect(try ambiguous.candidates(
             speakers: [speaker("s", vector(0), seconds: 3)],
             speakerFingerprint: fingerprint, prototypes: prototypes
         ).isEmpty)
 
         let duration = try VoiceProfileMatcher(parameters: parameters(minimumSeconds: 3))
-        #expect(duration.candidates(
+        #expect(try duration.candidates(
             speakers: [speaker("s", vector(0), seconds: 2.99)],
             speakerFingerprint: fingerprint, prototypes: [prototype("alice", vector(0))]
         ).isEmpty)
@@ -75,7 +75,7 @@ struct VoiceProfileMatcherTests {
             preprocessingRevision: "1", dimension: 256
         )
         let matcher = try VoiceProfileMatcher(parameters: parameters())
-        #expect(matcher.candidates(
+        #expect(try matcher.candidates(
             speakers: [speaker("s", vector(0), seconds: 3)],
             speakerFingerprint: fingerprint,
             prototypes: [EnrollmentPrototype(participantID: "alice", embedding: vector(0), fingerprint: other)]
@@ -92,14 +92,14 @@ struct VoiceProfileMatcherTests {
             prototype("alice", angle: 0),
             prototype("bob", angle: 0.30)
         ]
-        let result = matcher.candidates(
+        let result = try matcher.candidates(
             speakers: speakers, speakerFingerprint: fingerprint, prototypes: prototypes
         )
         #expect(result.map(\.speakerID) == ["s1", "s2"])
         #expect(result.map(\.participantID) == ["bob", "alice"])
         #expect(abs(result[0].distance - cosineDistance(0.10, 0.30)) < 0.000_001)
         #expect(abs(result[1].distance - cosineDistance(0.01, 0)) < 0.000_001)
-        #expect(matcher.candidates(
+        #expect(try matcher.candidates(
             speakers: speakers.reversed(), speakerFingerprint: fingerprint,
             prototypes: prototypes.reversed()
         ) == result)
@@ -107,7 +107,7 @@ struct VoiceProfileMatcherTests {
 
     @Test func stableTiesUseIDsAndUnknownNodesCoverRectangles() throws {
         let matcher = try VoiceProfileMatcher(parameters: parameters(maximumDistance: 2))
-        let tied = matcher.candidates(
+        let tied = try matcher.candidates(
             speakers: [speaker("z", vector(0), seconds: 3), speaker("a", vector(0), seconds: 3)],
             speakerFingerprint: fingerprint,
             prototypes: [prototype("bob", vector(0)), prototype("alice", vector(0))]
@@ -115,15 +115,84 @@ struct VoiceProfileMatcherTests {
         #expect(tied.map(\.speakerID) == ["a", "z"])
         #expect(tied.map(\.participantID) == ["alice", "bob"])
 
-        #expect(matcher.candidates(speakers: [], speakerFingerprint: fingerprint, prototypes: []).isEmpty)
-        #expect(matcher.candidates(
+        #expect(try matcher.candidates(speakers: [], speakerFingerprint: fingerprint, prototypes: []).isEmpty)
+        #expect(try matcher.candidates(
             speakers: [speaker("a", vector(0), seconds: 3)],
             speakerFingerprint: fingerprint, prototypes: []
         ).isEmpty)
-        #expect(matcher.candidates(
+        #expect(try matcher.candidates(
             speakers: [speaker("a", vector(0), seconds: 3), speaker("b", vector(0), seconds: 3)],
             speakerFingerprint: fingerprint, prototypes: [prototype("alice", vector(0))]
         ).count == 1)
+    }
+
+    @Test func rejectsEmptyAndDuplicateSpeakerIDsBeforeAssignment() throws {
+        let matcher = try VoiceProfileMatcher(parameters: parameters())
+        #expect(throws: VoiceProfileMatcherError.emptySpeakerID) {
+            try matcher.candidates(
+                speakers: [speaker("", vector(0), seconds: 3)],
+                speakerFingerprint: fingerprint, prototypes: [prototype("alice", vector(0))]
+            )
+        }
+
+        let duplicates = [
+            speaker("same", vector(0), seconds: 3),
+            speaker("same", vector(1), seconds: 3)
+        ]
+        #expect(throws: VoiceProfileMatcherError.duplicateSpeakerID("same")) {
+            try matcher.candidates(
+                speakers: duplicates, speakerFingerprint: fingerprint,
+                prototypes: [prototype("alice", vector(0))]
+            )
+        }
+        #expect(throws: VoiceProfileMatcherError.duplicateSpeakerID("same")) {
+            try matcher.candidates(
+                speakers: duplicates.reversed(), speakerFingerprint: fingerprint,
+                prototypes: [prototype("alice", vector(0))]
+            )
+        }
+    }
+
+    @Test func rejectsBlankParticipantIDsButGroupsDuplicateParticipantPrototypes() throws {
+        let matcher = try VoiceProfileMatcher(parameters: parameters())
+        #expect(throws: VoiceProfileMatcherError.emptyParticipantID) {
+            try matcher.candidates(
+                speakers: [speaker("speaker", vector(0), seconds: 3)],
+                speakerFingerprint: fingerprint,
+                prototypes: [prototype("", vector(0))]
+            )
+        }
+        #expect(throws: VoiceProfileMatcherError.emptyParticipantID) {
+            try matcher.candidates(
+                speakers: [], speakerFingerprint: fingerprint,
+                prototypes: [prototype(" ", vector(0))]
+            )
+        }
+
+        let result = try matcher.candidates(
+            speakers: [speaker("speaker", vector(1), seconds: 3)],
+            speakerFingerprint: fingerprint,
+            prototypes: [prototype("alice", vector(0)), prototype("alice", vector(1))]
+        )
+        #expect(result.map(\.participantID) == ["alice"])
+    }
+
+    @Test func malformedMatchingParameterJSONIsRejected() throws {
+        let decoder = JSONDecoder()
+        decoder.nonConformingFloatDecodingStrategy = .convertFromString(
+            positiveInfinity: "Infinity", negativeInfinity: "-Infinity", nan: "NaN"
+        )
+        for json in [
+            #"{"maximumDistance":"NaN","minimumRunnerUpMargin":0,"minimumCleanSpeechSeconds":0}"#,
+            #"{"maximumDistance":"Infinity","minimumRunnerUpMargin":0,"minimumCleanSpeechSeconds":0}"#,
+            #"{"maximumDistance":2.1,"minimumRunnerUpMargin":0,"minimumCleanSpeechSeconds":0}"#,
+            #"{"maximumDistance":1,"minimumRunnerUpMargin":2.1,"minimumCleanSpeechSeconds":0}"#,
+            #"{"maximumDistance":1,"minimumRunnerUpMargin":0,"minimumCleanSpeechSeconds":-1}"#
+        ] {
+            #expect(throws: (any Error).self) {
+                try decoder.decode(MatchingParameters.self, from: Data(json.utf8))
+            }
+        }
     }
 
     @Test(arguments: [

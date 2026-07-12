@@ -19,6 +19,13 @@ public struct LabeledDistance: Codable, Equatable, Sendable {
     }
 }
 
+public enum ThresholdMetricsError: Error, Equatable, Sendable {
+    case invalidThreshold
+    case negativeCount
+    case inconsistentCohort
+    case invalidThresholdOrder
+}
+
 public struct ThresholdMetrics: Codable, Equatable, Sendable {
     public let threshold: Double
     public let falseMatchCount: Int
@@ -32,32 +39,69 @@ public struct ThresholdMetrics: Codable, Equatable, Sendable {
         missedMatchCount: Int,
         trueMatchCount: Int,
         trueRejectCount: Int
+    ) throws {
+        guard threshold.isFinite, threshold >= 0, threshold <= 1 else {
+            throw ThresholdMetricsError.invalidThreshold
+        }
+        guard falseMatchCount >= 0,
+              missedMatchCount >= 0,
+              trueMatchCount >= 0,
+              trueRejectCount >= 0 else {
+            throw ThresholdMetricsError.negativeCount
+        }
+        self.init(
+            validatedThreshold: threshold,
+            falseMatchCount: falseMatchCount,
+            missedMatchCount: missedMatchCount,
+            trueMatchCount: trueMatchCount,
+            trueRejectCount: trueRejectCount
+        )
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            threshold: values.decode(Double.self, forKey: .threshold),
+            falseMatchCount: values.decode(Int.self, forKey: .falseMatchCount),
+            missedMatchCount: values.decode(Int.self, forKey: .missedMatchCount),
+            trueMatchCount: values.decode(Int.self, forKey: .trueMatchCount),
+            trueRejectCount: values.decode(Int.self, forKey: .trueRejectCount)
+        )
+    }
+
+    public var falseMatchRate: Double {
+        safeRate(falseMatchCount, trueRejectCount)
+    }
+
+    public var missedMatchRate: Double {
+        safeRate(missedMatchCount, trueMatchCount)
+    }
+
+    public var trueMatchRate: Double {
+        safeRate(trueMatchCount, missedMatchCount)
+    }
+
+    public var trueRejectRate: Double {
+        safeRate(trueRejectCount, falseMatchCount)
+    }
+
+    private func safeRate(_ numerator: Int, _ other: Int) -> Double {
+        let denominator = Double(numerator) + Double(other)
+        return denominator == 0 ? 0 : Double(numerator) / denominator
+    }
+
+    fileprivate init(
+        validatedThreshold threshold: Double,
+        falseMatchCount: Int,
+        missedMatchCount: Int,
+        trueMatchCount: Int,
+        trueRejectCount: Int
     ) {
         self.threshold = threshold
         self.falseMatchCount = falseMatchCount
         self.missedMatchCount = missedMatchCount
         self.trueMatchCount = trueMatchCount
         self.trueRejectCount = trueRejectCount
-    }
-
-    public var falseMatchRate: Double {
-        safeRate(falseMatchCount, falseMatchCount + trueRejectCount)
-    }
-
-    public var missedMatchRate: Double {
-        safeRate(missedMatchCount, missedMatchCount + trueMatchCount)
-    }
-
-    public var trueMatchRate: Double {
-        safeRate(trueMatchCount, missedMatchCount + trueMatchCount)
-    }
-
-    public var trueRejectRate: Double {
-        safeRate(trueRejectCount, falseMatchCount + trueRejectCount)
-    }
-
-    private func safeRate(_ numerator: Int, _ denominator: Int) -> Double {
-        denominator == 0 ? 0 : Double(numerator) / Double(denominator)
     }
 }
 
@@ -74,12 +118,31 @@ public struct CalibrationBin: Codable, Equatable, Sendable {
 }
 
 public enum CalibrationMetrics {
+    public static func decodeThresholdMetrics(from data: Data) throws -> [ThresholdMetrics] {
+        let metrics = try JSONDecoder().decode([ThresholdMetrics].self, from: data)
+        guard let first = metrics.first else { return [] }
+        let samePersonTotal = UInt(first.missedMatchCount) + UInt(first.trueMatchCount)
+        let differentPersonTotal = UInt(first.falseMatchCount) + UInt(first.trueRejectCount)
+
+        for index in metrics.indices {
+            let metric = metrics[index]
+            guard UInt(metric.missedMatchCount) + UInt(metric.trueMatchCount) == samePersonTotal,
+                  UInt(metric.falseMatchCount) + UInt(metric.trueRejectCount) == differentPersonTotal else {
+                throw ThresholdMetricsError.inconsistentCohort
+            }
+            if index > 0, metrics[index - 1].threshold >= metric.threshold {
+                throw ThresholdMetricsError.invalidThresholdOrder
+            }
+        }
+        return metrics
+    }
+
     public static func evaluate(
         _ values: [LabeledDistance],
         thresholds: [Double]
     ) -> [ThresholdMetrics] {
         guard values.allSatisfy(isValid),
-              thresholds.allSatisfy({ $0.isFinite && $0 >= 0 && $0 <= 2 }) else { return [] }
+              thresholds.allSatisfy({ $0.isFinite && $0 >= 0 && $0 <= 1 }) else { return [] }
         return Array(Set(thresholds)).sorted().map { threshold in
             var falseMatches = 0
             var missedMatches = 0
@@ -95,7 +158,7 @@ public enum CalibrationMetrics {
                 }
             }
             return ThresholdMetrics(
-                threshold: threshold,
+                validatedThreshold: threshold,
                 falseMatchCount: falseMatches,
                 missedMatchCount: missedMatches,
                 trueMatchCount: trueMatches,

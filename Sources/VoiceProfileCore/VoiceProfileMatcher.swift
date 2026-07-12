@@ -41,6 +41,12 @@ public enum MatchingParametersError: Error, Equatable, Sendable {
     case invalidMinimumCleanSpeechSeconds
 }
 
+public enum VoiceProfileMatcherError: Error, Equatable, Sendable {
+    case emptySpeakerID
+    case duplicateSpeakerID(String)
+    case emptyParticipantID
+}
+
 public struct MatchingParameters: Codable, Equatable, Sendable {
     public let maximumDistance: Double
     public let minimumRunnerUpMargin: Double
@@ -88,11 +94,23 @@ public struct VoiceProfileMatcher: Sendable {
         speakers: [SpeakerRepresentation],
         speakerFingerprint: EmbeddingModelFingerprint,
         prototypes: [EnrollmentPrototype]
-    ) -> [SpeakerMatchCandidate] {
+    ) throws -> [SpeakerMatchCandidate] {
+        if speakers.contains(where: { $0.speakerID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) {
+            throw VoiceProfileMatcherError.emptySpeakerID
+        }
+        let speakerCounts = Dictionary(grouping: speakers, by: \.speakerID).mapValues(\.count)
+        if let duplicate = speakerCounts.filter({ $0.value > 1 }).keys.sorted().first {
+            throw VoiceProfileMatcherError.duplicateSpeakerID(duplicate)
+        }
         let speakers = speakers.sorted { $0.speakerID < $1.speakerID }
-        guard !speakers.isEmpty else { return [] }
 
         let compatible = prototypes.filter { $0.fingerprint == speakerFingerprint }
+        if compatible.contains(where: {
+            $0.participantID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }) {
+            throw VoiceProfileMatcherError.emptyParticipantID
+        }
+        guard !speakers.isEmpty else { return [] }
         let grouped = Dictionary(grouping: compatible, by: \.participantID)
         let participantIDs = grouped.keys.sorted()
         guard !participantIDs.isEmpty else { return [] }
