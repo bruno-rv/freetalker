@@ -108,3 +108,46 @@ exit 0.
 The recovery suite is serialized because its production-connected tests share
 the application singleton. The first concurrent focused run exposed that test
 isolation requirement and was stopped; the serialized rerun passed.
+
+## Corrected P1: HUD Ownership Arbitration
+
+- Added explicit `.none` / `.recovery` / `.recording` HUD ownership in the
+  coordinator. Recovery queue and Scratchpad-router updates always continue,
+  but recovery may show or hide HUD content only while recording does not own
+  it.
+- Recording panels, dictation processing, Scratchpad processing, and voice-edit
+  capture/processing claim HUD ownership. Cancellation and processing terminal
+  paths release it and present the next pending recovery at that defined idle
+  transition.
+- Recording ownership carries a UUID generation. Completion from an older
+  processing generation cannot release a newer recording panel's ownership.
+- Removed direct translation-failure HUD writes from pipeline callbacks; they
+  now flow exclusively through arbitration.
+
+Corrected-P1 RED:
+
+```text
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  swift test --filter TranslationRecoveryTests
+exit 1: missing TranslationRecoveryHUDOwner and recording HUD claim/release
+APIs. A second RED required generation-aware terminal release.
+```
+
+Corrected-P1 GREEN:
+
+```text
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  swift test --filter TranslationRecoveryTests
+15 tests in 1 serialized suite passed.
+
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter \
+  'TranslationRecoveryTests|HUDWarningPresentationTests|RecordingDestinationTests|RecordingOutputSelectionTests|ScratchpadRecordingTests|ScratchpadPersistenceTests|FloatingControlsPresentationTests'
+exit 0.
+
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
+exit 0.
+```
+
+The production regressions cover a visible recovery followed by newer
+recording ownership while a retry completes, late enqueue during recording,
+safe terminal re-presentation, and stale terminal generation rejection.
