@@ -202,6 +202,21 @@ struct OutputTranslationPipelineTests {
         #expect(coordinator.pendingOutputTranslationFailures().isEmpty)
     }
 
+    @Test func externalOuterTaskHandlerTreatsCancellationAsSilentCleanup() async {
+        var events: [String] = []
+
+        await AppCoordinator.runExternalPipelineTask(
+            operation: { () async throws -> Int in throw CancellationError() },
+            onSuccess: { _ in events.append("success") },
+            onEmptyTranscript: { events.append("empty") },
+            onRecordFailure: { events.append("record") },
+            onTranslationFailure: { _ in events.append("translation") },
+            onFailure: { _ in events.append("failure") }
+        )
+
+        #expect(events.isEmpty)
+    }
+
     private static let template = Template(id: "plain", name: "Plain", prompt: "Clean it")
 
     private static func snapshot(model: String = "model") -> CloudLLMSettingsSnapshot {
