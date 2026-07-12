@@ -46,6 +46,10 @@ final class AudioCapture {
         existing + [warning]
     }
 
+    nonisolated static func captureWarnings(_ existing: [String], rollingBackTo count: Int) -> [String] {
+        Array(existing.prefix(count))
+    }
+
     nonisolated static func deviceApplicationPolicy(
         effectiveVoiceProcessing: Bool
     ) -> DeviceApplicationPolicy {
@@ -69,6 +73,7 @@ final class AudioCapture {
         converter = nil
         captureWarnings.removeAll()
 
+        let attemptWarningStart = captureWarnings.count
         do {
             try startCaptureAttempt(deviceUID: deviceUID, requestedVoiceProcessing: noiseSuppression)
         } catch {
@@ -79,6 +84,7 @@ final class AudioCapture {
             }
 
             Self.logger.error("Voice-processing capture failed: \(error.localizedDescription, privacy: .public)")
+            captureWarnings = Self.captureWarnings(captureWarnings, rollingBackTo: attemptWarningStart)
             try replaceWithRawEngine()
             recordWarning("Voice processing failed — using raw microphone audio")
             try startCaptureAttempt(deviceUID: deviceUID, requestedVoiceProcessing: false)
