@@ -10,6 +10,8 @@ final class ScratchpadView: NSView, NSTextFieldDelegate {
     var onStartDictation: () -> Void = {}
     var onStopDictation: () -> Void = {}
     var onInsertRecovery: () -> Void = {}
+    var onRetryTranslation: () -> Void = {}
+    var onInsertSourceText: () -> Void = {}
     var onAIAction: (ScratchpadAIAction) -> Void = { _ in }
     var onCustomAIAction: () -> Void = {}
     var onCustomInstructionChanged: () -> Void = {}
@@ -17,8 +19,11 @@ final class ScratchpadView: NSView, NSTextFieldDelegate {
     private let previewLabel = NSTextField(wrappingLabelWithString: "")
     private let statusLabel = NSTextField(wrappingLabelWithString: "")
     private let recoveryLabel = NSTextField(wrappingLabelWithString: "")
+    private let translationRecoveryLabel = NSTextField(wrappingLabelWithString: "")
     private let dictateButton = NSButton(title: "Dictate", target: nil, action: nil)
     private(set) var recoveryButton = NSButton(title: "Insert Recovered Text", target: nil, action: nil)
+    private(set) var retryTranslationButton = NSButton(title: "Retry translation", target: nil, action: nil)
+    private(set) var insertSourceTextButton = NSButton(title: "Insert source text", target: nil, action: nil)
     private let customInstructionField = NSTextField()
     private let aiProgress = NSProgressIndicator()
     private let aiErrorLabel = NSTextField(wrappingLabelWithString: "")
@@ -67,6 +72,19 @@ final class ScratchpadView: NSView, NSTextFieldDelegate {
             let hidden = newValue?.isEmpty != false
             recoveryLabel.isHidden = hidden
             recoveryButton.isHidden = hidden
+        }
+    }
+
+    var translationRecovery: TranslationRecoveryPresentation? {
+        didSet {
+            translationRecoveryLabel.stringValue = translationRecovery.map {
+                "\($0.message)\n\($0.recoverableText)"
+            } ?? ""
+            let hidden = translationRecovery == nil
+            translationRecoveryLabel.isHidden = hidden
+            retryTranslationButton.isHidden = hidden
+            insertSourceTextButton.isHidden = hidden
+            retryTranslationButton.isEnabled = translationRecovery?.isRetrying == false
         }
     }
 
@@ -121,6 +139,13 @@ final class ScratchpadView: NSView, NSTextFieldDelegate {
         recoveryButton.setAccessibilityHelp("Insert the preserved transcription at the current selection")
         recoveryButton.toolTip = "Insert the preserved transcription at the current selection"
 
+        retryTranslationButton.target = self
+        retryTranslationButton.action = #selector(retryTranslation)
+        retryTranslationButton.setAccessibilityHelp("Retry with the current eligible cloud configuration")
+        insertSourceTextButton.target = self
+        insertSourceTextButton.action = #selector(insertSourceText)
+        insertSourceTextButton.setAccessibilityHelp("Insert the retained source at its original destination")
+
         let improve = aiButton("Improve writing", action: #selector(improveWriting))
         let expand = aiButton("Expand", action: #selector(expandWriting))
         let condense = aiButton("Condense", action: #selector(condenseWriting))
@@ -163,17 +188,27 @@ final class ScratchpadView: NSView, NSTextFieldDelegate {
         statusLabel.setAccessibilityLabel("Scratchpad status")
         recoveryLabel.isSelectable = true
         recoveryLabel.setAccessibilityLabel("Recovered transcription")
+        translationRecoveryLabel.isSelectable = true
+        translationRecoveryLabel.textColor = .systemRed
+        translationRecoveryLabel.setAccessibilityLabel("Translation failed")
 
         previewText = nil
         statusText = document.warning
         recoveryText = nil
+        translationRecovery = nil
 
         let recoveryRow = NSStackView(views: [recoveryLabel, recoveryButton])
         recoveryRow.orientation = .horizontal
         recoveryRow.spacing = 8
         recoveryRow.distribution = .fill
+        let translationRecoveryRow = NSStackView(views: [
+            translationRecoveryLabel, retryTranslationButton, insertSourceTextButton
+        ])
+        translationRecoveryRow.orientation = .horizontal
+        translationRecoveryRow.spacing = 8
+        translationRecoveryRow.distribution = .fill
 
-        let root = NSStackView(views: [toolbar, aiRow, aiErrorLabel, statusLabel, previewLabel, recoveryRow, scrollView])
+        let root = NSStackView(views: [toolbar, aiRow, aiErrorLabel, statusLabel, previewLabel, translationRecoveryRow, recoveryRow, scrollView])
         root.orientation = .vertical
         root.alignment = .leading
         root.spacing = 8
@@ -191,6 +226,7 @@ final class ScratchpadView: NSView, NSTextFieldDelegate {
             statusLabel.widthAnchor.constraint(equalTo: root.widthAnchor),
             previewLabel.widthAnchor.constraint(equalTo: root.widthAnchor),
             recoveryRow.widthAnchor.constraint(equalTo: root.widthAnchor),
+            translationRecoveryRow.widthAnchor.constraint(equalTo: root.widthAnchor),
             scrollView.widthAnchor.constraint(equalTo: root.widthAnchor),
             scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 260),
         ])
@@ -240,6 +276,8 @@ final class ScratchpadView: NSView, NSTextFieldDelegate {
     @objc private func clearFormatting() { editorController.clearFormatting() }
     @objc private func dictate() { isRecording ? onStopDictation() : onStartDictation() }
     @objc private func insertRecovery() { onInsertRecovery() }
+    @objc private func retryTranslation() { onRetryTranslation() }
+    @objc private func insertSourceText() { onInsertSourceText() }
     @objc private func improveWriting() { onAIAction(.improveWriting) }
     @objc private func expandWriting() { onAIAction(.expand) }
     @objc private func condenseWriting() { onAIAction(.condense) }

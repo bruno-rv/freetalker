@@ -65,6 +65,13 @@ protocol ScratchpadRecordingRouting: AnyObject {
     func completeRecording(_ text: String, for token: ScratchpadInsertionToken) -> Bool
     func cancelRecording(for token: ScratchpadInsertionToken)
     func failRecording(_ message: String, for token: ScratchpadInsertionToken)
+    func completeTranslationRecovery(_ text: String, for token: ScratchpadInsertionToken) -> Bool
+}
+
+extension ScratchpadRecordingRouting {
+    func completeTranslationRecovery(_ text: String, for token: ScratchpadInsertionToken) -> Bool {
+        completeRecording(text, for: token)
+    }
 }
 
 @MainActor
