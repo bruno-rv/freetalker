@@ -73,7 +73,7 @@ import Testing
         let id = try fixture.insert()
         try fixture.db.deleteRow(id: id)
 
-        #expect(throws: DatabaseError.self) {
+        #expect(throws: DatabaseError.translationParentMissing(id)) {
             try fixture.db.upsertTranslation(parentID: id, target: .hindi, text: "अनुवाद")
         }
         #expect(try fixture.db.translationVariants(parentID: id).isEmpty)
@@ -84,16 +84,35 @@ import Testing
         let id = try fixture.insert()
         let secondConnection = SendableDatabase(try Database(path: fixture.url))
 
-        async let upsert: Void? = Task.detached {
-            try? secondConnection.value.upsertTranslation(
-                parentID: id, target: .german, text: "Übersetzung"
-            )
+        async let upsert: Result<Void, DatabaseError> = Task.detached {
+            do {
+                try secondConnection.value.upsertTranslation(
+                    parentID: id, target: .german, text: "Übersetzung"
+                )
+                return .success(())
+            } catch let error as DatabaseError {
+                return .failure(error)
+            } catch {
+                Issue.record("Unexpected upsert error: \(error)")
+                return .failure(.sqlFailed("unexpected error"))
+            }
         }.value
         async let deletion: Void = Task.detached {
             try fixture.sendableDatabase.value.deleteRow(id: id)
         }.value
 
-        _ = await upsert
+        switch await upsert {
+        case .success:
+            break
+        case .failure(.translationParentMissing(let missingID)):
+            #expect(missingID == id)
+        case .failure(.sqlFailed(let message)):
+            #expect(message.contains("FOREIGN KEY constraint failed"))
+            #expect(!message.localizedCaseInsensitiveContains("busy"))
+            #expect(!message.localizedCaseInsensitiveContains("locked"))
+        case .failure(let error):
+            Issue.record("Unexpected upsert outcome: \(error)")
+        }
         try await deletion
         #expect(try secondConnection.value.translationVariants(parentID: id).isEmpty)
     }

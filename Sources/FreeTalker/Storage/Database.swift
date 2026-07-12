@@ -1,9 +1,10 @@
 import CSQLite
 import Foundation
 
-enum DatabaseError: Error {
+enum DatabaseError: Error, Equatable {
     case openFailed(String)
     case sqlFailed(String)
+    case translationParentMissing(Int64)
 }
 
 /// Thin wrapper over the system libsqlite3 C API. No ORM — a handful of hand-written
@@ -29,6 +30,7 @@ final class Database {
         try exec("PRAGMA foreign_keys=ON;")
         try createSchema()
         try DatabaseMigrator.migrate(try requireHandle())
+        try createTranslationSchema()
     }
 
     deinit {
@@ -45,7 +47,8 @@ final class Database {
             transcript TEXT NOT NULL,
             refined TEXT NOT NULL,
             engine TEXT NOT NULL,
-            source_id INTEGER
+            source_id INTEGER,
+            requested_output_language TEXT NOT NULL DEFAULT 'same'
         );
         """)
         try exec("""
@@ -68,6 +71,20 @@ final class Database {
             INSERT INTO dictations_fts(dictations_fts, rowid, transcript, refined) VALUES('delete', old.id, old.transcript, old.refined);
             INSERT INTO dictations_fts(rowid, transcript, refined) VALUES (new.id, new.transcript, new.refined);
         END;
+        """)
+    }
+
+    private func createTranslationSchema() throws {
+        try exec("""
+        CREATE TABLE IF NOT EXISTS dictation_translation_variants (
+          parent_id TEXT NOT NULL,
+          target_language TEXT NOT NULL,
+          text TEXT NOT NULL,
+          created_at REAL NOT NULL,
+          updated_at REAL NOT NULL,
+          PRIMARY KEY (parent_id, target_language),
+          FOREIGN KEY (parent_id) REFERENCES dictations(id) ON DELETE CASCADE
+        );
         """)
     }
 
@@ -319,7 +336,7 @@ final class Database {
     func upsertTranslation(parentID: Int64, target: TranslationTarget, text: String) throws {
         try transaction {
             guard try dictationExists(id: parentID) else {
-                throw DatabaseError.sqlFailed("Translation parent does not exist")
+                throw DatabaseError.translationParentMissing(parentID)
             }
             let stmt = try prepare("""
             INSERT INTO dictation_translation_variants

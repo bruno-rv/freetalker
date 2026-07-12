@@ -231,8 +231,36 @@ enum DatabaseMigrator {
 
     private static func migrateLibraryV10(_ db: OpaquePointer) throws {
         guard try tableExists("dictations", db: db) else { return }
-        try execute(db, """
-        ALTER TABLE dictations ADD COLUMN requested_output_language TEXT NOT NULL DEFAULT 'same';
+        let hasRequestedOutput: Bool
+        do {
+            hasRequestedOutput = try columnExists("requested_output_language", in: "dictations", db: db)
+        } catch {
+            throw DatabaseError.sqlFailed("Migration 10 column inspection failed: \(error)")
+        }
+        let hasLegacyForeignKey: Bool
+        do {
+            hasLegacyForeignKey = try hasSourceIDForeignKey(db)
+        } catch {
+            throw DatabaseError.sqlFailed("Migration 10 foreign-key inspection failed: \(error)")
+        }
+        if hasLegacyForeignKey {
+            do {
+                try rebuildLegacyDictationsV10(
+                    db, hasRequestedOutput: hasRequestedOutput,
+                    hasFTS: try tableExists("dictations_fts", db: db)
+                )
+            } catch {
+                throw DatabaseError.sqlFailed("Migration 10 Library rebuild failed: \(error)")
+            }
+        } else if !hasRequestedOutput {
+            do {
+                try execute(db, "ALTER TABLE dictations ADD COLUMN requested_output_language TEXT NOT NULL DEFAULT 'same';")
+            } catch {
+                throw DatabaseError.sqlFailed("Migration 10 metadata column failed: \(error)")
+            }
+        }
+        do {
+            try execute(db, """
         CREATE TABLE dictation_translation_variants (
           parent_id TEXT NOT NULL,
           target_language TEXT NOT NULL,
@@ -243,6 +271,83 @@ enum DatabaseMigrator {
           FOREIGN KEY (parent_id) REFERENCES dictations(id) ON DELETE CASCADE
         );
         """)
+        } catch {
+            throw DatabaseError.sqlFailed("Migration 10 variant table failed: \(error)")
+        }
+    }
+
+    private static func rebuildLegacyDictationsV10(
+        _ db: OpaquePointer, hasRequestedOutput: Bool, hasFTS: Bool
+    ) throws {
+        let requestedOutputExpression = hasRequestedOutput ? "requested_output_language" : "'same'"
+        let rebuildSQL = """
+        PRAGMA defer_foreign_keys=ON;
+        DROP TRIGGER IF EXISTS dictations_ai;
+        DROP TRIGGER IF EXISTS dictations_ad;
+        DROP TRIGGER IF EXISTS dictations_au;
+        ALTER TABLE dictations RENAME TO legacy_dictations_v9;
+        CREATE TABLE dictations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL,
+            language TEXT NOT NULL,
+            template TEXT NOT NULL,
+            transcript TEXT NOT NULL,
+            refined TEXT NOT NULL,
+            engine TEXT NOT NULL,
+            source_id INTEGER,
+            requested_output_language TEXT NOT NULL DEFAULT 'same'
+        );
+        INSERT INTO dictations
+            (id, ts, language, template, transcript, refined, engine, source_id, requested_output_language)
+        SELECT id, ts, language, template, transcript, refined, engine, source_id,
+        """ + requestedOutputExpression + """
+
+        FROM legacy_dictations_v9;
+        DROP TABLE legacy_dictations_v9;
+        """
+        try execute(db, rebuildSQL)
+        guard hasFTS else { return }
+        try execute(db, """
+        CREATE TRIGGER dictations_ai AFTER INSERT ON dictations BEGIN
+            INSERT INTO dictations_fts(rowid, transcript, refined) VALUES (new.id, new.transcript, new.refined);
+        END;
+        CREATE TRIGGER dictations_ad AFTER DELETE ON dictations BEGIN
+            INSERT INTO dictations_fts(dictations_fts, rowid, transcript, refined) VALUES('delete', old.id, old.transcript, old.refined);
+        END;
+        CREATE TRIGGER dictations_au AFTER UPDATE ON dictations BEGIN
+            INSERT INTO dictations_fts(dictations_fts, rowid, transcript, refined) VALUES('delete', old.id, old.transcript, old.refined);
+            INSERT INTO dictations_fts(rowid, transcript, refined) VALUES (new.id, new.transcript, new.refined);
+        END;
+        """)
+    }
+
+    private static func hasSourceIDForeignKey(_ db: OpaquePointer) throws -> Bool {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(
+            db,
+            "SELECT 1 FROM pragma_foreign_key_list('dictations') WHERE \"from\" = 'source_id' LIMIT 1;",
+            -1, &statement, nil
+        ) == SQLITE_OK, let statement else { throw DatabaseError.sqlFailed(lastError(db)) }
+        defer { sqlite3_finalize(statement) }
+        return sqlite3_step(statement) == SQLITE_ROW
+    }
+
+    private static func columnExists(_ column: String, in table: String, db: OpaquePointer) throws -> Bool {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(
+            db, "PRAGMA table_info('\(table)');",
+            -1, &statement, nil
+        ) == SQLITE_OK, let statement else { throw DatabaseError.sqlFailed(lastError(db)) }
+        defer { sqlite3_finalize(statement) }
+        var result = sqlite3_step(statement)
+        while result == SQLITE_ROW {
+            if let name = sqlite3_column_text(statement, 1), String(cString: name) == column {
+                return true
+            }
+            result = sqlite3_step(statement)
+        }
+        guard result == SQLITE_DONE else { throw DatabaseError.sqlFailed(lastError(db)) }
+        return false
     }
 
     private static func migrateAttemptTriggersV9(_ db: OpaquePointer) throws {

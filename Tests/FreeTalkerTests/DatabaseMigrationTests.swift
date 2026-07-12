@@ -1,4 +1,5 @@
 import CSQLite
+import Foundation
 import Testing
 @testable import FreeTalker
 
@@ -122,6 +123,94 @@ import Testing
         #expect(try db.migrationVersions() == Array(1...DatabaseMigrator.latestVersion))
         #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('dictation_translation_variants') WHERE name = 'parent_id' AND type = 'TEXT';") == 1)
         #expect(try db.integer("SELECT COUNT(*) FROM pragma_foreign_key_list('dictation_translation_variants') WHERE \"table\" = 'dictations' AND \"from\" = 'parent_id' AND on_delete = 'CASCADE';") == 1)
+    }
+
+    @Test func versionTenRebuildsLegacySourceForeignKeyWithoutLosingHistoryOrSearch() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("freetalker-legacy-v9-\(UUID().uuidString).sqlite")
+        defer {
+            try? FileManager.default.removeItem(at: url)
+            try? FileManager.default.removeItem(atPath: url.path + "-wal")
+            try? FileManager.default.removeItem(atPath: url.path + "-shm")
+        }
+        do {
+            let legacy = try TemporaryDatabase(path: url.path)
+            try DatabaseMigrator.migrate(legacy.handle)
+            try legacy.execute("""
+            DELETE FROM schema_migrations WHERE version = 10;
+            CREATE TABLE dictations (
+              id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, language TEXT NOT NULL,
+              template TEXT NOT NULL, transcript TEXT NOT NULL, refined TEXT NOT NULL,
+              engine TEXT NOT NULL, source_id INTEGER REFERENCES dictations(id)
+            );
+            CREATE VIRTUAL TABLE dictations_fts USING fts5(
+              transcript, refined, content='dictations', content_rowid='id'
+            );
+            CREATE TRIGGER dictations_ai AFTER INSERT ON dictations BEGIN
+              INSERT INTO dictations_fts(rowid, transcript, refined) VALUES (new.id, new.transcript, new.refined);
+            END;
+            CREATE TRIGGER dictations_ad AFTER DELETE ON dictations BEGIN
+              INSERT INTO dictations_fts(dictations_fts, rowid, transcript, refined) VALUES('delete', old.id, old.transcript, old.refined);
+            END;
+            CREATE TRIGGER dictations_au AFTER UPDATE ON dictations BEGIN
+              INSERT INTO dictations_fts(dictations_fts, rowid, transcript, refined) VALUES('delete', old.id, old.transcript, old.refined);
+              INSERT INTO dictations_fts(rowid, transcript, refined) VALUES (new.id, new.transcript, new.refined);
+            END;
+            INSERT INTO dictations VALUES (41, 1, 'en', 'Clean', 'source words', 'source result', 'local', NULL);
+            INSERT INTO dictations VALUES (99, 2, 'pt', 'Clean', 'child words', 'searchable child', 'local', 41);
+            """)
+            try DatabaseMigrator.migrate(legacy.handle)
+            #expect(try legacy.integer("SELECT COUNT(*) FROM pragma_foreign_key_list('dictations') WHERE \"from\" = 'source_id';") == 0)
+        }
+
+        let library = try Database(path: url)
+        #expect(try library.searchDictations(query: "searchable").map(\.id) == [99])
+        #expect(try library.searchDictations(query: "source result").map(\.id) == [41])
+        try library.deleteRow(id: 41)
+        let fetchedChild = try library.dictation(id: 99)
+        let child = try #require(fetchedChild)
+        #expect(child.sourceID == 41)
+        #expect(child.sourceLanguage == SourceLanguage("pt"))
+        #expect(child.requestedOutputLanguage == .sameAsSpoken)
+        #expect(child.templateName == "Clean")
+        #expect(child.transcript == "child words")
+        #expect(child.refined == "searchable child")
+        #expect(child.engine == "local")
+        #expect(try library.searchDictations(query: "searchable").map(\.id) == [99])
+        #expect(try library.searchDictations(query: "source result").isEmpty)
+
+        let insertedID = try library.insertDictation(.init(
+            timestamp: Date(), sourceLanguage: SourceLanguage("de"),
+            requestedOutputLanguage: .sameAsSpoken, template: "Clean",
+            transcript: "new trigger words", refined: "new searchable result", engine: "local"
+        ))
+        #expect(try library.searchDictations(query: "new searchable").map(\.id) == [insertedID])
+        try library.deleteRow(id: insertedID)
+        #expect(try library.searchDictations(query: "new searchable").isEmpty)
+    }
+
+    @Test func migratorBeforeLibraryCreationDoesNotPoisonVersionTen() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("freetalker-migrator-first-\(UUID().uuidString).sqlite")
+        defer {
+            try? FileManager.default.removeItem(at: url)
+            try? FileManager.default.removeItem(atPath: url.path + "-wal")
+            try? FileManager.default.removeItem(atPath: url.path + "-shm")
+        }
+        do {
+            let shared = try TemporaryDatabase(path: url.path)
+            try DatabaseMigrator.migrate(shared.handle)
+            #expect(try shared.migrationVersions() == Array(1...DatabaseMigrator.latestVersion))
+        }
+
+        let library = try Database(path: url)
+        let id = try library.insertDictation(.init(
+            timestamp: Date(), sourceLanguage: SourceLanguage("en"),
+            requestedOutputLanguage: .spanish, template: "Clean",
+            transcript: "hello", refined: "hello", engine: "local"
+        ))
+        try library.upsertTranslation(parentID: id, target: .spanish, text: "hola")
+        #expect(try library.translationVariants(parentID: id).map(\.text) == ["hola"])
     }
 
     @Test func versionTenFailureRollsBackLibrarySchemaAndLedger() throws {
@@ -318,9 +407,9 @@ import Testing
 private final class TemporaryDatabase {
     let handle: OpaquePointer
 
-    init() throws {
+    init(path: String = ":memory:") throws {
         var database: OpaquePointer?
-        guard sqlite3_open(":memory:", &database) == SQLITE_OK, let database else {
+        guard sqlite3_open(path, &database) == SQLITE_OK, let database else {
             defer { sqlite3_close(database) }
             throw DatabaseError.openFailed("Could not open temporary database")
         }
