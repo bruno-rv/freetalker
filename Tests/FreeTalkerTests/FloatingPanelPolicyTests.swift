@@ -16,4 +16,25 @@ import Testing
         #expect(panel.ignoresMouseEvents == false)
         #expect(panel.isMovableByWindowBackground == false)
     }
+
+    @Test func resizeClampsAgainstTheScreenCapturedBeforeTheWindowChangesScreens() {
+        let capturedVisibleFrame = CGRect(x: 0, y: 0, width: 1_000, height: 800)
+        let adjacentVisibleFrame = CGRect(x: 1_000, y: 0, width: 1_000, height: 800)
+        let originalOrigin = CGPoint(x: 100, y: 100)
+        let resizedPanelSize = CGSize(width: 300, height: 80)
+
+        let origin = HUDController.resizedOrigin(
+            preserving: originalOrigin,
+            panelSize: resizedPanelSize,
+            capturedVisibleFrame: capturedVisibleFrame
+        )
+        let wrongScreenOrigin = FloatingPanelGeometry.clampedOrigin(
+            originalOrigin,
+            panelSize: resizedPanelSize,
+            visibleFrame: adjacentVisibleFrame
+        )
+
+        #expect(origin == originalOrigin)
+        #expect(wrongScreenOrigin != originalOrigin)
+    }
 }

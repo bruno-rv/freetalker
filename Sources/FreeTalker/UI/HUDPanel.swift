@@ -103,6 +103,18 @@ final class HUDController {
         return "…" + text.suffix(maxCharacters)
     }
 
+    nonisolated static func resizedOrigin(
+        preserving origin: CGPoint,
+        panelSize: CGSize,
+        capturedVisibleFrame: CGRect
+    ) -> CGPoint {
+        FloatingPanelGeometry.clampedOrigin(
+            origin,
+            panelSize: panelSize,
+            visibleFrame: capturedVisibleFrame
+        )
+    }
+
     private func display(mode: Mode) {
         let callbacks = PanelCallbacks(
             onCancel: { [weak self] in self?.onPanelCancel?() },
@@ -126,14 +138,14 @@ final class HUDController {
         if let existing = self.panel {
             panel = existing
             let origin = panel.frame.origin
+            let visibleFrame = (panel.screen ?? NSScreen.main)?.visibleFrame
             panel.contentView = hosting
             panel.setContentSize(size)
-            let screen = panel.screen ?? NSScreen.main
-            if let screen {
-                panel.setFrameOrigin(FloatingPanelGeometry.clampedOrigin(
-                    origin,
+            if let visibleFrame {
+                panel.setFrameOrigin(Self.resizedOrigin(
+                    preserving: origin,
                     panelSize: panel.frame.size,
-                    visibleFrame: screen.visibleFrame
+                    capturedVisibleFrame: visibleFrame
                 ))
             }
         } else {

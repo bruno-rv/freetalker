@@ -1,92 +1,84 @@
-# Voice editing plan task 3 report: local preview coordinator
+# Task 3 Report: Draggable and Restorable Recording HUD
 
 ## Status
 
-DONE
+Implemented and verified.
 
 ## Changes
 
-- Added a local-only Foundation Models edit service that creates a fresh language-model session
-  for every edit and frames selected text/instructions as escaped, untrusted data.
-- Added a memory-only coordinator that resolves exact normalized snippet matches before local
-  generation, exposes ambiguous matches for explicit choice, and never writes during preview.
-- Confirmation delegates replacement exclusively to `SelectionAccessing`, preserving its immediate
-  bracketed revalidation; failed stale confirmations retain the preview and perform no successful
-  write.
-- Cancel, successful confirmation, and explicit copy clear the held instruction and preview.
-  Clipboard writes occur only through the explicit copy action.
-- Added a SwiftUI preview/chooser with explicit Replace, Copy, and Cancel actions.
-- Added focused coverage for missing selections, snippet priority, ambiguity, preview-only behavior,
-  cancel, stale and successful confirmation, explicit copy, and local-generation failure.
+- Added an internal `HUDController.makePanel(size:)` factory so panel policy is testable without exposing the controller's panel.
+- Preserved the nonactivating, non-key, non-main, floating panel policy and all three collection behaviors.
+- Restores the saved normalized HUD position only when the panel is first created; otherwise uses the legacy bottom-center default.
+- Captures the current origin before content resize, then restores and clamps it against the current display.
+- Re-clamps the HUD when screen parameters change and unregisters the notification observer on teardown.
+- Added an AppKit drag surface behind the SwiftUI controls. It uses `performDrag(with:)` and persists the normalized final frame after the drag returns.
+- Kept `isMovableByWindowBackground` disabled and preserved all existing HUD controls, callbacks, and public methods.
 
-## TDD evidence
+## TDD Evidence
 
-### RED
+RED command:
 
-```text
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter VoiceEditCoordinatorTests
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter 'FloatingPanelPolicyTests|FloatingPanelGeometryTests'
 ```
 
-Exited 1 with the expected missing `VoiceEditCoordinator` and `LocalEditServicing` symbols.
+Result: exit 1. The new tests failed to compile because `HUDController.makePanel` and the initial resize-policy entry point did not exist, proving the requested policy was absent. During GREEN, the resize test was simplified to exercise the existing `FloatingPanelGeometry.clampedOrigin` API directly, avoiding an unnecessary forwarding helper.
 
-### GREEN
+Focused GREEN command:
 
-```text
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter VoiceEditCoordinatorTests
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter 'FloatingPanelPolicyTests|FloatingPanelGeometryTests|HUDWarningPresentation'
 ```
 
-Exited 0; 8 focused tests passed.
+Result: exit 0; 15 tests in 3 suites passed.
 
-## Verification
+Full verification command:
 
-```text
-make test
-make app
-git diff --check
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
 ```
 
-The final full suite passed with 158 tests in 16 suites. The release executable and ad-hoc signed app
-bundle built successfully. Diff whitespace validation passed.
+Result: exit 0; 329 tests in 31 suites passed.
+
+Additional check: `git diff --check` exited 0.
+
+## Self-review
+
+- Scope is limited to the requested HUD source and two test files.
+- The background drag view remains behind controls, so existing button and pill event handling retains priority.
+- Persistence occurs once after `performDrag(with:)` returns; resize and display changes clamp without overwriting the user's saved display identity.
+- Existing unrelated modifications to Task 1 and Task 2 reports were preserved.
 
 ## Concerns
 
-- Task 4 still owns app lifecycle, hotkey-to-presentation wiring, and the snippet settings UI. This
-  task accepts the existing `pendingVoiceEditSelection` snapshot through the coordinator initializer
-  so that integration does not recapture or weaken the Task 1 trust boundary.
+No known functional concerns. AppKit drag routing is covered structurally by keeping global background movement disabled and placing the drag surface behind SwiftUI controls; automated tests cover policy and resize geometry, not synthesized mouse dragging.
 
-## Review follow-up
+## Important Review Fix: Pre-resize Display Capture
 
-- Added operation-generation invalidation checks after both snippet lookup and local generation.
-  Cancel now clears state immediately, and suspended work cannot publish a late preview, chooser,
-  or error.
-- Made the sensitive selection snapshot nullable and observable through a privacy-state flag. Every
-  terminal path clears the snapshot and instruction; the preview no longer duplicates original text.
-- Made clipboard writes fallible and switched the system implementation to `writeObjects` without a
-  preemptive clear. Copy failures preserve the preview for retry and expose an actionable message;
-  the preview view dismisses only after a successful copy.
-- Mapped every `SelectionAccessError` to a specific accessible message while retaining the preview
-  for retry or explicit copy. The stale-confirm fake now throws before recording any mutation.
+The resize path now captures both the panel origin and the current screen's visible frame before replacing the content view or calling `setContentSize`. The resized frame is restored and clamped against that captured display, so an AppKit screen reassignment caused by the new size cannot move the HUD to an adjacent display.
 
-### Review TDD evidence
+An internal pure `HUDController.resizedOrigin` seam makes this policy directly testable. The boundary regression supplies the original display and an adjacent post-resize display, proves the adjacent display would move the origin, and verifies the captured display preserves the pre-resize origin.
 
-The focused RED build failed on the missing sensitive-state, fallible-copy, invalidation, and typed
-confirmation-error contracts. The focused GREEN run passed 11 tests, including five parameterized
-selection-error cases.
+RED command:
 
-## Second review follow-up
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter FloatingPanelPolicyTests.resizeClampsAgainstTheScreenCapturedBeforeTheWindowChangesScreens
+```
 
-- The coordinator now owns the actual generation `Task`, cancels it on cancel, restart, every
-  terminal cleanup, and propagation from a cancelled `begin()` caller. Publication tokens remain as
-  a second guard, but cancellation now reaches the suspended edit service and Foundation Models
-  request. `LocalEditService` checks cancellation immediately before and after `session.respond`.
-- Generation no longer carries a full `SelectionSnapshot` across snippet lookup; it extracts only
-  the selected string at the point local generation needs it.
-- The default pasteboard path snapshots every data-backed type, attempts `writeObjects`, and restores
-  the prior supported items when that write fails or throws.
-- Added a cancellation-aware suspended-service regression that exits through `CancellationError`
-  without manual resumption, plus an injectable failed-pasteboard restoration regression.
+Result: exit 1 with the expected compile failure, `type 'HUDController' has no member 'resizedOrigin'`.
 
-### Second review TDD evidence
+GREEN regression command:
 
-The focused RED build failed on the missing pasteboard adapter/item/copy types. The focused GREEN
-run passed 12 tests, including the owned-task cancellation observation and clipboard restoration.
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter FloatingPanelPolicyTests.resizeClampsAgainstTheScreenCapturedBeforeTheWindowChangesScreens
+```
+
+Result: exit 0; 1 test in 1 suite passed.
+
+Fresh covering verification:
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter 'FloatingPanelPolicyTests|FloatingPanelGeometryTests|HUDWarningPresentation'
+```
+
+Result: exit 0; 16 tests in 3 suites passed. `git diff --check` also exited 0.
