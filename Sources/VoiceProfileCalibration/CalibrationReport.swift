@@ -99,68 +99,133 @@ public enum CalibrationReportWriteError: Error, Equatable, Sendable, CustomStrin
     }
 }
 
+struct CalibrationReportWriterHooks: Sendable {
+    let beforeWrite: @Sendable (String) throws -> Void
+    let record: @Sendable (String) -> Void
+
+    init(
+        beforeWrite: @escaping @Sendable (String) throws -> Void = { _ in },
+        record: @escaping @Sendable (String) -> Void = { _ in }
+    ) {
+        self.beforeWrite = beforeWrite
+        self.record = record
+    }
+}
+
 public enum CalibrationReportWriter {
     public static func write(_ report: CalibrationReport, to directory: URL) throws {
+        try write(report, to: directory, hooks: .init())
+    }
+
+    static func write(
+        _ report: CalibrationReport,
+        to directory: URL,
+        hooks: CalibrationReportWriterHooks
+    ) throws {
         guard directory.path.hasPrefix("/") else {
             throw CalibrationReportWriteError.unsafeOutput
         }
-        guard let resolvedParent = realpath(directory.deletingLastPathComponent().path, nil) else {
+        let name = directory.lastPathComponent
+        guard !name.isEmpty, name != ".", name != ".." else {
             throw CalibrationReportWriteError.unsafeOutput
         }
-        defer { free(resolvedParent) }
-        let parent = URL(fileURLWithFileSystemRepresentation: resolvedParent, isDirectory: true, relativeTo: nil)
-        guard try ancestorsAreSafe(parent) else { throw CalibrationReportWriteError.unsafeOutput }
-        let name = directory.lastPathComponent
-        let parentDescriptor = open(parent.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
-        guard parentDescriptor >= 0 else { throw CalibrationReportWriteError.unsafeOutput }
+        let parentDescriptor = try openDirectoryWithoutFollowingLinks(
+            directory.deletingLastPathComponent()
+        )
         defer { close(parentDescriptor) }
         var existing = stat()
         if fstatat(parentDescriptor, name, &existing, AT_SYMLINK_NOFOLLOW) == 0 {
             if existing.st_mode & S_IFMT == S_IFLNK { throw CalibrationReportWriteError.unsafeOutput }
             throw CalibrationReportWriteError.outputExists
         }
-        guard mkdirat(parentDescriptor, name, 0o700) == 0 else {
-            if errno == EEXIST { throw CalibrationReportWriteError.outputExists }
+        let stagingName = ".voice-calibration-\(UUID().uuidString)"
+        guard mkdirat(parentDescriptor, stagingName, 0o700) == 0 else {
             throw CalibrationReportWriteError.writeFailed
         }
-        let descriptor = openat(parentDescriptor, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
-        guard descriptor >= 0 else {
-            _ = unlinkat(parentDescriptor, name, AT_REMOVEDIR)
+        let stagingDescriptor = openat(
+            parentDescriptor, stagingName, O_RDONLY | O_DIRECTORY | O_NOFOLLOW
+        )
+        guard stagingDescriptor >= 0 else {
+            _ = unlinkat(parentDescriptor, stagingName, AT_REMOVEDIR)
             throw CalibrationReportWriteError.unsafeOutput
         }
-        defer { close(descriptor) }
+        var published = false
+        defer {
+            if !published {
+                _ = unlinkat(stagingDescriptor, "calibration-report.json", 0)
+                _ = unlinkat(stagingDescriptor, "calibration-report.md", 0)
+            }
+            close(stagingDescriptor)
+            if !published { _ = unlinkat(parentDescriptor, stagingName, AT_REMOVEDIR) }
+        }
         do {
-            try write(try report.jsonData(), named: "calibration-report.json", in: descriptor)
-            try write(Data(report.markdown().utf8), named: "calibration-report.md", in: descriptor)
+            try hooks.beforeWrite("calibration-report.json")
+            try write(
+                try report.jsonData(), named: "calibration-report.json",
+                eventName: "json", in: stagingDescriptor, hooks: hooks
+            )
+            try hooks.beforeWrite("calibration-report.md")
+            try write(
+                Data(report.markdown().utf8), named: "calibration-report.md",
+                eventName: "markdown", in: stagingDescriptor, hooks: hooks
+            )
+            guard fsync(stagingDescriptor) == 0 else {
+                throw CalibrationReportWriteError.writeFailed
+            }
+            hooks.record("fsync:staging")
+            guard renameatx_np(
+                parentDescriptor, stagingName, parentDescriptor, name,
+                UInt32(RENAME_EXCL)
+            ) == 0 else {
+                if errno == EEXIST { throw CalibrationReportWriteError.outputExists }
+                throw CalibrationReportWriteError.writeFailed
+            }
+            published = true
+            hooks.record("publish")
+            guard fsync(parentDescriptor) == 0 else {
+                throw CalibrationReportWriteError.writeFailed
+            }
+            hooks.record("fsync:parent")
         } catch {
-            unlinkat(descriptor, "calibration-report.json", 0)
-            unlinkat(descriptor, "calibration-report.md", 0)
-            _ = unlinkat(parentDescriptor, name, AT_REMOVEDIR)
             throw error
         }
     }
 
-    private static func ancestorsAreSafe(_ directory: URL) throws -> Bool {
-        var current = directory
-        while current.path != "/" {
-            var metadata = stat()
-            if lstat(current.path, &metadata) == 0 {
-                guard metadata.st_mode & S_IFMT == S_IFDIR else { return false }
-            } else if errno != ENOENT { return false }
-            current.deleteLastPathComponent()
+    private static func openDirectoryWithoutFollowingLinks(_ directory: URL) throws -> Int32 {
+        let path: String
+        if directory.path == "/var" || directory.path.hasPrefix("/var/") {
+            path = "/private" + directory.path
+        } else if directory.path == "/tmp" || directory.path.hasPrefix("/tmp/") {
+            path = "/private" + directory.path
+        } else {
+            path = directory.path
         }
-        return true
+        let root = open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+        guard root >= 0 else { throw CalibrationReportWriteError.unsafeOutput }
+        var current = root
+        for component in URL(fileURLWithPath: path, isDirectory: true).pathComponents.dropFirst() {
+            let next = openat(current, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+            if current != root { close(current) }
+            guard next >= 0 else {
+                close(root)
+                throw CalibrationReportWriteError.unsafeOutput
+            }
+            current = next
+        }
+        if current != root { close(root) }
+        return current
     }
 
-    private static func write(_ data: Data, named name: String, in directory: Int32) throws {
-        let temporary = ".\(name).tmp"
-        let descriptor = openat(directory, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
+    private static func write(
+        _ data: Data,
+        named name: String,
+        eventName: String,
+        in directory: Int32,
+        hooks: CalibrationReportWriterHooks
+    ) throws {
+        let descriptor = openat(directory, name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
         guard descriptor >= 0 else { throw CalibrationReportWriteError.writeFailed }
-        var success = false
-        defer {
-            close(descriptor)
-            if !success { unlinkat(directory, temporary, 0) }
-        }
+        defer { close(descriptor) }
         try data.withUnsafeBytes { buffer in
             var offset = 0
             while offset < buffer.count {
@@ -169,10 +234,9 @@ public enum CalibrationReportWriter {
                 offset += count
             }
         }
-        guard fsync(descriptor) == 0,
-              renameat(directory, temporary, directory, name) == 0 else {
+        guard fsync(descriptor) == 0 else {
             throw CalibrationReportWriteError.writeFailed
         }
-        success = true
+        hooks.record("fsync:file:\(eventName)")
     }
 }

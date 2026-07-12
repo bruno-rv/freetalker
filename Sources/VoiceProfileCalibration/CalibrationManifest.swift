@@ -1,4 +1,10 @@
 import Foundation
+import VoiceProfileFluidAudio
+
+public struct ValidatedCalibrationInput: Sendable {
+    public let sample: CalibrationSample
+    public let media: StableMediaInput
+}
 
 public struct CalibrationManifest: Codable, Equatable, Sendable {
     public let version: Int
@@ -10,10 +16,14 @@ public struct CalibrationManifest: Codable, Equatable, Sendable {
     }
 
     public func validatedSamples() throws -> [CalibrationSample] {
+        try validatedInputs().map(\ .sample)
+    }
+
+    public func validatedInputs() throws -> [ValidatedCalibrationInput] {
         guard version == 1 else { throw CalibrationManifestError.unsupportedVersion(version) }
         var sampleIDs = Set<String>()
         for sample in samples {
-            try sample.validate()
+            try sample.validateMetadata()
             guard sampleIDs.insert(sample.sampleID).inserted else {
                 throw CalibrationManifestError.duplicateSampleID(sample.sampleID)
             }
@@ -26,7 +36,16 @@ public struct CalibrationManifest: Codable, Equatable, Sendable {
                 throw CalibrationManifestError.insufficientSessions(participantID: participantID)
             }
         }
-        return samples.sorted { $0.sampleID < $1.sampleID }
+        return try samples.sorted { $0.sampleID < $1.sampleID }.map { sample in
+            do {
+                return ValidatedCalibrationInput(
+                    sample: sample,
+                    media: try StableMediaInput(opening: URL(fileURLWithPath: sample.mediaPath))
+                )
+            } catch {
+                throw CalibrationManifestError.invalidMedia(sample.sampleID)
+            }
+        }
     }
 }
 
@@ -55,7 +74,7 @@ public struct CalibrationSample: Codable, Equatable, Sendable {
         self.consentConfirmed = consentConfirmed
     }
 
-    fileprivate func validate() throws {
+    fileprivate func validateMetadata() throws {
         for (field, value) in [
             ("sampleID", sampleID), ("participantID", participantID),
             ("sessionID", sessionID), ("expectedSpeakerID", expectedSpeakerID)
@@ -64,11 +83,6 @@ public struct CalibrationSample: Codable, Equatable, Sendable {
         }
         guard consentConfirmed else { throw CalibrationManifestError.consentNotConfirmed(sampleID) }
         guard mediaPath.hasPrefix("/") else { throw CalibrationManifestError.invalidMedia(sampleID) }
-        var metadata = stat()
-        guard lstat(mediaPath, &metadata) == 0,
-              metadata.st_mode & S_IFMT == S_IFREG else {
-            throw CalibrationManifestError.invalidMedia(sampleID)
-        }
     }
 
     private var safeSampleID: String {

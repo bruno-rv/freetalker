@@ -52,8 +52,12 @@ make calibrate-voice-profiles MANIFEST=/absolute/path/to/consented-manifest.json
 
 The command writes JSON and Markdown under
 `.codex/sdd/reports/voice-profile-calibration/`. The directory is mode `0700`
-and report files are mode `0600`. Audio is read directly from the manifest path;
-the tool does not copy or cache audio, embeddings, or model bytes.
+and report files are mode `0600`. Both files are prepared in a private sibling
+directory, synchronized, and published together without replacing an existing
+destination. Audio files are opened once with symbolic-link following disabled;
+the held file identity is checked before and after extraction. The shared
+extractor reads a duplicated descriptor rather than reopening the manifest
+path. The tool does not copy or cache audio, embeddings, or model bytes.
 
 Reports contain only model metadata, aggregate cohort counts, distributions,
 bins, threshold-grid observations, runner-up-margin observations, and

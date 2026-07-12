@@ -9,14 +9,21 @@ public struct CalibrationRunner: Sendable {
     public init(extract: @escaping Extract) { self.extract = extract }
 
     public func run(manifest: CalibrationManifest) async throws -> CalibrationReport {
-        let samples = try manifest.validatedSamples()
+        try await run(validatedInputs: manifest.validatedInputs())
+    }
+
+    public func run(validatedInputs: [ValidatedCalibrationInput]) async throws -> CalibrationReport {
+        let samples = validatedInputs.map(\ .sample)
         var records: [Record] = []
         var rejected: [String] = []
         var fingerprint: EmbeddingModelFingerprint?
 
-        for sample in samples {
+        for input in validatedInputs {
+            let sample = input.sample
             do {
-                var result: OfflineVoiceRepresentationResult? = try await extract(URL(fileURLWithPath: sample.mediaPath))
+                var result: OfflineVoiceRepresentationResult? = try await input.media.withStableURL { stableURL in
+                    try await extract(stableURL)
+                }
                 guard let extracted = result,
                       fingerprint == nil || fingerprint == extracted.fingerprint,
                       let representation = extracted.speakers.first(where: { $0.speakerID == sample.expectedSpeakerID }),
@@ -38,6 +45,7 @@ public struct CalibrationRunner: Sendable {
 
         guard let fingerprint else { throw CalibrationRunnerError.noUsableSamples }
         var distances: [LabeledDistance] = []
+        var queryObservations: [LabeledDistance] = []
         var margins: [Double] = []
         let participantIDs = Set(records.map(\ .participantID)).sorted()
         for query in records.sorted(by: { $0.sampleID < $1.sampleID }) {
@@ -54,6 +62,11 @@ public struct CalibrationRunner: Sendable {
             }
             let qualityValues = query.representation.samples.compactMap(\ .quality)
             let quality = qualityValues.isEmpty ? nil : qualityValues.reduce(0, +) / Double(qualityValues.count)
+            queryObservations.append(LabeledDistance(
+                expectedSamePerson: true, distance: 0,
+                cleanSpeechSeconds: query.representation.cleanSpeechSeconds,
+                quality: quality
+            ))
             for (participantID, distance) in perParticipant {
                 distances.append(LabeledDistance(
                     expectedSamePerson: participantID == query.participantID,
@@ -83,13 +96,14 @@ public struct CalibrationRunner: Sendable {
             ),
             samePerson: .init(same.map(\ .distance)),
             differentPerson: .init(different.map(\ .distance)),
-            durationBins: CalibrationMetrics.durationBins(distances, boundaries: [2, 5, 10]),
-            qualityBins: CalibrationMetrics.qualityBins(distances, boundaries: [0.5, 0.75, 0.9]),
+            durationBins: CalibrationMetrics.durationBins(queryObservations, boundaries: [2, 5, 10]),
+            qualityBins: CalibrationMetrics.qualityBins(queryObservations, boundaries: [0.5, 0.75, 0.9]),
             thresholdMetrics: CalibrationMetrics.evaluate(distances, thresholds: stride(from: 0.05, through: 0.5, by: 0.05).map { $0 }),
             runnerUpMargins: .init(margins), warnings: warnings.sorted()
         )
         records.removeAll(keepingCapacity: false)
         distances.removeAll(keepingCapacity: false)
+        queryObservations.removeAll(keepingCapacity: false)
         margins.removeAll(keepingCapacity: false)
         return report
     }
