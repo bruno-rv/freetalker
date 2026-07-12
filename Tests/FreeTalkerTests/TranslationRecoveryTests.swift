@@ -108,6 +108,69 @@ struct TranslationRecoveryTests {
         await Self.waitUntil { coordinator.nextTranslationRecoveryPresentation == nil }
         #expect(router.presentations.last! == nil)
     }
+
+    @Test func recordingHUDKeepsOwnershipWhenRetryCompletesAndPendingFIFOReappearsAfterTerminal() async {
+        let coordinator = AppCoordinator.shared
+        Self.clearCoordinator(coordinator)
+        let translator = SuspendedTranslationProbe()
+        coordinator.configureTranslationRecoveryForTesting(
+            snapshot: { Self.snapshot() }, translate: translator.process,
+            deliver: { _, _, _ in true }
+        )
+        defer {
+            coordinator.recordingHUDDidReachTerminalState()
+            coordinator.resetTranslationRecoveryTestingConfiguration()
+            Self.clearCoordinator(coordinator)
+        }
+        _ = coordinator.handleOutputTranslationFailure(Self.failure(source: "first"))
+        _ = coordinator.handleOutputTranslationFailure(Self.failure(source: "second"))
+        #expect(coordinator.translationRecoveryHUDOwner == .recovery)
+
+        coordinator.recordingHUDWillPresent()
+        #expect(coordinator.translationRecoveryHUDOwner == .recording)
+        coordinator.retryNextTranslation()
+        await translator.waitUntilCalled()
+        await translator.resume(returning: "translated")
+        await Self.waitUntil { coordinator.nextTranslationRecoveryPresentation?.recoverableText == "second" }
+
+        #expect(coordinator.translationRecoveryHUDOwner == .recording)
+        coordinator.recordingHUDDidReachTerminalState()
+        #expect(coordinator.translationRecoveryHUDOwner == .recovery)
+        #expect(coordinator.nextTranslationRecoveryPresentation?.recoverableText == "second")
+    }
+
+    @Test func lateRecoveryEnqueueCannotReplaceRecordingHUD() {
+        let coordinator = AppCoordinator.shared
+        Self.clearCoordinator(coordinator)
+        defer {
+            coordinator.recordingHUDDidReachTerminalState()
+            Self.clearCoordinator(coordinator)
+        }
+        coordinator.recordingHUDWillPresent()
+
+        _ = coordinator.handleOutputTranslationFailure(Self.failure(source: "late"))
+
+        #expect(coordinator.translationRecoveryHUDOwner == .recording)
+        #expect(coordinator.nextTranslationRecoveryPresentation?.recoverableText == "late")
+        coordinator.recordingHUDDidReachTerminalState()
+        #expect(coordinator.translationRecoveryHUDOwner == .recovery)
+    }
+
+    @Test func staleRecordingTerminalCannotReleaseNewerHUDOwnership() {
+        let coordinator = AppCoordinator.shared
+        Self.clearCoordinator(coordinator)
+        defer {
+            coordinator.recordingHUDDidReachTerminalState()
+            Self.clearCoordinator(coordinator)
+        }
+        _ = coordinator.handleOutputTranslationFailure(Self.failure(source: "pending"))
+        let older = coordinator.recordingHUDWillPresent()
+        _ = coordinator.recordingHUDWillPresent()
+
+        coordinator.recordingHUDDidReachTerminalState(generation: older)
+
+        #expect(coordinator.translationRecoveryHUDOwner == .recording)
+    }
     @Test func pendingRecoveryRetainsImmutableFailureInputs() {
         let token = ScratchpadInsertionToken(id: UUID())
         let context = Self.context(destination: .scratchpad(token))

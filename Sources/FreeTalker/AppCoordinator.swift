@@ -9,6 +9,7 @@ import SwiftUI
 final class AppCoordinator: ObservableObject {
     enum CaptureOwner: Equatable { case none, dictation, voiceEdit }
     enum CaptureDecision: Equatable { case start, stop, busy(CaptureOwner) }
+    enum TranslationRecoveryHUDOwner: Equatable { case none, recovery, recording }
 
     nonisolated static func captureStartDecision(current: CaptureOwner, requested: CaptureOwner) -> CaptureDecision {
         current == .none ? .start : .busy(current)
@@ -46,6 +47,8 @@ final class AppCoordinator: ObservableObject {
     private var pendingOutputTranslationFailuresStorage: [OutputTranslationFailure] = []
     private lazy var translationRecoveryController = makeTranslationRecoveryController()
     weak var translationRecoveryPresentationRouter: (any TranslationRecoveryPresentationRouting)?
+    private(set) var translationRecoveryHUDOwner: TranslationRecoveryHUDOwner = .none
+    private var recordingHUDOwnershipGeneration: UUID?
     /// Set while the global hotkey listener couldn't be started (missing Accessibility
     /// permission) and we're waiting for the user to grant it. See Round 1 Codex finding 8.
     @Published private(set) var hotKeyStatusText: String?
@@ -396,6 +399,7 @@ final class AppCoordinator: ObservableObject {
             captureOwner = .voiceEdit
             isRecording = true
             hotKeyManager.isRecording = true
+            recordingHUDWillPresent()
             hud.show(text: Self.voiceEditRecordingHUDText(captureWarnings: audioCapture.captureWarnings))
         } catch {
             pendingVoiceEditSelection = nil
@@ -415,16 +419,22 @@ final class AppCoordinator: ObservableObject {
         let (peak, rms) = AudioLevel.peakAndRMS(samples)
         if let issue = Self.capturedAudioIssue(sampleCount: samples.count, peak: peak, rms: rms) {
             hud.flash(issue)
+            recordingHUDDidReachTerminalState()
             return
         }
         guard let selection else {
             hud.flash("No voice instruction captured")
+            recordingHUDDidReachTerminalState()
             return
         }
         isProcessing = true
+        let hudGeneration = recordingHUDWillPresent()
         hud.show(text: "Transcribing instruction locally…")
         Task {
-            defer { isProcessing = false }
+            defer {
+                isProcessing = false
+                recordingHUDDidReachTerminalState(generation: hudGeneration)
+            }
             do {
                 // Voice Edit is deliberately pinned to the on-device engine even when normal
                 // dictation is configured for cloud STT.
@@ -705,12 +715,31 @@ final class AppCoordinator: ObservableObject {
     }
 
     private func presentTranslationRecoveryState() {
+        defer { translationRecoveryPresentationRouter?.translationRecoveryPresentationDidChange() }
+        guard translationRecoveryHUDOwner != .recording else { return }
         if let presentation = translationRecoveryController.nextPresentation {
+            translationRecoveryHUDOwner = .recovery
             hud.showTranslationRecovery(presentation)
-        } else {
+        } else if translationRecoveryHUDOwner == .recovery {
+            translationRecoveryHUDOwner = .none
             hud.hide()
         }
-        translationRecoveryPresentationRouter?.translationRecoveryPresentationDidChange()
+    }
+
+    @discardableResult
+    func recordingHUDWillPresent() -> UUID {
+        let generation = UUID()
+        recordingHUDOwnershipGeneration = generation
+        translationRecoveryHUDOwner = .recording
+        return generation
+    }
+
+    func recordingHUDDidReachTerminalState(generation: UUID? = nil) {
+        guard translationRecoveryHUDOwner == .recording else { return }
+        if let generation, generation != recordingHUDOwnershipGeneration { return }
+        recordingHUDOwnershipGeneration = nil
+        translationRecoveryHUDOwner = .none
+        presentTranslationRecoveryState()
     }
 
     func pendingOutputTranslationFailures() -> [OutputTranslationFailure] {
@@ -1070,6 +1099,7 @@ final class AppCoordinator: ObservableObject {
             oneShotLanguage: oneShotLanguage,
             translationState: presentedTranslationState
         )
+        recordingHUDWillPresent()
         hud.showRecordingPanel(state)
     }
 
@@ -1176,6 +1206,7 @@ final class AppCoordinator: ObservableObject {
             pin: AppSettings.shared.languagePin
         )
 
+        let hudGeneration = recordingHUDWillPresent()
         hud.show(text: Self.contextPermissionHint(for: contextCapture.limitation) ?? "Processing…")
 
         Task {
@@ -1209,7 +1240,8 @@ final class AppCoordinator: ObservableObject {
                 localContext: Self.localContextForProcessor(
                     isCloudConfigured: !(processor is AppleFMProcessor),
                     capture: resolvedCapture
-                )
+                ),
+                hudGeneration: hudGeneration
             )
         }
     }
@@ -1262,6 +1294,7 @@ final class AppCoordinator: ObservableObject {
                 clearHUD: { self.hud.flash("Cancelled") }
             )
         }
+        recordingHUDDidReachTerminalState()
     }
 
     nonisolated static func performCancelRecording(
@@ -1552,8 +1585,11 @@ final class AppCoordinator: ObservableObject {
         }
     }
 
-    private func runPipeline(samples: [Float], engine: any TranscriptionEngine, engineName: String, template: Template, appName: String?, target: InsertionTarget?, forcedLanguage: String?, outputLanguage: OutputLanguage, cloudSnapshot: CloudLLMSettingsSnapshot, skipPostProcessing: Bool, processor: (any PostProcessor)? = nil, localContext: LocalProcessingContext? = nil) async {
-        defer { isProcessing = false }
+    private func runPipeline(samples: [Float], engine: any TranscriptionEngine, engineName: String, template: Template, appName: String?, target: InsertionTarget?, forcedLanguage: String?, outputLanguage: OutputLanguage, cloudSnapshot: CloudLLMSettingsSnapshot, skipPostProcessing: Bool, processor: (any PostProcessor)? = nil, localContext: LocalProcessingContext? = nil, hudGeneration: UUID) async {
+        defer {
+            isProcessing = false
+            recordingHUDDidReachTerminalState(generation: hudGeneration)
+        }
 
         await Self.runExternalPipelineTask(
             operation: {
@@ -1591,9 +1627,6 @@ final class AppCoordinator: ObservableObject {
             onTranslationFailure: { failure in
                 let message = handleOutputTranslationFailure(failure, externalTarget: target)
                 lastError = message
-                if let presentation = translationRecoveryController.nextPresentation {
-                    hud.showTranslationRecovery(presentation)
-                }
             },
             onFailure: { error in
                 lastError = "Transcription failed: \(error.localizedDescription)"
@@ -1639,6 +1672,7 @@ final class AppCoordinator: ObservableObject {
             pin: AppSettings.shared.languagePin
         )
         isProcessing = true
+        let hudGeneration = recordingHUDWillPresent()
         hud.show(text: "Processing…")
         let context = RecordingProcessingContext(
             destination: .scratchpad(token), spokenLanguage: forcedLanguage,
@@ -1648,7 +1682,10 @@ final class AppCoordinator: ObservableObject {
         let processor = outputLanguage == .sameAsSpoken ? resolveActiveProcessor() : nil
 
         Task {
-            defer { isProcessing = false }
+            defer {
+                isProcessing = false
+                recordingHUDDidReachTerminalState(generation: hudGeneration)
+            }
             await Self.runScratchpadPipelineTask(
                 operation: {
                     try await destinationLifecycle.runAsync(
@@ -1678,9 +1715,6 @@ final class AppCoordinator: ObservableObject {
                 onTranslationFailure: { failure in
                     let message = handleOutputTranslationFailure(failure)
                     lastError = message
-                    if let presentation = translationRecoveryController.nextPresentation {
-                        hud.showTranslationRecovery(presentation)
-                    }
                 },
                 onFailure: { error in
                     let message = error is PipelineError ? "Transcription failed" : "Transcription failed: \(error.localizedDescription)"
