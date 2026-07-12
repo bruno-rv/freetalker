@@ -65,8 +65,7 @@ protocol ScratchpadTransforming: Sendable {
 
 struct ScratchpadTransformationService: ScratchpadTransforming {
     typealias Process = @Sendable (
-        _ transcript: String,
-        _ template: Template,
+        _ request: PostProcessingRequest,
         _ snapshot: CloudLLMSettingsSnapshot
     ) async throws -> String
 
@@ -96,22 +95,25 @@ struct ScratchpadTransformationService: ScratchpadTransforming {
             name: action.label,
             prompt: action.prompt(instruction: instruction)
         )
-        let output = try await process(text, template, snapshot)
+        let output = try await process(
+            .init(
+                transcript: text,
+                template: template,
+                appName: nil,
+                languagePolicy: .preserveSource
+            ),
+            snapshot
+        )
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !output.isEmpty else { throw ScratchpadTransformationError.emptyResponse }
         return output
     }
 
     private static func processWithCloudLLM(
-        transcript: String,
-        template: Template,
+        request: PostProcessingRequest,
         snapshot: CloudLLMSettingsSnapshot
     ) async throws -> String {
-        try await CloudLLMProcessor(snapshot: snapshot).process(
-            transcript: transcript,
-            template: template,
-            appName: nil
-        )
+        try await CloudLLMProcessor(snapshot: snapshot).process(request)
     }
 }
 

@@ -104,9 +104,11 @@ import Testing
         )
 
         let prompt = buildLocalProcessorInstructions(
-            template: Template.builtIns[0],
+            request: .init(
+                transcript: "text", template: Template.builtIns[0], appName: "Mail",
+                languagePolicy: .preserveSource
+            ),
             vocabulary: [],
-            appName: "Mail",
             context: context
         )
 
@@ -119,7 +121,14 @@ import Testing
 
     @Test func localPromptCapsContextAtTwelveThousandCharacters() {
         let context = LocalProcessingContext(appName: nil, windowTitle: nil, text: String(repeating: "a", count: 12_001))
-        let prompt = buildLocalProcessorInstructions(template: Template.builtIns[0], vocabulary: [], appName: nil, context: context)
+        let prompt = buildLocalProcessorInstructions(
+            request: .init(
+                transcript: "text", template: Template.builtIns[0], appName: nil,
+                languagePolicy: .preserveSource
+            ),
+            vocabulary: [],
+            context: context
+        )
         #expect(prompt.contains(String(repeating: "a", count: 12_000)))
         #expect(!prompt.contains(String(repeating: "a", count: 12_001)))
     }
@@ -171,7 +180,7 @@ import Testing
     @Test func cloudAndPostProcessorAPIsHaveNoContextParameter() {
         let requirement: any PostProcessor.Type = CloudLLMProcessor.self
         _ = requirement
-        let method: (CloudLLMProcessor) -> (String, Template, String?) async throws -> String = CloudLLMProcessor.process
+        let method: (CloudLLMProcessor) -> (PostProcessingRequest) async throws -> String = CloudLLMProcessor.process
         _ = method
     }
 

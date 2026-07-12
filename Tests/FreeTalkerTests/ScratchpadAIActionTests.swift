@@ -49,6 +49,7 @@ struct ScratchpadAIActionTests {
         let request = await spy.request
         #expect(request?.snapshot == requestSnapshot)
         #expect(request?.transcript == "Texto original")
+        #expect(request?.languagePolicy == .preserveSource)
         #expect(request?.template.prompt.localizedCaseInsensitiveContains("same language") == true)
         #expect(request?.template.prompt.localizedCaseInsensitiveContains("only") == true)
     }
@@ -543,6 +544,7 @@ private actor RequestSpy {
         let transcript: String
         let template: Template
         let snapshot: CloudLLMSettingsSnapshot
+        let languagePolicy: OutputProcessingPolicy
     }
 
     let response: String
@@ -550,8 +552,13 @@ private actor RequestSpy {
 
     init(response: String) { self.response = response }
 
-    func process(transcript: String, template: Template, snapshot: CloudLLMSettingsSnapshot) async throws -> String {
-        request = Request(transcript: transcript, template: template, snapshot: snapshot)
+    func process(_ request: PostProcessingRequest, snapshot: CloudLLMSettingsSnapshot) async throws -> String {
+        self.request = Request(
+            transcript: request.transcript,
+            template: request.template,
+            snapshot: snapshot,
+            languagePolicy: request.languagePolicy
+        )
         return response
     }
 }
