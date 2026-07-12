@@ -3,7 +3,7 @@ import Testing
 @testable import FreeTalker
 
 @MainActor
-@Suite("Output translation pipeline")
+@Suite("Output translation pipeline", .serialized)
 struct OutputTranslationPipelineTests {
     @Test(arguments: [("en", "en"), ("pt", "pt"), ("fr", nil), (nil, nil)] as [(String?, String?)])
     func sttReceivesOnlySupportedSpokenHints(argument: (String?, String?)) async throws {
@@ -102,28 +102,114 @@ struct OutputTranslationPipelineTests {
         #expect(AppCoordinator.pipelineFailureKind(AppCoordinator.PipelineError.emptyTranscript) == .transcription)
     }
 
-    @Test func coordinatorRetainsUnresolvedTranslationForTaskSeven() throws {
+    @Test func coordinatorRetainsUnresolvedTranslationsFIFOAndConsumesExactID() async throws {
         let coordinator = AppCoordinator.shared
-        let context = RecordingProcessingContext(
+        while coordinator.consumeNextPendingOutputTranslationFailure() != nil {}
+        let externalContext = RecordingProcessingContext(
             destination: .external, spokenLanguage: "pt", outputLanguage: .english,
             template: Self.template, cloudSnapshot: Self.snapshot()
         )
-        let failure = OutputTranslationFailure(
-            source: "fonte", context: context, underlyingError: PipelineStubError.failed
+        let token = ScratchpadInsertionToken(id: UUID())
+        let scratchpadContext = RecordingProcessingContext(
+            destination: .scratchpad(token), spokenLanguage: "en", outputLanguage: .french,
+            template: Self.template, cloudSnapshot: Self.snapshot(model: "second")
         )
+        var insertCount = 0
+        var recordCount = 0
+        var failures: [OutputTranslationFailure] = []
+        for (source, context) in [("fonte", externalContext), ("source", scratchpadContext)] {
+            do {
+                _ = try await coordinator.processDictation(
+                    samples: [0.5], engine: PipelineEngineSpy(output: .init(text: source, language: "en")),
+                    engineName: "Spy", context: context,
+                    translator: PipelineTranslationSpy(error: PipelineStubError.failed),
+                    insert: { _, _ in insertCount += 1; return true },
+                    record: { _ in recordCount += 1 }
+                )
+                Issue.record("Expected translation failure")
+            } catch let failure as OutputTranslationFailure {
+                failures.append(failure)
+            } catch {
+                Issue.record("Unexpected error: \(error)")
+            }
+        }
+        #expect(failures.map(coordinator.handleOutputTranslationFailure) == ["Translation failed", "Translation failed"])
 
-        coordinator.deferOutputTranslationFailure(failure)
-        let retained = try #require(coordinator.takeDeferredOutputTranslationFailure())
+        let pending = coordinator.pendingOutputTranslationFailures()
+        let ids = pending.map(\.id)
+        #expect(Set(ids).count == 2)
+        #expect(pending.map(\.source) == ["fonte", "source"])
+        #expect(pending.map(\.context) == [externalContext, scratchpadContext])
+        #expect(insertCount == 0)
+        #expect(recordCount == 0)
+        #expect(coordinator.consumePendingOutputTranslationFailure(id: ids[1])?.id == ids[1])
+        #expect(coordinator.pendingOutputTranslationFailures().map(\.id) == [ids[0]])
+        #expect(coordinator.consumeNextPendingOutputTranslationFailure()?.id == ids[0])
+        #expect(coordinator.consumeNextPendingOutputTranslationFailure() == nil)
+    }
 
-        #expect(retained.source == "fonte")
-        #expect(retained.context == context)
-        #expect(coordinator.takeDeferredOutputTranslationFailure() == nil)
+    @Test func missingOrIneligibleCapturedSnapshotFailsBeforeTranslation() async {
+        for snapshot in [nil, Self.ineligibleSnapshot()] as [CloudLLMSettingsSnapshot?] {
+            let translation = PipelineTranslationSpy(output: "must not run")
+            let context = RecordingProcessingContext(
+                destination: .external, spokenLanguage: "en", outputLanguage: .german,
+                template: Self.template, cloudSnapshot: snapshot
+            )
+
+            do {
+                _ = try await AppCoordinator.shared.processDictation(
+                    samples: [0.5], engine: PipelineEngineSpy(output: .init(text: "raw", language: "en")),
+                    engineName: "Spy", context: context, translator: translation,
+                    insert: { _, _ in Issue.record("Must not insert"); return true },
+                    record: { _ in Issue.record("Must not record") }
+                )
+                Issue.record("Expected translation failure")
+            } catch let failure as OutputTranslationFailure {
+                #expect(failure.source == "raw")
+                #expect(failure.context == context)
+            } catch {
+                Issue.record("Unexpected error: \(error)")
+            }
+
+            #expect(await translation.callCount == 0)
+        }
+    }
+
+    @Test func cancellationFromTranslatorRemainsCancellationAndHasNoDeliveryOrRetention() async {
+        let coordinator = AppCoordinator.shared
+        while coordinator.consumeNextPendingOutputTranslationFailure() != nil {}
+        var insertCount = 0
+        var recordCount = 0
+
+        do {
+            _ = try await coordinator.processDictation(
+                samples: [0.5], engine: PipelineEngineSpy(output: .init(text: "raw", language: "en")),
+                engineName: "Spy", template: Self.template, outputLanguage: .german,
+                cloudSnapshot: Self.snapshot(), translator: PipelineTranslationSpy(error: CancellationError()),
+                insert: { _, _ in insertCount += 1; return true }, record: { _ in recordCount += 1 }
+            )
+            Issue.record("Expected cancellation")
+        } catch is CancellationError {
+        } catch let failure as OutputTranslationFailure {
+            coordinator.enqueueOutputTranslationFailure(failure)
+            Issue.record("Cancellation was wrapped as translation failure")
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+
+        #expect(insertCount == 0)
+        #expect(recordCount == 0)
+        #expect(coordinator.pendingOutputTranslationFailures().isEmpty)
     }
 
     private static let template = Template(id: "plain", name: "Plain", prompt: "Clean it")
 
     private static func snapshot(model: String = "model") -> CloudLLMSettingsSnapshot {
         .init(provider: .anthropic, baseURL: "https://example.com", model: model, key: "key", vocabulary: [])
+    }
+
+    private static func ineligibleSnapshot() -> CloudLLMSettingsSnapshot {
+        .init(provider: .anthropic, baseURL: "", model: "", key: "", vocabulary: [])
     }
 }
 

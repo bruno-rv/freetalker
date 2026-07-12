@@ -34,9 +34,20 @@ struct RecordingProcessingResult {
 }
 
 struct OutputTranslationFailure: Error, LocalizedError {
+    let id: UUID
     let source: String
     let context: RecordingProcessingContext
     let underlyingError: Error
+
+    init(
+        id: UUID = UUID(), source: String, context: RecordingProcessingContext,
+        underlyingError: Error
+    ) {
+        self.id = id
+        self.source = source
+        self.context = context
+        self.underlyingError = underlyingError
+    }
 
     var errorDescription: String? { "Translation failed" }
 }
@@ -134,7 +145,7 @@ final class RecordingDestinationLifecycle {
             return (value, accepted)
         } catch {
             if case .scratchpad(let token) = destination {
-                if error is CancellationError {
+                if error is CancellationError || Task.isCancelled {
                     router?.cancelRecording(for: token)
                     clearPending(for: token)
                 } else {
@@ -142,6 +153,7 @@ final class RecordingDestinationLifecycle {
                     else { pendingFailures.append(error.localizedDescription) }
                 }
             }
+            if error is CancellationError || Task.isCancelled { throw CancellationError() }
             throw error
         }
     }

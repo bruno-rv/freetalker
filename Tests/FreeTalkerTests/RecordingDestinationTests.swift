@@ -187,6 +187,33 @@ struct RecordingDestinationTests {
         #expect(router.events.last == .cancellation)
     }
 
+    @MainActor @Test func cancelledTaskWithOrdinaryErrorRoutesOnlyCancellation() async {
+        let router = RouterProbe()
+        let lifecycle = RecordingDestinationLifecycle(router: router)
+        let token = ScratchpadInsertionToken(id: UUID())
+        let task = Task { @MainActor in
+            try await lifecycle.runAsync(
+                destination: .scratchpad(token),
+                process: {
+                    try await Task.sleep(for: .seconds(10))
+                    throw ProbeError.failed
+                },
+                text: { $0 as String }, external: { _ in Issue.record("Must not deliver") }
+            )
+        }
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            Issue.record("Expected cancellation")
+        } catch is CancellationError {
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+        #expect(router.events == [.cancellation])
+        #expect(lifecycle.consumePendingFailure() == nil)
+    }
+
     @MainActor @Test func asyncScratchpadRejectionStoresRecoveryWithoutExternalEffects() async throws {
         let token = ScratchpadInsertionToken(id: UUID())
         let lifecycle = RecordingDestinationLifecycle(router: RouterProbe(acceptCompletion: false))

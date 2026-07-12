@@ -225,6 +225,38 @@ struct ScratchpadRecordingTests {
         #expect(coordinator.pendingScratchpadRecording(for: recoveryToken) == " recover")
     }
 
+    @Test func coordinatorScratchpadTranslationCancellationRoutesCancellationWithoutRecovery() async {
+        let coordinator = AppCoordinator.shared
+        let router = ScratchpadCancellationProbe()
+        let token = ScratchpadInsertionToken(id: UUID())
+        coordinator.scratchpadRecordingRouter = router
+        defer { coordinator.scratchpadRecordingRouter = nil }
+        var insertCount = 0
+        var recordCount = 0
+
+        do {
+            _ = try await coordinator.processDictation(
+                samples: [0.5], engine: ScratchpadCancellationEngine(), engineName: "Spy",
+                context: RecordingProcessingContext(
+                    destination: .scratchpad(token), spokenLanguage: "en", outputLanguage: .german,
+                    template: Template(id: "plain", name: "Plain", prompt: "Clean"),
+                    cloudSnapshot: .init(provider: .anthropic, baseURL: "https://example.com", model: "model", key: "key", vocabulary: [])
+                ),
+                translator: ScratchpadCancellationTranslator(),
+                insert: { _, _ in insertCount += 1; return true }, record: { _ in recordCount += 1 }
+            )
+            Issue.record("Expected cancellation")
+        } catch is CancellationError {
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+
+        #expect(router.events == [.cancellation])
+        #expect(insertCount == 0)
+        #expect(recordCount == 0)
+        #expect(coordinator.pendingScratchpadRecording(for: token) == nil)
+    }
+
     @Test func windowIsNormalFocusableAndFormattingToolbarIsAccessible() {
         let harness = Harness("Text")
         let window = harness.controller.window
@@ -433,4 +465,32 @@ private struct ClosedFailure: Error, LocalizedError {
 
 private enum CloseFailure: Error {
     case save
+}
+
+private actor ScratchpadCancellationEngine: TranscriptionEngine {
+    nonisolated let name = "Spy"
+    nonisolated var statusText: String { "Ready" }
+    func transcribe(samples: [Float], forcedLanguage: String?) async throws -> TranscriptionOutput {
+        .init(text: "raw", language: "en")
+    }
+}
+
+private struct ScratchpadCancellationTranslator: Translating {
+    func process(
+        source: String, template: Template, policy: OutputProcessingPolicy,
+        snapshot: CloudLLMSettingsSnapshot
+    ) async throws -> String {
+        throw CancellationError()
+    }
+}
+
+@MainActor
+private final class ScratchpadCancellationProbe: ScratchpadRecordingRouting {
+    var events: [RecordingDestinationEvent] = []
+    func updatePreview(_ text: String?, for token: ScratchpadInsertionToken) { events.append(.preview(text)) }
+    func completeRecording(_ text: String, for token: ScratchpadInsertionToken) -> Bool {
+        events.append(.completion(text)); return true
+    }
+    func cancelRecording(for token: ScratchpadInsertionToken) { events.append(.cancellation) }
+    func failRecording(_ message: String, for token: ScratchpadInsertionToken) { events.append(.failure(message)) }
 }
