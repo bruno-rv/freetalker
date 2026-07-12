@@ -82,6 +82,30 @@ struct AudioCaptureDecisionTests {
         #expect(AudioCapture.voiceProcessingAction(requested: false, current: true, transitionFailed: true) == .replaceWithRawEngine)
     }
 
+    @Test func rawCaptureReplacesEngineWhenVoiceProcessingRemainsEnabled() {
+        #expect(
+            AudioCapture.rawCapturePostconditionAction(
+                effectiveVoiceProcessing: true,
+                usingReplacementEngine: false
+            ) == .replaceEngine
+        )
+        #expect(
+            AudioCapture.rawCapturePostconditionAction(
+                effectiveVoiceProcessing: false,
+                usingReplacementEngine: true
+            ) == .accept
+        )
+    }
+
+    @Test func rawCaptureAbortsWhenReplacementEngineStillHasVoiceProcessingEnabled() {
+        #expect(
+            AudioCapture.rawCapturePostconditionAction(
+                effectiveVoiceProcessing: true,
+                usingReplacementEngine: true
+            ) == .abort
+        )
+    }
+
     @Test func captureWarningsAccumulateInOrder() {
         let suppressionWarning = "Voice processing unavailable"
         let deviceWarning = "Configured microphone unavailable"

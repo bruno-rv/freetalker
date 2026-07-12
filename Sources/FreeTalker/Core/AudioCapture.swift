@@ -27,6 +27,12 @@ final class AudioCapture {
         case replaceWithRawEngine
     }
 
+    enum RawCapturePostconditionAction: Equatable {
+        case accept
+        case replaceEngine
+        case abort
+    }
+
     private static let logger = Logger(subsystem: "com.bruno.freetalker", category: "audio-capture")
     private var engine = AVAudioEngine()
     private var converter: AVAudioConverter?
@@ -84,6 +90,14 @@ final class AudioCapture {
         effectiveVoiceProcessing: Bool
     ) -> CaptureFailureAction {
         effectiveVoiceProcessing ? .retryRaw : .propagate
+    }
+
+    nonisolated static func rawCapturePostconditionAction(
+        effectiveVoiceProcessing: Bool,
+        usingReplacementEngine: Bool
+    ) -> RawCapturePostconditionAction {
+        guard effectiveVoiceProcessing else { return .accept }
+        return usingReplacementEngine ? .abort : .replaceEngine
     }
 
     /// Starts capturing. Throws if the mic can't be opened (e.g. permission denied).
@@ -242,6 +256,16 @@ final class AudioCapture {
             recordWarning("Voice processing could not be configured — using raw microphone audio")
         }
 
+        if !requested,
+           Self.rawCapturePostconditionAction(
+               effectiveVoiceProcessing: input.isVoiceProcessingEnabled,
+               usingReplacementEngine: false
+           ) == .replaceEngine {
+            Self.logger.error("Voice processing remained enabled after requesting raw capture")
+            try replaceWithRawEngine()
+            input = engine.inputNode
+        }
+
         Self.logger.info("Voice processing requested=\(requested) effective=\(input.isVoiceProcessingEnabled)")
         return input
     }
@@ -258,7 +282,10 @@ final class AudioCapture {
                 throw CaptureError.rawFallbackUnavailable(error.localizedDescription)
             }
         }
-        guard !input.isVoiceProcessingEnabled else {
+        guard Self.rawCapturePostconditionAction(
+            effectiveVoiceProcessing: input.isVoiceProcessingEnabled,
+            usingReplacementEngine: true
+        ) == .accept else {
             throw CaptureError.rawFallbackUnavailable("voice processing remained enabled")
         }
         Self.logger.warning("Recreated audio engine for raw-capture fallback")
