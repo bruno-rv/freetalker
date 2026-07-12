@@ -182,7 +182,7 @@ private final class SettingsWindowObserverView: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         guard let window else { return }
-        AppLifecycleWindowPolicy.configureSettingsWindow(window)
+        AppLifecycleWindowPolicy.configureFocusableUtilityWindow(window)
         window.makeKeyAndOrderFront(nil)
     }
 }

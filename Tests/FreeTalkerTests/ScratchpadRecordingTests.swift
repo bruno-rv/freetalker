@@ -231,6 +231,21 @@ struct ScratchpadRecordingTests {
         #expect(harness.controller.scratchpadView.recoveryButton.accessibilityHelp()?.isEmpty == false)
     }
 
+    @Test func windowJoinsOtherApplicationsFullScreenSpacesWithoutBecomingAHUD() throws {
+        let window = try #require(Harness("Text").controller.window)
+
+        #expect(window.collectionBehavior.contains(.canJoinAllSpaces))
+        #expect(window.collectionBehavior.contains(.canJoinAllApplications))
+        #expect(!window.collectionBehavior.contains(.fullScreenPrimary))
+        #expect(!window.collectionBehavior.contains(.fullScreenAuxiliary))
+        #expect(!window.collectionBehavior.contains(.stationary))
+        #expect(window.level == .normal)
+        #expect(window.level != .floating)
+        #expect(window.styleMask.contains([.titled, .closable, .resizable]))
+        #expect(!window.styleMask.contains(.nonactivatingPanel))
+        #expect(window.canBecomeKey)
+    }
+
     @Test func closeAndTerminationFlushDocument() {
         let closeURL = temporaryURL()
         let closeController = makeController(url: closeURL)
