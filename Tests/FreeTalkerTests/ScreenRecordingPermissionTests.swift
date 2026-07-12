@@ -18,12 +18,17 @@ import Testing
     }
 
     @Test func settingsPresentationShowsBothActionsOnlyWhenNotGranted() {
-        let missing = ScreenRecordingPermissionPresentation.make(status: .notGranted)
+        let missing = ScreenRecordingPermissionPresentation.make(status: .notGranted, requestAttempted: false)
         #expect(missing.label == "Screen Recording not granted")
         #expect(missing.showsRequestAccess)
         #expect(missing.showsOpenSystemSettings)
 
-        let granted = ScreenRecordingPermissionPresentation.make(status: .granted)
+        let pendingRelaunch = ScreenRecordingPermissionPresentation.make(status: .notGranted, requestAttempted: true)
+        #expect(pendingRelaunch.label == "Screen Recording not available yet")
+        #expect(pendingRelaunch.guidance?.contains("relaunch") == true)
+        #expect(!pendingRelaunch.showsRequestAccess)
+
+        let granted = ScreenRecordingPermissionPresentation.make(status: .granted, requestAttempted: true)
         #expect(granted.label == "Screen Recording granted")
         #expect(!granted.showsRequestAccess)
         #expect(!granted.showsOpenSystemSettings)

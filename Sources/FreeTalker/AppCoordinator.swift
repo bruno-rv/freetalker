@@ -31,6 +31,7 @@ final class AppCoordinator: ObservableObject {
     /// Set while the global hotkey listener couldn't be started (missing Accessibility
     /// permission) and we're waiting for the user to grant it. See Round 1 Codex finding 8.
     @Published private(set) var hotKeyStatusText: String?
+    @Published private(set) var isHotKeyListening = false
 
     /// Source of truth for the hands-free gesture (Amendment B): idle / pttRecording /
     /// locked. `isRecording` and `hotKeyManager.isRecording` (consulted synchronously by the
@@ -179,7 +180,7 @@ final class AppCoordinator: ObservableObject {
         // just the menu bar popover focusing a window) re-checks the tap — catching
         // permissions granted in System Settings while the app was already running.
         NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.ensureHotKeyListening() }
+            Task { @MainActor in self?.restartHotKeyListening() }
         }
         // Amendment B3: clicking the HUD pill locks an in-progress PTT recording or stops a
         // locked one — wired once, not per-`ensureHotKeyListening()` call.
@@ -233,6 +234,7 @@ final class AppCoordinator: ObservableObject {
     /// Accessibility already reads trusted. The poll stops as soon as the tap is alive.
     func ensureHotKeyListening() {
         if hotKeyManager.isListening {
+            isHotKeyListening = true
             hotKeyStatusText = nil
             stopHotKeyRetryPoll()
             return
@@ -249,9 +251,11 @@ final class AppCoordinator: ObservableObject {
             redoSpec: AppSettings.shared.redoHotKeySpec,
             voiceEditSpec: AppSettings.shared.voiceEditHotKeySpec
         ) {
+            isHotKeyListening = true
             hotKeyStatusText = nil
             stopHotKeyRetryPoll()
         } else {
+            isHotKeyListening = false
             updateHotKeyStatusText()
             beginHotKeyRetryPollIfNeeded()
         }
@@ -304,7 +308,9 @@ final class AppCoordinator: ObservableObject {
             hud.show(text: Self.voiceEditRecordingHUDText(captureWarnings: audioCapture.captureWarnings))
         } catch {
             pendingVoiceEditSelection = nil
-            lastError = "Mic error: \(error.localizedDescription)"
+            let message = Self.captureStartFailureMessage(errorDescription: error.localizedDescription)
+            lastError = message
+            hud.flash(message)
         }
     }
 
@@ -420,7 +426,12 @@ final class AppCoordinator: ObservableObject {
     /// Forces the tap to be recreated (the configured hotkey changed in Settings).
     func restartHotKeyListening() {
         hotKeyManager.stop()
+        isHotKeyListening = false
         ensureHotKeyListening()
+    }
+
+    nonisolated static func captureStartFailureMessage(errorDescription: String) -> String {
+        "Could not start recording: \(errorDescription)"
     }
 
     private func beginHotKeyRetryPollIfNeeded() {
@@ -671,7 +682,9 @@ final class AppCoordinator: ObservableObject {
             startLivePreviewIfNeeded()
             return true
         } catch {
-            lastError = "Mic error: \(error.localizedDescription)"
+            let message = Self.captureStartFailureMessage(errorDescription: error.localizedDescription)
+            lastError = message
+            hud.flash(message)
             return false
         }
     }
