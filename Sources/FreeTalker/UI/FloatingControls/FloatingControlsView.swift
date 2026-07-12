@@ -4,6 +4,7 @@ struct FloatingControlsView: View {
     let state: FloatingControlsHoverState
     let edge: LauncherEdge
     let languagePin: String
+    let translationState: TranslationControlsState
     let callbacks: FloatingControlsController.Callbacks
 
     var body: some View {
@@ -35,17 +36,12 @@ struct FloatingControlsView: View {
         launcherButton("Start dictation", systemImage: "mic.fill", action: callbacks.onDictation)
         launcherButton("Open Scratchpad", systemImage: "square.and.pencil", action: callbacks.onScratchpad)
         launcherButton("Open FreeTalker", systemImage: "gearshape.fill", action: callbacks.onOpenSettings)
-        Menu {
-            languageButton("Auto", code: "auto")
-            languageButton("English", code: "en")
-            languageButton("Portuguese", code: "pt")
-        } label: {
-            Image(systemName: "character.bubble.fill")
-                .frame(width: 24, height: 24)
-        }
-        .menuStyle(.borderlessButton)
-        .help("Choose dictation language")
-        .accessibilityLabel("Choose dictation language")
+        TranslationControls(
+            languagePin: languagePin,
+            state: translationState,
+            onLanguage: callbacks.onLanguage,
+            onOutput: callbacks.onOutput
+        )
     }
 
     private func launcherButton(
@@ -61,19 +57,6 @@ struct FloatingControlsView: View {
         .accessibilityLabel(label)
     }
 
-    private func languageButton(_ label: String, code: String) -> some View {
-        Button {
-            callbacks.onLanguage(code)
-        } label: {
-            if languagePin == code {
-                Label(label, systemImage: "checkmark")
-            } else {
-                Text(label)
-            }
-        }
-        .help("Use \(label) for dictation")
-        .accessibilityLabel("Use \(label) for dictation")
-    }
 }
 
 extension LauncherEdge {

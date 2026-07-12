@@ -1,0 +1,110 @@
+import SwiftUI
+
+struct TranslationControlsState: Equatable {
+    let effectiveOutput: OutputLanguage
+    let override: OutputLanguage?
+    let availability: CloudFeatureAvailability
+}
+
+struct TranslationControlsPresentation: Equatable {
+    struct OutputChoice: Equatable {
+        let language: OutputLanguage
+        let label: String
+    }
+
+    static let spokenLabel = "Speak:"
+    static let outputLabel = "Output:"
+    static let outputChoices = OutputLanguage.allCases.map {
+        OutputChoice(language: $0, label: $0.displayName)
+    }
+
+    let state: TranslationControlsState
+
+    var tooltip: String? { state.availability.tooltip }
+    var accessibilityHelp: String? { state.availability.accessibilityHelp }
+
+    func isEnabled(_ language: OutputLanguage) -> Bool {
+        language == .sameAsSpoken || state.availability.enabled
+    }
+}
+
+struct TranslationControls: View {
+    let languagePin: String
+    let state: TranslationControlsState
+    let onLanguage: (String) -> Void
+    let onOutput: (OutputLanguage) -> Void
+
+    private var presentation: TranslationControlsPresentation {
+        TranslationControlsPresentation(state: state)
+    }
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Text(TranslationControlsPresentation.spokenLabel)
+            Menu {
+                spokenButton("Auto", code: "auto")
+                spokenButton("English", code: "en")
+                spokenButton("Portuguese", code: "pt")
+            } label: {
+                Text(spokenName)
+            }
+            .menuStyle(.borderlessButton)
+            .help("Choose dictation language")
+            .accessibilityLabel("Choose dictation language")
+
+            Text(TranslationControlsPresentation.outputLabel)
+            Menu {
+                ForEach(Self.outputChoices, id: \.language.rawValue) { choice in
+                    outputChoice(choice)
+                }
+            } label: {
+                Text(state.effectiveOutput.displayName)
+            }
+            .menuStyle(.borderlessButton)
+            .help("Choose recording output language")
+            .accessibilityLabel("Choose recording output language")
+        }
+        .font(.caption)
+    }
+
+    private static let outputChoices = TranslationControlsPresentation.outputChoices
+
+    private var spokenName: String {
+        switch languagePin {
+        case "en": "English"
+        case "pt": "Portuguese"
+        default: "Auto"
+        }
+    }
+
+    private func spokenButton(_ label: String, code: String) -> some View {
+        Button { onLanguage(code) } label: {
+            if languagePin == code { Label(label, systemImage: "checkmark") }
+            else { Text(label) }
+        }
+        .help("Use \(label) for dictation")
+        .accessibilityLabel("Use \(label) for dictation")
+    }
+
+    @ViewBuilder
+    private func outputChoice(_ choice: TranslationControlsPresentation.OutputChoice) -> some View {
+        let button = Button { onOutput(choice.language) } label: {
+            if state.effectiveOutput == choice.language {
+                Label(choice.label, systemImage: "checkmark")
+            } else {
+                Text(choice.label)
+            }
+        }
+        .disabled(!presentation.isEnabled(choice.language))
+
+        if choice.language != .sameAsSpoken,
+           let tooltip = presentation.tooltip,
+           let accessibilityHelp = presentation.accessibilityHelp {
+            HStack { button }
+                .help(tooltip)
+                .accessibilityHint(Text(accessibilityHelp))
+        } else {
+            button
+        }
+    }
+}

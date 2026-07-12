@@ -28,10 +28,56 @@ import Testing
             activeTemplateName: "Clean",
             localContextScopeName: "Off",
             localContextPermissionHint: nil,
-            oneShotLanguage: nil
+            oneShotLanguage: nil,
+            translationState: .init(
+                effectiveOutput: .sameAsSpoken,
+                override: nil,
+                availability: .init(enabled: true, tooltip: nil, accessibilityHelp: nil)
+            )
         )
 
         #expect(state.previewText == "live preview")
         #expect(state.warnings == ["Noise suppression unavailable; recording without it."])
+    }
+
+    @Test func activeHUDOutputCallbackChangesOnlyCurrentRecordingSelection() {
+        var selection = RecordingOutputSelection()
+        _ = selection.start(default: .portuguese)
+        let callbacks = HUDController.PanelCallbacks(
+            onOutput: { selection.select($0, isRecording: true) }
+        )
+
+        callbacks.onOutput(.german)
+
+        #expect(selection.pending == nil)
+        #expect(selection.current == .german)
+    }
+
+    @Test func HUDAndLauncherPresentTheSameEffectiveOverrideState() {
+        let availability = CloudFeatureAvailability(
+            enabled: true,
+            tooltip: nil,
+            accessibilityHelp: nil
+        )
+        let launcher = TranslationControlsState(
+            effectiveOutput: .german,
+            override: .german,
+            availability: availability
+        )
+        let hud = HUDController.RecordingPanelState(
+            isLocked: true,
+            elapsed: 3,
+            cap: 60,
+            previewText: nil,
+            warnings: [],
+            activeTemplateName: "Clean",
+            localContextScopeName: "Off",
+            localContextPermissionHint: nil,
+            oneShotLanguage: nil,
+            translationState: launcher
+        )
+
+        #expect(hud.translationState == launcher)
+        #expect(hud.translationState.override == .german)
     }
 }

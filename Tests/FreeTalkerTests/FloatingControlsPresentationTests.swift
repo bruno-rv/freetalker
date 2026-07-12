@@ -54,11 +54,17 @@ import Testing
             state: .collapsed,
             edge: .right,
             languagePin: "auto",
+            translationState: .init(
+                effectiveOutput: .sameAsSpoken,
+                override: nil,
+                availability: .init(enabled: true, tooltip: nil, accessibilityHelp: nil)
+            ),
             callbacks: .init(
                 onDictation: {},
                 onScratchpad: {},
                 onOpenSettings: {},
-                onLanguage: { _ in }
+                onLanguage: { _ in },
+                onOutput: { _ in }
             )
         ))
 
@@ -77,7 +83,8 @@ import Testing
                 onDictation: {},
                 onScratchpad: {},
                 onOpenSettings: {},
-                onLanguage: { settings.languagePin = $0 }
+                onLanguage: { settings.languagePin = $0 },
+                onOutput: { _ in }
             )
         )
         controller.start()
@@ -86,6 +93,53 @@ import Testing
         settings.languagePin = "pt"
 
         #expect(controller.presentedLanguagePin == "pt")
+    }
+
+    @Test func translationControlsUseExplicitLabelsAndCanonicalOutputOrder() {
+        #expect(TranslationControlsPresentation.spokenLabel == "Speak:")
+        #expect(TranslationControlsPresentation.outputLabel == "Output:")
+        #expect(TranslationControlsPresentation.outputChoices.map(\.language) == OutputLanguage.allCases)
+        #expect(TranslationControlsPresentation.outputChoices.map(\.label) == [
+            "Same as spoken", "English", "Portuguese", "Mandarin Chinese", "Hindi",
+            "Spanish", "Standard Arabic", "French", "German"
+        ])
+    }
+
+    @Test func namedOutputsAreDisabledWithIdenticalHelpWhileSameRemainsEnabled() {
+        let reason = "Add an API key in Settings."
+        let state = TranslationControlsState(
+            effectiveOutput: .sameAsSpoken,
+            override: nil,
+            availability: .init(enabled: false, tooltip: reason, accessibilityHelp: reason)
+        )
+        let presentation = TranslationControlsPresentation(state: state)
+
+        #expect(presentation.isEnabled(.sameAsSpoken))
+        #expect(OutputLanguage.allCases.dropFirst().allSatisfy { !presentation.isEnabled($0) })
+        #expect(presentation.tooltip == reason)
+        #expect(presentation.accessibilityHelp == reason)
+    }
+
+    @Test func outputSelectionCallbackKeepsPreRecordingOverrideSynchronized() {
+        let suite = "FloatingControlsPresentationTests.output.\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = AppSettings(defaults: defaults)
+        var selection = RecordingOutputSelection()
+        let controller = FloatingControlsController(
+            settings: settings,
+            outputSelection: { selection },
+            callbacks: .init(
+                onDictation: {}, onScratchpad: {}, onOpenSettings: {}, onLanguage: { _ in },
+                onOutput: { selection.select($0, isRecording: false) }
+            )
+        )
+
+        controller.selectOutput(.german)
+
+        #expect(selection.pending == .german)
+        #expect(controller.presentedTranslationState.override == .german)
+        #expect(controller.presentedTranslationState.effectiveOutput == .german)
     }
 
     @Test(arguments: [

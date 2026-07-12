@@ -80,6 +80,7 @@ final class AppCoordinator: ObservableObject {
     /// Ticks the HUD's elapsed/cap display roughly once a second while `locked`.
     private var lockedHUDTimer: Timer?
     private var oneShotLanguage: String?
+    @Published private(set) var recordingOutputSelection = RecordingOutputSelection()
 
     let speechModelDownloadCoordinator: SpeechModelDownloadCoordinator
     let speechModelStore: SpeechModelStore
@@ -221,8 +222,24 @@ final class AppCoordinator: ObservableObject {
         hud.onPanelDone = { [weak self] in self?.handlePanelDone() }
         hud.onPanelRaw = { [weak self] in self?.handlePanelRaw() }
         hud.onPanelLanguage = { [weak self] code in self?.handlePanelOneShotLanguage(code) }
+        hud.onPanelOutput = { [weak self] language in self?.selectRecordingOutput(language) }
         hud.onPanelCycleTemplate = { [weak self] in self?.handlePanelCycleTemplate() }
         hud.onPanelLock = { [weak self] in self?.handlePillClick() }
+    }
+
+    func selectRecordingOutput(_ language: OutputLanguage) {
+        recordingOutputSelection.select(language, isRecording: isRecording)
+        updateRecordingPanel()
+    }
+
+    private var translationControlsState: TranslationControlsState {
+        let settings = AppSettings.shared
+        let snapshot = settings.cloudLLMSnapshot
+        return TranslationControlsState(
+            effectiveOutput: recordingOutputSelection.effective ?? settings.defaultOutputLanguage,
+            override: recordingOutputSelection.effective,
+            availability: .make(eligibility: snapshot.eligibility, provider: snapshot.provider)
+        )
     }
 
     func selectSpeechModelFromUser(_ variant: String) async {
@@ -898,7 +915,8 @@ final class AppCoordinator: ObservableObject {
             activeTemplateName: activeTemplateName,
             localContextScopeName: contextScope.displayName,
             localContextPermissionHint: contextPermissionHint,
-            oneShotLanguage: oneShotLanguage
+            oneShotLanguage: oneShotLanguage,
+            translationState: translationControlsState
         )
         hud.showRecordingPanel(state)
     }
