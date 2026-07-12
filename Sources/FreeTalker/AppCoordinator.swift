@@ -1384,21 +1384,22 @@ final class AppCoordinator: ObservableObject {
         Task {
             defer { isProcessing = false }
             do {
-                let result = try await transcribeAndRefine(
-                    samples: samples,
-                    engine: engine,
-                    engineName: engineName,
-                    template: template,
-                    appName: nil,
-                    forcedLanguage: forcedLanguage,
-                    skipPostProcessing: skipPostProcessing,
-                    processor: processor,
-                    localContext: nil
+                let (result, accepted) = try await destinationLifecycle.runAsync(
+                    destination: .scratchpad(token),
+                    process: {
+                        try await transcribeAndRefine(
+                            samples: samples, engine: engine, engineName: engineName,
+                            template: template, appName: nil, forcedLanguage: forcedLanguage,
+                            skipPostProcessing: skipPostProcessing, processor: processor,
+                            localContext: nil
+                        )
+                    },
+                    text: { $0.refined },
+                    external: { _ in }
                 )
                 if let fallbackReason = result.fallbackReason {
                     logPostProcessingFallback(fallbackReason)
                 }
-                let accepted = deliverScratchpadCompletion(result.refined, for: token)
                 if accepted {
                     hud.hide()
                 } else {
@@ -1407,7 +1408,6 @@ final class AppCoordinator: ObservableObject {
             } catch {
                 let message = error is PipelineError ? "Transcription failed" : "Transcription failed: \(error.localizedDescription)"
                 lastError = message
-                _ = try? Self.routeDestinationEvent(.failure(message), destination: .scratchpad(token), router: scratchpadRecordingRouter) {}
                 hud.flash(message)
             }
         }
@@ -1467,27 +1467,27 @@ final class AppCoordinator: ObservableObject {
             try LibraryStore.shared.record(language: language, template: template, transcript: transcript, refined: refined, engine: engine)
         }
     ) async throws -> (transcript: String, refined: String, posted: Bool, fallbackReason: PostProcessingFallbackReason?) {
-        let result = try await transcribeAndRefine(
-            samples: samples,
-            engine: engine,
-            engineName: engineName,
-            template: template,
-            appName: appName,
-            forcedLanguage: forcedLanguage,
-            skipPostProcessing: skipPostProcessing,
-            processor: processor,
-            localContext: localContext
-        )
-
         var posted = false
-        _ = try destinationLifecycle.complete(result.refined, destination: .external) {
+        let (result, _) = try await destinationLifecycle.runAsync(
+            destination: .external,
+            process: {
+                try await transcribeAndRefine(
+                    samples: samples, engine: engine, engineName: engineName,
+                    template: template, appName: appName, forcedLanguage: forcedLanguage,
+                    skipPostProcessing: skipPostProcessing, processor: processor,
+                    localContext: localContext
+                )
+            },
+            text: { $0.refined },
+            external: { result in
             posted = insert(result.refined, target)
             do {
                 try record(result.language, result.recordedTemplateName, result.transcript, result.refined, result.engineName)
             } catch {
                 throw PipelineError.recordFailed(error)
             }
-        }
+            }
+        )
         return (result.transcript, result.refined, posted, result.fallbackReason)
     }
 

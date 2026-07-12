@@ -78,6 +78,31 @@ final class RecordingDestinationLifecycle {
         }
     }
 
+    func runAsync<Value>(
+        destination: RecordingDestination,
+        process: () async throws -> Value,
+        text: (Value) -> String,
+        external: (Value) throws -> Void
+    ) async throws -> (value: Value, accepted: Bool) {
+        do {
+            let value = try await process()
+            let accepted = try complete(text(value), destination: destination) {
+                try external(value)
+            }
+            return (value, accepted)
+        } catch {
+            if case .scratchpad(let token) = destination {
+                if error is CancellationError {
+                    router?.cancelRecording(for: token)
+                    recoveries.removeValue(forKey: token)
+                } else {
+                    router?.failRecording(error.localizedDescription, for: token)
+                }
+            }
+            throw error
+        }
+    }
+
     func pending(for token: ScratchpadInsertionToken) -> String? { recoveries[token] }
     func consumePending(for token: ScratchpadInsertionToken) -> String? { recoveries.removeValue(forKey: token) }
     func storePending(_ text: String, for token: ScratchpadInsertionToken) { recoveries[token] = text }

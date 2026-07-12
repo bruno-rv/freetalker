@@ -110,3 +110,19 @@ RED: the focused destination suite failed to compile because
 `RecordingDestinationLifecycle` and its start/cancel/completion APIs did not
 exist. GREEN: destination suite 8/8, context/style regressions 26/26, full suite
 346 tests across 33 suites.
+
+## Async production orchestration follow-up
+
+Added `RecordingDestinationLifecycle.runAsync`, now called by both the real
+external `processDictation` wrapper and the real scratchpad processing Task.
+The seam accepts only the existing processing operation, refined-text
+projection, and external side-effect closure, so transcription/refinement is
+not duplicated. It routes async success, thrown failure, and cancellation by
+destination.
+
+RED: focused async lifecycle tests failed to compile because `runAsync` was
+absent. GREEN: destination suite 11/11, context/style 26/26, full suite 349
+tests across 33 suites. Async spies prove external completion performs both
+insertion and record effects, scratchpad rejection/weak loss performs zero
+external effects and retains recovery, transcription failure notifies the
+router, and cancellation emits cancellation and clears recovery.
