@@ -109,6 +109,33 @@ struct ScratchpadPersistenceTests {
         ))
     }
 
+    @Test func caretTokenRequiresAComposedCharacterBoundary() throws {
+        let document = ScratchpadDocument(url: temporaryURL())
+        document.textStorage.append(NSAttributedString(string: "A😀B"))
+        let splitSurrogate = document.makeInsertionToken(selectedRange: NSRange(location: 2, length: 0))
+
+        #expect(!document.replaceIfValid(
+            token: splitSurrogate,
+            with: NSAttributedString(string: "invalid"),
+            undoActionName: "Insert Dictation"
+        ))
+        #expect(document.textStorage.string == "A😀B")
+
+        let start = document.makeInsertionToken(selectedRange: NSRange(location: 0, length: 0))
+        #expect(document.replaceIfValid(
+            token: start,
+            with: NSAttributedString(string: "<"),
+            undoActionName: "Insert Dictation"
+        ))
+        let end = document.makeInsertionToken(selectedRange: NSRange(location: 5, length: 0))
+        #expect(document.replaceIfValid(
+            token: end,
+            with: NSAttributedString(string: ">"),
+            undoActionName: "Insert Dictation"
+        ))
+        #expect(document.textStorage.string == "<A😀B>")
+    }
+
     @Test func oneUndoRestoresTheOriginalAttributedSelection() throws {
         let document = ScratchpadDocument(url: temporaryURL())
         let original = NSMutableAttributedString(string: "before")
