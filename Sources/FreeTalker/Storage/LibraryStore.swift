@@ -1,8 +1,14 @@
 import Foundation
 
+@MainActor
+protocol LibraryTranslationStoring: AnyObject {
+    func translationVariants(parentID: Int64) throws -> [DictationTranslationVariant]
+    func upsertTranslation(parentID: Int64, target: TranslationTarget, text: String) throws
+}
+
 /// Observable façade over Database for the Library UI.
 @MainActor
-final class LibraryStore: ObservableObject {
+final class LibraryStore: ObservableObject, LibraryTranslationStoring {
     static let shared = LibraryStore()
 
     enum LibraryStoreError: LocalizedError {
