@@ -33,6 +33,12 @@ final class AudioCapture {
         case abort
     }
 
+    enum ConfiguredDeviceVerificationAction: Equatable {
+        case accept
+        case abortMismatch
+        case abortQueryFailure
+    }
+
     private static let logger = Logger(subsystem: "org.freetalker.app", category: "audio-capture")
     private var engine = AVAudioEngine()
     private var converter: AVAudioConverter?
@@ -100,6 +106,14 @@ final class AudioCapture {
         return usingReplacementEngine ? .abort : .replaceEngine
     }
 
+    nonisolated static func configuredDeviceVerificationAction(
+        expectedDeviceID: AudioDeviceID,
+        effectiveDeviceID: AudioDeviceID?
+    ) -> ConfiguredDeviceVerificationAction {
+        guard let effectiveDeviceID else { return .abortQueryFailure }
+        return effectiveDeviceID == expectedDeviceID ? .accept : .abortMismatch
+    }
+
     /// Starts capturing. Throws if the mic can't be opened (e.g. permission denied).
     /// - Parameter deviceUID: CoreAudio UID of the input device to pin (AppSettings
     ///   `microphoneDeviceUID`), or nil to use the system default input.
@@ -151,8 +165,7 @@ final class AudioCapture {
             case .systemManaged:
                 verifySystemManagedInput(uid: deviceUID)
             case .applyConfiguredInput:
-                applyConfiguredInputDevice(uid: deviceUID, to: attemptInput)
-                logEffectiveInputDevice(for: attemptInput)
+                try applyConfiguredInputDevice(uid: deviceUID, to: attemptInput)
             }
 
             let inputFormat = attemptInput.outputFormat(forBus: 0)
@@ -294,17 +307,15 @@ final class AudioCapture {
     /// Pins the engine's input to the CoreAudio device identified by `uid`, if any. Must run
     /// before reading `input.outputFormat`/installing the tap: switching devices can change the
     /// native sample rate/channel count. No-op (system default stays in effect) when `uid` is
-    /// nil. When `uid` is set but doesn't resolve to a connected device, or the AudioUnit
-    /// rejects it, leaves the system default in effect and records a capture warning.
-    private func applyConfiguredInputDevice(uid: String?, to input: AVAudioInputNode) {
+    /// nil. When `uid` is set but cannot be selected and verified as effective, aborts capture
+    /// rather than silently recording from the system default.
+    private func applyConfiguredInputDevice(uid: String?, to input: AVAudioInputNode) throws {
         guard let uid else { return }
         guard let deviceID = AudioInputDevices.resolveID(forUID: uid) else {
-            recordWarning("Configured microphone not found — using system default")
-            return
+            throw CaptureError.configuredDeviceUnavailable("the microphone is not connected")
         }
         guard let audioUnit = input.audioUnit else {
-            recordWarning("Could not select configured microphone — using system default")
-            return
+            throw CaptureError.configuredDeviceUnavailable("the audio input is unavailable")
         }
         var mutableDeviceID = deviceID
         let status = AudioUnitSetProperty(
@@ -314,8 +325,29 @@ final class AudioCapture {
             0,
             &mutableDeviceID,
             UInt32(MemoryLayout<AudioDeviceID>.size))
-        if status != noErr {
-            recordWarning("Could not select configured microphone — using system default")
+        guard status == noErr else {
+            throw CaptureError.configuredDeviceUnavailable(
+                "macOS rejected the microphone selection (status \(status))"
+            )
+        }
+
+        let effectiveDeviceID = currentDeviceID(for: audioUnit)
+        switch Self.configuredDeviceVerificationAction(
+            expectedDeviceID: deviceID,
+            effectiveDeviceID: effectiveDeviceID
+        ) {
+        case .accept:
+            Self.logger.info("Verified effective input device ID: \(deviceID)")
+        case .abortMismatch:
+            Self.logger.error(
+                "Configured input device ID \(deviceID) did not become effective; got \(effectiveDeviceID ?? 0)"
+            )
+            throw CaptureError.configuredDeviceUnavailable("macOS selected a different microphone")
+        case .abortQueryFailure:
+            Self.logger.error("Configured input device ID \(deviceID) could not be verified")
+            throw CaptureError.configuredDeviceUnavailable(
+                "the selected microphone could not be verified"
+            )
         }
     }
 
@@ -365,12 +397,7 @@ final class AudioCapture {
         return deviceID
     }
 
-    @discardableResult
-    private func logEffectiveInputDevice(for input: AVAudioInputNode) -> AudioDeviceID? {
-        guard let audioUnit = input.audioUnit else {
-            Self.logger.error("Effective input device unknown: input audio unit unavailable")
-            return nil
-        }
+    private func currentDeviceID(for audioUnit: AudioUnit) -> AudioDeviceID? {
         var deviceID = AudioDeviceID()
         var size = UInt32(MemoryLayout<AudioDeviceID>.size)
         let status = AudioUnitGetProperty(
@@ -385,7 +412,6 @@ final class AudioCapture {
             Self.logger.error("Effective input device unknown: CurrentDevice property query failed with status \(status)")
             return nil
         }
-        Self.logger.info("Effective input device ID: \(deviceID)")
         return deviceID
     }
 
@@ -439,6 +465,7 @@ final class AudioCapture {
 private enum CaptureError: LocalizedError {
     case converterUnavailable(String)
     case rawFallbackUnavailable(String)
+    case configuredDeviceUnavailable(String)
 
     var errorDescription: String? {
         switch self {
@@ -446,6 +473,8 @@ private enum CaptureError: LocalizedError {
             "Could not convert microphone format \(format) to 16 kHz mono audio"
         case let .rawFallbackUnavailable(reason):
             "Could not establish raw microphone capture after voice-processing failure: \(reason)"
+        case let .configuredDeviceUnavailable(reason):
+            "Could not use the configured microphone because \(reason). Recording was not started."
         }
     }
 }
