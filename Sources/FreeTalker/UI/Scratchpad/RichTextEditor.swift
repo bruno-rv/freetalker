@@ -37,14 +37,9 @@ struct RichTextEditor: NSViewRepresentable {
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
-        private weak var document: ScratchpadDocument?
-
-        init(document: ScratchpadDocument) {
-            self.document = document
-        }
-
-        func textDidChange(_ notification: Notification) {
-            document?.scheduleSave()
+        init(document _: ScratchpadDocument) {
+            // Retained as the NSTextViewDelegate coordination point. Persistence
+            // is driven solely by the attached NSTextStorage delegate.
         }
     }
 }

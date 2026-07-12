@@ -59,3 +59,41 @@ Test run with 367 tests in 35 suites passed.
 None. AppKit's native list and undo APIs behaved as required. The test harness
 hosts its text view in an `NSWindow` so it exercises the real responder-chain
 undo manager rather than a synthetic substitute.
+
+## Review fixes
+
+Addressed both Task 7 review findings:
+
+- Applying the requested native list now toggles it off only when every selected
+  paragraph already has that list. Mixed selections deterministically apply the
+  requested list to every paragraph. Toggle-off removes `NSTextList` and only
+  the editor's list indents/tab stop, preserving unrelated paragraph properties.
+- Ordinary typing now schedules persistence through the `NSTextStorageDelegate`
+  path only. The `NSTextViewDelegate` coordinator remains the editor coordination
+  point but does not schedule a duplicate save.
+- Added countable `didScheduleSave` and `didSave` observation hooks while keeping
+  the production RTF persistence implementation active.
+
+Review-fix RED:
+
+```text
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter ScratchpadEditorTests
+error: extra arguments at positions #2, #3 in call
+```
+
+The new tests required the missing scheduling observation seam; under the prior
+list implementation, the toggle-off and mixed-selection assertions also did not
+have the required behavior.
+
+Review-fix GREEN:
+
+```text
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter 'Scratchpad(Editor|Persistence)Tests'
+Test run with 21 tests in 2 suites passed.
+
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
+Test run with 370 tests in 35 suites passed.
+```
+
+The original corrupt-file dirty-protection test remains green, and the semantic
+RTF list round-trip test still reloads an actual `.disc` `NSTextList`.

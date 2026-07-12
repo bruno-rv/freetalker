@@ -66,6 +66,70 @@ struct ScratchpadEditorTests {
         #expect(style?.textLists.first?.markerFormat == .disc)
     }
 
+    @Test func requestedListTogglesOffAcrossFullyListedSelection() {
+        let harness = EditorHarness("One\nTwo")
+        let range = NSRange(location: 0, length: 7)
+        let original = NSMutableParagraphStyle()
+        original.alignment = .center
+        original.paragraphSpacing = 11
+        original.tabStops = [NSTextTab(textAlignment: .right, location: 72)]
+        harness.document.textStorage.addAttribute(.paragraphStyle, value: original, range: range)
+        harness.select(range)
+        harness.controller.applyList(.bulleted)
+
+        harness.controller.applyList(.bulleted)
+
+        let style = harness.document.textStorage.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
+        #expect(style?.textLists.isEmpty == true)
+        #expect(style?.headIndent == 0)
+        #expect(style?.firstLineHeadIndent == 0)
+        #expect(style?.tabStops.contains { $0.location == 18 } == false)
+        #expect(style?.tabStops.contains { $0.location == 72 } == true)
+        #expect(style?.alignment == .center)
+        #expect(style?.paragraphSpacing == 11)
+    }
+
+    @Test func mixedListSelectionAppliesRequestedListToEveryParagraph() {
+        let harness = EditorHarness("One\nTwo")
+        harness.select(NSRange(location: 0, length: 3))
+        harness.controller.applyList(.bulleted)
+        harness.select(NSRange(location: 0, length: 7))
+
+        harness.controller.applyList(.bulleted)
+
+        let first = harness.document.textStorage.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
+        let second = harness.document.textStorage.attribute(.paragraphStyle, at: 4, effectiveRange: nil) as? NSParagraphStyle
+        #expect(first?.textLists.first?.markerFormat == .disc)
+        #expect(second?.textLists.first?.markerFormat == .disc)
+    }
+
+    @Test func ordinaryTypingSchedulesAndDebouncesPersistenceExactlyOnce() async throws {
+        var scheduleCount = 0
+        var saveCount = 0
+        let url = temporaryURL()
+        let document = ScratchpadDocument(
+            url: url,
+            didScheduleSave: { scheduleCount += 1 },
+            didSave: { saveCount += 1 }
+        )
+        let textView = RichTextEditor.makeTextView(document: document)
+        let coordinator = RichTextEditor.Coordinator(document: document)
+        textView.delegate = coordinator
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 300), styleMask: [], backing: .buffered, defer: false)
+        window.contentView = textView
+
+        textView.insertText("A", replacementRange: textView.selectedRange())
+        #expect(scheduleCount == 1)
+        textView.insertText("B", replacementRange: textView.selectedRange())
+        #expect(scheduleCount == 2)
+
+        try await Task.sleep(for: .milliseconds(500))
+        #expect(saveCount == 1)
+        #expect(ScratchpadPersistence(url: url).load().text.string == "AB")
+        _ = coordinator
+        _ = window
+    }
+
     @Test func clearFormattingRemovesOnlySupportedFormatting() {
         let harness = EditorHarness("Styled")
         let range = NSRange(location: 0, length: 6)
