@@ -7,3 +7,13 @@ struct DictationTranslationVariant: Equatable, Sendable {
     var createdAt: Date
     var updatedAt: Date
 }
+
+enum TranslationVariantExpectation: Equatable, Sendable {
+    case absent
+    case version(Date)
+}
+
+enum TranslationVariantWriteResult: Equatable, Sendable {
+    case committed(DictationTranslationVariant)
+    case replacementConfirmationRequired(DictationTranslationVariant)
+}

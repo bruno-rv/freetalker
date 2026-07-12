@@ -162,13 +162,10 @@ private struct DictationDetailView: View {
     @State private var reprocessing = false
     @State private var actionError: String?
     @StateObject private var translation = LibraryTranslationController()
+    @ObservedObject private var insertionDestinations = LibraryInsertionDestinationStore.shared
 
     private var translationPresentation: LibraryTranslationPresentation {
-        let snapshot = AppSettings.shared.cloudLLMSnapshot
-        return LibraryTranslationPresentation(availability: .make(
-            eligibility: snapshot.eligibility,
-            provider: snapshot.provider
-        ))
+        LibraryTranslationPresentation(availability: translation.availability)
     }
 
     var body: some View {
@@ -215,9 +212,7 @@ private struct DictationDetailView: View {
             .padding()
         }
         .task(id: dictation.id) {
-            translation.cancel()
-            translation.select(.original)
-            translation.loadVariants(parentID: dictation.id)
+            translation.selectEntry(id: dictation.id)
         }
         .confirmationDialog(
             "Replace saved \(translation.pendingReplacementTarget?.promptName ?? "translation") translation?",
@@ -248,11 +243,19 @@ private struct DictationDetailView: View {
         }
         .alert(
             "Library Action Failed",
-            isPresented: Binding(get: { actionError != nil }, set: { if !$0 { actionError = nil } })
+            isPresented: Binding(
+                get: { actionError != nil || translation.insertionFailureMessage != nil },
+                set: { if !$0 { actionError = nil; translation.dismissInsertionFailure() } }
+            )
         ) {
-            Button("OK", role: .cancel) { actionError = nil }
+            Button("Copy") {
+                do { try translation.copyDisplayedText(for: dictation) }
+                catch { actionError = error.localizedDescription }
+                translation.dismissInsertionFailure()
+            }
+            Button("OK", role: .cancel) { actionError = nil; translation.dismissInsertionFailure() }
         } message: {
-            Text(actionError ?? "")
+            Text(actionError ?? translation.insertionFailureMessage ?? "")
         }
     }
 
@@ -291,10 +294,13 @@ private struct DictationDetailView: View {
                 }
 
                 Button {
-                    translation.insertDisplayedText(for: dictation)
+                    _ = translation.insertDisplayedText(for: dictation)
                 } label: {
                     Label("Insert", systemImage: "text.insert")
                 }
+                .disabled(!translation.canInsert)
+                .help(translation.canInsert ? "Insert at the target captured before Library opened" : "No safe insertion target was captured. Use Copy instead.")
+                .accessibilityHint(translation.canInsert ? "Inserts at the captured external target" : "No safe insertion target was captured. Use Copy instead.")
 
                 if translation.isTranslating {
                     ProgressView().controlSize(.small)

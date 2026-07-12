@@ -3,7 +3,7 @@ import Foundation
 @MainActor
 protocol LibraryTranslationStoring: AnyObject {
     func translationVariants(parentID: Int64) throws -> [DictationTranslationVariant]
-    func upsertTranslation(parentID: Int64, target: TranslationTarget, text: String) throws
+    func conditionalUpsertTranslation(parentID: Int64, target: TranslationTarget, text: String, expected: TranslationVariantExpectation) throws -> TranslationVariantWriteResult
 }
 
 /// Observable façade over Database for the Library UI.
@@ -97,6 +97,11 @@ final class LibraryStore: ObservableObject, LibraryTranslationStoring {
     func upsertTranslation(parentID: Int64, target: TranslationTarget, text: String) throws {
         guard let db else { throw LibraryStoreError.databaseUnavailable }
         try db.upsertTranslation(parentID: parentID, target: target, text: text)
+    }
+
+    func conditionalUpsertTranslation(parentID: Int64, target: TranslationTarget, text: String, expected: TranslationVariantExpectation) throws -> TranslationVariantWriteResult {
+        guard let db else { throw LibraryStoreError.databaseUnavailable }
+        return try db.conditionalUpsertTranslation(parentID: parentID, target: target, text: text, expected: expected)
     }
 
     func deleteTranslation(parentID: Int64, target: TranslationTarget) throws {

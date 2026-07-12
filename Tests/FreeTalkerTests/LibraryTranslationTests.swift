@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 import Testing
 @testable import FreeTalker
 
@@ -7,6 +8,7 @@ import Testing
         let service = TranslationSpy(results: [.success("traduit"), .success("traduzido")])
         let store = VariantStoreSpy()
         let controller = makeController(service: service, store: store)
+        controller.selectEntry(id: 7)
 
         controller.translate(entry: entry(refined: "refined"), to: .french)
         await controller.waitForCurrentRequest()
@@ -26,12 +28,14 @@ import Testing
         }
 
         for target in TranslationTarget.allCases {
-            controller.translate(entry: entry(id: Int64(snapshots + 1)), to: target)
+            let current = entry(id: Int64(snapshots + 1))
+            controller.selectEntry(id: current.id)
+            controller.translate(entry: current, to: target)
             await controller.waitForCurrentRequest()
         }
 
         #expect(await service.targets == TranslationTarget.allCases)
-        #expect(snapshots == TranslationTarget.allCases.count)
+        #expect(snapshots == TranslationTarget.allCases.count + 1) // initial availability + one per request
     }
 
     @Test func existingTargetRequiresConfirmationBeforeSnapshotOrMutation() async {
@@ -43,18 +47,18 @@ import Testing
             snapshots += 1
             return Self.snapshot
         }
-        controller.loadVariants(parentID: 7)
+        controller.selectEntry(id: 7)
 
         controller.translate(entry: entry(), to: .spanish)
 
         #expect(controller.pendingReplacementTarget == .spanish)
-        #expect(snapshots == 0)
+        #expect(snapshots == 1) // initial availability only
         #expect(store.upserts.isEmpty)
 
         controller.confirmReplacement()
         await controller.waitForCurrentRequest()
 
-        #expect(snapshots == 1)
+        #expect(snapshots == 2)
         #expect(store.upserts.map(\.text) == ["nuevo"])
         #expect(controller.variants.map(\.text) == ["nuevo"])
     }
@@ -67,6 +71,7 @@ import Testing
         ])
         let store = VariantStoreSpy()
         let controller = makeController(service: service, store: store)
+        controller.selectEntry(id: 7)
 
         controller.translate(entry: entry(), to: .french)
         await first.waitUntilStarted()
@@ -90,7 +95,7 @@ import Testing
         ])
         let store = VariantStoreSpy(variants: [old])
         let controller = makeController(service: service, store: store)
-        controller.loadVariants(parentID: 7)
+        controller.selectEntry(id: 7)
 
         controller.translate(entry: entry(), to: .german)
         await controller.waitForCurrentRequest()
@@ -117,6 +122,7 @@ import Testing
             return Self.snapshot
         }
         let original = entry()
+        controller.selectEntry(id: original.id)
 
         controller.translate(entry: original, to: .french)
         await controller.waitForCurrentRequest()
@@ -124,7 +130,7 @@ import Testing
         await controller.waitForCurrentRequest()
 
         #expect(await service.targets == [.french, .french])
-        #expect(snapshots == 2)
+        #expect(snapshots == 3) // initial availability + two requests
         #expect(controller.variants.map(\.text) == ["traduit"])
     }
 
@@ -137,10 +143,11 @@ import Testing
             service: TranslationSpy(results: []),
             store: store,
             copy: { copied.append($0) },
-            insert: { inserted.append($0) }
+            destination: { .init(bundleIdentifier: "external", target: .init(bundleID: "external", pid: 2, focusedElement: nil, window: nil)) },
+            targetedInsert: { text, _ in inserted.append(text); return true }
         )
         let original = entry(refined: "original")
-        controller.loadVariants(parentID: original.id)
+        controller.selectEntry(id: original.id)
 
         #expect(controller.displayedText(for: original) == "original")
         controller.select(.variant(.french))
@@ -169,19 +176,131 @@ import Testing
         #expect(presentation.targets == TranslationTarget.allCases)
     }
 
+    @Test func selectingAnotherEntryClearsConfirmationErrorRetryAndIgnoresLateResponse() async {
+        let gate = Gate()
+        let service = TranslationSpy(results: [.gated(gate, "late")])
+        let existing = variant(target: .french, text: "old")
+        let store = VariantStoreSpy(variants: [existing])
+        let controller = makeController(service: service, store: store)
+        controller.selectEntry(id: 7)
+        controller.translate(entry: entry(), to: .french)
+        #expect(controller.pendingReplacementTarget == .french)
+        controller.dismissReplacement()
+        store.variants = []
+        controller.translate(entry: entry(), to: .german)
+        await gate.waitUntilStarted()
+
+        controller.selectEntry(id: 8)
+        await gate.release()
+        await Task.yield()
+
+        #expect(controller.selection == .original)
+        #expect(controller.pendingReplacementTarget == nil)
+        #expect(controller.errorMessage == nil)
+        #expect(!controller.canRetry)
+        #expect(controller.variants.isEmpty)
+        #expect(store.upserts.isEmpty)
+    }
+
+    @Test func insertionUsesOnlyCapturedTargetAndReportsManualRecovery() {
+        let target = InsertionTarget(bundleID: "external", pid: 42, focusedElement: nil, window: nil)
+        let destination = LibraryInsertionDestination(bundleIdentifier: "external", target: target)
+        var receivedPID: pid_t?
+        let controller = makeController(
+            service: TranslationSpy(results: []), store: VariantStoreSpy(),
+            destination: { destination },
+            targetedInsert: { _, target in receivedPID = target.pid; return false }
+        )
+        let original = entry()
+        controller.selectEntry(id: original.id)
+
+        #expect(!controller.insertDisplayedText(for: original))
+        #expect(receivedPID == 42)
+        #expect(controller.insertionFailureMessage?.contains("Copy") == true)
+    }
+
+    @Test func insertionWithoutSafeDestinationIsDisabled() {
+        let controller = makeController(
+            service: TranslationSpy(results: []), store: VariantStoreSpy(), destination: { nil }
+        )
+        controller.selectEntry(id: 7)
+        #expect(!controller.canInsert)
+        #expect(!controller.insertDisplayedText(for: entry()))
+    }
+
+    @Test func availabilityTracksConfigurationAndCredentialUpdates() async {
+        let configuration = PassthroughSubject<Void, Never>()
+        let credentials = PassthroughSubject<Void, Never>()
+        let current = SnapshotBox(Self.snapshot)
+        let controller = LibraryTranslationController(
+            translator: TranslationSpy(results: []), store: VariantStoreSpy(),
+            snapshot: { current.value }, copy: { _ in }, destination: { nil }, targetedInsert: { _, _ in false },
+            cloudConfigurationUpdates: configuration.eraseToAnyPublisher(),
+            cloudCredentialUpdates: credentials.eraseToAnyPublisher()
+        )
+        #expect(controller.availability.enabled)
+        current.value = CloudLLMSettingsSnapshot(provider: .anthropic, baseURL: "https://api.anthropic.com", model: "m", key: nil, vocabulary: [])
+        credentials.send()
+        await Task.yield()
+        #expect(!controller.availability.enabled)
+        current.value = Self.snapshot
+        configuration.send()
+        await Task.yield()
+        #expect(controller.availability.enabled)
+    }
+
+    @Test func concurrentWriteRequiresExactReconfirmationWithoutARefresh() async {
+        let first = variant(target: .french, text: "concurrent-one")
+        var second = first
+        second.text = "concurrent-two"
+        second.updatedAt = first.updatedAt.addingTimeInterval(1)
+        let store = VariantStoreSpy(forcedResults: [
+            .replacementConfirmationRequired(first),
+            .replacementConfirmationRequired(second)
+        ])
+        let controller = makeController(service: TranslationSpy(results: [.success("mine")]), store: store)
+        let original = entry()
+        controller.selectEntry(id: original.id)
+
+        controller.translate(entry: original, to: .french)
+        await controller.waitForCurrentRequest()
+        #expect(controller.pendingReplacementTarget == .french)
+        controller.confirmReplacement()
+
+        #expect(controller.pendingReplacementTarget == .french)
+        #expect(controller.variants.first == second)
+        #expect(store.readCount == 1)
+    }
+
+    @Test func committedResultUpdatesCacheEvenWhenSubsequentReadsWouldFail() async {
+        let store = VariantStoreSpy()
+        store.failReadsAfter = 1
+        let controller = makeController(service: TranslationSpy(results: [.success("saved")]), store: store)
+        let original = entry()
+        controller.selectEntry(id: original.id)
+        controller.translate(entry: original, to: .german)
+        await controller.waitForCurrentRequest()
+
+        #expect(controller.variants.map(\.text) == ["saved"])
+        #expect(controller.errorMessage == nil)
+        #expect(store.readCount == 1)
+    }
+
     private func makeController(
         service: TranslationSpy,
         store: VariantStoreSpy,
         snapshot: @escaping @MainActor () -> CloudLLMSettingsSnapshot = { Self.snapshot },
         copy: @escaping @MainActor (String) throws -> Void = { _ in },
-        insert: @escaping @MainActor (String) -> Void = { _ in }
+        destination: @escaping @MainActor () -> LibraryInsertionDestination? = { nil },
+        targetedInsert: @escaping @MainActor (String, InsertionTarget) -> Bool = { _, _ in false }
     ) -> LibraryTranslationController {
         LibraryTranslationController(
             translator: service,
             store: store,
             snapshot: snapshot,
             copy: copy,
-            insert: insert
+            destination: destination,
+            targetedInsert: targetedInsert
         )
     }
 
@@ -220,25 +339,49 @@ import Testing
 
 private enum TestError: Error { case failed }
 
+@MainActor private final class SnapshotBox {
+    var value: CloudLLMSettingsSnapshot
+    init(_ value: CloudLLMSettingsSnapshot) { self.value = value }
+}
+
 private final class VariantStoreSpy: LibraryTranslationStoring {
     struct Upsert { let parentID: Int64; let target: TranslationTarget; let text: String }
     var variants: [DictationTranslationVariant]
     var upserts: [Upsert] = []
     var parentExists = true
+    var forcedResults: [TranslationVariantWriteResult]
+    var readCount = 0
+    var failReadsAfter: Int?
 
-    init(variants: [DictationTranslationVariant] = []) { self.variants = variants }
+    init(variants: [DictationTranslationVariant] = [], forcedResults: [TranslationVariantWriteResult] = []) {
+        self.variants = variants
+        self.forcedResults = forcedResults
+    }
 
-    func translationVariants(parentID: Int64) throws -> [DictationTranslationVariant] { variants }
+    func translationVariants(parentID: Int64) throws -> [DictationTranslationVariant] {
+        readCount += 1
+        if let failReadsAfter, readCount > failReadsAfter { throw TestError.failed }
+        return variants
+    }
 
-    func upsertTranslation(parentID: Int64, target: TranslationTarget, text: String) throws {
+    func conditionalUpsertTranslation(parentID: Int64, target: TranslationTarget, text: String, expected: TranslationVariantExpectation) throws -> TranslationVariantWriteResult {
         guard parentExists else { throw DatabaseError.translationParentMissing(parentID) }
+        if !forcedResults.isEmpty { return forcedResults.removeFirst() }
+        if let current = variants.first(where: { $0.parentID == parentID && $0.target == target }) {
+            guard case .version(current.updatedAt) = expected else { return .replacementConfirmationRequired(current) }
+        } else if case .version = expected {
+            throw DatabaseError.sqlFailed("changed")
+        }
         upserts.append(.init(parentID: parentID, target: target, text: text))
         let now = Date()
         if let index = variants.firstIndex(where: { $0.parentID == parentID && $0.target == target }) {
             variants[index].text = text
             variants[index].updatedAt = now
+            return .committed(variants[index])
         } else {
-            variants.append(.init(parentID: parentID, target: target, text: text, createdAt: now, updatedAt: now))
+            let variant = DictationTranslationVariant(parentID: parentID, target: target, text: text, createdAt: now, updatedAt: now)
+            variants.append(variant)
+            return .committed(variant)
         }
     }
 }

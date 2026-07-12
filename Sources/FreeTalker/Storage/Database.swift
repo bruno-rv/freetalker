@@ -356,6 +356,78 @@ final class Database {
         }
     }
 
+    func conditionalUpsertTranslation(
+        parentID: Int64,
+        target: TranslationTarget,
+        text: String,
+        expected: TranslationVariantExpectation
+    ) throws -> TranslationVariantWriteResult {
+        var outcome: TranslationVariantWriteResult?
+        try transaction {
+            guard try dictationExists(id: parentID) else {
+                throw DatabaseError.translationParentMissing(parentID)
+            }
+            let current = try translationVariant(parentID: parentID, target: target)
+            let matches: Bool
+            switch (expected, current) {
+            case (.absent, nil): matches = true
+            case (.version(let version), .some(let variant)):
+                matches = abs(variant.updatedAt.timeIntervalSince1970 - version.timeIntervalSince1970) < 0.000_001
+            default: matches = false
+            }
+            guard matches else {
+                if let current { outcome = .replacementConfirmationRequired(current) }
+                else {
+                    // A confirmed variant was deleted. Treat the now-absent state as requiring
+                    // a fresh user action rather than silently changing confirmation semantics.
+                    throw DatabaseError.sqlFailed("Translation variant changed before confirmation")
+                }
+                return
+            }
+
+            let wallClock = Date().timeIntervalSince1970
+            let now = Date(timeIntervalSince1970: max(wallClock, (current?.updatedAt.timeIntervalSince1970 ?? 0) + 0.001))
+            let createdAt = current?.createdAt ?? now
+            let stmt = try prepare("""
+            INSERT INTO dictation_translation_variants
+                (parent_id, target_language, text, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(parent_id, target_language) DO UPDATE SET
+                text = excluded.text, updated_at = excluded.updated_at;
+            """)
+            defer { sqlite3_finalize(stmt) }
+            sqlite3_bind_int64(stmt, 1, parentID)
+            bindText(stmt, 2, target.rawValue)
+            bindText(stmt, 3, text)
+            sqlite3_bind_double(stmt, 4, createdAt.timeIntervalSince1970)
+            sqlite3_bind_double(stmt, 5, now.timeIntervalSince1970)
+            guard sqlite3_step(stmt) == SQLITE_DONE else { throw DatabaseError.sqlFailed(lastError()) }
+            outcome = .committed(.init(
+                parentID: parentID, target: target, text: text,
+                createdAt: createdAt, updatedAt: now
+            ))
+        }
+        guard let outcome else { throw DatabaseError.sqlFailed("Translation write produced no result") }
+        return outcome
+    }
+
+    private func translationVariant(parentID: Int64, target: TranslationTarget) throws -> DictationTranslationVariant? {
+        let stmt = try prepare("SELECT parent_id, text, created_at, updated_at FROM dictation_translation_variants WHERE parent_id = ? AND target_language = ?;")
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, parentID)
+        bindText(stmt, 2, target.rawValue)
+        let result = sqlite3_step(stmt)
+        guard result == SQLITE_ROW else {
+            guard result == SQLITE_DONE else { throw DatabaseError.sqlFailed(lastError()) }
+            return nil
+        }
+        return .init(
+            parentID: sqlite3_column_int64(stmt, 0), target: target, text: columnText(stmt, 1),
+            createdAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 2)),
+            updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 3))
+        )
+    }
+
     func deleteTranslation(parentID: Int64, target: TranslationTarget) throws {
         try transaction {
             let stmt = try prepare("DELETE FROM dictation_translation_variants WHERE parent_id = ? AND target_language = ?;")

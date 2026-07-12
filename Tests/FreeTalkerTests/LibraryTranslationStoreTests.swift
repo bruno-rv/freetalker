@@ -120,6 +120,41 @@ import Testing
     @Test func unknownPersistedTargetIsNotReturnedAsSame() throws {
         #expect(TranslationTarget(rawValue: OutputLanguage.sameAsSpoken.rawValue) == nil)
     }
+
+    @Test func conditionalInsertNeverOverwritesAConcurrentVariant() throws {
+        let fixture = try Fixture()
+        let id = try fixture.insert()
+        let first = try fixture.db.conditionalUpsertTranslation(
+            parentID: id, target: .french, text: "un", expected: .absent
+        )
+        let secondConnection = try Database(path: fixture.url)
+        let second = try secondConnection.conditionalUpsertTranslation(
+            parentID: id, target: .french, text: "deux", expected: .absent
+        )
+
+        guard case .committed(let committed) = first else { Issue.record("Expected commit"); return }
+        #expect(committed.text == "un")
+        guard case .replacementConfirmationRequired(let current) = second else { Issue.record("Expected confirmation"); return }
+        #expect(current.text == "un")
+        #expect(try fixture.db.translationVariants(parentID: id).map(\.text) == ["un"])
+    }
+
+    @Test func confirmedReplacementRequiresTheExactCurrentVersion() throws {
+        let fixture = try Fixture()
+        let id = try fixture.insert()
+        guard case .committed(let first) = try fixture.db.conditionalUpsertTranslation(
+            parentID: id, target: .german, text: "eins", expected: .absent
+        ) else { Issue.record("Expected first commit"); return }
+        guard case .committed(let second) = try fixture.db.conditionalUpsertTranslation(
+            parentID: id, target: .german, text: "zwei", expected: .version(first.updatedAt)
+        ) else { Issue.record("Expected confirmed commit"); return }
+
+        let stale = try fixture.db.conditionalUpsertTranslation(
+            parentID: id, target: .german, text: "drei", expected: .version(first.updatedAt)
+        )
+        guard case .replacementConfirmationRequired(let current) = stale else { Issue.record("Expected reconfirmation"); return }
+        #expect(current == second)
+    }
 }
 
 private final class Fixture {
