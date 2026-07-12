@@ -230,6 +230,10 @@ final class AppSettings: ObservableObject {
         }
     }
 
+    @Published var defaultOutputLanguage: OutputLanguage {
+        didSet { defaults.set(defaultOutputLanguage.rawValue, forKey: Keys.defaultOutputLanguage) }
+    }
+
     @Published var appLanguageRules: [String: String] {
         didSet {
             let sanitized = Self.sanitizedLanguageRules(appLanguageRules)
@@ -492,6 +496,7 @@ final class AppSettings: ObservableObject {
         static let handsFreeMaxMinutes = "handsFreeMaxMinutes"
         static let appRules = "appRules"
         static let languagePin = "languagePin"
+        static let defaultOutputLanguage = "defaultOutputLanguage"
         static let appLanguageRules = "appLanguageRules"
         static let microphoneDeviceUID = "microphoneDeviceUID"
         static let vocabularyText = "vocabularyText"
@@ -580,6 +585,12 @@ final class AppSettings: ObservableObject {
         languagePin = normalizedLanguagePin
         if normalizedLanguagePin != storedLanguagePin {
             defaults.set(normalizedLanguagePin, forKey: Keys.languagePin)
+        }
+        let storedDefaultOutputLanguage = defaults.string(forKey: Keys.defaultOutputLanguage)
+        let normalizedDefaultOutputLanguage = OutputLanguage.persisted(rawValue: storedDefaultOutputLanguage)
+        defaultOutputLanguage = normalizedDefaultOutputLanguage
+        if storedDefaultOutputLanguage != normalizedDefaultOutputLanguage.rawValue {
+            defaults.set(normalizedDefaultOutputLanguage.rawValue, forKey: Keys.defaultOutputLanguage)
         }
         let storedLanguageRules = defaults.dictionary(forKey: Keys.appLanguageRules) as? [String: String] ?? [:]
         let sanitizedLanguageRulesAtLoad = Self.sanitizedLanguageRules(storedLanguageRules)

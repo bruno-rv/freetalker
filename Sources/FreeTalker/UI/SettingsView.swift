@@ -420,6 +420,14 @@ private struct GeneralSettingsView: View {
                     Text("Portuguese").tag("pt")
                 }
                 .disabled(!settings.edgeLauncherEnabled)
+                Picker("Default output language", selection: $settings.defaultOutputLanguage) {
+                    ForEach(OutputLanguage.allCases, id: \.rawValue) { language in
+                        Text(language.displayName).tag(language)
+                    }
+                }
+                Text("Translation requires a configured cloud LLM API; Same as spoken does not.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section("Recovery") {
