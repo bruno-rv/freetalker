@@ -43,7 +43,7 @@ final class AppCoordinator: ObservableObject {
     @Published private(set) var isRecording = false
     @Published private(set) var isProcessing = false
     @Published private(set) var lastError: String?
-    private var deferredOutputTranslationFailure: OutputTranslationFailure?
+    private var pendingOutputTranslationFailuresStorage: [OutputTranslationFailure] = []
     /// Set while the global hotkey listener couldn't be started (missing Accessibility
     /// permission) and we're waiting for the user to grant it. See Round 1 Codex finding 8.
     @Published private(set) var hotKeyStatusText: String?
@@ -613,13 +613,30 @@ final class AppCoordinator: ObservableObject {
         destinationLifecycle.clearPending(for: token)
     }
 
-    func deferOutputTranslationFailure(_ failure: OutputTranslationFailure) {
-        deferredOutputTranslationFailure = failure
+    func enqueueOutputTranslationFailure(_ failure: OutputTranslationFailure) {
+        pendingOutputTranslationFailuresStorage.append(failure)
     }
 
-    func takeDeferredOutputTranslationFailure() -> OutputTranslationFailure? {
-        defer { deferredOutputTranslationFailure = nil }
-        return deferredOutputTranslationFailure
+    @discardableResult
+    func handleOutputTranslationFailure(_ failure: OutputTranslationFailure) -> String {
+        enqueueOutputTranslationFailure(failure)
+        return failure.localizedDescription
+    }
+
+    func pendingOutputTranslationFailures() -> [OutputTranslationFailure] {
+        pendingOutputTranslationFailuresStorage
+    }
+
+    func consumePendingOutputTranslationFailure(id: UUID) -> OutputTranslationFailure? {
+        guard let index = pendingOutputTranslationFailuresStorage.firstIndex(where: { $0.id == id }) else {
+            return nil
+        }
+        return pendingOutputTranslationFailuresStorage.remove(at: index)
+    }
+
+    func consumeNextPendingOutputTranslationFailure() -> OutputTranslationFailure? {
+        guard !pendingOutputTranslationFailuresStorage.isEmpty else { return nil }
+        return pendingOutputTranslationFailuresStorage.removeFirst()
     }
 
     @discardableResult
@@ -1429,9 +1446,9 @@ final class AppCoordinator: ObservableObject {
         } catch PipelineError.recordFailed(_) {
             hud.flash("Library save failed")
         } catch let failure as OutputTranslationFailure {
-            deferOutputTranslationFailure(failure)
-            lastError = failure.localizedDescription
-            hud.flash(failure.localizedDescription)
+            let message = handleOutputTranslationFailure(failure)
+            lastError = message
+            hud.flash(message)
         } catch {
             lastError = "Transcription failed: \(error.localizedDescription)"
             let saved = await preserveFailedAudio(samples, failure: JobFailure(stage: .transcribing, message: error.localizedDescription))
@@ -1508,8 +1525,7 @@ final class AppCoordinator: ObservableObject {
                     hud.flash("Dictation ready — reopen Scratchpad to recover it")
                 }
             } catch let failure as OutputTranslationFailure {
-                deferOutputTranslationFailure(failure)
-                let message = failure.localizedDescription
+                let message = handleOutputTranslationFailure(failure)
                 lastError = message
                 hud.flash(message)
             } catch {
@@ -1688,7 +1704,7 @@ final class AppCoordinator: ObservableObject {
             refined = transcription.text
             recordedTemplateName = TemplateStore.rawTranscriptTemplateName
         } else if case .translate = context.outputLanguage.processingPolicy {
-            guard let snapshot = context.cloudSnapshot else {
+            guard let snapshot = context.cloudSnapshot, snapshot.eligibility.isEligible else {
                 throw OutputTranslationFailure(
                     source: transcription.text, context: context,
                     underlyingError: TranslationService.Error.unavailable(.invalidConfiguration)
@@ -1701,7 +1717,10 @@ final class AppCoordinator: ObservableObject {
                     policy: context.outputLanguage.processingPolicy,
                     snapshot: snapshot
                 )
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
+                try Task.checkCancellation()
                 throw OutputTranslationFailure(source: transcription.text, context: context, underlyingError: error)
             }
             recordedTemplateName = context.template.name
