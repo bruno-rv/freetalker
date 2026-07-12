@@ -38,4 +38,32 @@ struct AudioCaptureDecisionTests {
 
         #expect(both == [suppressionWarning, deviceWarning])
     }
+
+    @Test func failedAttemptWarningsRollBackBeforeFallbackWarnings() {
+        let existing = ["Warning from before capture attempt"]
+        let attemptStart = existing.count
+        let withFailedAttemptWarning = AudioCapture.captureWarnings(
+            existing,
+            adding: "Voice processing used the system microphone"
+        )
+
+        let rolledBack = AudioCapture.captureWarnings(
+            withFailedAttemptWarning,
+            rollingBackTo: attemptStart
+        )
+        let withFallback = AudioCapture.captureWarnings(
+            rolledBack,
+            adding: "Voice processing failed — using raw microphone audio"
+        )
+        let withSuccessfulRawWarning = AudioCapture.captureWarnings(
+            withFallback,
+            adding: "Configured microphone not found — using system default"
+        )
+
+        #expect(withSuccessfulRawWarning == [
+            "Warning from before capture attempt",
+            "Voice processing failed — using raw microphone audio",
+            "Configured microphone not found — using system default",
+        ])
+    }
 }
