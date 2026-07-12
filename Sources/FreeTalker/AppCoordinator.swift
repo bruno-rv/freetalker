@@ -10,6 +10,11 @@ final class AppCoordinator: ObservableObject {
     enum CaptureOwner: Equatable { case none, dictation, voiceEdit }
     enum CaptureDecision: Equatable { case start, stop, busy(CaptureOwner) }
     enum TranslationRecoveryHUDOwner: Equatable { case none, recovery, recording }
+    enum RecordingHUDEarlyTerminal: CaseIterable {
+        case voiceEditEscape
+        case externalDeadAudio
+        case scratchpadDeadAudio
+    }
 
     nonisolated static func captureStartDecision(current: CaptureOwner, requested: CaptureOwner) -> CaptureDecision {
         current == .none ? .start : .busy(current)
@@ -742,6 +747,16 @@ final class AppCoordinator: ObservableObject {
         presentTranslationRecoveryState()
     }
 
+    func recordingHUDDidEndEarly(
+        _ terminal: RecordingHUDEarlyTerminal,
+        generation: UUID? = nil
+    ) {
+        switch terminal {
+        case .voiceEditEscape, .externalDeadAudio, .scratchpadDeadAudio:
+            recordingHUDDidReachTerminalState(generation: generation)
+        }
+    }
+
     func pendingOutputTranslationFailures() -> [OutputTranslationFailure] {
         pendingOutputTranslationFailuresStorage
     }
@@ -874,6 +889,7 @@ final class AppCoordinator: ObservableObject {
             hotKeyManager.isRecording = false
             _ = audioCapture.stop()
             hud.flash("Voice Edit cancelled")
+            recordingHUDDidEndEarly(.voiceEditEscape)
             return
         }
         let (newState, action) = RecordingStateMachine.transition(state: recordingState, event: .esc, currentGeneration: recordingGeneration)
@@ -1163,6 +1179,7 @@ final class AppCoordinator: ObservableObject {
         if let issue = Self.capturedAudioIssue(sampleCount: samples.count, peak: peak, rms: rms) {
             lastError = issue
             hud.flash(issue)
+            recordingHUDDidEndEarly(.externalDeadAudio)
             return
         }
         isProcessing = true
@@ -1658,6 +1675,7 @@ final class AppCoordinator: ObservableObject {
                 router: scratchpadRecordingRouter
             ) {}) ?? false
             if !delivered { destinationLifecycle.storePendingFailure(issue) }
+            recordingHUDDidEndEarly(.scratchpadDeadAudio)
             return
         }
 
