@@ -163,6 +163,5 @@ private final class SettingsWindowObserverView: NSView {
         guard let window else { return }
         AppLifecycleWindowPolicy.configureSettingsWindow(window)
         window.makeKeyAndOrderFront(nil)
-        window.orderFrontRegardless()
     }
 }
