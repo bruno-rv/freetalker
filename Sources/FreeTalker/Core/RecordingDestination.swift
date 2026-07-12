@@ -9,6 +9,38 @@ enum RecordingDestination: Equatable, Sendable {
     case scratchpad(ScratchpadInsertionToken)
 }
 
+struct RecordingProcessingContext: Equatable, Sendable {
+    let destination: RecordingDestination
+    let spokenLanguage: String?
+    let outputLanguage: OutputLanguage
+    let template: Template
+    let cloudSnapshot: CloudLLMSettingsSnapshot?
+
+    var transcriptionLanguage: String? {
+        guard spokenLanguage == "en" || spokenLanguage == "pt" else { return nil }
+        return spokenLanguage
+    }
+}
+
+struct RecordingProcessingResult {
+    let rawTranscript: String
+    let finalOutput: String
+    let sourceLanguage: SourceLanguage
+    let requestedOutputLanguage: OutputLanguage
+    let templateName: String
+    let engineName: String
+    let posted: Bool
+    let fallbackReason: AppCoordinator.PostProcessingFallbackReason?
+}
+
+struct OutputTranslationFailure: Error, LocalizedError {
+    let source: String
+    let context: RecordingProcessingContext
+    let underlyingError: Error
+
+    var errorDescription: String? { "Translation failed" }
+}
+
 enum RecordingDestinationEvent: Equatable {
     case preview(String?)
     case completion(String)

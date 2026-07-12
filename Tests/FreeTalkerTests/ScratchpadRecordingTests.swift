@@ -28,6 +28,18 @@ struct ScratchpadRecordingTests {
         #expect(harness.controller.scratchpadDocument.textStorage.string == "Hello there")
     }
 
+    @Test func translatedCompletionUsesCapturedTokenAfterSelectionDrift() {
+        let harness = Harness("First Second")
+        harness.controller.scratchpadView.textView.setSelectedRange(NSRange(location: 0, length: 5))
+        harness.controller.startDictation()
+        let capturedToken = harness.startedToken
+
+        harness.controller.scratchpadView.textView.setSelectedRange(NSRange(location: 6, length: 6))
+
+        #expect(harness.controller.completeRecording("Translated", for: capturedToken))
+        #expect(harness.controller.scratchpadDocument.textStorage.string == "Translated Second")
+    }
+
     @Test func previewNeverEntersStorageOrUndoHistory() {
         let harness = Harness("Stored")
         harness.controller.startDictation()
