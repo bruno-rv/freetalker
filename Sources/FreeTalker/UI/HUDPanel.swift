@@ -4,7 +4,9 @@ import SwiftUI
 
 @MainActor
 final class HUDController {
-    private var panel: HUDPanel?
+    private var panel: NSPanel?
+    private let settings: AppSettings
+    private var screenChangeObserver: NotificationObserverToken?
     /// Pending auto-hide for a `flash(_:duration:)` call. Cancelled whenever `show`/`flash`/
     /// `hide` runs again (e.g. a new recording starts) so a stale timer can't hide a HUD that's
     /// since been repurposed. See Round 2 Codex finding 6.
@@ -18,6 +20,23 @@ final class HUDController {
     var onPanelLanguage: ((String) -> Void)?
     var onPanelCycleTemplate: (() -> Void)?
     var onPanelLock: (() -> Void)?
+
+    init(settings: AppSettings = .shared) {
+        self.settings = settings
+        screenChangeObserver = NotificationObserverToken(NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.reclampPanel() }
+        })
+    }
+
+    deinit {
+        if let screenChangeObserver {
+            NotificationCenter.default.removeObserver(screenChangeObserver.value)
+        }
+    }
 
     /// What the pill currently displays.
     enum Mode: Equatable {
@@ -96,47 +115,107 @@ final class HUDController {
         let hosting = NSHostingView(rootView: HUDView(
             mode: mode,
             onPillClick: { [weak self] in self?.onPillClick?() },
-            panelCallbacks: callbacks
+            panelCallbacks: callbacks,
+            onBackgroundDragCompleted: { [weak self] in self?.persistPanelPosition() }
         ))
         let fitting = hosting.fittingSize
         let size = NSSize(width: max(fitting.width, 60), height: max(fitting.height, 36))
         hosting.frame = NSRect(origin: .zero, size: size)
 
-        let panel: HUDPanel
+        let panel: NSPanel
         if let existing = self.panel {
             panel = existing
+            let origin = panel.frame.origin
+            panel.contentView = hosting
+            panel.setContentSize(size)
+            let screen = panel.screen ?? NSScreen.main
+            if let screen {
+                panel.setFrameOrigin(FloatingPanelGeometry.clampedOrigin(
+                    origin,
+                    panelSize: panel.frame.size,
+                    visibleFrame: screen.visibleFrame
+                ))
+            }
         } else {
-            panel = HUDPanel(
-                contentRect: NSRect(origin: .zero, size: size),
-                styleMask: [.borderless, .nonactivatingPanel],
-                backing: .buffered,
-                defer: false
-            )
-            panel.level = .floating
-            panel.isOpaque = false
-            panel.backgroundColor = .clear
-            panel.hasShadow = true
-            // Deliberately NOT true (unlike a plain notification HUD): the pill/panel must
-            // receive clicks (lock/stop gesture, B3; per-control taps, Feature 3). `HUDPanel`
-            // overrides canBecomeKey/canBecomeMain to false so accepting mouse events here never
-            // steals focus from the frontmost app.
-            panel.ignoresMouseEvents = false
-            panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+            panel = Self.makePanel(size: size)
+            panel.contentView = hosting
             self.panel = panel
+            positionForFirstPresentation(panel)
         }
 
-        panel.contentView = hosting
-        panel.setContentSize(size)
-        position(panel)
         panel.orderFrontRegardless()
     }
 
-    private func position(_ panel: NSPanel) {
+    static func makePanel(size: NSSize) -> NSPanel {
+        let panel = HUDPanel(
+            contentRect: NSRect(origin: .zero, size: size),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.level = .floating
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        // The HUD must receive control taps without becoming key or moving for arbitrary clicks.
+        panel.ignoresMouseEvents = false
+        panel.isMovableByWindowBackground = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        return panel
+    }
+
+    private func positionForFirstPresentation(_ panel: NSPanel) {
         guard let screen = NSScreen.main else { return }
-        let frame = screen.visibleFrame
-        let x = frame.midX - panel.frame.width / 2
-        let y = frame.minY + 90
-        panel.setFrameOrigin(NSPoint(x: x, y: y))
+        let displays = NSScreen.screens.map(Self.displayFrame)
+        let origin: CGPoint
+        if let saved = settings.hudPosition {
+            origin = FloatingPanelGeometry.restoredOrigin(
+                saved: saved,
+                displays: displays,
+                fallback: Self.displayFrame(screen),
+                panelSize: panel.frame.size
+            )
+        } else {
+            origin = FloatingPanelGeometry.clampedOrigin(
+                CGPoint(x: screen.visibleFrame.midX - panel.frame.width / 2,
+                        y: screen.visibleFrame.minY + 90),
+                panelSize: panel.frame.size,
+                visibleFrame: screen.visibleFrame
+            )
+        }
+        panel.setFrameOrigin(origin)
+    }
+
+    private func reclampPanel() {
+        guard let panel, let screen = panel.screen ?? NSScreen.main else { return }
+        panel.setFrameOrigin(FloatingPanelGeometry.clampedOrigin(
+            panel.frame.origin,
+            panelSize: panel.frame.size,
+            visibleFrame: screen.visibleFrame
+        ))
+    }
+
+    private func persistPanelPosition() {
+        guard let panel, let screen = panel.screen ?? NSScreen.main else { return }
+        settings.hudPosition = FloatingPanelGeometry.normalizedOrigin(
+            frame: panel.frame,
+            display: Self.displayFrame(screen)
+        )
+    }
+
+    private static func displayFrame(_ screen: NSScreen) -> DisplayFrame {
+        let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")]
+            as? NSNumber
+        return DisplayFrame(id: number?.stringValue ?? screen.localizedName,
+                            visibleFrame: screen.visibleFrame)
+    }
+}
+
+private final class NotificationObserverToken: @unchecked Sendable {
+    let value: NSObjectProtocol
+
+    init(_ value: NSObjectProtocol) {
+        self.value = value
     }
 }
 
@@ -155,6 +234,7 @@ struct HUDView: View {
     let mode: HUDController.Mode
     var onPillClick: () -> Void = {}
     var panelCallbacks: HUDController.PanelCallbacks = .init()
+    var onBackgroundDragCompleted: () -> Void = {}
 
     var body: some View {
         Group {
@@ -186,6 +266,7 @@ struct HUDView: View {
         .font(.system(size: 13, weight: .medium))
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
+        .background(HUDDragSurface(onDragCompleted: onBackgroundDragCompleted))
         .background(.regularMaterial, in: Capsule())
     }
 
@@ -256,5 +337,36 @@ struct HUDView: View {
     private static func formatMMSS(_ seconds: TimeInterval) -> String {
         let total = max(0, Int(seconds.rounded()))
         return String(format: "%d:%02d", total / 60, total % 60)
+    }
+}
+
+private struct HUDDragSurface: NSViewRepresentable {
+    let onDragCompleted: () -> Void
+
+    func makeNSView(context: Context) -> HUDDragView {
+        HUDDragView(onDragCompleted: onDragCompleted)
+    }
+
+    func updateNSView(_ view: HUDDragView, context: Context) {
+        view.onDragCompleted = onDragCompleted
+    }
+}
+
+private final class HUDDragView: NSView {
+    var onDragCompleted: () -> Void
+
+    init(onDragCompleted: @escaping () -> Void) {
+        self.onDragCompleted = onDragCompleted
+        super.init(frame: .zero)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { nil }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.performDrag(with: event)
+        onDragCompleted()
     }
 }
