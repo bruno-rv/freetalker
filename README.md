@@ -98,7 +98,7 @@ bundle again, enable it, and relaunch.
   re-run a stored transcript through a different Template. Each entry can be deleted
   individually, or wiped entirely with **Delete All** — which also purges any saved debug audio
   (`last-dictation.wav`, failed-transcription recordings) alongside the database rows. Choosing
-  **Translate…** sends only the chosen Library text to the configured Cloud post-processing
+  **Translate…** sends the chosen Library text only to the configured Cloud post-processing
   endpoint.
 - **Library → Recoveries** keeps failed dictation audio locally on this Mac so you can listen,
   retry with optional language/model/template overrides, or permanently delete it. Recovery
