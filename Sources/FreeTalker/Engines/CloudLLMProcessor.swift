@@ -50,17 +50,40 @@ struct CloudLLMProcessor: PostProcessor {
         let providerLabel = snapshot.provider.rawValue
         let baseURL = snapshot.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         let model = snapshot.model.trimmingCharacters(in: .whitespacesAndNewlines)
-        let instructions = buildProcessorInstructions(request: request, vocabulary: snapshot.vocabulary)
 
         switch snapshot.provider {
         case .anthropic:
-            return try await callAnthropic(apiKey: apiKey!, baseURL: baseURL, model: model, instructions: instructions, transcript: request.transcript, providerLabel: providerLabel)
+            return try await callAnthropic(apiKey: apiKey!, baseURL: baseURL, model: model, request: request, providerLabel: providerLabel)
         case .ollama, .openAICompatible:
-            return try await callOpenAICompatible(apiKey: apiKey, baseURL: baseURL, model: model, instructions: instructions, transcript: request.transcript, providerLabel: providerLabel)
+            return try await callOpenAICompatible(apiKey: apiKey, baseURL: baseURL, model: model, request: request, providerLabel: providerLabel)
         }
     }
 
-    private func callAnthropic(apiKey: String, baseURL: String, model: String, instructions: String, transcript: String, providerLabel: String) async throws -> String {
+    static func anthropicRequestBody(model: String, request: PostProcessingRequest, vocabulary: [String]) throws -> Data {
+        let body: [String: Any] = [
+            "model": model,
+            "max_tokens": 2048,
+            "system": buildProcessorInstructions(request: request, vocabulary: vocabulary),
+            "messages": [[
+                "role": "user",
+                "content": buildProcessorUserContent(request: request, vocabulary: vocabulary)
+            ]]
+        ]
+        return try JSONSerialization.data(withJSONObject: body)
+    }
+
+    static func openAICompatibleRequestBody(model: String, request: PostProcessingRequest, vocabulary: [String]) throws -> Data {
+        let body: [String: Any] = [
+            "model": model,
+            "messages": [
+                ["role": "system", "content": buildProcessorInstructions(request: request, vocabulary: vocabulary)],
+                ["role": "user", "content": buildProcessorUserContent(request: request, vocabulary: vocabulary)]
+            ]
+        ]
+        return try JSONSerialization.data(withJSONObject: body)
+    }
+
+    private func callAnthropic(apiKey: String, baseURL: String, model: String, request processingRequest: PostProcessingRequest, providerLabel: String) async throws -> String {
         guard let url = URL(string: baseURL)?.appendingPathComponent("messages") else {
             throw CloudLLMError.missingConfiguration(provider: providerLabel)
         }
@@ -70,13 +93,7 @@ struct CloudLLMProcessor: PostProcessor {
         request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        let body: [String: Any] = [
-            "model": model,
-            "max_tokens": 2048,
-            "system": instructions,
-            "messages": [["role": "user", "content": transcript]]
-        ]
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.httpBody = try Self.anthropicRequestBody(model: model, request: processingRequest, vocabulary: snapshot.vocabulary)
 
         let (data, response) = try await URLSession.shared.data(for: request)
         try Self.checkStatus(response, provider: providerLabel)
@@ -89,7 +106,7 @@ struct CloudLLMProcessor: PostProcessor {
         return decoded.content.compactMap(\.text).joined()
     }
 
-    private func callOpenAICompatible(apiKey: String?, baseURL: String, model: String, instructions: String, transcript: String, providerLabel: String) async throws -> String {
+    private func callOpenAICompatible(apiKey: String?, baseURL: String, model: String, request processingRequest: PostProcessingRequest, providerLabel: String) async throws -> String {
         guard let url = URL(string: baseURL)?.appendingPathComponent("chat/completions") else {
             throw CloudLLMError.missingConfiguration(provider: providerLabel)
         }
@@ -97,14 +114,7 @@ struct CloudLLMProcessor: PostProcessor {
         request.httpMethod = "POST"
         Self.applyOpenAICompatibleHeaders(apiKey: apiKey, to: &request)
 
-        let body: [String: Any] = [
-            "model": model,
-            "messages": [
-                ["role": "system", "content": instructions],
-                ["role": "user", "content": transcript]
-            ]
-        ]
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.httpBody = try Self.openAICompatibleRequestBody(model: model, request: processingRequest, vocabulary: snapshot.vocabulary)
 
         let (data, response) = try await URLSession.shared.data(for: request)
         try Self.checkStatus(response, provider: providerLabel)
