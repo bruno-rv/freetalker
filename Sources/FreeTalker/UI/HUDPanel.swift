@@ -161,7 +161,7 @@ struct HUDView: View {
             switch mode {
             case .text(let text):
                 Text(text)
-                    .lineLimit(2)
+                    .lineLimit(Self.lineLimit(for: text))
                     .truncationMode(.head)
                     .multilineTextAlignment(.leading)
                     .frame(maxWidth: 320, alignment: .leading)
@@ -187,6 +187,10 @@ struct HUDView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
         .background(.regularMaterial, in: Capsule())
+    }
+
+    nonisolated static func lineLimit(for text: String) -> Int? {
+        text.contains("\n") ? nil : 2
     }
 
     @ViewBuilder

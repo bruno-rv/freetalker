@@ -203,7 +203,7 @@ final class AudioCapture {
             &size
         )
         guard status == noErr else {
-            Self.logger.error("Effective input device query failed with status \(status)")
+            Self.logger.error("Effective input device unknown: CurrentDevice property query failed with status \(status)")
             return
         }
         Self.logger.info("Effective input device ID: \(deviceID)")
