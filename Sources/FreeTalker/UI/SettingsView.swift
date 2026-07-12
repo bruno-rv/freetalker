@@ -124,15 +124,45 @@ struct VoiceEditHotKeyPresentation: Equatable {
 
 struct ScreenRecordingPermissionPresentation: Equatable {
     let label: String
+    let guidance: String?
     let showsRequestAccess: Bool
     let showsOpenSystemSettings: Bool
 
-    static func make(status: ScreenRecordingAuthorization) -> Self {
+    static func make(status: ScreenRecordingAuthorization, requestAttempted: Bool) -> Self {
         let granted = status == .granted
         return Self(
-            label: granted ? "Screen Recording granted" : "Screen Recording not granted",
-            showsRequestAccess: !granted,
+            label: granted ? "Screen Recording granted" : (requestAttempted ? "Screen Recording not available yet" : "Screen Recording not granted"),
+            guidance: !granted && requestAttempted
+                ? "macOS may require FreeTalker to relaunch after access is granted. If it still appears unavailable, remove and re-add FreeTalker in System Settings."
+                : nil,
+            showsRequestAccess: !granted && !requestAttempted,
             showsOpenSystemSettings: !granted
+        )
+    }
+}
+
+struct InputMonitoringPermissionPresentation: Equatable {
+    let isOperational: Bool
+    let label: String
+    let guidance: String
+    let showsOpenSystemSettings: Bool
+
+    static func make(rawAuthorized: Bool, hotKeyOperational: Bool) -> Self {
+        if hotKeyOperational {
+            return Self(
+                isOperational: true,
+                label: "Input Monitoring and global shortcuts working",
+                guidance: "",
+                showsOpenSystemSettings: false
+            )
+        }
+        return Self(
+            isOperational: false,
+            label: rawAuthorized
+                ? "Global shortcuts unavailable"
+                : "Input Monitoring and global shortcuts unavailable",
+            guidance: "Enable FreeTalker in System Settings, then relaunch it. If it is already enabled, remove and re-add it.",
+            showsOpenSystemSettings: true
         )
     }
 }
@@ -146,6 +176,7 @@ private struct GeneralSettingsView: View {
     @State private var microphoneAuthorized = Permissions.isMicrophoneAuthorized()
     @State private var inputMonitoringAuthorized = Permissions.isInputMonitoringAuthorized()
     @State private var screenRecordingAuthorization = Permissions.screenRecordingAuthorization()
+    @State private var screenRecordingRequestAttempted = false
     @State private var capturingHotKey = false
     @State private var captureSession: HotKeyCapture.Session?
     /// Set when re-recording the PTT key is refused because it would collide with, or
@@ -214,13 +245,18 @@ private struct GeneralSettingsView: View {
 
                 HStack {
                     Circle()
-                        .fill(inputMonitoringAuthorized ? .green : .red)
+                        .fill(inputMonitoringPresentation.isOperational ? .green : .red)
                         .frame(width: 8, height: 8)
-                    Text(inputMonitoringAuthorized ? "Input Monitoring granted" : "Input Monitoring not granted")
+                    Text(inputMonitoringPresentation.label)
                     Spacer()
-                    if !inputMonitoringAuthorized {
+                    if inputMonitoringPresentation.showsOpenSystemSettings {
                         Button("Open System Settings") { Permissions.openInputMonitoringSettings() }
                     }
+                }
+                if !inputMonitoringPresentation.isOperational {
+                    Text(inputMonitoringPresentation.guidance)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
                 }
                 HStack {
                     Circle()
@@ -230,12 +266,18 @@ private struct GeneralSettingsView: View {
                     Spacer()
                     if screenRecordingPresentation.showsRequestAccess {
                         Button("Request Access") {
+                            screenRecordingRequestAttempted = true
                             screenRecordingAuthorization = Permissions.requestScreenRecording()
                         }
                     }
                     if screenRecordingPresentation.showsOpenSystemSettings {
                         Button("Open System Settings") { Permissions.openScreenRecordingSettings() }
                     }
+                }
+                if let guidance = screenRecordingPresentation.guidance {
+                    Text(guidance)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
                 }
             }
 
@@ -599,7 +641,11 @@ private struct GeneralSettingsView: View {
     }
 
     private var screenRecordingPresentation: ScreenRecordingPermissionPresentation {
-        .make(status: screenRecordingAuthorization)
+        .make(status: screenRecordingAuthorization, requestAttempted: screenRecordingRequestAttempted)
+    }
+
+    private var inputMonitoringPresentation: InputMonitoringPermissionPresentation {
+        .make(rawAuthorized: inputMonitoringAuthorized, hotKeyOperational: coordinator.isHotKeyListening)
     }
 
     @ViewBuilder
