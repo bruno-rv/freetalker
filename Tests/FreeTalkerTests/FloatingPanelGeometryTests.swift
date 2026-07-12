@@ -162,4 +162,17 @@ struct FloatingPanelGeometryTests {
         #expect(low == CGPoint(x: -252, y: -8))
         #expect(high == CGPoint(x: 252, y: 268))
     }
+
+    @Test func contentResizePreservesAndClampsCurrentOriginInsteadOfRecentering() {
+        let visibleFrame = CGRect(x: 100, y: 200, width: 600, height: 400)
+
+        let origin = FloatingPanelGeometry.clampedOrigin(
+            CGPoint(x: 690, y: 590),
+            panelSize: CGSize(width: 240, height: 100),
+            visibleFrame: visibleFrame
+        )
+
+        #expect(origin == CGPoint(x: 652, y: 568))
+        #expect(origin != CGPoint(x: 280, y: 350))
+    }
 }
