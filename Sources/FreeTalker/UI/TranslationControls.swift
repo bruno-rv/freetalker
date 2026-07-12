@@ -26,6 +26,27 @@ struct TranslationControlsPresentation: Equatable {
     func isEnabled(_ language: OutputLanguage) -> Bool {
         language == .sameAsSpoken || state.availability.enabled
     }
+
+    func accessibilityPolicy(for language: OutputLanguage) -> OutputChoiceAccessibilityPolicy {
+        let enabled = isEnabled(language)
+        return OutputChoiceAccessibilityPolicy(
+            wrapperIsEnabled: true,
+            childCommandIsEnabled: enabled,
+            label: language.displayName,
+            value: enabled ? (state.effectiveOutput == language ? "Selected" : "Available") : "Unavailable",
+            hint: enabled ? nil : accessibilityHelp,
+            tooltip: enabled ? nil : tooltip
+        )
+    }
+}
+
+struct OutputChoiceAccessibilityPolicy: Equatable {
+    let wrapperIsEnabled: Bool
+    let childCommandIsEnabled: Bool
+    let label: String
+    let value: String
+    let hint: String?
+    let tooltip: String?
 }
 
 struct TranslationControls: View {
@@ -88,6 +109,7 @@ struct TranslationControls: View {
 
     @ViewBuilder
     private func outputChoice(_ choice: TranslationControlsPresentation.OutputChoice) -> some View {
+        let policy = presentation.accessibilityPolicy(for: choice.language)
         let button = Button { onOutput(choice.language) } label: {
             if state.effectiveOutput == choice.language {
                 Label(choice.label, systemImage: "checkmark")
@@ -95,13 +117,16 @@ struct TranslationControls: View {
                 Text(choice.label)
             }
         }
-        .disabled(!presentation.isEnabled(choice.language))
+        .disabled(!policy.childCommandIsEnabled)
 
-        if choice.language != .sameAsSpoken,
-           let tooltip = presentation.tooltip,
-           let accessibilityHelp = presentation.accessibilityHelp {
+        if !policy.childCommandIsEnabled,
+           let tooltip = policy.tooltip,
+           let accessibilityHelp = policy.hint {
             HStack { button }
                 .help(tooltip)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(Text(policy.label))
+                .accessibilityValue(Text(policy.value))
                 .accessibilityHint(Text(accessibilityHelp))
         } else {
             button

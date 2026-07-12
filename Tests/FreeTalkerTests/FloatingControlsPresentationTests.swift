@@ -118,6 +118,13 @@ import Testing
         #expect(OutputLanguage.allCases.dropFirst().allSatisfy { !presentation.isEnabled($0) })
         #expect(presentation.tooltip == reason)
         #expect(presentation.accessibilityHelp == reason)
+        let policy = presentation.accessibilityPolicy(for: .german)
+        #expect(policy.wrapperIsEnabled)
+        #expect(!policy.childCommandIsEnabled)
+        #expect(policy.label == "German")
+        #expect(policy.value == "Unavailable")
+        #expect(policy.hint == reason)
+        #expect(policy.tooltip == reason)
     }
 
     @Test func outputSelectionCallbackKeepsPreRecordingOverrideSynchronized() {
@@ -140,6 +147,73 @@ import Testing
         #expect(selection.pending == .german)
         #expect(controller.presentedTranslationState.override == .german)
         #expect(controller.presentedTranslationState.effectiveOutput == .german)
+    }
+
+    @Test func restartReinstallsOutputDefaultProviderAndCredentialSubscriptionsOnce() async {
+        let suite = "FloatingControlsPresentationTests.restart.\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = AppSettings(defaults: defaults)
+        let center = NotificationCenter()
+        var selection = RecordingOutputSelection()
+        var key: String?
+        var outputCallbacks = 0
+        var snapshotCalls = 0
+        let controller = FloatingControlsController(
+            settings: settings,
+            outputSelection: { selection },
+            cloudSnapshot: {
+                snapshotCalls += 1
+                return CloudLLMSettingsSnapshot(
+                    provider: settings.llmProvider,
+                    baseURL: settings.cloudLLMBaseURL,
+                    model: settings.cloudLLMModel,
+                    key: key,
+                    vocabulary: []
+                )
+            },
+            notificationCenter: center,
+            callbacks: .init(
+                onDictation: {}, onScratchpad: {}, onOpenSettings: {}, onLanguage: { _ in },
+                onOutput: { outputCallbacks += 1; selection.select($0, isRecording: false) }
+            )
+        )
+        controller.start()
+        controller.stop()
+        controller.start()
+
+        controller.selectOutput(.german)
+        #expect(outputCallbacks == 1)
+        #expect(controller.presentedTranslationState.override == .german)
+
+        selection.resolveTerminal()
+        settings.defaultOutputLanguage = .french
+        await waitUntil { controller.presentedTranslationState.effectiveOutput == .french }
+        #expect(controller.presentedTranslationState.effectiveOutput == .french)
+
+        settings.llmProvider = .anthropic
+        settings.cloudLLMBaseURL = "https://api.anthropic.com/v1"
+        settings.cloudLLMModel = "claude"
+        await waitUntil { !controller.presentedTranslationState.availability.enabled }
+        #expect(!controller.presentedTranslationState.availability.enabled)
+
+        key = "saved"
+        let callsBeforeCredential = snapshotCalls
+        center.post(name: .cloudLLMCredentialsDidChange, object: nil)
+        #expect(controller.presentedTranslationState.availability.enabled)
+        #expect(snapshotCalls == callsBeforeCredential + 1)
+
+        key = nil
+        center.post(name: .cloudLLMCredentialsDidChange, object: nil)
+        #expect(!controller.presentedTranslationState.availability.enabled)
+        #expect(snapshotCalls == callsBeforeCredential + 2)
+        controller.stop()
+    }
+
+    private func waitUntil(_ condition: @escaping @MainActor () -> Bool) async {
+        for _ in 0..<100 where !condition() {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
     }
 
     @Test(arguments: [

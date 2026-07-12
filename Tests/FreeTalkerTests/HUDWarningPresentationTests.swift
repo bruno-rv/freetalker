@@ -80,4 +80,32 @@ import Testing
         #expect(hud.translationState == launcher)
         #expect(hud.translationState.override == .german)
     }
+
+    @Test func coordinatorPresentationTracksLiveConfigurationEligibility() {
+        let invalid = CloudLLMSettingsSnapshot(
+            provider: .openAICompatible,
+            baseURL: "not a url",
+            model: "model",
+            key: nil,
+            vocabulary: []
+        )
+        let eligible = CloudLLMSettingsSnapshot(
+            provider: .openAICompatible,
+            baseURL: "http://localhost:11434/v1",
+            model: "model",
+            key: nil,
+            vocabulary: []
+        )
+
+        #expect(!AppCoordinator.translationControlsState(
+            defaultOutput: .sameAsSpoken,
+            selection: .init(),
+            snapshot: invalid
+        ).availability.enabled)
+        #expect(AppCoordinator.translationControlsState(
+            defaultOutput: .sameAsSpoken,
+            selection: .init(),
+            snapshot: eligible
+        ).availability.enabled)
+    }
 }

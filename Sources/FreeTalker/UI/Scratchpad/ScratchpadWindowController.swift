@@ -125,7 +125,7 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
             AppSettings.shared.$cloudLLMModel.map { _ in () }
         ).dropFirst(3).eraseToAnyPublisher()
         let credentialUpdates = cloudCredentialUpdates ?? NotificationCenter.default.publisher(
-            for: .scratchpadCloudCredentialsDidChange
+            for: .cloudLLMCredentialsDidChange
         ).map { _ in () }.eraseToAnyPublisher()
         cloudSettingsCancellable = Publishers.Merge(configurationUpdates, credentialUpdates)
         .receive(on: RunLoop.main)
