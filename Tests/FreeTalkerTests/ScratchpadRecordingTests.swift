@@ -68,22 +68,100 @@ struct ScratchpadRecordingTests {
     }
 
     @Test func reopeningRegistersRouterAndConsumesPendingTextIntoVisibleRecovery() {
-        var pending: [ScratchpadInsertionToken: String] = [:]
-        let harness = Harness(
-            "Text",
-            pending: { pending[$0] },
-            consumePending: { pending.removeValue(forKey: $0) }
-        )
+        let harness = Harness("Text")
         harness.controller.startDictation()
         let token = harness.startedToken
         harness.controller.windowWillClose(Notification(name: NSWindow.willCloseNotification))
-        pending[token] = "completed while closed"
+        harness.probe.storePending("completed while closed", token: token)
 
         harness.controller.open(activate: false)
 
         #expect(harness.controller.scratchpadView.recoveryText == "completed while closed")
-        #expect(pending[token] == nil)
+        #expect(harness.probe.pending[token] == "completed while closed")
         #expect(harness.registeredRouter === harness.controller)
+    }
+
+    @Test func twoRecoveriesRemainFIFOAndConsumeOnlyAfterSuccessfulInsertion() {
+        let harness = Harness("Base")
+        let first = ScratchpadInsertionToken(id: UUID())
+        let second = ScratchpadInsertionToken(id: UUID())
+        harness.probe.storePending(" one", token: first)
+        harness.probe.storePending(" two", token: second)
+        harness.controller.open(activate: false)
+        #expect(harness.controller.scratchpadView.recoveryText == " one")
+
+        harness.controller.scratchpadView.textView.setSelectedRange(NSRange(location: 4, length: 0))
+        harness.controller.scratchpadView.recoveryButton.performClick(nil)
+        #expect(harness.controller.scratchpadDocument.textStorage.string == "Base one")
+        #expect(harness.probe.pending[first] == nil)
+        #expect(harness.probe.pending[second] == " two")
+        #expect(harness.controller.scratchpadView.recoveryText == " two")
+
+        harness.controller.scratchpadView.textView.setSelectedRange(NSRange(location: 8, length: 0))
+        harness.controller.scratchpadView.recoveryButton.performClick(nil)
+        #expect(harness.controller.scratchpadDocument.textStorage.string == "Base one two")
+        #expect(harness.probe.pending.isEmpty)
+        #expect(harness.controller.scratchpadView.recoveryText == nil)
+    }
+
+    @Test func closeDuringCaptureStopsThenCompletionBecomesPendingAndReopensIdle() throws {
+        let harness = Harness("Base")
+        harness.controller.startDictation()
+        let token = harness.startedToken
+
+        harness.controller.windowWillClose(Notification(name: NSWindow.willCloseNotification))
+        #expect(harness.stopCalls == 1)
+        #expect(harness.registeredRouter == nil)
+        #expect(!harness.controller.scratchpadView.isRecording)
+        #expect(harness.controller.scratchpadView.previewText == nil)
+
+        _ = try harness.probe.lifecycle.complete(" closed", destination: .scratchpad(token)) {}
+        harness.controller.open(activate: false)
+        #expect(!harness.controller.scratchpadView.isRecording)
+        #expect(harness.controller.scratchpadView.statusText != "Processing…")
+        #expect(harness.controller.scratchpadView.recoveryText == " closed")
+    }
+
+    @Test func cancellationAndFailureWhileClosedReopenIdleWithoutStaleProcessing() async {
+        let cancelled = Harness("Base")
+        cancelled.controller.startDictation()
+        let cancelledToken = cancelled.startedToken
+        cancelled.controller.windowWillClose(Notification(name: NSWindow.willCloseNotification))
+        cancelled.probe.lifecycle.install(.scratchpad(cancelledToken))
+        cancelled.probe.lifecycle.cancel(stop: {})
+        cancelled.controller.open(activate: false)
+        #expect(!cancelled.controller.scratchpadView.isRecording)
+        #expect(cancelled.controller.scratchpadView.statusText == nil)
+
+        let failed = Harness("Base")
+        failed.controller.startDictation()
+        let failedToken = failed.startedToken
+        failed.controller.windowWillClose(Notification(name: NSWindow.willCloseNotification))
+        do {
+            _ = try await failed.probe.lifecycle.runAsync(
+                destination: .scratchpad(failedToken), process: { throw ClosedFailure() },
+                text: { $0 as String }, external: { _ in }
+            )
+        } catch {}
+        failed.controller.open(activate: false)
+        #expect(!failed.controller.scratchpadView.isRecording)
+        #expect(failed.controller.scratchpadView.statusText == "closed failure")
+    }
+
+    @Test func repeatedStartPreservesOriginalRecordingToken() {
+        let harness = Harness("Base")
+        harness.controller.startDictation()
+        let original = harness.startedToken
+        harness.controller.startDictation()
+        #expect(harness.startedDestinations == [.scratchpad(original)])
+    }
+
+    @Test func busyCoordinatorRejectsStartBeforeCreatingADestination() {
+        let harness = Harness("Base")
+        harness.probe.isBusy = true
+        harness.controller.startDictation()
+        #expect(harness.startedDestinations.isEmpty)
+        #expect(!harness.controller.scratchpadView.isRecording)
     }
 
     @Test func startUsesScratchpadDestinationAndStopUsesCoordinatorCallback() {
@@ -105,6 +183,13 @@ struct ScratchpadRecordingTests {
         #expect(harness.controller.scratchpadView.formattingButtons.allSatisfy {
             ($0.accessibilityLabel()?.isEmpty == false) && ($0.toolTip?.isEmpty == false)
         })
+        let dictate = harness.controller.scratchpadView.formattingButtons.last
+        #expect(dictate?.accessibilityLabel() == "Start scratchpad dictation")
+        #expect(dictate?.accessibilityHelp() == "Record speech at the current scratchpad selection")
+        harness.controller.startDictation()
+        #expect(dictate?.accessibilityLabel() == "Stop scratchpad dictation")
+        #expect(dictate?.accessibilityHelp() == "Stop recording and transcribe into the scratchpad")
+        #expect(harness.controller.scratchpadView.recoveryButton.accessibilityHelp()?.isEmpty == false)
     }
 
     @Test func closeAndTerminationFlushDocument() {
@@ -136,11 +221,13 @@ struct ScratchpadRecordingTests {
         ScratchpadWindowController(
             documentURL: url,
             startRecording: { _ in true },
+            recordingIsBusy: { false },
             stopRecording: {},
             registerRouter: { _ in },
-            pendingRecording: { _ in nil },
+            pendingRecordings: { [] },
             consumePendingRecording: { _ in nil },
             clearPendingRecording: { _ in },
+            consumePendingFailure: { nil },
             notificationCenter: notificationCenter
         )
     }
@@ -148,7 +235,7 @@ struct ScratchpadRecordingTests {
 
 @MainActor
 private final class Harness {
-    private let probe: CallbackProbe
+    let probe: CallbackProbe
     let controller: ScratchpadWindowController
 
     var startedDestinations: [RecordingDestination] { probe.startedDestinations }
@@ -163,11 +250,7 @@ private final class Harness {
         return token
     }
 
-    init(
-        _ text: String,
-        pending: @escaping (ScratchpadInsertionToken) -> String? = { _ in nil },
-        consumePending: @escaping (ScratchpadInsertionToken) -> String? = { _ in nil }
-    ) {
+    init(_ text: String) {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
             .appendingPathExtension("rtf")
@@ -175,12 +258,18 @@ private final class Harness {
         self.probe = probe
         controller = ScratchpadWindowController(
             documentURL: url,
-            startRecording: { destination in probe.startedDestinations.append(destination); return true },
+            startRecording: { destination in
+                probe.startedDestinations.append(destination)
+                probe.lifecycle.install(destination)
+                return true
+            },
+            recordingIsBusy: { probe.isBusy },
             stopRecording: { probe.stopCalls += 1 },
-            registerRouter: { probe.registeredRouter = $0 },
-            pendingRecording: pending,
-            consumePendingRecording: consumePending,
-            clearPendingRecording: { _ in }
+            registerRouter: { probe.registeredRouter = $0; probe.lifecycle.router = $0 },
+            pendingRecordings: { probe.lifecycle.pendingRecordings() },
+            consumePendingRecording: { probe.lifecycle.consumePending(for: $0) },
+            clearPendingRecording: { probe.lifecycle.clearPending(for: $0) },
+            consumePendingFailure: { probe.lifecycle.consumePendingFailure() }
         )
         controller.scratchpadDocument.textStorage.append(NSAttributedString(string: text))
     }
@@ -188,7 +277,19 @@ private final class Harness {
 
 @MainActor
 private final class CallbackProbe {
+    let lifecycle = RecordingDestinationLifecycle()
     var startedDestinations: [RecordingDestination] = []
     var stopCalls = 0
+    var isBusy = false
     weak var registeredRouter: (any ScratchpadRecordingRouting)?
+    var pending: [ScratchpadInsertionToken: String] {
+        Dictionary(uniqueKeysWithValues: lifecycle.pendingRecordings().map { ($0.token, $0.text) })
+    }
+    func storePending(_ text: String, token: ScratchpadInsertionToken) {
+        lifecycle.storePending(text, for: token)
+    }
+}
+
+private struct ClosedFailure: Error, LocalizedError {
+    var errorDescription: String? { "closed failure" }
 }

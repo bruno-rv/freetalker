@@ -14,7 +14,7 @@ final class ScratchpadView: NSView {
     private let statusLabel = NSTextField(wrappingLabelWithString: "")
     private let recoveryLabel = NSTextField(wrappingLabelWithString: "")
     private let dictateButton = NSButton(title: "Dictate", target: nil, action: nil)
-    private let recoveryButton = NSButton(title: "Insert Recovered Text", target: nil, action: nil)
+    private(set) var recoveryButton = NSButton(title: "Insert Recovered Text", target: nil, action: nil)
 
     var previewText: String? {
         get { previewLabel.isHidden ? nil : previewLabel.stringValue }
@@ -46,7 +46,9 @@ final class ScratchpadView: NSView {
         didSet {
             dictateButton.title = isRecording ? "Stop" : "Dictate"
             dictateButton.setAccessibilityLabel(isRecording ? "Stop scratchpad dictation" : "Start scratchpad dictation")
-            dictateButton.toolTip = isRecording ? "Stop recording and transcribe into the scratchpad" : "Record speech at the current scratchpad selection"
+            let help = isRecording ? "Stop recording and transcribe into the scratchpad" : "Record speech at the current scratchpad selection"
+            dictateButton.setAccessibilityHelp(help)
+            dictateButton.toolTip = help
         }
     }
 
@@ -88,6 +90,7 @@ final class ScratchpadView: NSView {
         recoveryButton.target = self
         recoveryButton.action = #selector(insertRecovery)
         recoveryButton.setAccessibilityLabel("Insert recovered transcription")
+        recoveryButton.setAccessibilityHelp("Insert the preserved transcription at the current selection")
         recoveryButton.toolTip = "Insert the preserved transcription at the current selection"
 
         formattingButtons = [heading, bold, italic, bullets, numbers, clear, dictateButton]

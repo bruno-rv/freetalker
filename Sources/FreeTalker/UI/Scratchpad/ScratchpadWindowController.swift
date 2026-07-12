@@ -8,46 +8,55 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
     let scratchpadView: ScratchpadView
 
     private let startRecording: (RecordingDestination) -> Bool
+    private let recordingIsBusy: () -> Bool
     private let stopRecording: () -> Void
     private let registerRouter: ((any ScratchpadRecordingRouting)?) -> Void
-    private let pendingRecording: (ScratchpadInsertionToken) -> String?
+    private let pendingRecordings: () -> [RecordingDestinationLifecycle.PendingRecording]
     private let consumePendingRecording: (ScratchpadInsertionToken) -> String?
     private let clearPendingRecording: (ScratchpadInsertionToken) -> Void
+    private let consumePendingFailure: () -> String?
     nonisolated private let notificationCenter: NotificationCenter
     nonisolated(unsafe) private var terminationObserver: NSObjectProtocol?
     private var activeToken: ScratchpadInsertionToken?
+    private var recoveries: [RecordingDestinationLifecycle.PendingRecording] = []
 
     convenience init() {
         let coordinator = AppCoordinator.shared
         self.init(
             documentURL: Self.defaultDocumentURL,
             startRecording: { coordinator.startHandsFreeRecording(destination: $0) },
+            recordingIsBusy: { coordinator.isRecording || coordinator.isProcessing },
             stopRecording: { coordinator.stopCurrentRecording() },
             registerRouter: { coordinator.scratchpadRecordingRouter = $0 },
-            pendingRecording: { coordinator.pendingScratchpadRecording(for: $0) },
+            pendingRecordings: { coordinator.pendingScratchpadRecordings() },
             consumePendingRecording: { coordinator.consumePendingScratchpadRecording(for: $0) },
-            clearPendingRecording: { coordinator.clearPendingScratchpadRecording(for: $0) }
+            clearPendingRecording: { coordinator.clearPendingScratchpadRecording(for: $0) },
+            consumePendingFailure: { coordinator.consumePendingScratchpadFailure() }
         )
     }
 
     init(
         documentURL: URL,
         startRecording: @escaping (RecordingDestination) -> Bool,
+        recordingIsBusy: @escaping () -> Bool,
         stopRecording: @escaping () -> Void,
         registerRouter: @escaping ((any ScratchpadRecordingRouting)?) -> Void,
-        pendingRecording: @escaping (ScratchpadInsertionToken) -> String?,
+        pendingRecordings: @escaping () -> [RecordingDestinationLifecycle.PendingRecording],
         consumePendingRecording: @escaping (ScratchpadInsertionToken) -> String?,
         clearPendingRecording: @escaping (ScratchpadInsertionToken) -> Void,
+        consumePendingFailure: @escaping () -> String?,
         notificationCenter: NotificationCenter = .default
     ) {
         scratchpadDocument = ScratchpadDocument(url: documentURL)
         scratchpadView = ScratchpadView(document: scratchpadDocument)
         self.startRecording = startRecording
+        self.recordingIsBusy = recordingIsBusy
         self.stopRecording = stopRecording
         self.registerRouter = registerRouter
-        self.pendingRecording = pendingRecording
+        self.pendingRecordings = pendingRecordings
         self.consumePendingRecording = consumePendingRecording
         self.clearPendingRecording = clearPendingRecording
+        self.consumePendingFailure = consumePendingFailure
         self.notificationCenter = notificationCenter
 
         let window = NSWindow(
@@ -85,7 +94,10 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
 
     func open(activate: Bool = true) {
         registerAsRouter()
-        recoverPendingRecording()
+        recoverPendingRecordings()
+        if recoveries.isEmpty, let failure = consumePendingFailure() {
+            scratchpadView.statusText = failure
+        }
         if activate { NSApplication.shared.activate(ignoringOtherApps: true) }
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
@@ -93,6 +105,7 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
     }
 
     func startDictation() {
+        guard activeToken == nil, !scratchpadView.isRecording, !recordingIsBusy() else { return }
         let token = scratchpadView.editorController.makeTransformationToken()
         activeToken = token
         scratchpadView.previewText = nil
@@ -121,7 +134,7 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
 
     func completeRecording(_ text: String, for token: ScratchpadInsertionToken) -> Bool {
         guard token == activeToken else {
-            preserveForRecovery(text)
+            enqueueRecovery(token: token, text: text)
             return false
         }
         scratchpadView.previewText = nil
@@ -136,7 +149,7 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
         if accepted {
             clearPendingRecording(token)
         } else {
-            preserveForRecovery(text)
+            enqueueRecovery(token: token, text: text)
         }
         return accepted
     }
@@ -159,37 +172,52 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
     }
 
     func windowWillClose(_ notification: Notification) {
+        if activeToken != nil, scratchpadView.isRecording { stopRecording() }
         flushDocument()
         registerRouter(nil)
+        activeToken = nil
+        scratchpadView.isRecording = false
+        scratchpadView.previewText = nil
+        scratchpadView.statusText = nil
     }
 
     private func registerAsRouter() {
         registerRouter(self)
     }
 
-    private func recoverPendingRecording() {
-        guard let token = activeToken, pendingRecording(token) != nil,
-              let text = consumePendingRecording(token) else { return }
-        preserveForRecovery(text)
-        activeToken = nil
-        scratchpadView.isRecording = false
+    private func recoverPendingRecordings() {
+        for item in pendingRecordings() { enqueueRecovery(token: item.token, text: item.text) }
+        renderCurrentRecovery()
     }
 
-    private func preserveForRecovery(_ text: String) {
-        scratchpadView.recoveryText = text
-        scratchpadView.statusText = "The original insertion point changed. The transcription is preserved below."
+    private func enqueueRecovery(token: ScratchpadInsertionToken, text: String) {
+        guard !recoveries.contains(where: { $0.token == token }) else { return }
+        recoveries.append(.init(token: token, text: text))
+        renderCurrentRecovery()
+    }
+
+    private func renderCurrentRecovery() {
+        scratchpadView.recoveryText = recoveries.first?.text
+        if recoveries.isEmpty {
+            if scratchpadView.statusText == "The original insertion point changed. The transcription is preserved below." {
+                scratchpadView.statusText = nil
+            }
+        } else {
+            scratchpadView.statusText = "The original insertion point changed. The transcription is preserved below."
+        }
     }
 
     private func insertRecovery() {
-        guard let text = scratchpadView.recoveryText else { return }
+        guard let recovery = recoveries.first else { return }
         let token = scratchpadView.editorController.makeTransformationToken()
         guard scratchpadView.editorController.replaceTransformation(
             token,
-            with: NSAttributedString(string: text),
+            with: NSAttributedString(string: recovery.text),
             actionName: "Recover Dictation"
         ) else { return }
-        scratchpadView.recoveryText = nil
-        scratchpadView.statusText = nil
+        _ = consumePendingRecording(recovery.token)
+        recoveries.removeFirst()
+        renderCurrentRecovery()
     }
 
     private func flushDocument() {

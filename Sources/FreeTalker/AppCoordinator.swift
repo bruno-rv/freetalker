@@ -550,6 +550,14 @@ final class AppCoordinator: ObservableObject {
         destinationLifecycle.consumePending(for: token)
     }
 
+    func pendingScratchpadRecordings() -> [RecordingDestinationLifecycle.PendingRecording] {
+        destinationLifecycle.pendingRecordings()
+    }
+
+    func consumePendingScratchpadFailure() -> String? {
+        destinationLifecycle.consumePendingFailure()
+    }
+
     func storePendingScratchpadRecording(_ text: String, for token: ScratchpadInsertionToken) {
         destinationLifecycle.storePending(text, for: token)
     }
@@ -1363,7 +1371,12 @@ final class AppCoordinator: ObservableObject {
         if let issue = Self.capturedAudioIssue(sampleCount: samples.count, peak: peak, rms: rms) {
             lastError = issue
             hud.flash(issue)
-            _ = try? Self.routeDestinationEvent(.failure(issue), destination: .scratchpad(token), router: scratchpadRecordingRouter) {}
+            let delivered = (try? Self.routeDestinationEvent(
+                .failure(issue),
+                destination: .scratchpad(token),
+                router: scratchpadRecordingRouter
+            ) {}) ?? false
+            if !delivered { destinationLifecycle.storePendingFailure(issue) }
             return
         }
 
