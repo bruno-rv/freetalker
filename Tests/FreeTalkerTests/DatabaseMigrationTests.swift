@@ -48,7 +48,7 @@ import Testing
         ALTER TABLE attempts_v8 RENAME TO job_attempts;
         CREATE INDEX idx_job_attempts_job_id ON job_attempts(job_id);
         CREATE TABLE job_attempt_triggers (attempt_id INTEGER NOT NULL, trigger TEXT NOT NULL, PRIMARY KEY(attempt_id, trigger));
-        DELETE FROM schema_migrations WHERE version = 9;
+        DELETE FROM schema_migrations WHERE version >= 9;
         INSERT INTO transcription_jobs (id, kind, source_reference, state, created_at, updated_at) VALUES ('valid-job', 'recovery', '/audio', 'failed', 1, 2);
         INSERT INTO job_attempts (id, job_id, attempt_number, started_at, completed_at, failure_stage, failure_message, language, speech_model, template, result)
           VALUES (41, 'valid-job', 3, 10, 20, 'transcribing', 'kept failure', 'pt', 'small', 'clean', 'failed');
@@ -79,7 +79,7 @@ import Testing
         CREATE INDEX idx_job_attempts_job_id ON job_attempts(job_id);
         CREATE TABLE job_attempt_triggers (attempt_id INTEGER NOT NULL, trigger TEXT NOT NULL, PRIMARY KEY(attempt_id, trigger));
         CREATE TABLE legacy_job_attempts (collision INTEGER);
-        DELETE FROM schema_migrations WHERE version = 9;
+        DELETE FROM schema_migrations WHERE version >= 9;
         INSERT INTO job_attempts (id, job_id, attempt_number, started_at) VALUES (88, 'orphan', 1, 1);
         INSERT INTO job_attempt_triggers VALUES (88, 'kept-on-rollback');
         """)
@@ -101,6 +101,53 @@ import Testing
 
         #expect(try db.schema() == schema)
         #expect(try db.migrationVersions() == Array(1...DatabaseMigrator.latestVersion))
+    }
+
+    @Test func versionNineLibraryUpgradePreservesRowsAndAddsOutputMetadata() throws {
+        let db = try TemporaryDatabase()
+        try DatabaseMigrator.migrate(db.handle)
+        try db.execute("""
+        DELETE FROM schema_migrations WHERE version = 10;
+        CREATE TABLE dictations (
+          id INTEGER PRIMARY KEY, ts REAL NOT NULL, language TEXT NOT NULL,
+          template TEXT NOT NULL, transcript TEXT NOT NULL, refined TEXT NOT NULL,
+          engine TEXT NOT NULL, source_id INTEGER
+        );
+        INSERT INTO dictations VALUES (7, 123, 'pt', 'Clean', 'raw', 'kept', 'local', NULL);
+        """)
+
+        try DatabaseMigrator.migrate(db.handle)
+
+        #expect(try db.string("SELECT language || '|' || requested_output_language || '|' || refined FROM dictations WHERE id = 7;") == "pt|same|kept")
+        #expect(try db.migrationVersions() == Array(1...DatabaseMigrator.latestVersion))
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('dictation_translation_variants') WHERE name = 'parent_id' AND type = 'TEXT';") == 1)
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_foreign_key_list('dictation_translation_variants') WHERE \"table\" = 'dictations' AND \"from\" = 'parent_id' AND on_delete = 'CASCADE';") == 1)
+    }
+
+    @Test func versionTenFailureRollsBackLibrarySchemaAndLedger() throws {
+        let db = try TemporaryDatabase()
+        try db.execute("""
+        CREATE TABLE dictations (
+          id INTEGER PRIMARY KEY, ts REAL NOT NULL, language TEXT NOT NULL,
+          template TEXT NOT NULL, transcript TEXT NOT NULL, refined TEXT NOT NULL,
+          engine TEXT NOT NULL, source_id INTEGER
+        );
+        """)
+        try DatabaseMigrator.migrate(db.handle)
+        try db.execute("""
+        DROP TABLE dictation_translation_variants;
+        ALTER TABLE dictations DROP COLUMN requested_output_language;
+        DELETE FROM schema_migrations WHERE version = 10;
+        CREATE TABLE dictation_translation_variants (collision INTEGER);
+        INSERT INTO dictations VALUES (7, 1, 'en', 'Clean', 'raw', 'kept', 'local', NULL);
+        """)
+
+        #expect(throws: DatabaseError.self) { try DatabaseMigrator.migrate(db.handle) }
+
+        #expect(try db.migrationVersions() == Array(1...9))
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('dictations') WHERE name = 'requested_output_language';") == 0)
+        #expect(try db.integer("SELECT COUNT(*) FROM dictations WHERE id = 7 AND refined = 'kept';") == 1)
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('dictation_translation_variants') WHERE name = 'collision';") == 1)
     }
 
     @Test func mediaForeignKeysRejectOrphansAndCascadeFromJobs() throws {

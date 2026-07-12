@@ -23,9 +23,12 @@ final class Database {
             let message = String(cString: sqlite3_errmsg(handle))
             throw DatabaseError.openFailed(message)
         }
+        sqlite3_busy_timeout(handle, 5_000)
         try exec("PRAGMA journal_mode=WAL;")
         try exec("PRAGMA secure_delete=ON;")
+        try exec("PRAGMA foreign_keys=ON;")
         try createSchema()
+        try DatabaseMigrator.migrate(try requireHandle())
     }
 
     deinit {
@@ -42,10 +45,7 @@ final class Database {
             transcript TEXT NOT NULL,
             refined TEXT NOT NULL,
             engine TEXT NOT NULL,
-            -- SQLite foreign keys stay OFF permanently in this app (never
-            -- `PRAGMA foreign_keys=ON`) — a dangling source_id after the source row is deleted
-            -- is intended provenance behavior, not corruption.
-            source_id INTEGER REFERENCES dictations(id)
+            source_id INTEGER
         );
         """)
         try exec("""
@@ -74,20 +74,21 @@ final class Database {
     // MARK: - Writes
 
     @discardableResult
-    func insertDictation(timestamp: Date, language: String, template: String, transcript: String, refined: String, engine: String, sourceID: Int64? = nil) throws -> Int64 {
-        let sql = "INSERT INTO dictations (ts, language, template, transcript, refined, engine, source_id) VALUES (?, ?, ?, ?, ?, ?, ?);"
+    func insertDictation(_ request: DictationInsertRequest) throws -> Int64 {
+        let sql = "INSERT INTO dictations (ts, language, requested_output_language, template, transcript, refined, engine, source_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?);"
         let stmt = try prepare(sql)
         defer { sqlite3_finalize(stmt) }
-        sqlite3_bind_double(stmt, 1, timestamp.timeIntervalSince1970)
-        bindText(stmt, 2, language)
-        bindText(stmt, 3, template)
-        bindText(stmt, 4, transcript)
-        bindText(stmt, 5, refined)
-        bindText(stmt, 6, engine)
-        if let sourceID {
-            sqlite3_bind_int64(stmt, 7, sourceID)
+        sqlite3_bind_double(stmt, 1, request.timestamp.timeIntervalSince1970)
+        bindText(stmt, 2, request.sourceLanguage.rawValue)
+        bindText(stmt, 3, request.requestedOutputLanguage.rawValue)
+        bindText(stmt, 4, request.template)
+        bindText(stmt, 5, request.transcript)
+        bindText(stmt, 6, request.refined)
+        bindText(stmt, 7, request.engine)
+        if let sourceID = request.sourceID {
+            sqlite3_bind_int64(stmt, 8, sourceID)
         } else {
-            sqlite3_bind_null(stmt, 7)
+            sqlite3_bind_null(stmt, 8)
         }
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.sqlFailed(lastError())
@@ -167,19 +168,39 @@ final class Database {
         return sqlite3_column_int(stmt, 0)
     }
 
+    func foreignKeysEnabled() throws -> Bool {
+        let stmt = try prepare("PRAGMA foreign_keys;")
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_step(stmt) == SQLITE_ROW else { throw DatabaseError.sqlFailed(lastError()) }
+        return sqlite3_column_int(stmt, 0) == 1
+    }
+
+    func migrationVersions() throws -> [Int] {
+        let stmt = try prepare("SELECT version FROM schema_migrations ORDER BY version;")
+        defer { sqlite3_finalize(stmt) }
+        var versions: [Int] = []
+        var result = sqlite3_step(stmt)
+        while result == SQLITE_ROW {
+            versions.append(Int(sqlite3_column_int(stmt, 0)))
+            result = sqlite3_step(stmt)
+        }
+        guard result == SQLITE_DONE else { throw DatabaseError.sqlFailed(lastError()) }
+        return versions
+    }
+
     // MARK: - Reads
 
     /// All dictations, reverse-chronological. `id DESC` breaks ties when two rows share a `ts`
     /// (e.g. inserted within the same clock tick) — id is the monotonic tiebreaker.
     func allDictations() throws -> [Dictation] {
-        let sql = "SELECT id, ts, language, template, transcript, refined, engine, source_id FROM dictations ORDER BY ts DESC, id DESC;"
+        let sql = "SELECT id, ts, language, requested_output_language, template, transcript, refined, engine, source_id FROM dictations ORDER BY ts DESC, id DESC;"
         let stmt = try prepare(sql)
         defer { sqlite3_finalize(stmt) }
         return try readAll(stmt)
     }
 
     func latestDictation() throws -> Dictation? {
-        let sql = "SELECT id, ts, language, template, transcript, refined, engine, source_id FROM dictations ORDER BY id DESC LIMIT 1;"
+        let sql = "SELECT id, ts, language, requested_output_language, template, transcript, refined, engine, source_id FROM dictations ORDER BY id DESC LIMIT 1;"
         let stmt = try prepare(sql)
         defer { sqlite3_finalize(stmt) }
         return try readAll(stmt).first
@@ -192,7 +213,7 @@ final class Database {
         guard !trimmed.isEmpty else { return try allDictations() }
 
         let ftsSQL = """
-        SELECT d.id, d.ts, d.language, d.template, d.transcript, d.refined, d.engine, d.source_id
+        SELECT d.id, d.ts, d.language, d.requested_output_language, d.template, d.transcript, d.refined, d.engine, d.source_id
         FROM dictations d
         JOIN dictations_fts f ON f.rowid = d.id
         WHERE dictations_fts MATCH ?
@@ -209,7 +230,7 @@ final class Database {
 
         // Fallback: plain LIKE scan.
         let likeSQL = """
-        SELECT id, ts, language, template, transcript, refined, engine, source_id FROM dictations
+        SELECT id, ts, language, requested_output_language, template, transcript, refined, engine, source_id FROM dictations
         WHERE transcript LIKE ? OR refined LIKE ?
         ORDER BY ts DESC, id DESC;
         """
@@ -239,16 +260,18 @@ final class Database {
         while Self.classifyStep(stepResult) == .row {
             let id = sqlite3_column_int64(stmt, 0)
             let ts = sqlite3_column_double(stmt, 1)
-            let language = columnText(stmt, 2)
-            let template = columnText(stmt, 3)
-            let transcript = columnText(stmt, 4)
-            let refined = columnText(stmt, 5)
-            let engine = columnText(stmt, 6)
-            let sourceID: Int64? = sqlite3_column_type(stmt, 7) == SQLITE_NULL ? nil : sqlite3_column_int64(stmt, 7)
+            let sourceLanguage = SourceLanguage(columnText(stmt, 2))
+            let requestedOutputLanguage = OutputLanguage.persisted(rawValue: columnText(stmt, 3))
+            let template = columnText(stmt, 4)
+            let transcript = columnText(stmt, 5)
+            let refined = columnText(stmt, 6)
+            let engine = columnText(stmt, 7)
+            let sourceID: Int64? = sqlite3_column_type(stmt, 8) == SQLITE_NULL ? nil : sqlite3_column_int64(stmt, 8)
             results.append(Dictation(
                 id: id,
                 timestamp: Date(timeIntervalSince1970: ts),
-                language: language,
+                sourceLanguage: sourceLanguage,
+                requestedOutputLanguage: requestedOutputLanguage,
                 templateName: template,
                 transcript: transcript,
                 refined: refined,
@@ -263,6 +286,69 @@ final class Database {
         return results
     }
 
+    func dictation(id: Int64) throws -> Dictation? {
+        let stmt = try prepare("SELECT id, ts, language, requested_output_language, template, transcript, refined, engine, source_id FROM dictations WHERE id = ?;")
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, id)
+        return try readAll(stmt).first
+    }
+
+    func translationVariants(parentID: Int64) throws -> [DictationTranslationVariant] {
+        let stmt = try prepare("SELECT parent_id, target_language, text, created_at, updated_at FROM dictation_translation_variants WHERE parent_id = ? ORDER BY target_language;")
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, parentID)
+        var variants: [DictationTranslationVariant] = []
+        var result = sqlite3_step(stmt)
+        while result == SQLITE_ROW {
+            guard let target = TranslationTarget(rawValue: columnText(stmt, 1)) else {
+                throw DatabaseError.sqlFailed("Invalid translation target in Library database")
+            }
+            variants.append(.init(
+                parentID: sqlite3_column_int64(stmt, 0),
+                target: target,
+                text: columnText(stmt, 2),
+                createdAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 3)),
+                updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 4))
+            ))
+            result = sqlite3_step(stmt)
+        }
+        guard result == SQLITE_DONE else { throw DatabaseError.sqlFailed(lastError()) }
+        return variants
+    }
+
+    func upsertTranslation(parentID: Int64, target: TranslationTarget, text: String) throws {
+        try transaction {
+            guard try dictationExists(id: parentID) else {
+                throw DatabaseError.sqlFailed("Translation parent does not exist")
+            }
+            let stmt = try prepare("""
+            INSERT INTO dictation_translation_variants
+                (parent_id, target_language, text, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(parent_id, target_language) DO UPDATE SET
+                text = excluded.text, updated_at = excluded.updated_at;
+            """)
+            defer { sqlite3_finalize(stmt) }
+            let now = Date().timeIntervalSince1970
+            sqlite3_bind_int64(stmt, 1, parentID)
+            bindText(stmt, 2, target.rawValue)
+            bindText(stmt, 3, text)
+            sqlite3_bind_double(stmt, 4, now)
+            sqlite3_bind_double(stmt, 5, now)
+            guard sqlite3_step(stmt) == SQLITE_DONE else { throw DatabaseError.sqlFailed(lastError()) }
+        }
+    }
+
+    func deleteTranslation(parentID: Int64, target: TranslationTarget) throws {
+        try transaction {
+            let stmt = try prepare("DELETE FROM dictation_translation_variants WHERE parent_id = ? AND target_language = ?;")
+            defer { sqlite3_finalize(stmt) }
+            sqlite3_bind_int64(stmt, 1, parentID)
+            bindText(stmt, 2, target.rawValue)
+            guard sqlite3_step(stmt) == SQLITE_DONE else { throw DatabaseError.sqlFailed(lastError()) }
+        }
+    }
+
     // MARK: - Helpers
 
     private func prepare(_ sql: String) throws -> OpaquePointer? {
@@ -271,6 +357,22 @@ final class Database {
             throw DatabaseError.sqlFailed(lastError())
         }
         return stmt
+    }
+
+    private func transaction(_ body: () throws -> Void) throws {
+        try exec("BEGIN IMMEDIATE;")
+        do {
+            try body()
+            try exec("COMMIT;")
+        } catch {
+            try? exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    private func requireHandle() throws -> OpaquePointer {
+        guard let handle else { throw DatabaseError.openFailed("Database handle is unavailable") }
+        return handle
     }
 
     private func exec(_ sql: String) throws {

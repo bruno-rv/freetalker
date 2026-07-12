@@ -67,19 +67,35 @@ final class LibraryStore: ObservableObject {
     /// the failure — the transcript is already inserted/pasteboarded by this point, so a failure
     /// here only loses the Library row, not the user's words. See Round 1 Codex finding 10.
     @discardableResult
-    func record(language: String, template: String, transcript: String, refined: String, engine: String, sourceID: Int64? = nil) throws -> Int64 {
+    func record(language: String, requestedOutputLanguage: OutputLanguage = .sameAsSpoken, template: String, transcript: String, refined: String, engine: String, sourceID: Int64? = nil) throws -> Int64 {
         guard let db else { throw LibraryStoreError.databaseUnavailable }
-        let id = try db.insertDictation(
+        let id = try db.insertDictation(.init(
             timestamp: Date(),
-            language: language,
+            sourceLanguage: SourceLanguage(language),
+            requestedOutputLanguage: requestedOutputLanguage,
             template: template,
             transcript: transcript,
             refined: refined,
             engine: engine,
             sourceID: sourceID
-        )
+        ))
         refresh()
         return id
+    }
+
+    func translationVariants(parentID: Int64) throws -> [DictationTranslationVariant] {
+        guard let db else { throw LibraryStoreError.databaseUnavailable }
+        return try db.translationVariants(parentID: parentID)
+    }
+
+    func upsertTranslation(parentID: Int64, target: TranslationTarget, text: String) throws {
+        guard let db else { throw LibraryStoreError.databaseUnavailable }
+        try db.upsertTranslation(parentID: parentID, target: target, text: text)
+    }
+
+    func deleteTranslation(parentID: Int64, target: TranslationTarget) throws {
+        guard let db else { throw LibraryStoreError.databaseUnavailable }
+        try db.deleteTranslation(parentID: parentID, target: target)
     }
 
     func delete(id: Int64) throws {
