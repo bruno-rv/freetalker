@@ -1,6 +1,6 @@
 import Foundation
 
-struct Template: Identifiable, Equatable, Codable {
+struct Template: Identifiable, Equatable, Codable, Sendable {
     var id: String
     var name: String
     var prompt: String

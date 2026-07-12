@@ -10,62 +10,55 @@ struct AppleFMProcessor: PostProcessor {
         /// Apple Intelligence disabled, or model not yet downloaded). The pipeline treats this
         /// as a recoverable condition and falls back to the raw transcript — never an app crash.
         case unavailable
+        case translationUnsupported
     }
 
-    func process(transcript: String, template: Template, appName: String?) async throws -> String {
+    func process(_ request: PostProcessingRequest) async throws -> String {
+        guard request.languagePolicy == .preserveSource else {
+            throw FMError.translationUnsupported
+        }
         guard case .available = SystemLanguageModel.default.availability else {
             throw FMError.unavailable
         }
 
         let vocabulary = await AppSettings.shared.vocabulary
-        let instructions = buildProcessorInstructions(
-            template: template,
-            vocabulary: vocabulary,
-            trailing: "Always respond in the same language as the transcript below.",
-            appName: appName
-        )
+        let instructions = buildProcessorInstructions(request: request, vocabulary: vocabulary)
         let session = LanguageModelSession(instructions: instructions)
-        let response = try await session.respond(to: transcript)
+        let response = try await session.respond(to: request.transcript)
         return response.content
     }
 
     /// Local-only processing entry point. Context deliberately does not appear on the shared
     /// `PostProcessor` contract, which keeps cloud/BYOK implementations unable to receive it.
     func process(
-        transcript: String,
-        template: Template,
-        appName: String?,
+        request: PostProcessingRequest,
         context: LocalProcessingContext
     ) async throws -> String {
+        guard request.languagePolicy == .preserveSource else {
+            throw FMError.translationUnsupported
+        }
         guard case .available = SystemLanguageModel.default.availability else {
             throw FMError.unavailable
         }
 
         let vocabulary = await AppSettings.shared.vocabulary
         let instructions = buildLocalProcessorInstructions(
-            template: template,
+            request: request,
             vocabulary: vocabulary,
-            appName: appName,
             context: context
         )
         let session = LanguageModelSession(instructions: instructions)
-        let response = try await session.respond(to: transcript)
+        let response = try await session.respond(to: request.transcript)
         return response.content
     }
 }
 
 func buildLocalProcessorInstructions(
-    template: Template,
+    request: PostProcessingRequest,
     vocabulary: [String],
-    appName: String?,
     context: LocalProcessingContext
 ) -> String {
-    var instructions = buildProcessorInstructions(
-        template: template,
-        vocabulary: vocabulary,
-        trailing: "Always respond in the same language as the transcript below.",
-        appName: appName
-    )
+    var instructions = buildProcessorInstructions(request: request, vocabulary: vocabulary)
     let bounded = String(context.text.prefix(VisionOCRService.maximumCharacters))
     guard !bounded.isEmpty else { return instructions }
 

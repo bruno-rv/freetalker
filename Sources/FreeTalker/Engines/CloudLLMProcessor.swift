@@ -29,13 +29,10 @@ struct CloudLLMProcessor: PostProcessor {
         }
     }
 
-    func process(transcript: String, template: Template, appName: String?) async throws -> String {
+    func process(_ request: PostProcessingRequest) async throws -> String {
         // `snapshot` was captured on MainActor at processor-selection time (see doc comment
         // above) — no AppSettings/Keychain read here, just the trimmed values it already holds.
         let providerLabel = snapshot.provider.rawValue
-        let baseURL = snapshot.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        let model = snapshot.model.trimmingCharacters(in: .whitespacesAndNewlines)
-
         let apiKey: String?
         switch snapshot.eligibility {
         case .eligible(let eligibleKey):
@@ -46,18 +43,20 @@ struct CloudLLMProcessor: PostProcessor {
             throw CloudLLMError.missingAPIKey(provider: providerLabel)
         }
 
-        let instructions = buildProcessorInstructions(
-            template: template,
-            vocabulary: snapshot.vocabulary,
-            trailing: "Always respond in the same language as the transcript. Output only the result, no commentary.",
-            appName: appName
-        )
+        return try await processEligible(request, apiKey: apiKey)
+    }
+
+    func processEligible(_ request: PostProcessingRequest, apiKey: String?) async throws -> String {
+        let providerLabel = snapshot.provider.rawValue
+        let baseURL = snapshot.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let model = snapshot.model.trimmingCharacters(in: .whitespacesAndNewlines)
+        let instructions = buildProcessorInstructions(request: request, vocabulary: snapshot.vocabulary)
 
         switch snapshot.provider {
         case .anthropic:
-            return try await callAnthropic(apiKey: apiKey!, baseURL: baseURL, model: model, instructions: instructions, transcript: transcript, providerLabel: providerLabel)
+            return try await callAnthropic(apiKey: apiKey!, baseURL: baseURL, model: model, instructions: instructions, transcript: request.transcript, providerLabel: providerLabel)
         case .ollama, .openAICompatible:
-            return try await callOpenAICompatible(apiKey: apiKey, baseURL: baseURL, model: model, instructions: instructions, transcript: transcript, providerLabel: providerLabel)
+            return try await callOpenAICompatible(apiKey: apiKey, baseURL: baseURL, model: model, instructions: instructions, transcript: request.transcript, providerLabel: providerLabel)
         }
     }
 

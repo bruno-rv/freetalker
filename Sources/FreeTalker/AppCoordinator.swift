@@ -1530,15 +1530,19 @@ final class AppCoordinator: ObservableObject {
             let activeProcessor: any PostProcessor = processor ?? resolveActiveProcessor()
             do {
                 let processed: String
+                let request = PostProcessingRequest(
+                    transcript: transcription.text,
+                    template: template,
+                    appName: appName,
+                    languagePolicy: .preserveSource
+                )
                 if let localProcessor = activeProcessor as? AppleFMProcessor, let localContext {
                     processed = try await localProcessor.process(
-                        transcript: transcription.text,
-                        template: template,
-                        appName: appName,
+                        request: request,
                         context: localContext
                     )
                 } else {
-                    processed = try await activeProcessor.process(transcript: transcription.text, template: template, appName: appName)
+                    processed = try await activeProcessor.process(request)
                 }
                 let trimmed = processed.trimmingCharacters(in: .whitespacesAndNewlines)
                 // Never lose the user's words — fall back to the raw transcript if post-processing
@@ -1769,7 +1773,14 @@ final class AppCoordinator: ObservableObject {
         var fallbackReason: PostProcessingFallbackReason?
         do {
             // No known frontmost app for a historical re-process — appName: nil.
-            let processed = try await processor.process(transcript: dictation.transcript, template: template, appName: nil)
+            let processed = try await processor.process(
+                .init(
+                    transcript: dictation.transcript,
+                    template: template,
+                    appName: nil,
+                    languagePolicy: .preserveSource
+                )
+            )
             let trimmed = processed.trimmingCharacters(in: .whitespacesAndNewlines)
             // Same empty-refined fallback as processDictation. See Round 2 Codex finding 5.
             if trimmed.isEmpty {
