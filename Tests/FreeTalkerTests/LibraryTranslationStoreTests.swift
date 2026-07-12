@@ -155,6 +155,21 @@ import Testing
         guard case .replacementConfirmationRequired(let current) = stale else { Issue.record("Expected reconfirmation"); return }
         #expect(current == second)
     }
+
+    @Test func confirmedReplacementReportsConcurrentDeletionAsAbsent() throws {
+        let fixture = try Fixture()
+        let id = try fixture.insert()
+        guard case .committed(let first) = try fixture.db.conditionalUpsertTranslation(
+            parentID: id, target: .french, text: "one", expected: .absent
+        ) else { Issue.record("Expected commit"); return }
+        try fixture.db.deleteTranslation(parentID: id, target: .french)
+
+        let result = try fixture.db.conditionalUpsertTranslation(
+            parentID: id, target: .french, text: "two", expected: .version(first.updatedAt)
+        )
+        #expect(result == .replacementStateChangedToAbsent)
+        #expect(try fixture.db.translationVariants(parentID: id).isEmpty)
+    }
 }
 
 private final class Fixture {

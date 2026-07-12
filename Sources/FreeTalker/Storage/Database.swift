@@ -377,11 +377,7 @@ final class Database {
             }
             guard matches else {
                 if let current { outcome = .replacementConfirmationRequired(current) }
-                else {
-                    // A confirmed variant was deleted. Treat the now-absent state as requiring
-                    // a fresh user action rather than silently changing confirmation semantics.
-                    throw DatabaseError.sqlFailed("Translation variant changed before confirmation")
-                }
+                else { outcome = .replacementStateChangedToAbsent }
                 return
             }
 

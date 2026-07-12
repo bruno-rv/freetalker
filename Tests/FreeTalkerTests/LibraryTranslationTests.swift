@@ -134,17 +134,14 @@ import Testing
         #expect(controller.variants.map(\.text) == ["traduit"])
     }
 
-    @Test func originalAndVariantSelectionCopyAndInsertAreExplicitAndNonMutating() throws {
+    @Test func originalAndVariantSelectionCopyIsExplicitAndNonMutating() throws {
         let translated = variant(target: .french, text: "traduit")
         let store = VariantStoreSpy(variants: [translated])
         var copied: [String] = []
-        var inserted: [String] = []
         let controller = makeController(
             service: TranslationSpy(results: []),
             store: store,
-            copy: { copied.append($0) },
-            destination: { .init(bundleIdentifier: "external", target: .init(bundleID: "external", pid: 2, focusedElement: nil, window: nil)) },
-            targetedInsert: { text, _ in inserted.append(text); return true }
+            copy: { copied.append($0) }
         )
         let original = entry(refined: "original")
         controller.selectEntry(id: original.id)
@@ -153,10 +150,8 @@ import Testing
         controller.select(.variant(.french))
         #expect(controller.displayedText(for: original) == "traduit")
         try controller.copyDisplayedText(for: original)
-        controller.insertDisplayedText(for: original)
 
         #expect(copied == ["traduit"])
-        #expect(inserted == ["traduit"])
         #expect(store.upserts.isEmpty)
         #expect(original.refined == "original")
         #expect(original.transcript == "raw")
@@ -202,39 +197,13 @@ import Testing
         #expect(store.upserts.isEmpty)
     }
 
-    @Test func insertionUsesOnlyCapturedTargetAndReportsManualRecovery() {
-        let target = InsertionTarget(bundleID: "external", pid: 42, focusedElement: nil, window: nil)
-        let destination = LibraryInsertionDestination(bundleIdentifier: "external", target: target)
-        var receivedPID: pid_t?
-        let controller = makeController(
-            service: TranslationSpy(results: []), store: VariantStoreSpy(),
-            destination: { destination },
-            targetedInsert: { _, target in receivedPID = target.pid; return false }
-        )
-        let original = entry()
-        controller.selectEntry(id: original.id)
-
-        #expect(!controller.insertDisplayedText(for: original))
-        #expect(receivedPID == 42)
-        #expect(controller.insertionFailureMessage?.contains("Copy") == true)
-    }
-
-    @Test func insertionWithoutSafeDestinationIsDisabled() {
-        let controller = makeController(
-            service: TranslationSpy(results: []), store: VariantStoreSpy(), destination: { nil }
-        )
-        controller.selectEntry(id: 7)
-        #expect(!controller.canInsert)
-        #expect(!controller.insertDisplayedText(for: entry()))
-    }
-
     @Test func availabilityTracksConfigurationAndCredentialUpdates() async {
         let configuration = PassthroughSubject<Void, Never>()
         let credentials = PassthroughSubject<Void, Never>()
         let current = SnapshotBox(Self.snapshot)
         let controller = LibraryTranslationController(
             translator: TranslationSpy(results: []), store: VariantStoreSpy(),
-            snapshot: { current.value }, copy: { _ in }, destination: { nil }, targetedInsert: { _, _ in false },
+            snapshot: { current.value }, copy: { _ in },
             cloudConfigurationUpdates: configuration.eraseToAnyPublisher(),
             cloudCredentialUpdates: credentials.eraseToAnyPublisher()
         )
@@ -286,21 +255,48 @@ import Testing
         #expect(store.readCount == 1)
     }
 
+    @Test func libraryFocusLifecycleOffersCopyOnlyAndNeverTargetedInsert() {
+        let presentation = LibraryTranslationPresentation(availability: .make(
+            eligibility: .eligible(apiKey: nil), provider: .openAICompatible
+        ))
+        #expect(presentation.textActions == [.copy])
+    }
+
+    @Test func deletionAfterConfirmationClearsStaleVariantAndRetryUsesAbsentExpectation() async {
+        let existing = variant(target: .french, text: "old")
+        let store = VariantStoreSpy(
+            variants: [existing],
+            forcedResults: [.replacementStateChangedToAbsent]
+        )
+        let service = TranslationSpy(results: [.success("first"), .success("retry")])
+        let controller = makeController(service: service, store: store)
+        let original = entry()
+        controller.selectEntry(id: original.id)
+        controller.translate(entry: original, to: .french)
+        controller.confirmReplacement()
+        await controller.waitForCurrentRequest()
+
+        #expect(controller.variants.isEmpty)
+        #expect(controller.pendingReplacementTarget == nil)
+        #expect(controller.canRetry)
+
+        controller.retry(entry: original)
+        await controller.waitForCurrentRequest()
+        #expect(store.upserts.last?.text == "retry")
+        #expect(controller.variants.map(\.text) == ["retry"])
+    }
+
     private func makeController(
         service: TranslationSpy,
         store: VariantStoreSpy,
         snapshot: @escaping @MainActor () -> CloudLLMSettingsSnapshot = { Self.snapshot },
-        copy: @escaping @MainActor (String) throws -> Void = { _ in },
-        destination: @escaping @MainActor () -> LibraryInsertionDestination? = { nil },
-        targetedInsert: @escaping @MainActor (String, InsertionTarget) -> Bool = { _, _ in false }
+        copy: @escaping @MainActor (String) throws -> Void = { _ in }
     ) -> LibraryTranslationController {
         LibraryTranslationController(
             translator: service,
             store: store,
             snapshot: snapshot,
-            copy: copy,
-            destination: destination,
-            targetedInsert: targetedInsert
+            copy: copy
         )
     }
 
@@ -366,7 +362,13 @@ private final class VariantStoreSpy: LibraryTranslationStoring {
 
     func conditionalUpsertTranslation(parentID: Int64, target: TranslationTarget, text: String, expected: TranslationVariantExpectation) throws -> TranslationVariantWriteResult {
         guard parentExists else { throw DatabaseError.translationParentMissing(parentID) }
-        if !forcedResults.isEmpty { return forcedResults.removeFirst() }
+        if !forcedResults.isEmpty {
+            let result = forcedResults.removeFirst()
+            if result == .replacementStateChangedToAbsent {
+                variants.removeAll { $0.parentID == parentID && $0.target == target }
+            }
+            return result
+        }
         if let current = variants.first(where: { $0.parentID == parentID && $0.target == target }) {
             guard case .version(current.updatedAt) = expected else { return .replacementConfirmationRequired(current) }
         } else if case .version = expected {

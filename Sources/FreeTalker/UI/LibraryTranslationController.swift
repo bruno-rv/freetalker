@@ -2,33 +2,8 @@ import AppKit
 import Combine
 import Foundation
 
-struct LibraryInsertionDestination {
-    let bundleIdentifier: String
-    let target: InsertionTarget
-}
-
-@MainActor
-final class LibraryInsertionDestinationStore: ObservableObject {
-    static let shared = LibraryInsertionDestinationStore()
-    @Published private(set) var destination: LibraryInsertionDestination?
-
-    func capture(
-        frontmostApplication: NSRunningApplication? = NSWorkspace.shared.frontmostApplication,
-        snapshotTarget: (NSRunningApplication?) -> InsertionTarget? = Insertion.snapshotTarget
-    ) {
-        let ownBundleID = Bundle.main.bundleIdentifier
-        guard let app = frontmostApplication,
-              let bundleID = app.bundleIdentifier,
-              bundleID != ownBundleID,
-              let target = snapshotTarget(app) else {
-            destination = nil
-            return
-        }
-        destination = .init(bundleIdentifier: bundleID, target: target)
-    }
-}
-
 struct LibraryTranslationPresentation: Equatable {
+    enum TextAction: Equatable { case copy }
     static let privacyDisclosure = "Translation sends this text to the API endpoint configured under Cloud post-processing."
     let availability: CloudFeatureAvailability
     var isEnabled: Bool { availability.enabled }
@@ -36,6 +11,7 @@ struct LibraryTranslationPresentation: Equatable {
     var accessibilityHelp: String? { availability.accessibilityHelp }
     var privacyDisclosure: String { Self.privacyDisclosure }
     var targets: [TranslationTarget] { TranslationTarget.allCases }
+    var textActions: [TextAction] { [.copy] }
 }
 
 @MainActor
@@ -43,19 +19,15 @@ final class LibraryTranslationController: ObservableObject {
     enum Selection: Hashable { case original, variant(TranslationTarget) }
     typealias Snapshot = @MainActor () -> CloudLLMSettingsSnapshot
     typealias Copy = @MainActor (String) throws -> Void
-    typealias Destination = @MainActor () -> LibraryInsertionDestination?
-    typealias TargetedInsert = @MainActor (String, InsertionTarget) -> Bool
 
     @Published private(set) var variants: [DictationTranslationVariant] = []
     @Published private(set) var selection: Selection = .original
     @Published private(set) var isTranslating = false
     @Published private(set) var pendingReplacementTarget: TranslationTarget?
     @Published private(set) var errorMessage: String?
-    @Published private(set) var insertionFailureMessage: String?
     @Published private(set) var availability: CloudFeatureAvailability
 
     var canRetry: Bool { lastRequestedTarget != nil && errorMessage != nil }
-    var canInsert: Bool { destination() != nil }
 
     private struct PendingReplacement {
         let entry: Dictation
@@ -68,8 +40,6 @@ final class LibraryTranslationController: ObservableObject {
     private let store: any LibraryTranslationStoring
     private let snapshot: Snapshot
     private let copy: Copy
-    private let destination: Destination
-    private let targetedInsert: TargetedInsert
     private var subscriptions: Set<AnyCancellable> = []
     private var generation = 0
     private var requestTask: Task<Void, Never>?
@@ -82,8 +52,6 @@ final class LibraryTranslationController: ObservableObject {
         store: any LibraryTranslationStoring = LibraryStore.shared,
         snapshot: @escaping Snapshot = { AppSettings.shared.cloudLLMSnapshot },
         copy: @escaping Copy = LibraryTranslationController.copyToPasteboard,
-        destination: @escaping Destination = { LibraryInsertionDestinationStore.shared.destination },
-        targetedInsert: @escaping TargetedInsert = { Insertion.insert($0, target: $1) },
         cloudConfigurationUpdates: AnyPublisher<Void, Never>? = nil,
         cloudCredentialUpdates: AnyPublisher<Void, Never>? = nil
     ) {
@@ -91,8 +59,6 @@ final class LibraryTranslationController: ObservableObject {
         self.store = store
         self.snapshot = snapshot
         self.copy = copy
-        self.destination = destination
-        self.targetedInsert = targetedInsert
         let initial = snapshot()
         availability = .make(eligibility: initial.eligibility, provider: initial.provider)
 
@@ -119,7 +85,6 @@ final class LibraryTranslationController: ObservableObject {
         pendingReplacement = nil
         pendingReplacementTarget = nil
         errorMessage = nil
-        insertionFailureMessage = nil
         lastRequestedTarget = nil
         loadVariants(parentID: id)
     }
@@ -155,7 +120,6 @@ final class LibraryTranslationController: ObservableObject {
     func dismissReplacement() { pendingReplacement = nil; pendingReplacementTarget = nil }
     func retry(entry: Dictation) { if let target = lastRequestedTarget { translate(entry: entry, to: target) } }
     func dismissError() { errorMessage = nil }
-    func dismissInsertionFailure() { insertionFailureMessage = nil }
 
     func cancel() {
         generation += 1
@@ -175,20 +139,6 @@ final class LibraryTranslationController: ObservableObject {
     }
 
     func copyDisplayedText(for entry: Dictation) throws { try copy(displayedText(for: entry)) }
-
-    @discardableResult
-    func insertDisplayedText(for entry: Dictation) -> Bool {
-        guard selectedEntryID == entry.id else { return false }
-        let text = displayedText(for: entry)
-        guard let destination = destination() else {
-            try? copy(text)
-            insertionFailureMessage = "No safe insertion target was captured. The text was copied; return to the destination and paste it manually."
-            return false
-        }
-        let inserted = targetedInsert(text, destination.target)
-        insertionFailureMessage = inserted ? nil : "The original insertion target changed. Choose Copy, return to the destination, and paste it manually."
-        return inserted
-    }
 
     func waitForCurrentRequest() async { await requestTask?.value }
 
@@ -230,6 +180,11 @@ final class LibraryTranslationController: ObservableObject {
                 variants.append(current)
                 pendingReplacement = .init(entry: entry, target: target, version: current.updatedAt, translatedText: text)
                 pendingReplacementTarget = target
+            case .replacementStateChangedToAbsent:
+                variants.removeAll { $0.parentID == entry.id && $0.target == target }
+                pendingReplacement = nil
+                pendingReplacementTarget = nil
+                errorMessage = "The saved translation was deleted while replacement was pending. Retry to save a new translation."
             }
             isTranslating = false
         } catch {

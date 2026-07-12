@@ -16,4 +16,5 @@ enum TranslationVariantExpectation: Equatable, Sendable {
 enum TranslationVariantWriteResult: Equatable, Sendable {
     case committed(DictationTranslationVariant)
     case replacementConfirmationRequired(DictationTranslationVariant)
+    case replacementStateChangedToAbsent
 }
