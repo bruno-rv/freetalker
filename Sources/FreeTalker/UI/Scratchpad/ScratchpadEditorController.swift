@@ -20,10 +20,17 @@ enum ScratchpadListKind: Equatable {
     case numbered
 }
 
+struct ScratchpadSourceSnapshot: Equatable {
+    let range: NSRange
+    let originalText: String
+    let revision: Int
+}
+
 @MainActor
 final class ScratchpadEditorController {
     private let document: ScratchpadDocument
     private unowned let textView: NSTextView
+    private var capturedTransformation: (snapshot: ScratchpadSourceSnapshot, token: ScratchpadInsertionToken)?
 
     init(document: ScratchpadDocument, textView: NSTextView) {
         self.document = document
@@ -115,6 +122,59 @@ final class ScratchpadEditorController {
             undoActionName: actionName,
             undoManager: textView.undoManager
         )
+    }
+
+    func captureTransformationSource() -> ScratchpadSourceSnapshot? {
+        let string = document.textStorage.string as NSString
+        guard string.length > 0 else { return nil }
+        let selected = textView.selectedRange()
+        guard selected.location != NSNotFound,
+              selected.location <= string.length,
+              selected.length <= string.length - selected.location
+        else { return nil }
+        let range = selected.length > 0 ? selected : NSRange(location: 0, length: string.length)
+        let snapshot = ScratchpadSourceSnapshot(
+            range: range,
+            originalText: string.substring(with: range),
+            revision: Int(truncatingIfNeeded: document.revision)
+        )
+        capturedTransformation = (snapshot, document.makeInsertionToken(selectedRange: range))
+        return snapshot
+    }
+
+    func applyTransformation(_ result: String, to snapshot: ScratchpadSourceSnapshot) -> Bool {
+        let string = document.textStorage.string as NSString
+        guard snapshot.revision == Int(truncatingIfNeeded: document.revision),
+              snapshot.range.location <= string.length,
+              snapshot.range.length <= string.length - snapshot.range.location,
+              string.substring(with: snapshot.range) == snapshot.originalText
+        else { return false }
+
+        guard let capturedTransformation, capturedTransformation.snapshot == snapshot else { return false }
+        self.capturedTransformation = nil
+
+        var attributes: [NSAttributedString.Key: Any] = [:]
+        if snapshot.range.length > 0 {
+            attributes = document.textStorage.attributes(at: snapshot.range.location, effectiveRange: nil)
+        } else if snapshot.range.location > 0 {
+            attributes = document.textStorage.attributes(at: snapshot.range.location - 1, effectiveRange: nil)
+        }
+        let paragraphRange = string.paragraphRange(for: snapshot.range)
+        document.textStorage.enumerateAttribute(.paragraphStyle, in: paragraphRange) { value, _, stop in
+            if let value {
+                attributes[.paragraphStyle] = value
+                stop.pointee = true
+            }
+        }
+        let replacement = NSAttributedString(string: result, attributes: attributes)
+        guard document.replaceIfValid(
+            token: capturedTransformation.token,
+            with: replacement,
+            undoActionName: "AI Transformation",
+            undoManager: textView.undoManager
+        ) else { return false }
+        textView.setSelectedRange(NSRange(location: snapshot.range.location, length: (result as NSString).length))
+        return true
     }
 
     private func toggleFontTrait(_ trait: NSFontTraitMask, actionName: String) {

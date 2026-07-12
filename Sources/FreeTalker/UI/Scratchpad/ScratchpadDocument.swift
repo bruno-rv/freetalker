@@ -15,7 +15,7 @@ final class ScratchpadDocument: NSObject, ObservableObject, @preconcurrency NSTe
 
     private let persistence: ScratchpadPersistence
     private var insertionTargets: [UUID: InsertionTarget] = [:]
-    private var revision: UInt64 = 0
+    private(set) var revision: UInt64 = 0
     private var needsSave = false
     private var saveTask: Task<Void, Never>?
     private let didScheduleSave: () -> Void
