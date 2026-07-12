@@ -151,6 +151,77 @@ struct ScratchpadEditorTests {
         #expect(harness.document.textStorage.attribute(.link, at: 0, effectiveRange: nil) != nil)
     }
 
+    @Test func clearFormattingAtCaretClearsHeadingAndTypingAttributesForCurrentParagraph() {
+        let harness = EditorHarness("First\nHeading\nLast")
+        let headingRange = NSRange(location: 6, length: 8)
+        harness.document.textStorage.addAttribute(.font, value: NSFont.boldSystemFont(ofSize: 24), range: headingRange)
+        harness.textView.typingAttributes = [.font: NSFont.boldSystemFont(ofSize: 24), .foregroundColor: NSColor.red]
+        harness.select(NSRange(location: 9, length: 0))
+
+        harness.controller.clearFormatting()
+
+        let cleared = harness.document.textStorage.attribute(.font, at: 6, effectiveRange: nil) as? NSFont
+        let first = harness.document.textStorage.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        #expect(cleared?.pointSize != 24)
+        #expect(!fontTraits(cleared).contains(.boldFontMask))
+        #expect(first?.pointSize != 24)
+        #expect(harness.textView.typingAttributes[.font] == nil)
+        #expect(harness.textView.typingAttributes[.foregroundColor] == nil)
+    }
+
+    @Test func clearFormattingAtCaretRemovesListStructureButPreservesUnrelatedParagraphProperties() {
+        let harness = EditorHarness("One\nTwo")
+        let style = NSMutableParagraphStyle()
+        style.alignment = .center
+        style.paragraphSpacing = 11
+        style.textLists = [NSTextList(markerFormat: .disc, options: 0)]
+        style.firstLineHeadIndent = 18
+        style.headIndent = 36
+        style.tabStops = [NSTextTab(textAlignment: .left, location: 18), NSTextTab(textAlignment: .right, location: 72)]
+        harness.document.textStorage.addAttribute(.paragraphStyle, value: style, range: NSRange(location: 0, length: 4))
+        harness.select(NSRange(location: 2, length: 0))
+
+        harness.controller.clearFormatting()
+
+        let cleared = harness.document.textStorage.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
+        #expect(cleared?.textLists.isEmpty == true)
+        #expect(cleared?.firstLineHeadIndent == 0)
+        #expect(cleared?.headIndent == 0)
+        #expect(cleared?.tabStops.map(\.location) == [72])
+        #expect(cleared?.alignment == .center)
+        #expect(cleared?.paragraphSpacing == 11)
+    }
+
+    @Test func clearFormattingInEmptyDocumentOnlyClearsTypingAttributes() {
+        let harness = EditorHarness("")
+        harness.textView.typingAttributes = [.font: NSFont.boldSystemFont(ofSize: 24), .link: URL(string: "https://example.com")!]
+
+        harness.controller.clearFormatting()
+
+        #expect(harness.document.textStorage.length == 0)
+        #expect(harness.textView.typingAttributes[.font] == nil)
+        #expect(harness.textView.typingAttributes[.link] != nil)
+    }
+
+    @Test func caretClearFormattingIsOneUndoAndOnePersistenceSchedule() {
+        var schedules = 0
+        let harness = EditorHarness("Heading", didScheduleSave: { schedules += 1 })
+        let range = NSRange(location: 0, length: 7)
+        harness.document.textStorage.addAttribute(.font, value: NSFont.boldSystemFont(ofSize: 24), range: range)
+        schedules = 0
+        harness.select(NSRange(location: 3, length: 0))
+
+        harness.controller.clearFormatting()
+
+        #expect(schedules == 1)
+        let cleared = harness.document.textStorage.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        #expect(cleared?.pointSize != 24)
+        harness.textView.undoManager?.undo()
+        let restored = harness.document.textStorage.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        #expect(restored?.pointSize == 24)
+        #expect(harness.textView.undoManager?.canUndo == false)
+    }
+
     @Test func selectionReplacementUsesTheTextViewUndoManager() {
         let harness = EditorHarness("A😀B")
         harness.select(NSRange(location: 1, length: 2))
@@ -195,9 +266,9 @@ private final class EditorHarness {
     let controller: ScratchpadEditorController
     private let window: NSWindow
 
-    init(_ string: String) {
+    init(_ string: String, didScheduleSave: @escaping () -> Void = {}) {
         url = temporaryURL()
-        document = ScratchpadDocument(url: url)
+        document = ScratchpadDocument(url: url, didScheduleSave: didScheduleSave)
         document.textStorage.append(NSAttributedString(string: string))
         textView = RichTextEditor.makeTextView(document: document)
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 300), styleMask: [], backing: .buffered, defer: false)

@@ -23,6 +23,7 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
     nonisolated(unsafe) private var terminationObserver: NSObjectProtocol?
     nonisolated(unsafe) private var textStorageObserver: NSObjectProtocol?
     private var cloudSettingsCancellable: AnyCancellable?
+    nonisolated(unsafe) private var documentWarningCancellable: AnyCancellable?
     private var activeToken: ScratchpadInsertionToken?
     private var recoveries: [RecordingDestinationLifecycle.PendingRecording] = []
     private var retainedWarnings: [String] = []
@@ -61,13 +62,14 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
         clearPendingRecording: @escaping (ScratchpadInsertionToken) -> Void,
         consumePendingFailure: @escaping () -> String?,
         flushDocument: @escaping (ScratchpadDocument) throws -> Void,
+        saveDocument: ((NSAttributedString) throws -> Void)? = nil,
         transformationService: any ScratchpadTransforming = ScratchpadTransformationService(),
         cloudLLMSnapshot: @escaping () -> CloudLLMSettingsSnapshot = { AppSettings.shared.cloudLLMSnapshot },
         cloudConfigurationUpdates: AnyPublisher<Void, Never>? = nil,
         cloudCredentialUpdates: AnyPublisher<Void, Never>? = nil,
         notificationCenter: NotificationCenter = .default
     ) {
-        scratchpadDocument = ScratchpadDocument(url: documentURL)
+        scratchpadDocument = ScratchpadDocument(url: documentURL, save: saveDocument)
         scratchpadView = ScratchpadView(document: scratchpadDocument)
         self.startRecording = startRecording
         self.recordingIsBusy = recordingIsBusy
@@ -127,12 +129,16 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
         cloudSettingsCancellable = Publishers.Merge(configurationUpdates, credentialUpdates)
         .receive(on: RunLoop.main)
         .sink { [weak self] in self?.refreshAIAvailability(markPendingWhileInFlight: true) }
+        documentWarningCancellable = scratchpadDocument.$warning
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.updateStatusPresentation() }
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     deinit {
+        documentWarningCancellable?.cancel()
         if let terminationObserver { notificationCenter.removeObserver(terminationObserver) }
         if let textStorageObserver { NotificationCenter.default.removeObserver(textStorageObserver) }
     }
@@ -364,6 +370,9 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
 
     private func updateStatusPresentation() {
         var messages = retainedWarnings
+        if let warning = scratchpadDocument.warning, !messages.contains(warning) {
+            messages.append(warning)
+        }
         if !recoveries.isEmpty {
             messages.append("The original insertion point changed. The transcription is preserved below.")
         }
