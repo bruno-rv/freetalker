@@ -160,12 +160,22 @@ private struct DictationDetailView: View {
     let dictation: Dictation
     let onDeleteRequested: () -> Void
     @State private var reprocessing = false
+    @State private var actionError: String?
+    @StateObject private var translation = LibraryTranslationController()
+
+    private var translationPresentation: LibraryTranslationPresentation {
+        let snapshot = AppSettings.shared.cloudLLMSnapshot
+        return LibraryTranslationPresentation(availability: .make(
+            eligibility: snapshot.eligibility,
+            provider: snapshot.provider
+        ))
+    }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                labeledText("Transcript", dictation.transcript)
-                labeledText("Refined Output", dictation.refined)
+                translationControls
+                labeledText(selectionLabel, translation.displayedText(for: dictation))
 
                 HStack {
                     Text("Template: \(dictation.templateName)")
@@ -189,12 +199,137 @@ private struct DictationDetailView: View {
                     }
                     .disabled(reprocessing)
 
+                    if case .variant = translation.selection {
+                        Button("Regenerate…") {
+                            guard case .variant(let target) = translation.selection else { return }
+                            translation.translate(entry: dictation, to: target)
+                        }
+                        .disabled(translation.isTranslating || !translationPresentation.isEnabled)
+                    }
+
                     Spacer()
 
                     Button("Delete…", role: .destructive, action: onDeleteRequested)
                 }
             }
             .padding()
+        }
+        .task(id: dictation.id) {
+            translation.cancel()
+            translation.select(.original)
+            translation.loadVariants(parentID: dictation.id)
+        }
+        .confirmationDialog(
+            "Replace saved \(translation.pendingReplacementTarget?.promptName ?? "translation") translation?",
+            isPresented: Binding(
+                get: { translation.pendingReplacementTarget != nil },
+                set: { if !$0 { translation.dismissReplacement() } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Replace Translation", role: .destructive) { translation.confirmReplacement() }
+            Button("Cancel", role: .cancel) { translation.dismissReplacement() }
+        } message: {
+            Text("This replaces the saved translation. The original Library entry is not changed.")
+        }
+        .alert(
+            "Translation Failed",
+            isPresented: Binding(
+                get: { translation.errorMessage != nil },
+                set: { if !$0 { translation.dismissError() } }
+            )
+        ) {
+            if translation.canRetry {
+                Button("Retry") { translation.retry(entry: dictation) }
+            }
+            Button("OK", role: .cancel) { translation.dismissError() }
+        } message: {
+            Text(translation.errorMessage ?? "")
+        }
+        .alert(
+            "Library Action Failed",
+            isPresented: Binding(get: { actionError != nil }, set: { if !$0 { actionError = nil } })
+        ) {
+            Button("OK", role: .cancel) { actionError = nil }
+        } message: {
+            Text(actionError ?? "")
+        }
+    }
+
+    private var selectionLabel: String {
+        switch translation.selection {
+        case .original: "Original"
+        case .variant(let target): target.promptName
+        }
+    }
+
+    private var translationControls: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Picker("Version", selection: Binding(
+                    get: { translation.selection },
+                    set: { translation.select($0) }
+                )) {
+                    Text("Original").tag(LibraryTranslationController.Selection.original)
+                    ForEach(translation.variants, id: \.target.rawValue) { variant in
+                        Text(variant.target.promptName)
+                            .tag(LibraryTranslationController.Selection.variant(variant.target))
+                    }
+                }
+                .pickerStyle(.menu)
+
+                translateMenu
+
+                Button {
+                    do {
+                        try translation.copyDisplayedText(for: dictation)
+                    } catch {
+                        actionError = error.localizedDescription
+                    }
+                } label: {
+                    Label("Copy", systemImage: "doc.on.doc")
+                }
+
+                Button {
+                    translation.insertDisplayedText(for: dictation)
+                } label: {
+                    Label("Insert", systemImage: "text.insert")
+                }
+
+                if translation.isTranslating {
+                    ProgressView().controlSize(.small)
+                    Button("Cancel") { translation.cancel() }
+                }
+            }
+
+            Text(translationPresentation.privacyDisclosure)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private var translateMenu: some View {
+        let menu = Menu("Translate…") {
+            ForEach(translationPresentation.targets, id: \.rawValue) { target in
+                Button(target.promptName) {
+                    translation.translate(entry: dictation, to: target)
+                }
+            }
+        }
+        .disabled(!translationPresentation.isEnabled || translation.isTranslating)
+
+        if !translationPresentation.isEnabled,
+           let tooltip = translationPresentation.tooltip,
+           let accessibilityHelp = translationPresentation.accessibilityHelp {
+            HStack { menu }
+                .help(tooltip)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Translate Library entry")
+                .accessibilityValue("Unavailable")
+                .accessibilityHint(accessibilityHelp)
+        } else {
+            menu
         }
     }
 
@@ -203,13 +338,6 @@ private struct DictationDetailView: View {
             HStack {
                 Text(label).font(.headline)
                 Spacer()
-                Button {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(text, forType: .string)
-                } label: {
-                    Image(systemName: "doc.on.doc")
-                }
-                .buttonStyle(.plain)
             }
             Text(text)
                 .textSelection(.enabled)
