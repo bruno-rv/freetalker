@@ -2,6 +2,59 @@ import Testing
 @testable import FreeTalker
 
 struct AudioCaptureDecisionTests {
+    @Test func selectedMicrophoneUsesRawCaptureWhenSuppressionIsRequested() {
+        #expect(
+            AudioCapture.captureRoute(
+                deviceUID: "configured-microphone",
+                noiseSuppression: true
+            ) == .rawSelectedMicrophoneSuppressionUnavailable
+        )
+    }
+
+    @Test func systemDefaultUsesVoiceProcessingWhenSuppressionIsRequested() {
+        #expect(
+            AudioCapture.captureRoute(deviceUID: nil, noiseSuppression: true)
+                == .voiceProcessedSystemDefault
+        )
+    }
+
+    @Test func disabledSuppressionUsesRawCapture() {
+        #expect(
+            AudioCapture.captureRoute(
+                deviceUID: "configured-microphone",
+                noiseSuppression: false
+            ) == .rawSelectedMicrophone
+        )
+        #expect(
+            AudioCapture.captureRoute(deviceUID: nil, noiseSuppression: false)
+                == .rawSystemDefault
+        )
+    }
+
+    @Test func selectedMicrophoneSuppressionWarningIsTruthfulAndFirst() {
+        let route = AudioCapture.captureRoute(
+            deviceUID: "configured-microphone",
+            noiseSuppression: true
+        )
+        var warnings: [String] = []
+        if let warning = AudioCapture.captureWarning(for: route) {
+            warnings = AudioCapture.captureWarnings(warnings, adding: warning)
+        }
+        warnings = AudioCapture.captureWarnings(
+            warnings,
+            adding: "Configured microphone not found — using system default"
+        )
+
+        #expect(warnings == [
+            "Noise suppression is unavailable with a selected microphone — using raw microphone audio",
+            "Configured microphone not found — using system default",
+        ])
+        #expect(
+            AudioCapture.captureWarning(for: .voiceProcessedSystemDefault) == nil
+        )
+        #expect(AudioCapture.captureWarning(for: .rawSystemDefault) == nil)
+    }
+
     @Test func effectiveVoiceProcessingLetsVPIOManageDevices() {
         #expect(AudioCapture.deviceApplicationPolicy(effectiveVoiceProcessing: true) == .systemManaged)
         #expect(AudioCapture.deviceApplicationPolicy(effectiveVoiceProcessing: false) == .applyConfiguredInput)

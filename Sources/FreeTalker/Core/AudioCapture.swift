@@ -4,6 +4,13 @@ import Foundation
 import OSLog
 
 final class AudioCapture {
+    enum CaptureRoute: Equatable {
+        case voiceProcessedSystemDefault
+        case rawSelectedMicrophoneSuppressionUnavailable
+        case rawSelectedMicrophone
+        case rawSystemDefault
+    }
+
     enum DeviceApplicationPolicy: Equatable {
         case systemManaged
         case applyConfiguredInput
@@ -31,6 +38,23 @@ final class AudioCapture {
     private var conversionFailureCount = 0
 
     private(set) var captureWarnings: [String] = []
+
+    nonisolated static func captureRoute(
+        deviceUID: String?,
+        noiseSuppression: Bool
+    ) -> CaptureRoute {
+        if deviceUID != nil {
+            return noiseSuppression
+                ? .rawSelectedMicrophoneSuppressionUnavailable
+                : .rawSelectedMicrophone
+        }
+        return noiseSuppression ? .voiceProcessedSystemDefault : .rawSystemDefault
+    }
+
+    nonisolated static func captureWarning(for route: CaptureRoute) -> String? {
+        guard route == .rawSelectedMicrophoneSuppressionUnavailable else { return nil }
+        return "Noise suppression is unavailable with a selected microphone — using raw microphone audio"
+    }
 
     nonisolated static func voiceProcessingAction(
         requested: Bool,
@@ -73,9 +97,18 @@ final class AudioCapture {
         converter = nil
         captureWarnings.removeAll()
 
+        let route = Self.captureRoute(deviceUID: deviceUID, noiseSuppression: noiseSuppression)
+        if let warning = Self.captureWarning(for: route) {
+            recordWarning(warning)
+        }
+        let requestedVoiceProcessing = route == .voiceProcessedSystemDefault
+
         let attemptWarningStart = captureWarnings.count
         do {
-            try startCaptureAttempt(deviceUID: deviceUID, requestedVoiceProcessing: noiseSuppression)
+            try startCaptureAttempt(
+                deviceUID: deviceUID,
+                requestedVoiceProcessing: requestedVoiceProcessing
+            )
         } catch {
             guard Self.captureFailureAction(
                 effectiveVoiceProcessing: engine.inputNode.isVoiceProcessingEnabled
