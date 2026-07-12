@@ -70,16 +70,18 @@ import VoiceProfileCore
 
     @Test func fingerprintHashesExactArtifactTreesAndConfiguration() throws {
         let root = try makeArtifactFixture(embedding: ["weights.bin": Data("embedding".utf8)], fbank: ["graph/data.bin": Data("fbank".utf8)])
+        defer { try? FileManager.default.removeItem(at: root) }
         let fingerprint = try OfflineSpeakerRepresentationExtractor.fingerprint(modelsDirectory: root)
         #expect(fingerprint.provider == "FluidAudio")
         #expect(fingerprint.modelID == "speaker-diarization/Embedding.mlmodelc:embedding256")
         #expect(fingerprint.modelRevision == "tree-sha256-v1;Embedding.mlmodelc=81324d9b89b4f382e1a8eef199904113b62e0db3e48cc67bf163f5e86f900b02;FBank.mlmodelc=aaf5e4f40668cdeb5ca8867d121e16eecbb8ffb2098216c23e614848d7931173")
-        #expect(fingerprint.preprocessingRevision == "sampleRate=16000;embeddingBatchSize=32;excludeOverlap=true;minSegmentDuration=1.0;skipStrategy=none;exposeChunkEmbeddings=true")
+        #expect(fingerprint.preprocessingRevision == "contract=v1;fluidAudioVersion=0.15.5;fluidAudioRevision=19600a485baa4998812e4654b70d2bab8f2c9949;segmentation.windowDurationSeconds=10.0;segmentation.sampleRate=16000;segmentation.minDurationOn=0.0;segmentation.minDurationOff=0.0;segmentation.stepRatio=0.2;segmentation.speechOnsetThreshold=0.5;segmentation.speechOffsetThreshold=0.5;embedding.batchSize=32;embedding.excludeOverlap=true;embedding.minSegmentDurationSeconds=1.0;embedding.skipStrategy=none;clustering.threshold=0.6;clustering.warmStartFa=0.07;clustering.warmStartFb=0.8;clustering.minSpeakers=nil;clustering.maxSpeakers=nil;clustering.numSpeakers=nil;vbx.maxIterations=20;vbx.convergenceTolerance=0.0001;postProcessing.minGapDurationSeconds=0.1;postProcessing.exclusiveSegments=true;zeroVoteReembed.enabled=false;zeroVoteReembed.minDurationSeconds=0.4;exposeChunkEmbeddings=true")
         #expect(fingerprint.dimension == 256)
     }
 
     @Test func fingerprintChangesWhenArtifactContentChanges() throws {
         let root = try makeArtifactFixture(embedding: ["weights.bin": Data("a".utf8)], fbank: ["graph.bin": Data("b".utf8)])
+        defer { try? FileManager.default.removeItem(at: root) }
         let before = try OfflineSpeakerRepresentationExtractor.fingerprint(modelsDirectory: root)
         let file = artifactURL(root, "Embedding.mlmodelc").appendingPathComponent("weights.bin")
         try Data("updated".utf8).write(to: file)
@@ -90,6 +92,7 @@ import VoiceProfileCore
     @Test(arguments: ["missing", "symlink"])
     func fingerprintRejectsMissingAndSymlinkArtifactsWithoutLeakingPaths(_ condition: String) throws {
         let root = try makeArtifactFixture(embedding: ["weights.bin": Data("a".utf8)], fbank: ["graph.bin": Data("b".utf8)])
+        defer { try? FileManager.default.removeItem(at: root) }
         let embedding = artifactURL(root, "Embedding.mlmodelc")
         if condition == "missing" {
             try FileManager.default.removeItem(at: embedding)
@@ -108,6 +111,32 @@ import VoiceProfileCore
         } catch {
             #expect(!String(describing: error).contains(root.path))
             #expect(error is OfflineSpeakerRepresentationError)
+        }
+    }
+
+    @Test func preprocessingContractChangesWhenRepresentationConfigChanges() {
+        var changed = OfflineSpeakerRepresentationExtractor.config
+        changed.segmentation.stepRatio = 0.25
+        #expect(
+            OfflineSpeakerRepresentationExtractor.preprocessingRevision(config: changed)
+                != OfflineSpeakerRepresentationExtractor.preprocessingRevision(
+                    config: OfflineSpeakerRepresentationExtractor.config
+                )
+        )
+    }
+
+    @Test func fingerprintRejectsArtifactMutationDuringModelLoad() async throws {
+        let root = try makeArtifactFixture(embedding: ["weights.bin": Data("a".utf8)], fbank: ["graph.bin": Data("b".utf8)])
+        defer { try? FileManager.default.removeItem(at: root) }
+        await #expect(throws: OfflineSpeakerRepresentationError.modelArtifactChangedDuringLoad) {
+            _ = try await OfflineSpeakerRepresentationExtractor.verifyArtifactsAroundLoad(
+                modelsDirectory: root
+            ) {
+                try Data("changed".utf8).write(
+                    to: artifactURL(root, "Embedding.mlmodelc").appendingPathComponent("weights.bin")
+                )
+                return ()
+            }
         }
     }
 

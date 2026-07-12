@@ -1,8 +1,17 @@
 import CryptoKit
+import Darwin
 import FluidAudio
 import Foundation
 import os
 import VoiceProfileCore
+
+@_silgen_name("openat")
+private func systemOpenAt(
+    _ directory: Int32,
+    _ path: UnsafePointer<CChar>,
+    _ flags: Int32,
+    _ mode: mode_t
+) -> Int32
 
 public struct OfflineSpeakerTurn: Sendable, Equatable {
     public let speakerID: String
@@ -37,6 +46,7 @@ public enum OfflineSpeakerRepresentationError: Error, Equatable, Sendable {
     case missingModelArtifact(ModelArtifact)
     case invalidModelArtifact(ModelArtifact)
     case unreadableModelArtifact(ModelArtifact)
+    case modelArtifactChangedDuringLoad
 
     public enum ModelArtifact: String, Equatable, Sendable {
         case embedding
@@ -118,14 +128,23 @@ public struct OfflineSpeakerRepresentationExtractor: Sendable {
 
     public init(modelsDirectory: URL) {
         operation = { url, progress in
-            let config = Self.diarizerConfig
+            let config = Self.config
             let prepared = try await Self.modelCoordinator.model(for: modelsDirectory) {
-                let models = try await OfflineDiarizerModels.load(from: modelsDirectory) { update in
-                    progress(update.fractionCompleted * 0.5)
+                if !Self.artifactsExist(modelsDirectory: modelsDirectory) {
+                    _ = try await OfflineDiarizerModels.load(from: modelsDirectory) { update in
+                        progress(update.fractionCompleted * 0.25)
+                    }
+                }
+                let (models, fingerprint) = try await Self.verifyArtifactsAroundLoad(
+                    modelsDirectory: modelsDirectory
+                ) {
+                    try await OfflineDiarizerModels.load(from: modelsDirectory) { update in
+                        progress(0.25 + update.fractionCompleted * 0.25)
+                    }
                 }
                 return PreparedModels(
                     models: models,
-                    fingerprint: try Self.fingerprint(modelsDirectory: modelsDirectory, config: config)
+                    fingerprint: fingerprint
                 )
             }
             try Task.checkCancellation()
@@ -212,10 +231,51 @@ public struct OfflineSpeakerRepresentationExtractor: Sendable {
     }
 
     static func fingerprint(modelsDirectory: URL) throws -> EmbeddingModelFingerprint {
-        try fingerprint(modelsDirectory: modelsDirectory, config: diarizerConfig)
+        try fingerprint(modelsDirectory: modelsDirectory, config: config)
     }
 
-    private static let diarizerConfig = OfflineDiarizerConfig(exposeChunkEmbeddings: true)
+    static let config = OfflineDiarizerConfig(
+        segmentation: .init(
+            windowDurationSeconds: 10.0, sampleRate: 16_000,
+            minDurationOn: 0.0, minDurationOff: 0.0, stepRatio: 0.2,
+            speechOnsetThreshold: 0.5, speechOffsetThreshold: 0.5
+        ),
+        embedding: .init(
+            batchSize: 32, excludeOverlap: true,
+            minSegmentDurationSeconds: 1.0, skipStrategy: .none
+        ),
+        clustering: .init(
+            threshold: 0.6, warmStartFa: 0.07, warmStartFb: 0.8,
+            minSpeakers: nil, maxSpeakers: nil, numSpeakers: nil
+        ),
+        vbx: .init(maxIterations: 20, convergenceTolerance: 1e-4),
+        postProcessing: .init(minGapDurationSeconds: 0.1, exclusiveSegments: true),
+        zeroVoteReembed: .init(enabled: false, minDurationSeconds: 0.4),
+        export: .init(embeddingsPath: nil),
+        exposeChunkEmbeddings: true
+    )
+
+    static func verifyArtifactsAroundLoad<Value: Sendable>(
+        modelsDirectory: URL,
+        load: () async throws -> Value
+    ) async throws -> (Value, EmbeddingModelFingerprint) {
+        let before = try fingerprint(modelsDirectory: modelsDirectory)
+        let value = try await load()
+        let after = try fingerprint(modelsDirectory: modelsDirectory)
+        guard before == after else {
+            throw OfflineSpeakerRepresentationError.modelArtifactChangedDuringLoad
+        }
+        return (value, after)
+    }
+
+    private static func artifactsExist(modelsDirectory: URL) -> Bool {
+        let repo = modelsDirectory.appendingPathComponent(Repo.diarizer.folderName, isDirectory: true)
+        return FileManager.default.fileExists(
+            atPath: repo.appendingPathComponent(ModelNames.OfflineDiarizer.embeddingPath).path
+        ) && FileManager.default.fileExists(
+            atPath: repo.appendingPathComponent(ModelNames.OfflineDiarizer.fbankPath).path
+        )
+    }
 
     private static func fingerprint(
         modelsDirectory: URL,
@@ -230,19 +290,7 @@ public struct OfflineSpeakerRepresentationExtractor: Sendable {
             repo.appendingPathComponent(ModelNames.OfflineDiarizer.fbankPath, isDirectory: true),
             artifact: .fbank
         )
-        let skipStrategy: String
-        switch config.embedding.skipStrategy {
-        case .none: skipStrategy = "none"
-        case .maskSimilarity(let threshold): skipStrategy = "maskSimilarity(\(threshold))"
-        }
-        let preprocessing = [
-            "sampleRate=\(config.segmentation.sampleRate)",
-            "embeddingBatchSize=\(config.embedding.batchSize)",
-            "excludeOverlap=\(config.embedding.excludeOverlap)",
-            "minSegmentDuration=\(config.embedding.minSegmentDurationSeconds)",
-            "skipStrategy=\(skipStrategy)",
-            "exposeChunkEmbeddings=\(config.exposeChunkEmbeddings)"
-        ].joined(separator: ";")
+        let preprocessing = preprocessingRevision(config: config)
         return EmbeddingModelFingerprint(
             provider: "FluidAudio",
             modelID: "\(Repo.diarizer.folderName)/\(ModelNames.OfflineDiarizer.embeddingPath):embedding256",
@@ -251,64 +299,176 @@ public struct OfflineSpeakerRepresentationExtractor: Sendable {
             dimension: VoiceEmbedding.dimension
         )
     }
+
+    static func preprocessingRevision(config: OfflineDiarizerConfig) -> String {
+        let skipStrategy: String
+        switch config.embedding.skipStrategy {
+        case .none: skipStrategy = "none"
+        case .maskSimilarity(let threshold): skipStrategy = "maskSimilarity(\(threshold))"
+        }
+        func optional(_ value: Int?) -> String { value.map(String.init) ?? "nil" }
+        return [
+            "contract=v1",
+            "fluidAudioVersion=0.15.5",
+            "fluidAudioRevision=19600a485baa4998812e4654b70d2bab8f2c9949",
+            "segmentation.windowDurationSeconds=\(config.segmentation.windowDurationSeconds)",
+            "segmentation.sampleRate=\(config.segmentation.sampleRate)",
+            "segmentation.minDurationOn=\(config.segmentation.minDurationOn)",
+            "segmentation.minDurationOff=\(config.segmentation.minDurationOff)",
+            "segmentation.stepRatio=\(config.segmentation.stepRatio)",
+            "segmentation.speechOnsetThreshold=\(config.segmentation.speechOnsetThreshold)",
+            "segmentation.speechOffsetThreshold=\(config.segmentation.speechOffsetThreshold)",
+            "embedding.batchSize=\(config.embedding.batchSize)",
+            "embedding.excludeOverlap=\(config.embedding.excludeOverlap)",
+            "embedding.minSegmentDurationSeconds=\(config.embedding.minSegmentDurationSeconds)",
+            "embedding.skipStrategy=\(skipStrategy)",
+            "clustering.threshold=\(config.clustering.threshold)",
+            "clustering.warmStartFa=\(config.clustering.warmStartFa)",
+            "clustering.warmStartFb=\(config.clustering.warmStartFb)",
+            "clustering.minSpeakers=\(optional(config.clustering.minSpeakers))",
+            "clustering.maxSpeakers=\(optional(config.clustering.maxSpeakers))",
+            "clustering.numSpeakers=\(optional(config.clustering.numSpeakers))",
+            "vbx.maxIterations=\(config.vbx.maxIterations)",
+            "vbx.convergenceTolerance=\(config.vbx.convergenceTolerance)",
+            "postProcessing.minGapDurationSeconds=\(config.postProcessing.minGapDurationSeconds)",
+            "postProcessing.exclusiveSegments=\(config.postProcessing.exclusiveSegments)",
+            "zeroVoteReembed.enabled=\(config.zeroVoteReembed.enabled)",
+            "zeroVoteReembed.minDurationSeconds=\(config.zeroVoteReembed.minDurationSeconds)",
+            "exposeChunkEmbeddings=\(config.exposeChunkEmbeddings)"
+        ].joined(separator: ";")
+    }
 }
 
 private func artifactDigest(
     _ root: URL,
     artifact: OfflineSpeakerRepresentationError.ModelArtifact
 ) throws -> String {
-    let fileManager = FileManager.default
-    guard fileManager.fileExists(atPath: root.path) else {
-        throw OfflineSpeakerRepresentationError.missingModelArtifact(artifact)
+    let descriptor = open(root.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+    guard descriptor >= 0 else {
+        if errno == ENOENT { throw OfflineSpeakerRepresentationError.missingModelArtifact(artifact) }
+        if errno == ELOOP { throw OfflineSpeakerRepresentationError.invalidModelArtifact(artifact) }
+        throw OfflineSpeakerRepresentationError.unreadableModelArtifact(artifact)
     }
+    defer { close(descriptor) }
     do {
-        let rootValues = try root.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-        guard rootValues.isDirectory == true, rootValues.isSymbolicLink != true else {
-            throw OfflineSpeakerRepresentationError.invalidModelArtifact(artifact)
-        }
-        var files: [(path: Data, url: URL)] = []
-        func collect(_ directory: URL, prefix: String) throws {
-            let children = try fileManager.contentsOfDirectory(
-                at: directory,
-                includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
-            )
-            for url in children {
-                let values = try url.resourceValues(
-                    forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
-                )
-                guard values.isSymbolicLink != true else {
-                    throw OfflineSpeakerRepresentationError.invalidModelArtifact(artifact)
-                }
-                let relative = prefix.isEmpty ? url.lastPathComponent : "\(prefix)/\(url.lastPathComponent)"
-                if values.isDirectory == true {
-                    try collect(url, prefix: relative)
-                    continue
-                }
-                guard values.isRegularFile == true, !relative.isEmpty else {
-                    throw OfflineSpeakerRepresentationError.invalidModelArtifact(artifact)
-                }
-                files.append((Data(relative.utf8), url))
-            }
-        }
-        try collect(root, prefix: "")
-        guard !files.isEmpty else {
-            throw OfflineSpeakerRepresentationError.invalidModelArtifact(artifact)
-        }
-        files.sort { $0.path.lexicographicallyPrecedes($1.path) }
         var hasher = SHA256()
         hasher.update(data: Data("artifact-tree-sha256-v1\0".utf8))
-        for file in files {
-            let contents = try Data(contentsOf: file.url, options: [.mappedIfSafe])
-            hasher.update(data: encodedLength(file.path.count))
-            hasher.update(data: file.path)
-            hasher.update(data: encodedLength(contents.count))
-            hasher.update(data: contents)
-        }
+        var fileCount = 0
+        try hashDirectory(descriptor, prefix: [], hasher: &hasher, fileCount: &fileCount, artifact: artifact)
+        guard fileCount > 0 else { throw OfflineSpeakerRepresentationError.invalidModelArtifact(artifact) }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
-    } catch let error as OfflineSpeakerRepresentationError {
-        throw error
-    } catch {
+    } catch let error as OfflineSpeakerRepresentationError { throw error }
+    catch { throw OfflineSpeakerRepresentationError.unreadableModelArtifact(artifact) }
+}
+
+private func hashDirectory(
+    _ descriptor: Int32,
+    prefix: [UInt8],
+    hasher: inout SHA256,
+    fileCount: inout Int,
+    artifact: OfflineSpeakerRepresentationError.ModelArtifact
+) throws {
+    let duplicate = dup(descriptor)
+    guard duplicate >= 0, let directory = fdopendir(duplicate) else {
+        if duplicate >= 0 { close(duplicate) }
         throw OfflineSpeakerRepresentationError.unreadableModelArtifact(artifact)
+    }
+    var names: [[UInt8]] = []
+    errno = 0
+    while let entry = readdir(directory) {
+        let name = withUnsafeBytes(of: entry.pointee.d_name) { bytes in
+            Array(bytes.prefix { $0 != 0 })
+        }
+        if name != [46] && name != [46, 46] { names.append(name) }
+    }
+    let readError = errno
+    closedir(directory)
+    guard readError == 0 else { throw OfflineSpeakerRepresentationError.unreadableModelArtifact(artifact) }
+    names.sort { $0.lexicographicallyPrecedes($1) }
+
+    for name in names {
+        var cName = name.map { CChar(bitPattern: $0) }; cName.append(0)
+        var metadata = stat()
+        let status = cName.withUnsafeBufferPointer {
+            fstatat(descriptor, $0.baseAddress, &metadata, AT_SYMLINK_NOFOLLOW)
+        }
+        guard status == 0 else { throw OfflineSpeakerRepresentationError.unreadableModelArtifact(artifact) }
+        let mode = metadata.st_mode & S_IFMT
+        let relative = prefix.isEmpty ? name : prefix + [47] + name
+        if mode == S_IFDIR {
+            let child = cName.withUnsafeBufferPointer {
+                systemOpenAt(
+                    descriptor, $0.baseAddress!,
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC, 0
+                )
+            }
+            guard child >= 0 else { throw OfflineSpeakerRepresentationError.invalidModelArtifact(artifact) }
+            do {
+                try hashDirectory(
+                    child, prefix: relative, hasher: &hasher,
+                    fileCount: &fileCount, artifact: artifact
+                )
+                close(child)
+            } catch {
+                close(child)
+                throw error
+            }
+        } else if mode == S_IFREG {
+            let file = cName.withUnsafeBufferPointer {
+                systemOpenAt(descriptor, $0.baseAddress!, O_RDONLY | O_NOFOLLOW | O_CLOEXEC, 0)
+            }
+            guard file >= 0 else { throw OfflineSpeakerRepresentationError.invalidModelArtifact(artifact) }
+            do {
+                try hashFile(file, path: relative, initial: metadata, hasher: &hasher, artifact: artifact)
+                close(file)
+                fileCount += 1
+            } catch {
+                close(file)
+                throw error
+            }
+        } else {
+            throw OfflineSpeakerRepresentationError.invalidModelArtifact(artifact)
+        }
+    }
+}
+
+private func hashFile(
+    _ descriptor: Int32,
+    path: [UInt8],
+    initial: stat,
+    hasher: inout SHA256,
+    artifact: OfflineSpeakerRepresentationError.ModelArtifact
+) throws {
+    var opened = stat()
+    guard fstat(descriptor, &opened) == 0, (opened.st_mode & S_IFMT) == S_IFREG,
+          opened.st_dev == initial.st_dev, opened.st_ino == initial.st_ino else {
+        throw OfflineSpeakerRepresentationError.invalidModelArtifact(artifact)
+    }
+    hasher.update(data: encodedLength(path.count)); hasher.update(data: Data(path))
+    hasher.update(data: encodedLength(Int(opened.st_size)))
+    var remaining = opened.st_size
+    var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+    while remaining > 0 {
+        let requested = min(buffer.count, Int(remaining))
+        let count = buffer.withUnsafeMutableBytes {
+            read(descriptor, $0.baseAddress, requested)
+        }
+        if count < 0 && errno == EINTR { continue }
+        guard count > 0 else { throw OfflineSpeakerRepresentationError.modelArtifactChangedDuringLoad }
+        hasher.update(data: Data(buffer[0..<count])); remaining -= off_t(count)
+    }
+    var extra: UInt8 = 0
+    let extraCount = read(descriptor, &extra, 1)
+    guard extraCount == 0 else { throw OfflineSpeakerRepresentationError.modelArtifactChangedDuringLoad }
+    var final = stat()
+    guard fstat(descriptor, &final) == 0,
+          final.st_dev == opened.st_dev, final.st_ino == opened.st_ino,
+          final.st_size == opened.st_size,
+          final.st_mtimespec.tv_sec == opened.st_mtimespec.tv_sec,
+          final.st_mtimespec.tv_nsec == opened.st_mtimespec.tv_nsec,
+          final.st_ctimespec.tv_sec == opened.st_ctimespec.tv_sec,
+          final.st_ctimespec.tv_nsec == opened.st_ctimespec.tv_nsec else {
+        throw OfflineSpeakerRepresentationError.modelArtifactChangedDuringLoad
     }
 }
 
