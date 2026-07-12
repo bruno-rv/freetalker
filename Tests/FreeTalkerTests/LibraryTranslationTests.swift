@@ -167,7 +167,7 @@ import Testing
         #expect(!presentation.isEnabled)
         #expect(presentation.tooltip == availability.tooltip)
         #expect(presentation.accessibilityHelp == availability.accessibilityHelp)
-        #expect(presentation.privacyDisclosure == "Translation sends this text to the API endpoint configured under Cloud post-processing.")
+        #expect(presentation.privacyDisclosure == CloudPrivacyDisclosure.library)
         #expect(presentation.targets == TranslationTarget.allCases)
     }
 

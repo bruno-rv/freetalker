@@ -122,6 +122,14 @@ Drag the recording HUD to keep it out of your way. FreeTalker restores its
 position on the next recording and keeps it visible if the display layout
 changes.
 
+Set **Default output language** in Settings to **Same as spoken** (the
+default), English, Portuguese, Mandarin Chinese, Hindi, Spanish, Standard
+Arabic, French, or German. The edge launcher and recording HUD can override
+that choice for one recording without changing the default. Named output
+languages are API-only: FreeTalker sends the live transcript to the configured
+Cloud post-processing endpoint. A requested translation never falls back to
+Apple's on-device model, another provider, or automatic source-text insertion.
+
 Open **Scratchpad…** from the menu bar or the edge launcher. Type directly, or
 place the insertion point or select text and choose **Dictate**; live speech
 appears as a preview before the final transcript is inserted. Use the toolbar
@@ -203,9 +211,9 @@ normalized triggers are rejected. Ambiguous snippets migrated from older version
 explicit choice in the preview and can be resolved by editing their trigger phrases in Settings.
 Snippet renames update the persisted record used by future matches.
 
-Selected text, spoken instructions, and previews stay in memory and are never sent to a cloud service,
-saved to Library, or logged. Snippet names, triggers, and expansions are stored only in
-FreeTalker's local SQLite database.
+Voice Edit selected text, spoken instructions, and previews stay in memory and
+are never sent to a cloud service, saved to Library, or logged. Snippet names,
+triggers, and expansions are stored only in FreeTalker's local SQLite database.
 
 ### Custom vocabulary
 
@@ -253,7 +261,10 @@ app, or logged.
   endpoint, and model all set, cloud post-processing runs automatically for every Dictation —
   it isn't chosen per Template. A key is optional only for an OpenAI-compatible loopback HTTP
   endpoint (`localhost`, `127.0.0.1`, or `::1`); other endpoints and providers still require
-  one. Leave any required field unset and FreeTalker falls back to the on-device Apple model.
+  one. For ordinary template formatting that doesn't request translation,
+  leaving a required field unset can fall back to the on-device Apple model.
+  Named output translation, Scratchpad AI actions, and Library translation are
+  API-only and never use that fallback.
 
 Both sections have a **Test connection** button, enabled once the required fields are filled
 in. It sends a single request and reports a fixed status hint — "Connected ✓", an HTTP failure

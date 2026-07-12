@@ -27,12 +27,15 @@ final class ScratchpadView: NSView, NSTextFieldDelegate {
     private let customInstructionField = NSTextField()
     private let aiProgress = NSProgressIndicator()
     private let aiErrorLabel = NSTextField(wrappingLabelWithString: "")
+    private let aiPrivacyLabel = NSTextField(wrappingLabelWithString: CloudPrivacyDisclosure.scratchpad)
     private var aiWrappers: [NSView] = []
 
     var customInstruction: String {
         get { customInstructionField.stringValue }
         set { customInstructionField.stringValue = newValue }
     }
+
+    var aiPrivacyText: String { aiPrivacyLabel.stringValue }
 
     var isAIInFlight = false {
         didSet {
@@ -162,6 +165,9 @@ final class ScratchpadView: NSView, NSTextFieldDelegate {
         aiErrorLabel.textColor = .systemRed
         aiErrorLabel.setAccessibilityLabel("AI transformation error")
         aiErrorText = nil
+        aiPrivacyLabel.textColor = .secondaryLabelColor
+        aiPrivacyLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        aiPrivacyLabel.setAccessibilityLabel("Scratchpad AI privacy disclosure")
 
         aiWrappers = aiButtons.map { button in
             let wrapper = NSStackView(views: [button])
@@ -209,7 +215,7 @@ final class ScratchpadView: NSView, NSTextFieldDelegate {
         translationRecoveryRow.spacing = 8
         translationRecoveryRow.distribution = .fill
 
-        let root = NSStackView(views: [toolbar, aiRow, aiErrorLabel, statusLabel, previewLabel, translationRecoveryRow, recoveryRow, scrollView])
+        let root = NSStackView(views: [toolbar, aiRow, aiPrivacyLabel, aiErrorLabel, statusLabel, previewLabel, translationRecoveryRow, recoveryRow, scrollView])
         root.orientation = .vertical
         root.alignment = .leading
         root.spacing = 8
@@ -223,6 +229,7 @@ final class ScratchpadView: NSView, NSTextFieldDelegate {
             root.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -12),
             toolbar.widthAnchor.constraint(equalTo: root.widthAnchor),
             aiRow.widthAnchor.constraint(equalTo: root.widthAnchor),
+            aiPrivacyLabel.widthAnchor.constraint(equalTo: root.widthAnchor),
             aiErrorLabel.widthAnchor.constraint(equalTo: root.widthAnchor),
             statusLabel.widthAnchor.constraint(equalTo: root.widthAnchor),
             previewLabel.widthAnchor.constraint(equalTo: root.widthAnchor),
@@ -252,7 +259,7 @@ final class ScratchpadView: NSView, NSTextFieldDelegate {
                 hasInput: hasInput,
                 isInFlight: isAIInFlight,
                 hasInstruction: index != 3 || !customInstruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                providerName: snapshot.provider.rawValue
+                provider: snapshot.provider
             )
             button.isEnabled = availability.enabled
             button.setAccessibilityHelp(availability.accessibilityHelp)

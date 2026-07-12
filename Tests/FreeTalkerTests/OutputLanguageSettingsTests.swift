@@ -83,6 +83,13 @@ struct OutputLanguageSettingsTests {
         }
     }
 
+    @Test func settingsOutputPresentationUsesSharedLiveDisclosure() {
+        let presentation = OutputLanguageSettingsPresentation.make(snapshot: cloudSnapshot(
+            provider: .openAICompatible, baseURL: "http://localhost:1234", model: "model", key: nil
+        ))
+        #expect(presentation.privacyDisclosure == CloudPrivacyDisclosure.liveOutputTranslation)
+    }
+
     @Test func outputLanguageDefaultsToSameAsSpoken() {
         let defaults = isolatedDefaults()
         defer { remove(defaults) }

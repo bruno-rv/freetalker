@@ -284,7 +284,7 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
             hasInput: hasTransformationInput,
             isInFlight: false,
             hasInstruction: true,
-            providerName: settings.provider.rawValue
+            provider: settings.provider
         )
         guard availability.enabled else {
             scratchpadView.aiErrorText = availability.tooltip
@@ -307,6 +307,12 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
                 guard let self, self.activeAIGeneration == generation else { return }
                 if !self.scratchpadView.editorController.applyTransformation(result, to: source) {
                     self.scratchpadView.aiErrorText = "The source text changed. Nothing was replaced."
+                }
+            } catch let ScratchpadTransformationError.unavailable(eligibility) {
+                if self?.activeAIGeneration == generation {
+                    self?.scratchpadView.aiErrorText = CloudFeatureAvailability.make(
+                        eligibility: eligibility, provider: settings.provider
+                    ).tooltip
                 }
             } catch is CancellationError {
                 // Cancellation leaves the source untouched and needs no destructive alert.
