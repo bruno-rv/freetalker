@@ -50,10 +50,12 @@ final class FloatingControlsController {
     private var collapseWorkItem: DispatchWorkItem?
     private var cancellables: Set<AnyCancellable> = []
     private var screenObserver: FloatingControlsObserverToken?
+    private(set) var presentedLanguagePin: String?
 
     init(settings: AppSettings = .shared, callbacks: Callbacks) {
         self.settings = settings
         self.callbacks = callbacks
+        presentedLanguagePin = settings.languagePin
     }
 
     deinit {
@@ -71,9 +73,11 @@ final class FloatingControlsController {
         })
         settings.$edgeLauncherEnabled
             .combineLatest(settings.$edgeLauncherEdge, settings.$edgeLauncherPosition)
-            .receive(on: RunLoop.main)
-            .sink { [weak self] enabled, _, _ in
+            .combineLatest(settings.$languagePin)
+            .sink { [weak self] launcherSettings, languagePin in
                 guard let self else { return }
+                let (enabled, _, _) = launcherSettings
+                self.presentedLanguagePin = languagePin
                 if enabled { self.show() } else { self.hideForDisabledSetting() }
             }
             .store(in: &cancellables)
@@ -157,7 +161,7 @@ final class FloatingControlsController {
         let view = FloatingControlsView(
             state: state,
             edge: settings.edgeLauncherEdge,
-            languagePin: settings.languagePin,
+            languagePin: presentedLanguagePin ?? settings.languagePin,
             callbacks: callbacks
         )
         let hosting = FloatingControlsHostingView(rootView: view)
@@ -196,7 +200,7 @@ private final class FloatingControlsPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
-private final class FloatingControlsHostingView: NSHostingView<FloatingControlsView> {
+final class FloatingControlsHostingView: NSHostingView<FloatingControlsView> {
     var onPointerEntered: (() -> Void)?
     var onPointerExited: (() -> Void)?
     private var pointerTrackingArea: NSTrackingArea?
@@ -220,4 +224,5 @@ private final class FloatingControlsHostingView: NSHostingView<FloatingControlsV
 
     override func mouseEntered(with event: NSEvent) { onPointerEntered?() }
     override func mouseExited(with event: NSEvent) { onPointerExited?() }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }

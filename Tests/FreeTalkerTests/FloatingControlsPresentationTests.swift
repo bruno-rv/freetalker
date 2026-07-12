@@ -49,6 +49,45 @@ import Testing
         #expect(panel.collectionBehavior.contains(.fullScreenAuxiliary))
     }
 
+    @Test func hostingViewAcceptsFirstClickWithoutActivatingTheApp() {
+        let view = FloatingControlsHostingView(rootView: FloatingControlsView(
+            state: .collapsed,
+            edge: .right,
+            languagePin: "auto",
+            callbacks: .init(
+                onDictation: {},
+                onScratchpad: {},
+                onOpenSettings: {},
+                onLanguage: { _ in }
+            )
+        ))
+
+        #expect(view.acceptsFirstMouse(for: nil))
+    }
+
+    @Test func externalLanguageChangeRefreshesLauncherPresentation() {
+        let suite = "FloatingControlsPresentationTests.\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = AppSettings(defaults: defaults)
+        settings.edgeLauncherEnabled = true
+        let controller = FloatingControlsController(
+            settings: settings,
+            callbacks: .init(
+                onDictation: {},
+                onScratchpad: {},
+                onOpenSettings: {},
+                onLanguage: { settings.languagePin = $0 }
+            )
+        )
+        controller.start()
+        defer { controller.stop() }
+
+        settings.languagePin = "pt"
+
+        #expect(controller.presentedLanguagePin == "pt")
+    }
+
     @Test(arguments: [
         (LauncherEdge.left, "Left", "Expands to the right, into the screen."),
         (.right, "Right", "Expands to the left, into the screen."),
