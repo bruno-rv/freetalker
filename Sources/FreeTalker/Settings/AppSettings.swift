@@ -5,7 +5,7 @@ enum STTEngineKind: String, CaseIterable, Codable {
     case cloud
 }
 
-enum LLMProviderKind: String, CaseIterable, Codable {
+enum LLMProviderKind: String, CaseIterable, Codable, Sendable {
     case anthropic
     case ollama
     case openAICompatible
@@ -616,7 +616,7 @@ final class AppSettings: ObservableObject {
     }
 }
 
-struct CloudLLMSettingsSnapshot {
+struct CloudLLMSettingsSnapshot: Equatable, Sendable {
     let provider: LLMProviderKind
     let baseURL: String
     let model: String
@@ -665,7 +665,7 @@ struct CloudLLMSettingsSnapshot {
     }
 }
 
-enum CloudLLMEligibility {
+enum CloudLLMEligibility: Equatable, Sendable {
     case eligible(apiKey: String?)
     case invalidConfiguration
     case missingAPIKey
