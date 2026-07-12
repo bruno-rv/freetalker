@@ -80,6 +80,43 @@ struct RecordingDestinationTests {
         ) {}
         #expect(!accepted)
     }
+
+    @Test func scratchpadStopSkipsExternalSnapshotReads() {
+        let token = ScratchpadInsertionToken(id: UUID())
+        var reads = 0
+        let scratchpad: Int? = AppCoordinator.externalStopSnapshot(for: .scratchpad(token)) {
+            reads += 1
+            return 42
+        }
+        #expect(scratchpad == nil)
+        #expect(reads == 0)
+
+        let external: Int? = AppCoordinator.externalStopSnapshot(for: .external) {
+            reads += 1
+            return 42
+        }
+        #expect(external == 42)
+        #expect(reads == 1)
+    }
+
+    @MainActor
+    @Test func rejectedCompletionCanBeRecoveredAfterWeakRouterDisappears() {
+        let token = ScratchpadInsertionToken(id: UUID())
+        AppCoordinator.shared.scratchpadRecordingRouter = nil
+        #expect(!AppCoordinator.shared.deliverScratchpadCompletion("recover me", for: token))
+
+        #expect(AppCoordinator.shared.pendingScratchpadRecording(for: token) == "recover me")
+        #expect(AppCoordinator.shared.consumePendingScratchpadRecording(for: token) == "recover me")
+        #expect(AppCoordinator.shared.pendingScratchpadRecording(for: token) == nil)
+    }
+
+    @MainActor
+    @Test func cancellationClearsPendingScratchpadRecovery() {
+        let token = ScratchpadInsertionToken(id: UUID())
+        AppCoordinator.shared.storePendingScratchpadRecording("discard", for: token)
+        AppCoordinator.shared.clearPendingScratchpadRecording(for: token)
+        #expect(AppCoordinator.shared.pendingScratchpadRecording(for: token) == nil)
+    }
 }
 
 @MainActor

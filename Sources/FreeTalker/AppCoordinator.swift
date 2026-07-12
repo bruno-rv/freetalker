@@ -99,6 +99,7 @@ final class AppCoordinator: ObservableObject {
     private var voiceEditWindowDelegate: VoiceEditWindowDelegate?
     private var captureOwner: CaptureOwner = .none
     private var recordingDestination: RecordingDestination?
+    private var pendingScratchpadRecordings: [ScratchpadInsertionToken: String] = [:]
     weak var scratchpadRecordingRouter: (any ScratchpadRecordingRouting)?
 
     private let hotKeyManager = HotKeyManager()
@@ -538,6 +539,43 @@ final class AppCoordinator: ObservableObject {
         return destination ?? .external
     }
 
+    nonisolated static func externalStopSnapshot<Value>(
+        for destination: RecordingDestination,
+        capture: () -> Value
+    ) -> Value? {
+        guard destination == .external else { return nil }
+        return capture()
+    }
+
+    func pendingScratchpadRecording(for token: ScratchpadInsertionToken) -> String? {
+        pendingScratchpadRecordings[token]
+    }
+
+    func consumePendingScratchpadRecording(for token: ScratchpadInsertionToken) -> String? {
+        pendingScratchpadRecordings.removeValue(forKey: token)
+    }
+
+    func storePendingScratchpadRecording(_ text: String, for token: ScratchpadInsertionToken) {
+        pendingScratchpadRecordings[token] = text
+    }
+
+    func clearPendingScratchpadRecording(for token: ScratchpadInsertionToken) {
+        pendingScratchpadRecordings.removeValue(forKey: token)
+    }
+
+    @discardableResult
+    func deliverScratchpadCompletion(_ text: String, for token: ScratchpadInsertionToken) -> Bool {
+        let accepted = (try? Self.routeDestinationEvent(
+            .completion(text), destination: .scratchpad(token), router: scratchpadRecordingRouter
+        ) {}) ?? false
+        if accepted {
+            clearPendingScratchpadRecording(for: token)
+        } else {
+            storePendingScratchpadRecording(text, for: token)
+        }
+        return accepted
+    }
+
     static func routeDestinationEvent(
         _ event: RecordingDestinationEvent,
         destination: RecordingDestination,
@@ -622,16 +660,17 @@ final class AppCoordinator: ObservableObject {
     /// it's captured — defeating the same-app target-drift protection `InsertionTarget` exists
     /// for. See Codex finding: paste-target drift / same-app target drift.
     private func handlePillClick() {
-        let preSnapshottedFrontmostApp = NSWorkspace.shared.frontmostApplication
-        let preSnapshottedTarget = Insertion.snapshotTarget(app: preSnapshottedFrontmostApp)
-        let preSnapshottedContextTarget = snapshotContextTarget(app: preSnapshottedFrontmostApp)
+        let snapshot = Self.externalStopSnapshot(for: recordingDestination ?? .external) {
+            let app = NSWorkspace.shared.frontmostApplication
+            return (app: app, target: Insertion.snapshotTarget(app: app), contextTarget: snapshotContextTarget(app: app))
+        }
         let (newState, action) = RecordingStateMachine.transition(state: recordingState, event: .pillClick, currentGeneration: recordingGeneration)
         recordingState = newState
         switch action {
         case .enterLocked:
             enterLockedMode()
         case .stopAndTranscribe:
-            stopAndTranscribe(preSnapshotted: (app: preSnapshottedFrontmostApp, target: preSnapshottedTarget, contextTarget: preSnapshottedContextTarget))
+            stopAndTranscribe(preSnapshotted: snapshot)
         case .none, .startCapture, .cancel:
             break
         }
@@ -682,14 +721,15 @@ final class AppCoordinator: ObservableObject {
     private func handlePanelRaw() { handlePanelFinish(skipPostProcessing: true) }
 
     private func handlePanelFinish(skipPostProcessing: Bool) {
-        let preSnapshottedFrontmostApp = NSWorkspace.shared.frontmostApplication
-        let preSnapshottedTarget = Insertion.snapshotTarget(app: preSnapshottedFrontmostApp)
-        let preSnapshottedContextTarget = snapshotContextTarget(app: preSnapshottedFrontmostApp)
+        let snapshot = Self.externalStopSnapshot(for: recordingDestination ?? .external) {
+            let app = NSWorkspace.shared.frontmostApplication
+            return (app: app, target: Insertion.snapshotTarget(app: app), contextTarget: snapshotContextTarget(app: app))
+        }
         let (newState, action) = RecordingStateMachine.transition(state: recordingState, event: Self.recordingEvent(for: skipPostProcessing ? .raw : .done), currentGeneration: recordingGeneration)
         recordingState = newState
         switch action {
         case .stopAndTranscribe:
-            stopAndTranscribe(preSnapshotted: (app: preSnapshottedFrontmostApp, target: preSnapshottedTarget, contextTarget: preSnapshottedContextTarget), skipPostProcessing: skipPostProcessing)
+            stopAndTranscribe(preSnapshotted: snapshot, skipPostProcessing: skipPostProcessing)
         case .none, .startCapture, .enterLocked, .cancel:
             break
         }
@@ -1040,6 +1080,9 @@ final class AppCoordinator: ObservableObject {
             clearHUD: { self.hud.flash("Cancelled") }
         )
         _ = try? Self.routeDestinationEvent(.cancellation, destination: destination, router: scratchpadRecordingRouter) {}
+        if case .scratchpad(let token) = destination {
+            clearPendingScratchpadRecording(for: token)
+        }
     }
 
     nonisolated static func performCancelRecording(
@@ -1366,13 +1409,11 @@ final class AppCoordinator: ObservableObject {
                 if let fallbackReason = result.fallbackReason {
                     logPostProcessingFallback(fallbackReason)
                 }
-                let accepted = try Self.routeDestinationEvent(
-                    .completion(result.refined), destination: .scratchpad(token), router: scratchpadRecordingRouter
-                ) {}
+                let accepted = deliverScratchpadCompletion(result.refined, for: token)
                 if accepted {
                     hud.hide()
                 } else {
-                    hud.flash("Scratchpad changed — dictated text kept for recovery")
+                    hud.flash("Dictation ready — reopen Scratchpad to recover it")
                 }
             } catch {
                 let message = error is PipelineError ? "Transcription failed" : "Transcription failed: \(error.localizedDescription)"
