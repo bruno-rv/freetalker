@@ -82,6 +82,8 @@ enum SpeechModelDeleteFailure {
 }
 
 struct SettingsView: View {
+    static let automaticTemplateHelp = "When no App Rule matches, FreeTalker chooses Email, Refined Message, Clean Dictation, or Refined Prompt. Turn this off to keep the Active Template."
+
     @ObservedObject private var coordinator = AppCoordinator.shared
 
     var body: some View {
@@ -281,14 +283,16 @@ private struct GeneralSettingsView: View {
                 }
             }
 
-            Section("Local context") {
-                Picker("Scope", selection: $settings.localContextScope) {
+            Section("On-device text context") {
+                Picker("Text context", selection: $settings.localContextScope) {
                     ForEach(LocalContextScope.allCases, id: \.rawValue) { scope in
-                        Text(scope.displayName).tag(scope)
+                        Text(scope.displayName)
+                            .help(scope.explanation)
+                            .tag(scope)
                     }
                 }
-                Toggle("Automatic local style", isOn: $settings.automaticStyleEnabled)
-                Text("Captured once when dictation stops and used only by Apple's on-device Foundation Model. Window + local OCR uses Apple Vision and requires Screen Recording permission.")
+                .help("Choose what FreeTalker may read when dictation stops. Context is never sent to cloud providers.")
+                Text(settings.localContextScope.explanation)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if settings.localContextScope == .windowOCR, screenRecordingAuthorization != .granted {
@@ -300,7 +304,20 @@ private struct GeneralSettingsView: View {
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
+                Text("Context is captured once when dictation stops, kept in memory, and used only with Apple's on-device processing. It is never sent to cloud providers.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
+            .help("Control what nearby text FreeTalker may read when dictation stops. Context stays on this Mac and is used only with Apple's on-device processing.")
+
+            Section("Automatic template selection") {
+                Toggle("Automatically choose template", isOn: $settings.automaticStyleEnabled)
+                    .help(SettingsView.automaticTemplateHelp)
+                Text("Selects a built-in template based on the destination app and available context. App Rules take priority.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .help("Let FreeTalker choose a built-in template from the destination app and available on-device context. App Rules always take priority.")
 
             Section("Push-to-talk key") {
                 HStack {
