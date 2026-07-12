@@ -5,6 +5,25 @@ import Testing
 @Suite("Output language settings")
 @MainActor
 struct OutputLanguageSettingsTests {
+    @Test func successfulCredentialSaveAndDeletePostGeneralSignalWithoutSecretPayload() {
+        let center = NotificationCenter()
+        let store = OutputCredentialStoreSpy()
+        let observation = CredentialNotificationObservation()
+        let token = center.addObserver(forName: .cloudLLMCredentialsDidChange, object: nil, queue: nil) { note in
+            observation.record(note)
+        }
+        defer { center.removeObserver(token) }
+
+        #expect(CloudLLMCredentialWriter.update("secret", account: "test", store: store, notificationCenter: center))
+        #expect(CloudLLMCredentialWriter.update("", account: "test", store: store, notificationCenter: center))
+        #expect(observation.count == 2)
+        #expect(observation.payloadWasEmpty)
+        #expect(store.values["test"] == nil)
+
+        store.setSucceeds = false
+        #expect(!CloudLLMCredentialWriter.update("new-secret", account: "test", store: store, notificationCenter: center))
+        #expect(observation.count == 2)
+    }
     @Test func invalidCloudConfigurationDisablesOnlyNamedTranslations() {
         let snapshot = cloudSnapshot(provider: .anthropic, baseURL: "not a URL", model: "model", key: "key")
 
@@ -133,5 +152,39 @@ struct OutputLanguageSettingsTests {
     private func remove(_ defaults: UserDefaults) {
         let suite = defaults.string(forKey: "testSuiteName")!
         defaults.removePersistentDomain(forName: suite)
+    }
+}
+
+private final class OutputCredentialStoreSpy: SecretStore {
+    var values: [String: String] = [:]
+    var setSucceeds = true
+
+    func get(account: String) -> String? { values[account] }
+
+    func set(_ value: String, account: String) -> Bool {
+        guard setSucceeds else { return false }
+        values[account] = value
+        return true
+    }
+
+    func delete(account: String) -> Bool {
+        values.removeValue(forKey: account)
+        return true
+    }
+}
+
+private final class CredentialNotificationObservation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var notifications = 0
+    private var emptyPayload = true
+
+    var count: Int { lock.withLock { notifications } }
+    var payloadWasEmpty: Bool { lock.withLock { emptyPayload } }
+
+    func record(_ notification: Notification) {
+        lock.withLock {
+            notifications += 1
+            emptyPayload = emptyPayload && notification.object == nil && notification.userInfo == nil
+        }
     }
 }

@@ -46,6 +46,9 @@ final class FloatingControlsController {
     private let settings: AppSettings
     private let callbacks: Callbacks
     private let outputSelection: () -> RecordingOutputSelection
+    private let outputUpdates: AnyPublisher<Void, Never>
+    private let cloudSnapshot: () -> CloudLLMSettingsSnapshot
+    private let notificationCenter: NotificationCenter
     private var panel: NSPanel?
     private var hostingView: FloatingControlsHostingView?
     private var state = FloatingControlsHoverState.collapsed
@@ -59,28 +62,22 @@ final class FloatingControlsController {
         settings: AppSettings = .shared,
         outputSelection: @escaping () -> RecordingOutputSelection = { RecordingOutputSelection() },
         outputUpdates: AnyPublisher<Void, Never> = Empty().eraseToAnyPublisher(),
+        cloudSnapshot: (() -> CloudLLMSettingsSnapshot)? = nil,
+        notificationCenter: NotificationCenter = .default,
         callbacks: Callbacks
     ) {
         self.settings = settings
         self.outputSelection = outputSelection
+        self.outputUpdates = outputUpdates
+        self.cloudSnapshot = cloudSnapshot ?? { settings.cloudLLMSnapshot }
+        self.notificationCenter = notificationCenter
         self.callbacks = callbacks
         presentedLanguagePin = settings.languagePin
         presentedTranslationState = Self.translationState(
             settings: settings,
-            selection: outputSelection()
+            selection: outputSelection(),
+            snapshot: (cloudSnapshot ?? { settings.cloudLLMSnapshot })()
         )
-        outputUpdates
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] in
-                DispatchQueue.main.async { self?.refreshOutputPresentation() }
-            }
-            .store(in: &cancellables)
-        settings.objectWillChange
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] in
-                DispatchQueue.main.async { self?.refreshOutputPresentation() }
-            }
-            .store(in: &cancellables)
     }
 
     deinit {
@@ -107,6 +104,22 @@ final class FloatingControlsController {
                 if enabled { self.show() } else { self.hideForDisabledSetting() }
             }
             .store(in: &cancellables)
+        let configurationUpdates = Publishers.CombineLatest4(
+            settings.$defaultOutputLanguage,
+            settings.$llmProvider,
+            settings.$cloudLLMBaseURL,
+            settings.$cloudLLMModel
+        ).dropFirst().map { _ in () }.eraseToAnyPublisher()
+        Publishers.Merge(outputUpdates, configurationUpdates)
+        .receive(on: DispatchQueue.main)
+        .sink { [weak self] in
+            DispatchQueue.main.async { self?.refreshOutputPresentation() }
+        }
+        .store(in: &cancellables)
+        notificationCenter.publisher(for: .cloudLLMCredentialsDidChange)
+            .sink { [weak self] _ in self?.refreshOutputPresentation() }
+            .store(in: &cancellables)
+        refreshOutputPresentation()
     }
 
     func stop() {
@@ -136,9 +149,9 @@ final class FloatingControlsController {
 
     private static func translationState(
         settings: AppSettings,
-        selection: RecordingOutputSelection
+        selection: RecordingOutputSelection,
+        snapshot: CloudLLMSettingsSnapshot
     ) -> TranslationControlsState {
-        let snapshot = settings.cloudLLMSnapshot
         return TranslationControlsState(
             effectiveOutput: selection.effective ?? settings.defaultOutputLanguage,
             override: selection.effective,
@@ -149,7 +162,8 @@ final class FloatingControlsController {
     private func refreshTranslationState() {
         presentedTranslationState = Self.translationState(
             settings: settings,
-            selection: outputSelection()
+            selection: outputSelection(),
+            snapshot: cloudSnapshot()
         )
     }
 

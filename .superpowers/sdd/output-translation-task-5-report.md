@@ -54,3 +54,23 @@ Exited 0.
 - The launcher routes menu output events through its controller before re-rendering and observes HUD/coordinator output changes.
 - The reusable control is the sole owner of the two menu presentations, avoiding launcher/HUD drift.
 - `git diff --check` is clean. Pre-existing edits to unrelated task reports remain unstaged and uncommitted.
+
+## Review-finding follow-up
+
+- Generalized the secret-free refresh signal to `cloudLLMCredentialsDidChange`; the old Scratchpad name is a compatibility alias only. The Settings credential writer posts it only after a successful save or delete and never attaches the secret as object/user-info payload.
+- Launcher and coordinator/HUD now observe default output, provider, base URL, model, and credential changes. Credential refresh is synchronous after successful mutation; configuration refresh occurs on the next main-queue turn because `@Published` emits before storing the new value.
+- Moved all launcher settings/output/credential subscriptions into `start()`. `stop()` cancels them, restart reinstalls one set, and repeated active `start()` calls remain idempotent.
+- Disabled named output commands now sit inside a non-disabled accessibility element that owns the canonical language label, `Unavailable` value, canonical help/hint, and tooltip while the visual command stays disabled. Eligible choices retain their normal menu-button accessibility.
+
+Follow-up RED reproduced missing general notification/writer, missing restart-safe subscription injection, missing coordinator presentation seam, and missing disabled-wrapper accessibility policy.
+
+Follow-up focused gate:
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test \
+  --filter 'FloatingControlsPresentationTests|HUDWarningPresentationTests|FloatingPanelPolicyTests|OutputLanguageSettingsTests|ScratchpadAIActionTests.cloudConfigurationAndCredentialChangesRefreshAvailabilityWithoutReopen'
+```
+
+Passed 30 tests across 5 suites.
+
+Fresh full-suite `swift test` exited 0. `git diff --check` remained clean, and panel nonactivation/full-screen/first-click/hover behavior was unchanged.

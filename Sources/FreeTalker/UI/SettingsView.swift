@@ -551,10 +551,10 @@ private struct GeneralSettingsView: View {
                 TextField("Model", text: $settings.cloudLLMModel, prompt: providerDefaultModel.map(Text.init))
                 SecureField("API key", text: $cloudLLMKey)
                     .onChange(of: cloudLLMKey) { _, newValue in
-                        cloudLLMKeyError = !Keychain.set(newValue, account: Keychain.Account.cloudLLMKey(for: settings.llmProvider))
-                        if !cloudLLMKeyError {
-                            NotificationCenter.default.post(name: .scratchpadCloudCredentialsDidChange, object: nil)
-                        }
+                        cloudLLMKeyError = !CloudLLMCredentialWriter.update(
+                            newValue,
+                            account: Keychain.Account.cloudLLMKey(for: settings.llmProvider)
+                        )
                     }
                 if cloudLLMKeyError {
                     Text("Failed to save key to Keychain")

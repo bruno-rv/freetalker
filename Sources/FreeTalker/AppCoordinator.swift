@@ -204,6 +204,23 @@ final class AppCoordinator: ObservableObject {
                 self?.scheduleRecoveryRetentionPurge(retention)
             }
             .store(in: &cancellables)
+        Publishers.CombineLatest4(
+            AppSettings.shared.$defaultOutputLanguage,
+            AppSettings.shared.$llmProvider,
+            AppSettings.shared.$cloudLLMBaseURL,
+            AppSettings.shared.$cloudLLMModel
+        )
+        .dropFirst()
+        .map { _ in () }
+        .receive(on: DispatchQueue.main)
+        .sink { [weak self] in
+            DispatchQueue.main.async { self?.updateRecordingPanel() }
+        }
+        .store(in: &cancellables)
+        NotificationCenter.default.publisher(for: .cloudLLMCredentialsDidChange)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.updateRecordingPanel() }
+            .store(in: &cancellables)
         // Cheap catch-all: the user activating the app (opening Settings, the Library, even
         // just the menu bar popover focusing a window) re-checks the tap — catching
         // permissions granted in System Settings while the app was already running.
@@ -232,12 +249,24 @@ final class AppCoordinator: ObservableObject {
         updateRecordingPanel()
     }
 
-    private var translationControlsState: TranslationControlsState {
+    var presentedTranslationState: TranslationControlsState {
         let settings = AppSettings.shared
         let snapshot = settings.cloudLLMSnapshot
-        return TranslationControlsState(
-            effectiveOutput: recordingOutputSelection.effective ?? settings.defaultOutputLanguage,
-            override: recordingOutputSelection.effective,
+        return Self.translationControlsState(
+            defaultOutput: settings.defaultOutputLanguage,
+            selection: recordingOutputSelection,
+            snapshot: snapshot
+        )
+    }
+
+    nonisolated static func translationControlsState(
+        defaultOutput: OutputLanguage,
+        selection: RecordingOutputSelection,
+        snapshot: CloudLLMSettingsSnapshot
+    ) -> TranslationControlsState {
+        TranslationControlsState(
+            effectiveOutput: selection.effective ?? defaultOutput,
+            override: selection.effective,
             availability: .make(eligibility: snapshot.eligibility, provider: snapshot.provider)
         )
     }
@@ -916,7 +945,7 @@ final class AppCoordinator: ObservableObject {
             localContextScopeName: contextScope.displayName,
             localContextPermissionHint: contextPermissionHint,
             oneShotLanguage: oneShotLanguage,
-            translationState: translationControlsState
+            translationState: presentedTranslationState
         )
         hud.showRecordingPanel(state)
     }

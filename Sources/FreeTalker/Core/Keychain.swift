@@ -45,13 +45,15 @@ enum Keychain {
         return String(data: data, encoding: .utf8)
     }
 
-    static func delete(account: String) {
+    @discardableResult
+    static func delete(account: String) -> Bool {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account
         ]
-        SecItemDelete(query as CFDictionary)
+        let status = SecItemDelete(query as CFDictionary)
+        return status == errSecSuccess || status == errSecItemNotFound
     }
 
     enum Account {
@@ -70,13 +72,30 @@ enum Keychain {
 protocol SecretStore {
     func get(account: String) -> String?
     @discardableResult func set(_ value: String, account: String) -> Bool
-    func delete(account: String)
+    @discardableResult func delete(account: String) -> Bool
 }
 
 struct KeychainSecretStore: SecretStore {
     func get(account: String) -> String? { Keychain.get(account: account) }
     @discardableResult func set(_ value: String, account: String) -> Bool { Keychain.set(value, account: account) }
-    func delete(account: String) { Keychain.delete(account: account) }
+    @discardableResult func delete(account: String) -> Bool { Keychain.delete(account: account) }
+}
+
+enum CloudLLMCredentialWriter {
+    @discardableResult
+    static func update(
+        _ value: String,
+        account: String,
+        store: SecretStore = KeychainSecretStore(),
+        notificationCenter: NotificationCenter = .default
+    ) -> Bool {
+        let succeeded = value.isEmpty
+            ? store.delete(account: account)
+            : store.set(value, account: account)
+        guard succeeded else { return false }
+        notificationCenter.post(name: .cloudLLMCredentialsDidChange, object: nil)
+        return true
+    }
 }
 
 enum CloudLLMKeyMigration {
@@ -90,6 +109,6 @@ enum CloudLLMKeyMigration {
         guard let legacyValue = store.get(account: legacyAccount), !legacyValue.isEmpty else { return }
         guard store.set(legacyValue, account: targetAccount) else { return }
         guard store.get(account: targetAccount) == legacyValue else { return }
-        store.delete(account: legacyAccount)
+        _ = store.delete(account: legacyAccount)
     }
 }
