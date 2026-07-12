@@ -11,6 +11,7 @@ struct PendingTranslationRecovery {
     let sourceLanguage: String?
     let outputLanguage: TranslationTarget
     let template: Template
+    let engineName: String
     let destination: RecordingDestination
     let generation: UUID
     let capturedExternalTarget: InsertionTarget?
@@ -30,6 +31,7 @@ struct PendingTranslationRecovery {
         }
         self.outputLanguage = outputLanguage
         template = failure.context.template
+        engineName = failure.engineName
         destination = failure.context.destination
         self.generation = generation
         self.capturedExternalTarget = capturedExternalTarget
@@ -42,6 +44,7 @@ struct PendingTranslationRecovery {
         sourceLanguage = recovery.sourceLanguage
         outputLanguage = recovery.outputLanguage
         template = recovery.template
+        engineName = recovery.engineName
         destination = recovery.destination
         self.generation = generation
         capturedExternalTarget = recovery.capturedExternalTarget
@@ -51,6 +54,15 @@ struct PendingTranslationRecovery {
     func replacingGeneration(with generation: UUID = UUID()) -> Self {
         Self(replacingGenerationOf: self, with: generation)
     }
+}
+
+struct TranslationRecoveryHistoryRecord: Equatable {
+    let rawTranscript: String
+    let finalOutput: String
+    let sourceLanguage: SourceLanguage
+    let requestedOutputLanguage: OutputLanguage
+    let templateName: String
+    let engineName: String
 }
 
 struct TranslationRecoveryPresentation: Equatable {
@@ -85,10 +97,13 @@ final class PendingTranslationRecoveryController {
         _ destination: RecordingDestination,
         _ externalTarget: InsertionTarget?
     ) -> Bool
+    typealias RecordResolved = (TranslationRecoveryHistoryRecord) throws -> Void
 
     private let snapshot: Snapshot
     private let translate: Translate
     private let deliver: Deliver
+    private let recordResolved: RecordResolved
+    private let onHistoryFailure: (String) -> Void
     private let onChange: () -> Void
     private var recoveries: [PendingTranslationRecovery] = []
     private var inFlightIDs: Set<UUID> = []
@@ -98,11 +113,15 @@ final class PendingTranslationRecoveryController {
         snapshot: @escaping Snapshot,
         translate: @escaping Translate,
         deliver: @escaping Deliver,
+        recordResolved: @escaping RecordResolved = { _ in },
+        onHistoryFailure: @escaping (String) -> Void = { _ in },
         onChange: @escaping () -> Void = {}
     ) {
         self.snapshot = snapshot
         self.translate = translate
         self.deliver = deliver
+        self.recordResolved = recordResolved
+        self.onHistoryFailure = onHistoryFailure
         self.onChange = onChange
     }
 
@@ -166,6 +185,7 @@ final class PendingTranslationRecoveryController {
                   current.generation == attempt.generation else { return }
             if deliver(output, attempt.destination, attempt.capturedExternalTarget) {
                 remove(id: id, generation: attempt.generation)
+                recordHistoryIfNeeded(attempt, finalOutput: output)
             } else {
                 retain(output, id: id, generation: attempt.generation)
                 errors[id] = "The original destination changed. Copy the preserved text or try again."
@@ -185,6 +205,7 @@ final class PendingTranslationRecoveryController {
         invalidateAttempt(id: id)
         if deliver(recovery.sourceTranscript, recovery.destination, recovery.capturedExternalTarget) {
             remove(id: id)
+            recordHistoryIfNeeded(recovery, finalOutput: recovery.sourceTranscript)
         } else {
             retain(recovery.sourceTranscript, id: id)
             errors[id] = "The original destination changed. Copy the preserved text or try again."
@@ -217,6 +238,22 @@ final class PendingTranslationRecoveryController {
             $0.failureID == id && (generation == nil || $0.generation == generation)
         }) else { return }
         recoveries[index].recoverableText = text
+    }
+
+    private func recordHistoryIfNeeded(_ recovery: PendingTranslationRecovery, finalOutput: String) {
+        guard recovery.destination == .external else { return }
+        do {
+            try recordResolved(.init(
+                rawTranscript: recovery.sourceTranscript,
+                finalOutput: finalOutput,
+                sourceLanguage: SourceLanguage(recovery.sourceLanguage ?? ""),
+                requestedOutputLanguage: OutputLanguage(rawValue: recovery.outputLanguage.rawValue) ?? .sameAsSpoken,
+                templateName: recovery.template.name,
+                engineName: recovery.engineName
+            ))
+        } catch {
+            onHistoryFailure("Library save failed")
+        }
     }
 
     private static let retryTitle = TranslationRecoveryPresentation.retryTitle

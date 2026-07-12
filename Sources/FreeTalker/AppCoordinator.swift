@@ -661,7 +661,8 @@ final class AppCoordinator: ObservableObject {
                 source: source, template: template, policy: policy, snapshot: snapshot
             )
         },
-        deliver: PendingTranslationRecoveryController.Deliver? = nil
+        deliver: PendingTranslationRecoveryController.Deliver? = nil,
+        recordResolved: PendingTranslationRecoveryController.RecordResolved? = nil
     ) -> PendingTranslationRecoveryController {
         PendingTranslationRecoveryController(
             snapshot: snapshot,
@@ -675,6 +676,17 @@ final class AppCoordinator: ObservableObject {
                     return self.scratchpadRecordingRouter?.completeTranslationRecovery(text, for: token) ?? false
                 }
             },
+            recordResolved: recordResolved ?? { record in
+                try LibraryStore.shared.record(
+                    language: record.sourceLanguage.rawValue,
+                    requestedOutputLanguage: record.requestedOutputLanguage,
+                    template: record.templateName,
+                    transcript: record.rawTranscript,
+                    refined: record.finalOutput,
+                    engine: record.engineName
+                )
+            },
+            onHistoryFailure: { [weak self] message in self?.hud.flash(message) },
             onChange: { [weak self] in self?.presentTranslationRecoveryState() }
         )
     }
@@ -682,10 +694,12 @@ final class AppCoordinator: ObservableObject {
     func configureTranslationRecoveryForTesting(
         snapshot: @escaping PendingTranslationRecoveryController.Snapshot,
         translate: @escaping PendingTranslationRecoveryController.Translate,
-        deliver: @escaping PendingTranslationRecoveryController.Deliver
+        deliver: @escaping PendingTranslationRecoveryController.Deliver,
+        recordResolved: @escaping PendingTranslationRecoveryController.RecordResolved = { _ in }
     ) {
         translationRecoveryController = makeTranslationRecoveryController(
-            snapshot: snapshot, translate: translate, deliver: deliver
+            snapshot: snapshot, translate: translate, deliver: deliver,
+            recordResolved: recordResolved
         )
         presentTranslationRecoveryState()
     }
@@ -1911,9 +1925,17 @@ final class AppCoordinator: ObservableObject {
             refined = transcription.text
             recordedTemplateName = TemplateStore.rawTranscriptTemplateName
         } else if case .translate = context.outputLanguage.processingPolicy {
+            let failureContext = RecordingProcessingContext(
+                destination: context.destination,
+                spokenLanguage: transcription.language,
+                outputLanguage: context.outputLanguage,
+                template: context.template,
+                cloudSnapshot: context.cloudSnapshot
+            )
             guard let snapshot = context.cloudSnapshot, snapshot.eligibility.isEligible else {
                 throw OutputTranslationFailure(
-                    source: transcription.text, context: context,
+                    source: transcription.text, context: failureContext,
+                    engineName: engineName,
                     underlyingError: TranslationService.Error.unavailable(.invalidConfiguration)
                 )
             }
@@ -1928,7 +1950,10 @@ final class AppCoordinator: ObservableObject {
                 throw CancellationError()
             } catch {
                 try Task.checkCancellation()
-                throw OutputTranslationFailure(source: transcription.text, context: context, underlyingError: error)
+                throw OutputTranslationFailure(
+                    source: transcription.text, context: failureContext,
+                    engineName: engineName, underlyingError: error
+                )
             }
             recordedTemplateName = context.template.name
         } else {
