@@ -15,7 +15,7 @@ struct CloudFeatureAvailabilityTests {
         )
 
         #expect(availability.enabled == false)
-        #expect(availability.tooltip == "Add an API key for \(name) in Settings.")
+        #expect(availability.tooltip == "Add an API key for \(name) in Settings > General > Cloud post-processing.")
         #expect(availability.accessibilityHelp == availability.tooltip)
     }
 
@@ -26,7 +26,7 @@ struct CloudFeatureAvailabilityTests {
         )
 
         #expect(availability.enabled == false)
-        #expect(availability.tooltip == "Complete the API configuration in Settings.")
+        #expect(availability.tooltip == "Complete the Anthropic API configuration in Settings > General > Cloud post-processing.")
         #expect(availability.accessibilityHelp == availability.tooltip)
     }
 

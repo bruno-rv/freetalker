@@ -12,9 +12,9 @@ struct CloudFeatureAvailability: Equatable, Sendable {
         case .eligible:
             reason = nil
         case .invalidConfiguration:
-            reason = "Complete the API configuration in Settings."
+            reason = "Complete the \(provider.settingsName) API configuration in Settings > General > Cloud post-processing."
         case .missingAPIKey:
-            reason = "Add an API key for \(provider.settingsName) in Settings."
+            reason = "Add an API key for \(provider.settingsName) in Settings > General > Cloud post-processing."
         }
         return Self(
             enabled: reason == nil,

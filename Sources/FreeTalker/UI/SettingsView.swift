@@ -112,6 +112,24 @@ struct SettingsView: View {
     }
 }
 
+struct OutputLanguageSettingsPresentation: Equatable, Sendable {
+    let translationAvailability: CloudFeatureAvailability
+
+    var tooltip: String? { translationAvailability.tooltip }
+    var accessibilityHelp: String? { translationAvailability.accessibilityHelp }
+
+    static func make(snapshot: CloudLLMSettingsSnapshot) -> Self {
+        Self(translationAvailability: .make(
+            eligibility: snapshot.eligibility,
+            provider: snapshot.provider
+        ))
+    }
+
+    func isEnabled(_ language: OutputLanguage) -> Bool {
+        language == .sameAsSpoken || translationAvailability.enabled
+    }
+}
+
 struct VoiceEditHotKeyPresentation: Equatable {
     let label: String
     let actionLabel: String
@@ -420,14 +438,7 @@ private struct GeneralSettingsView: View {
                     Text("Portuguese").tag("pt")
                 }
                 .disabled(!settings.edgeLauncherEnabled)
-                Picker("Default output language", selection: $settings.defaultOutputLanguage) {
-                    ForEach(OutputLanguage.allCases, id: \.rawValue) { language in
-                        Text(language.displayName).tag(language)
-                    }
-                }
-                Text("Translation requires a configured cloud LLM API; Same as spoken does not.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                outputLanguagePicker
             }
 
             Section("Recovery") {
@@ -686,6 +697,30 @@ private struct GeneralSettingsView: View {
             microphoneAuthorized = Permissions.isMicrophoneAuthorized()
             inputMonitoringAuthorized = Permissions.isInputMonitoringAuthorized()
             screenRecordingAuthorization = Permissions.screenRecordingAuthorization()
+        }
+    }
+
+    @ViewBuilder
+    private var outputLanguagePicker: some View {
+        let presentation = OutputLanguageSettingsPresentation.make(snapshot: settings.cloudLLMSnapshot)
+        let content = VStack(alignment: .leading) {
+            Picker("Default output language", selection: $settings.defaultOutputLanguage) {
+                ForEach(OutputLanguage.allCases, id: \.rawValue) { language in
+                    Text(language.displayName)
+                        .tag(language)
+                        .disabled(!presentation.isEnabled(language))
+                }
+            }
+            Text("Translation requires Cloud post-processing; Same as spoken does not.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        if let help = presentation.tooltip {
+            content
+                .help(help)
+                .accessibilityHint(Text(presentation.accessibilityHelp ?? help))
+        } else {
+            content
         }
     }
 
