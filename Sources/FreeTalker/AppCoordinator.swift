@@ -23,6 +23,21 @@ final class AppCoordinator: ObservableObject {
         (["Speak the edit instruction, then press Voice Edit again"] + captureWarnings).joined(separator: "\n")
     }
 
+    /// Returns a user-facing issue for buffers that contain no credible microphone signal.
+    /// Normalized Float audio routinely has quiet speech well above 1e-7; keeping this gate at
+    /// the numerical-noise floor rejects dead all-zero taps without treating silence between
+    /// spoken words as a failed recording.
+    nonisolated static func capturedAudioIssue(sampleCount: Int, peak: Float, rms: Float) -> String? {
+        let deadSignalFloor: Float = 1e-7
+        guard sampleCount > 0,
+              peak.isFinite, rms.isFinite,
+              peak >= 0, rms >= 0,
+              peak > deadSignalFloor || rms > deadSignalFloor else {
+            return "No microphone audio detected"
+        }
+        return nil
+    }
+
     static let shared = AppCoordinator()
 
     @Published private(set) var isRecording = false
@@ -334,7 +349,12 @@ final class AppCoordinator: ObservableObject {
         isRecording = false
         hotKeyManager.isRecording = false
         let samples = audioCapture.stop()
-        guard let selection, !samples.isEmpty else {
+        let (peak, rms) = AudioLevel.peakAndRMS(samples)
+        if let issue = Self.capturedAudioIssue(sampleCount: samples.count, peak: peak, rms: rms) {
+            hud.flash(issue)
+            return
+        }
+        guard let selection else {
             hud.flash("No voice instruction captured")
             return
         }
@@ -821,8 +841,9 @@ final class AppCoordinator: ObservableObject {
         Self.logger.log("capture stopped: samples=\(samples.count) peak=\(peak) rms=\(rms)")
         writeLastCaptureDebugArtifact(samples)
 
-        guard !samples.isEmpty else {
-            hud.hide()
+        if let issue = Self.capturedAudioIssue(sampleCount: samples.count, peak: peak, rms: rms) {
+            lastError = issue
+            hud.flash(issue)
             return
         }
         isProcessing = true
