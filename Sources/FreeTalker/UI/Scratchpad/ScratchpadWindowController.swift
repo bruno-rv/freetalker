@@ -16,6 +16,9 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
     private let consumePendingRecording: (ScratchpadInsertionToken) -> String?
     private let clearPendingRecording: (ScratchpadInsertionToken) -> Void
     private let consumePendingFailure: () -> String?
+    private let translationRecoveryPresentation: () -> TranslationRecoveryPresentation?
+    private let retryTranslation: () -> Void
+    private let insertSourceText: () -> Void
     private let flush: (ScratchpadDocument) throws -> Void
     private let transformationService: any ScratchpadTransforming
     private let cloudLLMSnapshot: () -> CloudLLMSettingsSnapshot
@@ -45,6 +48,9 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
             consumePendingRecording: { coordinator.consumePendingScratchpadRecording(for: $0) },
             clearPendingRecording: { coordinator.clearPendingScratchpadRecording(for: $0) },
             consumePendingFailure: { coordinator.consumePendingScratchpadFailure() },
+            translationRecoveryPresentation: { coordinator.nextTranslationRecoveryPresentation },
+            retryTranslation: { coordinator.retryNextTranslation() },
+            insertSourceText: { coordinator.insertNextTranslationSource() },
             flushDocument: { try $0.flush() },
             transformationService: ScratchpadTransformationService(),
             cloudLLMSnapshot: { AppSettings.shared.cloudLLMSnapshot }
@@ -61,6 +67,9 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
         consumePendingRecording: @escaping (ScratchpadInsertionToken) -> String?,
         clearPendingRecording: @escaping (ScratchpadInsertionToken) -> Void,
         consumePendingFailure: @escaping () -> String?,
+        translationRecoveryPresentation: @escaping () -> TranslationRecoveryPresentation? = { nil },
+        retryTranslation: @escaping () -> Void = {},
+        insertSourceText: @escaping () -> Void = {},
         flushDocument: @escaping (ScratchpadDocument) throws -> Void,
         saveDocument: ((NSAttributedString) throws -> Void)? = nil,
         transformationService: any ScratchpadTransforming = ScratchpadTransformationService(),
@@ -79,6 +88,9 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
         self.consumePendingRecording = consumePendingRecording
         self.clearPendingRecording = clearPendingRecording
         self.consumePendingFailure = consumePendingFailure
+        self.translationRecoveryPresentation = translationRecoveryPresentation
+        self.retryTranslation = retryTranslation
+        self.insertSourceText = insertSourceText
         self.flush = flushDocument
         self.transformationService = transformationService
         self.cloudLLMSnapshot = cloudLLMSnapshot
@@ -101,6 +113,14 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
         scratchpadView.onStartDictation = { [weak self] in self?.startDictation() }
         scratchpadView.onStopDictation = { [weak self] in self?.stopDictation() }
         scratchpadView.onInsertRecovery = { [weak self] in self?.insertRecovery() }
+        scratchpadView.onRetryTranslation = { [weak self] in
+            self?.retryTranslation()
+            self?.refreshTranslationRecoveryPresentation()
+        }
+        scratchpadView.onInsertSourceText = { [weak self] in
+            self?.insertSourceText()
+            self?.refreshTranslationRecoveryPresentation()
+        }
         scratchpadView.onAIAction = { [weak self] action in self?.performAIAction(action) }
         scratchpadView.onCustomAIAction = { [weak self] in self?.performCustomAIAction() }
         scratchpadView.onCustomInstructionChanged = { [weak self] in self?.refreshAIAvailability() }
@@ -151,6 +171,7 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
             retainWarning(failure)
         }
         updateStatusPresentation()
+        refreshTranslationRecoveryPresentation()
         refreshAIAvailability()
         if activate { NSApplication.shared.activate(ignoringOtherApps: true) }
         showWindow(nil)
@@ -205,6 +226,17 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
         } else {
             enqueueRecovery(token: token, text: text)
         }
+        return accepted
+    }
+
+    func completeTranslationRecovery(_ text: String, for token: ScratchpadInsertionToken) -> Bool {
+        let accepted = scratchpadView.editorController.replaceTransformation(
+            token,
+            with: NSAttributedString(string: text),
+            actionName: "Translation Recovery"
+        )
+        if accepted { clearPendingRecording(token) }
+        else { scratchpadView.translationRecovery = translationRecoveryPresentation() }
         return accepted
     }
 
@@ -342,6 +374,10 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
     private func renderCurrentRecovery() {
         scratchpadView.recoveryText = recoveries.first?.text
         updateStatusPresentation()
+    }
+
+    private func refreshTranslationRecoveryPresentation() {
+        scratchpadView.translationRecovery = translationRecoveryPresentation()
     }
 
     private func insertRecovery() {

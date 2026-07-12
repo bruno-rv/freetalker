@@ -44,6 +44,23 @@ final class AppCoordinator: ObservableObject {
     @Published private(set) var isProcessing = false
     @Published private(set) var lastError: String?
     private var pendingOutputTranslationFailuresStorage: [OutputTranslationFailure] = []
+    private lazy var translationRecoveryController = PendingTranslationRecoveryController(
+        snapshot: { AppSettings.shared.cloudLLMSnapshot },
+        translate: { source, template, policy, snapshot in
+            try await TranslationService().process(
+                source: source, template: template, policy: policy, snapshot: snapshot
+            )
+        },
+        deliver: { [weak self] text, destination, externalTarget in
+            guard let self else { return false }
+            switch destination {
+            case .external:
+                return Insertion.insert(text, target: externalTarget)
+            case .scratchpad(let token):
+                return self.scratchpadRecordingRouter?.completeTranslationRecovery(text, for: token) ?? false
+            }
+        }
+    )
     /// Set while the global hotkey listener couldn't be started (missing Accessibility
     /// permission) and we're waiting for the user to grant it. See Round 1 Codex finding 8.
     @Published private(set) var hotKeyStatusText: String?
@@ -243,6 +260,8 @@ final class AppCoordinator: ObservableObject {
         hud.onPanelOutput = { [weak self] language in self?.selectRecordingOutput(language) }
         hud.onPanelCycleTemplate = { [weak self] in self?.handlePanelCycleTemplate() }
         hud.onPanelLock = { [weak self] in self?.handlePillClick() }
+        hud.onRetryTranslation = { [weak self] in self?.retryNextTranslation() }
+        hud.onInsertSourceText = { [weak self] in self?.insertNextTranslationSource() }
     }
 
     func selectRecordingOutput(_ language: OutputLanguage) {
@@ -619,8 +638,48 @@ final class AppCoordinator: ObservableObject {
 
     @discardableResult
     func handleOutputTranslationFailure(_ failure: OutputTranslationFailure) -> String {
+        handleOutputTranslationFailure(failure, externalTarget: nil)
+    }
+
+    func handleOutputTranslationFailure(
+        _ failure: OutputTranslationFailure,
+        externalTarget: InsertionTarget?
+    ) -> String {
         enqueueOutputTranslationFailure(failure)
+        translationRecoveryController.enqueue(failure, externalTarget: externalTarget)
         return failure.localizedDescription
+    }
+
+    var nextTranslationRecoveryPresentation: TranslationRecoveryPresentation? {
+        translationRecoveryController.nextPresentation
+    }
+
+    func retryNextTranslation() {
+        guard let id = translationRecoveryController.nextID else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            await translationRecoveryController.retryTranslation(id: id)
+            resolvePresentedTranslationIfNeeded(id: id)
+        }
+    }
+
+    func insertNextTranslationSource() {
+        guard let id = translationRecoveryController.nextID else { return }
+        translationRecoveryController.insertSourceText(id: id)
+        resolvePresentedTranslationIfNeeded(id: id)
+    }
+
+    private func resolvePresentedTranslationIfNeeded(id: UUID) {
+        if !translationRecoveryController.pendingRecoveries.contains(where: { $0.failureID == id }) {
+            if let index = pendingOutputTranslationFailuresStorage.firstIndex(where: { $0.id == id }) {
+                pendingOutputTranslationFailuresStorage.remove(at: index)
+            }
+        }
+        if let presentation = translationRecoveryController.nextPresentation {
+            hud.showTranslationRecovery(presentation)
+        } else {
+            hud.hide()
+        }
     }
 
     func pendingOutputTranslationFailures() -> [OutputTranslationFailure] {
@@ -631,12 +690,15 @@ final class AppCoordinator: ObservableObject {
         guard let index = pendingOutputTranslationFailuresStorage.firstIndex(where: { $0.id == id }) else {
             return nil
         }
+        translationRecoveryController.discard(id: id)
         return pendingOutputTranslationFailuresStorage.remove(at: index)
     }
 
     func consumeNextPendingOutputTranslationFailure() -> OutputTranslationFailure? {
         guard !pendingOutputTranslationFailuresStorage.isEmpty else { return nil }
-        return pendingOutputTranslationFailuresStorage.removeFirst()
+        let failure = pendingOutputTranslationFailuresStorage.removeFirst()
+        translationRecoveryController.discard(id: failure.id)
+        return failure
     }
 
     @discardableResult
@@ -1496,9 +1558,11 @@ final class AppCoordinator: ObservableObject {
                 hud.flash("Library save failed")
             },
             onTranslationFailure: { failure in
-                let message = handleOutputTranslationFailure(failure)
+                let message = handleOutputTranslationFailure(failure, externalTarget: target)
                 lastError = message
-                hud.flash(message)
+                if let presentation = translationRecoveryController.nextPresentation {
+                    hud.showTranslationRecovery(presentation)
+                }
             },
             onFailure: { error in
                 lastError = "Transcription failed: \(error.localizedDescription)"
@@ -1583,7 +1647,9 @@ final class AppCoordinator: ObservableObject {
                 onTranslationFailure: { failure in
                     let message = handleOutputTranslationFailure(failure)
                     lastError = message
-                    hud.flash(message)
+                    if let presentation = translationRecoveryController.nextPresentation {
+                        hud.showTranslationRecovery(presentation)
+                    }
                 },
                 onFailure: { error in
                     let message = error is PipelineError ? "Transcription failed" : "Transcription failed: \(error.localizedDescription)"

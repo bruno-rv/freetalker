@@ -21,6 +21,8 @@ final class HUDController {
     var onPanelOutput: ((OutputLanguage) -> Void)?
     var onPanelCycleTemplate: (() -> Void)?
     var onPanelLock: (() -> Void)?
+    var onRetryTranslation: (() -> Void)?
+    var onInsertSourceText: (() -> Void)?
 
     init(settings: AppSettings = .shared) {
         self.settings = settings
@@ -43,6 +45,7 @@ final class HUDController {
     enum Mode: Equatable {
         case text(String)
         case recordingPanel(RecordingPanelState)
+        case translationRecovery(TranslationRecoveryPresentation)
     }
 
     struct RecordingPanelState: Equatable {
@@ -69,6 +72,8 @@ final class HUDController {
         var onOutput: (OutputLanguage) -> Void = { _ in }
         var onCycleTemplate: () -> Void = {}
         var onLock: () -> Void = {}
+        var onRetryTranslation: () -> Void = {}
+        var onInsertSourceText: () -> Void = {}
     }
 
     func show(text: String) {
@@ -93,6 +98,12 @@ final class HUDController {
         pendingHide?.cancel()
         pendingHide = nil
         display(mode: .recordingPanel(state))
+    }
+
+    func showTranslationRecovery(_ presentation: TranslationRecoveryPresentation) {
+        pendingHide?.cancel()
+        pendingHide = nil
+        display(mode: .translationRecovery(presentation))
     }
 
     func hide() {
@@ -126,7 +137,9 @@ final class HUDController {
             onLanguage: { [weak self] code in self?.onPanelLanguage?(code) },
             onOutput: { [weak self] language in self?.onPanelOutput?(language) },
             onCycleTemplate: { [weak self] in self?.onPanelCycleTemplate?() },
-            onLock: { [weak self] in self?.onPanelLock?() }
+            onLock: { [weak self] in self?.onPanelLock?() },
+            onRetryTranslation: { [weak self] in self?.onRetryTranslation?() },
+            onInsertSourceText: { [weak self] in self?.onInsertSourceText?() }
         )
         let hosting = NSHostingView(rootView: HUDView(
             mode: mode,
@@ -277,6 +290,23 @@ struct HUDView: View {
                     }
                 }
                 .frame(maxWidth: 460, alignment: .leading)
+            case .translationRecovery(let presentation):
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(presentation.message)
+                        .foregroundStyle(.red)
+                    Text(presentation.recoverableText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .lineLimit(2)
+                    HStack(spacing: 8) {
+                        Button(presentation.retryTitle, action: panelCallbacks.onRetryTranslation)
+                            .disabled(presentation.isRetrying)
+                        Button(presentation.insertSourceTitle, action: panelCallbacks.onInsertSourceText)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .frame(maxWidth: 420, alignment: .leading)
             }
         }
         .font(.system(size: 13, weight: .medium))
@@ -323,7 +353,12 @@ struct HUDView: View {
             }
             .help("Done")
 
-            Button("Raw", action: panelCallbacks.onRaw)
+            Button(
+                TranslationRecoveryPresentation.sourceActionTitle(
+                    outputLanguage: state.translationState.effectiveOutput
+                ),
+                action: panelCallbacks.onRaw
+            )
                 .font(.caption)
                 .help("Finish without post-processing")
 
