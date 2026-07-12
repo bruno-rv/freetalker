@@ -378,6 +378,7 @@ Define tests around these core types:
 public struct EnrollmentPrototype: Equatable, Sendable {
     public let participantID: String
     public let embedding: VoiceEmbedding
+    public let fingerprint: EmbeddingModelFingerprint
 }
 
 public struct SpeakerMatchCandidate: Equatable, Sendable {
@@ -444,15 +445,17 @@ public struct VoiceProfileMatcher: Sendable {
     public init(parameters: MatchingParameters)
     public func candidates(
         speakers: [SpeakerRepresentation],
+        speakerFingerprint: EmbeddingModelFingerprint,
         prototypes: [EnrollmentPrototype]
     ) -> [SpeakerMatchCandidate]
 }
 ```
 
-Group prototypes by participant, score a speaker against every participant, and
-solve the complete cost matrix while allowing unknown speakers. Apply duration,
-maximum-distance, and runner-up-margin rules after computing the matrix. Break
-exact ties by stable participant and speaker IDs. Keep this implementation
+Reject prototypes whose fingerprint differs from `speakerFingerprint`, group the
+remaining prototypes by participant, score a speaker against every participant,
+and solve the complete cost matrix while allowing unknown speakers. Apply
+duration, maximum-distance, and runner-up-margin rules after computing the matrix.
+Break exact ties by stable participant and speaker IDs. Keep this implementation
 Foundation-only, reject non-finite parameters, and cover rectangular matrices,
 empty sides, and more speakers than profiles. Do not use factorial enumeration;
 the same core must remain safe when the eventual product has many global profiles.
