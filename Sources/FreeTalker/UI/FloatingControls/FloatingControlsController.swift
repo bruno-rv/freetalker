@@ -49,6 +49,10 @@ final class FloatingControlsController {
     private let outputUpdates: AnyPublisher<Void, Never>
     private let cloudSnapshot: () -> CloudLLMSettingsSnapshot
     private let notificationCenter: NotificationCenter
+    /// While a recording is active the HUD's recording panel takes over this same edge-anchored
+    /// spot (see `HUDController.launcherAnchoredFrame`) — showing both at once would double up
+    /// on the same corner of the screen.
+    private let isRecording: () -> Bool
     private var panel: NSPanel?
     private var hostingView: FloatingControlsHostingView?
     private var state = FloatingControlsHoverState.collapsed
@@ -64,6 +68,7 @@ final class FloatingControlsController {
         outputUpdates: AnyPublisher<Void, Never> = Empty().eraseToAnyPublisher(),
         cloudSnapshot: (() -> CloudLLMSettingsSnapshot)? = nil,
         notificationCenter: NotificationCenter = .default,
+        isRecording: @escaping () -> Bool = { false },
         callbacks: Callbacks
     ) {
         self.settings = settings
@@ -71,6 +76,7 @@ final class FloatingControlsController {
         self.outputUpdates = outputUpdates
         self.cloudSnapshot = cloudSnapshot ?? { settings.cloudLLMSnapshot }
         self.notificationCenter = notificationCenter
+        self.isRecording = isRecording
         self.callbacks = callbacks
         presentedLanguagePin = settings.languagePin
         presentedTranslationState = Self.translationState(
@@ -193,7 +199,6 @@ final class FloatingControlsController {
             panel = Self.makePanel(size: CGSize(width: 18, height: 64))
         }
         renderAndPosition()
-        panel?.orderFrontRegardless()
     }
 
     private func hideForDisabledSetting() {
@@ -227,6 +232,10 @@ final class FloatingControlsController {
 
     private func renderAndPosition() {
         guard let panel else { return }
+        guard !isRecording() else {
+            panel.orderOut(nil)
+            return
+        }
         var viewCallbacks = callbacks
         viewCallbacks.onOutput = { [weak self] language in self?.selectOutput(language) }
         let view = FloatingControlsView(
@@ -254,6 +263,7 @@ final class FloatingControlsController {
             visibleFrame: screen.visibleFrame
         ), display: true)
         hosting.reinstallTrackingArea()
+        panel.orderFrontRegardless()
     }
 
     private func screenForLauncher() -> NSScreen? {
