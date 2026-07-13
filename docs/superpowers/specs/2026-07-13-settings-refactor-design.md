@@ -10,12 +10,19 @@ Replace the top-level tab strip with a compact, icon-led sidebar containing Gene
 
 Templates and Snippets retain their existing list/editor behavior; only their outer surface and spacing are updated for consistency.
 
+## Contextual help
+
+Settings that introduce a concept, trade-off, or prerequisite that is not self-evident receive a subtle trailing `questionmark.circle` control. Activating it opens a short native popover explaining the setting in context; hovering exposes the same summary as a tooltip. The control has an explicit accessibility label and does not displace the setting's primary action.
+
+Help appears selectively for settings such as on-device context, automatic template selection, push-to-talk and hands-free modes, floating controls, recovery retention, local/cloud transcription choices, and app rules. Straightforward settings such as a microphone selector do not receive redundant help affordances.
+
 ## Visual language
 
 - Native SwiftUI dark-aware surfaces; do not force a global appearance.
 - SF Symbols for navigation and supporting icons, avoiding custom raster assets.
 - Grouped rounded panels, comfortable spacing, and secondary helper text.
 - System controls and accessibility labels remain intact.
+- Contextual help uses native popovers and tooltips instead of a separate documentation surface.
 
 ## Boundaries
 
