@@ -77,57 +77,60 @@ struct SnippetsSettingsView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            if let initializationError {
-                let availability = SnippetStoreAvailabilityPresentation.failure(initializationError)
-                Label(availability.message, systemImage: "exclamationmark.triangle")
-                    .foregroundStyle(.red)
-                if availability.showsRetry {
-                    Button("Retry local snippet storage", action: retry)
-                }
-            }
-            HSplitView {
-            VStack(alignment: .leading) {
-                List(selection: $selectedID) {
-                    ForEach(snippets) { snippet in Text(snippet.name).tag(snippet.id as String?) }
-                }
-                HStack {
-                    Button("New snippet", systemImage: "plus") { createDraft() }
-                    Button("Delete", systemImage: "trash") {
-                        pendingDelete = snippets.first { $0.id == selectedID }
+        SettingsPage(title: "Snippets", subtitle: "Manage reusable text snippets") {
+            VStack(alignment: .leading, spacing: 12) {
+                if let initializationError {
+                    let availability = SnippetStoreAvailabilityPresentation.failure(initializationError)
+                    Label(availability.message, systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.red)
+                    if availability.showsRetry {
+                        Button("Retry local snippet storage", action: retry)
                     }
-                    .disabled(selectedID == nil)
                 }
-            }
-            .frame(minWidth: 180)
 
-            Form {
-                TextField("Name", text: $draft.name)
-                    .accessibilityLabel("Snippet name")
-                Text("Trigger phrases (one per line)").font(.headline)
-                TextEditor(text: $draft.triggersText)
-                    .frame(minHeight: 90)
-                    .accessibilityLabel("Snippet trigger phrases")
-                Text("Expansion").font(.headline)
-                TextEditor(text: $draft.expansion)
-                    .frame(minHeight: 150)
-                    .accessibilityLabel("Snippet expansion")
-                if let validationMessage = draft.validationMessage {
-                    Text(validationMessage).font(.caption).foregroundStyle(.red)
+                HSplitView {
+                    VStack(alignment: .leading) {
+                        List(selection: $selectedID) {
+                            ForEach(snippets) { snippet in Text(snippet.name).tag(snippet.id as String?) }
+                        }
+                        HStack {
+                            Button("New snippet", systemImage: "plus") { createDraft() }
+                            Button("Delete", systemImage: "trash") {
+                                pendingDelete = snippets.first { $0.id == selectedID }
+                            }
+                            .disabled(selectedID == nil)
+                        }
+                    }
+                    .frame(minWidth: 180)
+
+                    Form {
+                        TextField("Name", text: $draft.name)
+                            .accessibilityLabel("Snippet name")
+                        Text("Trigger phrases (one per line)").font(.headline)
+                        TextEditor(text: $draft.triggersText)
+                            .frame(minHeight: 90)
+                            .accessibilityLabel("Snippet trigger phrases")
+                        Text("Expansion").font(.headline)
+                        TextEditor(text: $draft.expansion)
+                            .frame(minHeight: 150)
+                            .accessibilityLabel("Snippet expansion")
+                        if let validationMessage = draft.validationMessage {
+                            Text(validationMessage).font(.caption).foregroundStyle(.red)
+                        }
+                        if let errorMessage {
+                            Text(errorMessage).font(.caption).foregroundStyle(.red)
+                        }
+                        HStack {
+                            Spacer()
+                            Button("Save") { save() }
+                                .keyboardShortcut(.defaultAction)
+                                .disabled(draft.validationMessage != nil)
+                        }
+                    }
+                    .frame(minWidth: 320)
                 }
-                if let errorMessage {
-                    Text(errorMessage).font(.caption).foregroundStyle(.red)
-                }
-                HStack {
-                    Spacer()
-                    Button("Save") { save() }
-                        .keyboardShortcut(.defaultAction)
-                        .disabled(draft.validationMessage != nil)
-                }
+                .disabled(store == nil)
             }
-            .frame(minWidth: 320)
-            }
-            .disabled(store == nil)
         }
         .task { await reload() }
         .onChange(of: selectedID) { _, id in
