@@ -95,11 +95,13 @@ struct SettingsView: View {
                 GeneralSettingsView()
                     .opacity(selection == .general ? 1 : 0)
                     .allowsHitTesting(selection == .general)
+                    .disabled(selection != .general)
                     .accessibilityHidden(selection != .general)
 
                 TemplatesSettingsView()
                     .opacity(selection == .templates ? 1 : 0)
                     .allowsHitTesting(selection == .templates)
+                    .disabled(selection != .templates)
                     .accessibilityHidden(selection != .templates)
 
                 SnippetsSettingsView(
@@ -109,6 +111,7 @@ struct SettingsView: View {
                 )
                 .opacity(selection == .snippets ? 1 : 0)
                 .allowsHitTesting(selection == .snippets)
+                .disabled(selection != .snippets)
                 .accessibilityHidden(selection != .snippets)
             }
         }
