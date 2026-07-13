@@ -81,7 +81,7 @@ struct HotKeySpec: Codable, Equatable {
         return symbols.isEmpty ? "None" : symbols
     }
 
-    static func isValidRedoSpec(_ spec: HotKeySpec) -> Bool {
+    static func isValidInsertLastDictationSpec(_ spec: HotKeySpec) -> Bool {
         spec.keyCode != nil
     }
 
@@ -94,30 +94,31 @@ struct HotKeySpec: Codable, Equatable {
             && genericMask(forDeviceMask: a.modifiers) == genericMask(forDeviceMask: b.modifiers)
     }
 
-    /// True when holding `redoSpec`'s modifiers alone would already satisfy `pttSpec`'s engage
-    /// condition before `redoSpec`'s own keyDown ever arrives — i.e. `pttSpec` is modifier-only
-    /// and its side-normalized modifier set is a (non-strict) subset of `redoSpec`'s. Example:
-    /// PTT=⌃⌥, redo=⌃⌥D — holding ⌃⌥ to reach for D already engages PTT. Checked both directions
-    /// by the recorders: the redo recorder against the bound PTT spec, and re-recording PTT
-    /// against any bound redo spec.
-    static func redoShadowsHeldPTT(pttSpec: HotKeySpec, redoSpec: HotKeySpec) -> Bool {
+    /// True when holding `insertLastDictationSpec`'s modifiers alone would already satisfy
+    /// `pttSpec`'s engage condition before `insertLastDictationSpec`'s own keyDown ever arrives —
+    /// i.e. `pttSpec` is modifier-only and its side-normalized modifier set is a (non-strict)
+    /// subset of `insertLastDictationSpec`'s. Example: PTT=⌃⌥, insert=⌃⌥D — holding ⌃⌥ to reach
+    /// for D already engages PTT. Checked both directions by the recorders: the Insert Last
+    /// Dictation recorder against the bound PTT spec, and re-recording PTT against any bound
+    /// Insert Last Dictation spec.
+    static func insertLastDictationShadowsHeldPTT(pttSpec: HotKeySpec, insertLastDictationSpec: HotKeySpec) -> Bool {
         guard pttSpec.keyCode == nil, pttSpec.modifiers != 0 else { return false }
         let pttGeneric = genericMask(forDeviceMask: pttSpec.modifiers)
-        let redoGeneric = genericMask(forDeviceMask: redoSpec.modifiers)
-        return redoGeneric & pttGeneric == pttGeneric
+        let insertGeneric = genericMask(forDeviceMask: insertLastDictationSpec.modifiers)
+        return insertGeneric & pttGeneric == pttGeneric
     }
 
-    static func validRedoSpec(_ candidate: HotKeySpec, pttSpec: HotKeySpec) -> HotKeySpec? {
-        guard isValidRedoSpec(candidate), !collides(candidate, pttSpec), !redoShadowsHeldPTT(pttSpec: pttSpec, redoSpec: candidate) else {
+    static func validInsertLastDictationSpec(_ candidate: HotKeySpec, pttSpec: HotKeySpec) -> HotKeySpec? {
+        guard isValidInsertLastDictationSpec(candidate), !collides(candidate, pttSpec), !insertLastDictationShadowsHeldPTT(pttSpec: pttSpec, insertLastDictationSpec: candidate) else {
             return nil
         }
         return candidate
     }
 
     static func validActionSpec(_ candidate: HotKeySpec, pttSpec: HotKeySpec, otherActionSpec: HotKeySpec?) -> HotKeySpec? {
-        guard isValidRedoSpec(candidate),
+        guard isValidInsertLastDictationSpec(candidate),
               !collides(candidate, pttSpec),
-              !redoShadowsHeldPTT(pttSpec: pttSpec, redoSpec: candidate),
+              !insertLastDictationShadowsHeldPTT(pttSpec: pttSpec, insertLastDictationSpec: candidate),
               otherActionSpec.map({ !collides(candidate, $0) }) ?? true else { return nil }
         return candidate
     }
