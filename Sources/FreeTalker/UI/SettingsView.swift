@@ -1106,46 +1106,48 @@ private struct TemplatesSettingsView: View {
     @State private var selectedID: String?
 
     var body: some View {
-        HSplitView {
-            List(selection: $selectedID) {
-                ForEach(store.templates) { template in
-                    HStack {
-                        Text(template.name)
-                        if template.id == settings.activeTemplateID {
-                            Spacer()
-                            Image(systemName: "checkmark.circle.fill").foregroundStyle(.tint)
+        SettingsPage(title: "Templates", subtitle: "Create and refine reusable dictation formats") {
+            HSplitView {
+                List(selection: $selectedID) {
+                    ForEach(store.templates) { template in
+                        HStack {
+                            Text(template.name)
+                            if template.id == settings.activeTemplateID {
+                                Spacer()
+                                Image(systemName: "checkmark.circle.fill").foregroundStyle(.tint)
+                            }
                         }
+                        .tag(template.id)
                     }
-                    .tag(template.id)
                 }
-            }
-            // Master list stays compact — a bounded maxWidth so it doesn't compete for space
-            // with the (flexible) detail editor. Previously this had no maxWidth at all, and
-            // since List is inherently greedy (defaults to filling all available width when
-            // unconstrained) while the old Form-based TemplateEditor reported a small ideal
-            // width, HSplitView handed nearly all the window's width to this list and squeezed
-            // the editor down to its minimum — exactly the reported "list occupies almost the
-            // whole screen, prompt editor is shrunk" bug.
-            .frame(minWidth: 160, idealWidth: 200, maxWidth: 260)
-            .toolbar {
-                ToolbarItemGroup {
-                    Button {
-                        let new = Template(id: UUID().uuidString, name: "New Template", prompt: "")
-                        try? store.upsert(new)
-                        selectedID = new.id
-                    } label: { Image(systemName: "plus") }
-                    Button {
-                        if let selectedID { store.delete(id: selectedID); self.selectedID = nil }
-                    } label: { Image(systemName: "minus") }
-                    .disabled(selectedID == nil)
+                // Master list stays compact — a bounded maxWidth so it doesn't compete for space
+                // with the (flexible) detail editor. Previously this had no maxWidth at all, and
+                // since List is inherently greedy (defaults to filling all available width when
+                // unconstrained) while the old Form-based TemplateEditor reported a small ideal
+                // width, HSplitView handed nearly all the window's width to this list and squeezed
+                // the editor down to its minimum — exactly the reported "list occupies almost the
+                // whole screen, prompt editor is shrunk" bug.
+                .frame(minWidth: 160, idealWidth: 200, maxWidth: 260)
+                .toolbar {
+                    ToolbarItemGroup {
+                        Button {
+                            let new = Template(id: UUID().uuidString, name: "New Template", prompt: "")
+                            try? store.upsert(new)
+                            selectedID = new.id
+                        } label: { Image(systemName: "plus") }
+                        Button {
+                            if let selectedID { store.delete(id: selectedID); self.selectedID = nil }
+                        } label: { Image(systemName: "minus") }
+                        .disabled(selectedID == nil)
+                    }
                 }
-            }
 
-            if let selectedID, let template = store.template(id: selectedID) {
-                TemplateEditor(template: template)
-                    .id(template.id)
-            } else {
-                Text("Select a template").foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
+                if let selectedID, let template = store.template(id: selectedID) {
+                    TemplateEditor(template: template)
+                        .id(template.id)
+                } else {
+                    Text("Select a template").foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
             }
         }
     }
