@@ -41,23 +41,27 @@ final class AppSettings: ObservableObject {
             if let data = try? JSONEncoder().encode(hotKeySpec) {
                 defaults.set(data, forKey: Keys.hotKeySpec)
             }
-            // A PTT change can invalidate a previously-valid Redo Last pair (now colliding with
-            // it, or shadow-engaged before its own keyDown) even outside the recorder's own
-            // pre-check in SettingsView — e.g. a hand-edited default, or any future call site
-            // that assigns `hotKeySpec` directly. Re-validating here keeps the two settings
-            // consistent no matter how `hotKeySpec` changes; `redoHotKeySpec`'s own `didSet`
-            // below handles dropping the now-stale persisted key. See Round 1 Codex finding 10.
-            if let redoHotKeySpec, HotKeySpec.validRedoSpec(redoHotKeySpec, pttSpec: hotKeySpec) == nil {
-                self.redoHotKeySpec = nil
+            // A PTT change can invalidate a previously-valid Insert Last Dictation pair (now
+            // colliding with it, or shadow-engaged before its own keyDown) even outside the
+            // recorder's own pre-check in SettingsView — e.g. a hand-edited default, or any
+            // future call site that assigns `hotKeySpec` directly. Re-validating here keeps the
+            // two settings consistent no matter how `hotKeySpec` changes;
+            // `insertLastDictationHotKeySpec`'s own `didSet` below handles dropping the now-stale
+            // persisted key. See Round 1 Codex finding 10.
+            if let insertLastDictationHotKeySpec, HotKeySpec.validInsertLastDictationSpec(insertLastDictationHotKeySpec, pttSpec: hotKeySpec) == nil {
+                self.insertLastDictationHotKeySpec = nil
             }
             if let voiceEditHotKeySpec,
-               HotKeySpec.validActionSpec(voiceEditHotKeySpec, pttSpec: hotKeySpec, otherActionSpec: redoHotKeySpec) == nil {
+               HotKeySpec.validActionSpec(voiceEditHotKeySpec, pttSpec: hotKeySpec, otherActionSpec: insertLastDictationHotKeySpec) == nil {
                 self.voiceEditHotKeySpec = nil
             }
         }
     }
 
-    @Published var redoHotKeySpec: HotKeySpec? {
+    // ponytail: raw UserDefaults key stays "redoHotKeySpec" (see Keys.insertLastDictationHotKeySpec
+    // below) so existing users' saved bindings survive the "Redo Last" → "Insert Last Dictation"
+    // rename — only the Swift-facing name changed.
+    @Published var insertLastDictationHotKeySpec: HotKeySpec? {
         didSet {
             // Re-validate against the current PTT spec on every assignment, not just the ones
             // coming from SettingsView's recorder (which already checks before assigning) — a
@@ -65,20 +69,20 @@ final class AppSettings: ObservableObject {
             // let an invalid pair (modifier-only, side-normalized collision, or prefix-shadow vs.
             // PTT) persist. Invalid candidates silently drop to unbound (nil) rather than raising
             // a user prompt from here, which has no synchronous UI to surface one to. Reassigning
-            // `self.redoHotKeySpec` from inside this same observer does not re-invoke it (same
-            // reasoning as `vocabularyText`/`handsFreeMaxMinutes` above), so this falls straight
-            // through to the persistence branch below on the next (nil) value. See Round 1 Codex
-            // finding 10.
-            if let redoHotKeySpec,
-               HotKeySpec.validActionSpec(redoHotKeySpec, pttSpec: hotKeySpec, otherActionSpec: voiceEditHotKeySpec) == nil {
-                self.redoHotKeySpec = nil
-                defaults.removeObject(forKey: Keys.redoHotKeySpec)
+            // `self.insertLastDictationHotKeySpec` from inside this same observer does not
+            // re-invoke it (same reasoning as `vocabularyText`/`handsFreeMaxMinutes` above), so
+            // this falls straight through to the persistence branch below on the next (nil)
+            // value. See Round 1 Codex finding 10.
+            if let insertLastDictationHotKeySpec,
+               HotKeySpec.validActionSpec(insertLastDictationHotKeySpec, pttSpec: hotKeySpec, otherActionSpec: voiceEditHotKeySpec) == nil {
+                self.insertLastDictationHotKeySpec = nil
+                defaults.removeObject(forKey: Keys.insertLastDictationHotKeySpec)
                 return
             }
-            if let redoHotKeySpec, let data = try? JSONEncoder().encode(redoHotKeySpec) {
-                defaults.set(data, forKey: Keys.redoHotKeySpec)
+            if let insertLastDictationHotKeySpec, let data = try? JSONEncoder().encode(insertLastDictationHotKeySpec) {
+                defaults.set(data, forKey: Keys.insertLastDictationHotKeySpec)
             } else {
-                defaults.removeObject(forKey: Keys.redoHotKeySpec)
+                defaults.removeObject(forKey: Keys.insertLastDictationHotKeySpec)
             }
         }
     }
@@ -86,7 +90,7 @@ final class AppSettings: ObservableObject {
     @Published var voiceEditHotKeySpec: HotKeySpec? {
         didSet {
             if let voiceEditHotKeySpec,
-               HotKeySpec.validActionSpec(voiceEditHotKeySpec, pttSpec: hotKeySpec, otherActionSpec: redoHotKeySpec) == nil {
+               HotKeySpec.validActionSpec(voiceEditHotKeySpec, pttSpec: hotKeySpec, otherActionSpec: insertLastDictationHotKeySpec) == nil {
                 self.voiceEditHotKeySpec = nil
                 defaults.removeObject(forKey: Keys.voiceEditHotKeySpec)
                 return
@@ -513,7 +517,10 @@ final class AppSettings: ObservableObject {
 
     private enum Keys {
         static let hotKeySpec = "hotKeySpec"
-        static let redoHotKeySpec = "redoHotKeySpec"
+        /// Raw value intentionally kept as the old "redoHotKeySpec" string (pre-rename) — this
+        /// is UserDefaults' persisted key, so changing it would silently drop every user's saved
+        /// Insert Last Dictation binding. Only the Swift-facing name changed.
+        static let insertLastDictationHotKeySpec = "redoHotKeySpec"
         static let voiceEditHotKeySpec = "voiceEditHotKeySpec"
         /// Legacy (read-only, for migration): single-modifier NX device mask bit.
         static let legacyHotKeyDeviceMask = "hotKeyDeviceMask"
@@ -559,10 +566,10 @@ final class AppSettings: ObservableObject {
         } else {
             hotKeySpec = .default
         }
-        if let data = defaults.data(forKey: Keys.redoHotKeySpec) {
-            redoHotKeySpec = try? JSONDecoder().decode(HotKeySpec.self, from: data)
+        if let data = defaults.data(forKey: Keys.insertLastDictationHotKeySpec) {
+            insertLastDictationHotKeySpec = try? JSONDecoder().decode(HotKeySpec.self, from: data)
         } else {
-            redoHotKeySpec = nil
+            insertLastDictationHotKeySpec = nil
         }
         if let data = defaults.data(forKey: Keys.voiceEditHotKeySpec) {
             voiceEditHotKeySpec = try? JSONDecoder().decode(HotKeySpec.self, from: data)
@@ -662,18 +669,18 @@ final class AppSettings: ObservableObject {
             vocabularyText = storedVocabularyText
         }
         // All stored properties are initialized past this point, so `self`/`hotKeySpec` can be
-        // read: a persisted Redo Last pair that's since become invalid — hand-edited
+        // read: a persisted Insert Last Dictation pair that's since become invalid — hand-edited
         // UserDefaults, or `hotKeySpec` migrated from a legacy value above in a way that now
         // collides/shadows it — must be re-validated here, since a direct init assignment (like
-        // the `redoHotKeySpec =` above) doesn't trigger its own `didSet` (same reasoning as
-        // `vocabularyText`'s clamp above). See Round 1 Codex finding 10.
-        if let redoHotKeySpec,
-           HotKeySpec.validActionSpec(redoHotKeySpec, pttSpec: hotKeySpec, otherActionSpec: voiceEditHotKeySpec) == nil {
-            self.redoHotKeySpec = nil
-            defaults.removeObject(forKey: Keys.redoHotKeySpec)
+        // the `insertLastDictationHotKeySpec =` above) doesn't trigger its own `didSet` (same
+        // reasoning as `vocabularyText`'s clamp above). See Round 1 Codex finding 10.
+        if let insertLastDictationHotKeySpec,
+           HotKeySpec.validActionSpec(insertLastDictationHotKeySpec, pttSpec: hotKeySpec, otherActionSpec: voiceEditHotKeySpec) == nil {
+            self.insertLastDictationHotKeySpec = nil
+            defaults.removeObject(forKey: Keys.insertLastDictationHotKeySpec)
         }
         if let voiceEditHotKeySpec,
-           HotKeySpec.validActionSpec(voiceEditHotKeySpec, pttSpec: hotKeySpec, otherActionSpec: redoHotKeySpec) == nil {
+           HotKeySpec.validActionSpec(voiceEditHotKeySpec, pttSpec: hotKeySpec, otherActionSpec: insertLastDictationHotKeySpec) == nil {
             self.voiceEditHotKeySpec = nil
             defaults.removeObject(forKey: Keys.voiceEditHotKeySpec)
         }

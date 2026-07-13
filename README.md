@@ -116,8 +116,8 @@ bundle again, enable it, and relaunch.
 Settings uses a sidebar with eight focused sections:
 
 - **Privacy** — permissions and on-device context.
-- **Recording** — push-to-talk, hands-free recording, Redo Last, and Voice
-  Edit.
+- **Recording** — push-to-talk, hands-free recording, Insert Last Dictation,
+  and Voice Edit.
 - **Transcription** — microphone input, speech engines, models, live preview,
   noise reduction, and vocabulary.
 - **Processing** — app rules, automatic template selection, output
@@ -167,9 +167,10 @@ the same explanation is available as a hover tip.
   (default), 30, or 90 days, or keeps it until you delete it.
 - **Library → Imports** accepts WAV, M4A, MP3, MP4, and MOV from the file picker or drag and drop. FreeTalker extracts video audio, transcribes it with the selected local Whisper model, separates speakers locally, and lets you rename speakers and export TXT, Markdown, SRT, or VTT. Imports default to 7-day retention (configurable in Settings). The source file is never modified or deleted, and imported media, derived audio, transcripts, and speaker data never leave your Mac.
   The media integration suite generates a tiny MOV containing both video and audio, then verifies the production probe and decoder extract normalized 16 kHz mono frames without changing the MOV.
-- An optional **Redo-last key** (Settings → Recording, unbound by default)
-  re-inserts the newest Library entry at your cursor without re-recording —
-  handy when a paste got dismissed or overwritten.
+- An optional **Insert Last Dictation key** (Settings → Recording, unbound by
+  default) re-inserts the newest Library entry at your cursor without
+  re-recording or re-processing — handy when a paste got dismissed or
+  overwritten.
 
 ## Floating controls and scratchpad
 
@@ -270,7 +271,7 @@ post-processing requests; when cloud post-processing is configured, FreeTalker o
 ### Voice Edit and snippets
 
 <p align="center">
-  <img src="docs/screenshots/settings-recording.png" alt="Settings > Recording showing the push-to-talk hold key, Redo-last key, Voice Edit key, and hands-free auto-stop cap" width="700">
+  <img src="docs/screenshots/settings-recording.png" alt="Settings > Recording showing the push-to-talk hold key, Insert Last Dictation key, Voice Edit key, and hands-free auto-stop cap" width="700">
 </p>
 
 Assign a **Voice Edit key** in Settings → Recording, select editable text, and

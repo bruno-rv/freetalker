@@ -42,22 +42,22 @@ import Testing
 
     @Test func voiceEditHotkeyDispatchIsSynchronousAndSwallowed() {
         let ptt = HotKeyMatcher(spec: .default)
-        let redo = HotKeyMatcher(spec: HotKeySpec(modifiers: 0, keyCode: 105))
+        let insertLastDictation = HotKeyMatcher(spec: HotKeySpec(modifiers: 0, keyCode: 105))
         let voice = HotKeyMatcher(spec: HotKeySpec(modifiers: 0, keyCode: 107))
         var mutablePTT = ptt
-        var mutableRedo: HotKeyMatcher? = redo
+        var mutableInsertLastDictation: HotKeyMatcher? = insertLastDictation
         var mutableVoice: HotKeyMatcher? = voice
 
         let down = HotKeyManager.dispatch(
             kind: .keyDown, keyCode: 107, flags: 0, isAutorepeat: false,
-            matcher: &mutablePTT, redoMatcher: &mutableRedo, voiceEditMatcher: &mutableVoice
+            matcher: &mutablePTT, insertLastDictationMatcher: &mutableInsertLastDictation, voiceEditMatcher: &mutableVoice
         )
         #expect(down.voiceEditEngaged)
         #expect(down.swallow)
 
         let up = HotKeyManager.dispatch(
             kind: .keyUp, keyCode: 107, flags: 0, isAutorepeat: false,
-            matcher: &mutablePTT, redoMatcher: &mutableRedo, voiceEditMatcher: &mutableVoice
+            matcher: &mutablePTT, insertLastDictationMatcher: &mutableInsertLastDictation, voiceEditMatcher: &mutableVoice
         )
         #expect(!up.voiceEditEngaged)
         #expect(up.swallow)
@@ -194,14 +194,14 @@ import Testing
 
     @Test func stopStartPreservesSwallowedKeyUpExactlyOnce() {
         var ptt = HotKeyMatcher(spec: .default)
-        var redo: HotKeyMatcher? = HotKeyMatcher(spec: HotKeySpec(modifiers: 0, keyCode: 105))
+        var insertLastDictation: HotKeyMatcher? = HotKeyMatcher(spec: HotKeySpec(modifiers: 0, keyCode: 105))
         var voice: HotKeyMatcher? = HotKeyMatcher(spec: HotKeySpec(modifiers: 0, keyCode: 107))
         _ = voice?.handle(.keyDown, keyCode: 107, flags: 0)
         var tombstones = HotKeyManager.captureSwallowedKeyUpTombstones(
-            matcher: ptt, redoMatcher: redo, voiceEditMatcher: voice
+            matcher: ptt, insertLastDictationMatcher: insertLastDictation, voiceEditMatcher: voice
         )
 
-        HotKeyManager.resetMatchers(matcher: &ptt, redoMatcher: &redo, voiceEditMatcher: &voice)
+        HotKeyManager.resetMatchers(matcher: &ptt, insertLastDictationMatcher: &insertLastDictation, voiceEditMatcher: &voice)
 
         #expect(HotKeyManager.handleSwallowedKeyUpTombstone(
             kind: .keyUp, keyCode: 105, isAutorepeat: false, tombstones: &tombstones
@@ -260,11 +260,11 @@ import Testing
 
     @Test func threeHotkeysRejectEveryCollision() {
         let ptt = HotKeySpec.default
-        let redo = HotKeySpec(modifiers: 0, keyCode: 105)
+        let insertLastDictation = HotKeySpec(modifiers: 0, keyCode: 105)
         let voice = HotKeySpec(modifiers: 0, keyCode: 107)
-        #expect(HotKeySpec.validActionSpec(voice, pttSpec: ptt, otherActionSpec: redo) == voice)
-        #expect(HotKeySpec.validActionSpec(redo, pttSpec: ptt, otherActionSpec: redo) == nil)
-        #expect(HotKeySpec.validActionSpec(ptt, pttSpec: ptt, otherActionSpec: redo) == nil)
+        #expect(HotKeySpec.validActionSpec(voice, pttSpec: ptt, otherActionSpec: insertLastDictation) == voice)
+        #expect(HotKeySpec.validActionSpec(insertLastDictation, pttSpec: ptt, otherActionSpec: insertLastDictation) == nil)
+        #expect(HotKeySpec.validActionSpec(ptt, pttSpec: ptt, otherActionSpec: insertLastDictation) == nil)
     }
 
     @Test func voiceEditHotkeyPersistsAndInvalidAssignmentsAreDropped() {
@@ -278,8 +278,8 @@ import Testing
         settings = AppSettings(defaults: defaults)
         #expect(settings?.voiceEditHotKeySpec == voice)
 
-        settings?.redoHotKeySpec = voice
-        #expect(settings?.redoHotKeySpec == nil)
+        settings?.insertLastDictationHotKeySpec = voice
+        #expect(settings?.insertLastDictationHotKeySpec == nil)
         #expect(settings?.voiceEditHotKeySpec == voice)
     }
 

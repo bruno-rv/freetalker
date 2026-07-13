@@ -186,7 +186,7 @@ final class AppCoordinator: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.restartHotKeyListening() }
             .store(in: &cancellables)
-        AppSettings.shared.$redoHotKeySpec
+        AppSettings.shared.$insertLastDictationHotKeySpec
             .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.restartHotKeyListening() }
@@ -333,13 +333,13 @@ final class AppCoordinator: ObservableObject {
         hotKeyManager.onKeyDown = { [weak self] eventSeconds in self?.handleKeyDown(eventSeconds: eventSeconds) }
         hotKeyManager.onKeyUp = { [weak self] eventSeconds in self?.handleKeyUp(eventSeconds: eventSeconds) }
         hotKeyManager.onEscape = { [weak self] in self?.handleEscape() }
-        hotKeyManager.onRedoKeyDown = { [weak self] _ in self?.redoLast() }
+        hotKeyManager.onInsertLastDictationKeyDown = { [weak self] _ in self?.insertLastDictation() }
         Self.configureVoiceEditHotKey(manager: hotKeyManager) { [weak self] in
             self?.handleVoiceEditHotKey()
         }
         if hotKeyManager.start(
             spec: AppSettings.shared.hotKeySpec,
-            redoSpec: AppSettings.shared.redoHotKeySpec,
+            insertLastDictationSpec: AppSettings.shared.insertLastDictationHotKeySpec,
             voiceEditSpec: AppSettings.shared.voiceEditHotKeySpec
         ) {
             isHotKeyListening = true
@@ -2245,53 +2245,54 @@ final class AppCoordinator: ObservableObject {
         }
     }
 
-    enum RedoLastAction: Equatable {
-        /// `isRecording` or `isProcessing` was true — redo is silently ignored while active.
+    enum InsertLastDictationAction: Equatable {
+        /// `isRecording` or `isProcessing` was true — the insert is silently ignored while active.
         case ignored
-        case nothingToRedo
+        case nothingToInsert
         case libraryUnavailable
         case insert(refined: String)
     }
 
-    /// Guard + outcome decision for `redoLast()`. `fetchResult` is only consulted once the
-    /// active-recording/processing guard passes — matching `redoLast()`, which skips the
-    /// Database lookup entirely while active.
-    nonisolated static func redoLastAction(isRecording: Bool, isProcessing: Bool, fetchResult: Result<Dictation?, Error>) -> RedoLastAction {
+    /// Guard + outcome decision for `insertLastDictation()`. `fetchResult` is only consulted once
+    /// the active-recording/processing guard passes — matching `insertLastDictation()`, which
+    /// skips the Database lookup entirely while active.
+    nonisolated static func insertLastDictationAction(isRecording: Bool, isProcessing: Bool, fetchResult: Result<Dictation?, Error>) -> InsertLastDictationAction {
         guard !isRecording, !isProcessing else { return .ignored }
         switch fetchResult {
         case .failure:
             return .libraryUnavailable
         case .success(let dictation):
-            guard let dictation else { return .nothingToRedo }
+            guard let dictation else { return .nothingToInsert }
             return .insert(refined: dictation.refined)
         }
     }
 
-    /// The HUD message `redoLast()` shows after attempting to insert the newest Library entry's
-    /// Refined Output — mirrors the existing "posted vs. not" wording `runPipeline` uses for the
-    /// same distinction (manual-paste fallback, `Insertion.insert`'s `Bool` result), so a failed
-    /// synthetic paste (text left on the pasteboard only) is never reported to the user as if it
-    /// had actually landed at the cursor. See Round 1 Codex finding 9.
-    nonisolated static func redoLastResultMessage(posted: Bool) -> String {
-        posted ? "Redone" : "Copied — paste manually"
+    /// The HUD message `insertLastDictation()` shows after attempting to insert the newest
+    /// Library entry's Refined Output — mirrors the existing "posted vs. not" wording
+    /// `runPipeline` uses for the same distinction (manual-paste fallback, `Insertion.insert`'s
+    /// `Bool` result), so a failed synthetic paste (text left on the pasteboard only) is never
+    /// reported to the user as if it had actually landed at the cursor. See Round 1 Codex
+    /// finding 9.
+    nonisolated static func insertLastDictationResultMessage(posted: Bool) -> String {
+        posted ? "Inserted" : "Copied — paste manually"
     }
 
-    func redoLast() {
-        // Skip the Database lookup entirely while active — `redoLastAction` ignores
+    func insertLastDictation() {
+        // Skip the Database lookup entirely while active — `insertLastDictationAction` ignores
         // `fetchResult` in that branch anyway, so `.success(nil)` here is just a placeholder.
         let fetchResult: Result<Dictation?, Error> = (isRecording || isProcessing)
             ? .success(nil)
             : Result { try LibraryStore.shared.latestDictation() }
-        switch Self.redoLastAction(isRecording: isRecording, isProcessing: isProcessing, fetchResult: fetchResult) {
+        switch Self.insertLastDictationAction(isRecording: isRecording, isProcessing: isProcessing, fetchResult: fetchResult) {
         case .ignored:
             break
-        case .nothingToRedo:
-            hud.flash("Nothing to redo")
+        case .nothingToInsert:
+            hud.flash("No dictation to insert yet")
         case .libraryUnavailable:
             hud.flash("Library unavailable")
         case .insert(let refined):
             let posted = Insertion.insert(refined)
-            hud.flash(Self.redoLastResultMessage(posted: posted))
+            hud.flash(Self.insertLastDictationResultMessage(posted: posted))
         }
     }
 }
