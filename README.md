@@ -7,6 +7,10 @@ release — the transcript is refined by the Active Template and inserted at you
 the same key instead of holding it for hands-free recording. Local Whisper transcription and
 on-device Apple post-processing by default; cloud engines are optional and BYOK-only.
 
+<p align="center">
+  <img src="docs/screenshots/floating-controls.png" alt="FreeTalker floating control bar expanded from the edge launcher, with mic, scratchpad, settings, and language/output selectors" width="500">
+</p>
+
 ## Requirements
 
 - macOS 26, Apple Silicon.
@@ -55,6 +59,10 @@ also delete downloaded models that aren't active. FreeTalker keeps the active mo
 cleanup can't remove the model currently serving dictation. WhisperKit shares model files
 under `~/Documents/huggingface`.
 
+<p align="center">
+  <img src="docs/screenshots/settings-transcription.png" alt="Settings > Transcription showing the mic picker, noise reduction, WhisperKit vs Cloud engine toggle, model list, live preview, and vocabulary" width="700">
+</p>
+
 ## Permissions walkthrough
 
 On first launch, grant (System Settings → Privacy & Security):
@@ -78,6 +86,10 @@ permissions that macOS previously granted. Relaunch the current
 FreeTalker from the relevant Privacy & Security list, add the current app
 bundle again, enable it, and relaunch.
 
+<p align="center">
+  <img src="docs/screenshots/settings-privacy.png" alt="Settings > Privacy showing granted permissions and the local-only text context picker" width="700">
+</p>
+
 ## Settings
 
 Settings uses a sidebar with eight focused sections:
@@ -99,6 +111,10 @@ context include a question-mark button that opens a short native explanation;
 the same explanation is available as a hover tip.
 
 ## Running the app
+
+<p align="center">
+  <img src="docs/screenshots/recording-hud.png" alt="FreeTalker recording HUD during hands-free recording, showing elapsed time, lock, context, cancel/done, Raw, language selectors, and active template" width="600">
+</p>
 
 - Menu bar icon → pick the **Active Template** (Clean Dictation, Refined Message, Refined
   Prompt, Email — editable in Settings → Templates).
@@ -182,6 +198,10 @@ the correction spans multiple sentences.
 A built-in Template you've never edited quietly picks up improved prompts as the app evolves;
 once you edit one yourself, it's yours and is never touched automatically.
 
+<p align="center">
+  <img src="docs/screenshots/settings-templates.png" alt="Settings > Templates showing the template list and the Refined Message prompt editor" width="700">
+</p>
+
 ### Spoken Commands
 
 Every built-in Template also interprets a set of English instruction phrases spoken mid-dictation,
@@ -227,6 +247,10 @@ immediately after local OCR. Local context is never persisted, logged, or includ
 post-processing requests; when cloud post-processing is configured, FreeTalker omits it entirely.
 
 ### Voice Edit and snippets
+
+<p align="center">
+  <img src="docs/screenshots/settings-recording.png" alt="Settings > Recording showing the push-to-talk hold key, Redo-last key, Voice Edit key, and hands-free auto-stop cap" width="700">
+</p>
 
 Assign a **Voice Edit key** in Settings → Recording, select editable text, and
 press the key. Speak the instruction, then press the key again. Voice Edit
@@ -310,13 +334,6 @@ response body or the key itself.
 For fully local LLM post-processing, run Ollama Desktop and use the existing
 OpenAI-compatible BYOK provider with `http://localhost:11434/v1`. Ollama's local endpoint
 doesn't require an API key; FreeTalker omits the Authorization header when the key is empty.
-
-![FreeTalker Templates settings with the Refined Message prompt editor](docs/settings-templates.png)
-*Settings → Templates: choose a template and edit its post-processing prompt.*
-
-![FreeTalker recording panel showing elapsed time, raw mode, language, and template controls](docs/recording-panel.png)
-*Recording panel: monitor elapsed time and control raw mode, language, and the active
-template without leaving your current app.*
 
 ## Manual end-to-end checklist
 
