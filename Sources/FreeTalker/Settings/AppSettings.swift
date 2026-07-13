@@ -149,14 +149,55 @@ final class AppSettings: ObservableObject {
         }
     }
 
-    @Published var hudPosition: NormalizedWindowPosition? {
+    @Published var launcherPanelPosition: NormalizedWindowPosition? {
         didSet {
-            if let hudPosition, let data = try? JSONEncoder().encode(hudPosition) {
-                defaults.set(data, forKey: Keys.hudPosition)
-            } else {
-                defaults.removeObject(forKey: Keys.hudPosition)
-            }
+            persistPanelPosition(launcherPanelPosition, key: Keys.launcherPanelPosition)
         }
+    }
+
+    @Published var recordingHUDPosition: NormalizedWindowPosition? {
+        didSet {
+            persistPanelPosition(recordingHUDPosition, key: Keys.recordingHUDPosition)
+        }
+    }
+
+    @Published var transientHUDPosition: NormalizedWindowPosition? {
+        didSet {
+            persistPanelPosition(transientHUDPosition, key: Keys.transientHUDPosition)
+        }
+    }
+
+    func resetLauncherPanelPosition() {
+        launcherPanelPosition = nil
+    }
+
+    func resetRecordingHUDPosition() {
+        recordingHUDPosition = nil
+    }
+
+    func resetTransientHUDPosition() {
+        transientHUDPosition = nil
+    }
+
+    private func persistPanelPosition(_ position: NormalizedWindowPosition?, key: String) {
+        guard let position else {
+            defaults.removeObject(forKey: key)
+            return
+        }
+        guard position.isValid, let data = try? JSONEncoder().encode(position) else {
+            defaults.removeObject(forKey: key)
+            return
+        }
+        defaults.set(data, forKey: key)
+    }
+
+    private static func panelPosition(from defaults: UserDefaults, key: String) -> NormalizedWindowPosition? {
+        guard let data = defaults.data(forKey: key),
+              let position = try? JSONDecoder().decode(NormalizedWindowPosition.self, from: data),
+              position.isValid else {
+            return nil
+        }
+        return position
     }
 
     nonisolated static func clampNormalizedPosition(_ value: Double) -> Double {
@@ -485,6 +526,10 @@ final class AppSettings: ObservableObject {
         static let edgeLauncherEnabled = "edgeLauncherEnabled"
         static let edgeLauncherEdge = "edgeLauncherEdge"
         static let edgeLauncherPosition = "edgeLauncherPosition"
+        static let launcherPanelPosition = "launcherPanelPosition"
+        static let recordingHUDPosition = "recordingHUDPosition"
+        static let transientHUDPosition = "transientHUDPosition"
+        /// Legacy (read-only, for migration): shared HUD position.
         static let hudPosition = "hudPosition"
         static let llmProvider = "llmProvider"
         static let cloudLLMBaseURL = "cloudLLMBaseURL"
@@ -541,12 +586,15 @@ final class AppSettings: ObservableObject {
         edgeLauncherEdge = LauncherEdge(rawValue: defaults.string(forKey: Keys.edgeLauncherEdge) ?? "") ?? .right
         let storedEdgeLauncherPosition = defaults.object(forKey: Keys.edgeLauncherPosition) as? Double ?? 0.5
         edgeLauncherPosition = Self.clampNormalizedPosition(storedEdgeLauncherPosition)
-        if let data = defaults.data(forKey: Keys.hudPosition),
-           let position = try? JSONDecoder().decode(NormalizedWindowPosition.self, from: data),
-           position.x.isFinite, position.y.isFinite {
-            hudPosition = position
-        } else {
-            hudPosition = nil
+        launcherPanelPosition = Self.panelPosition(from: defaults, key: Keys.launcherPanelPosition)
+        recordingHUDPosition = Self.panelPosition(from: defaults, key: Keys.recordingHUDPosition)
+        let savedTransientHUDPosition = Self.panelPosition(from: defaults, key: Keys.transientHUDPosition)
+        let legacyHUDPosition = Self.panelPosition(from: defaults, key: Keys.hudPosition)
+        transientHUDPosition = savedTransientHUDPosition ?? legacyHUDPosition
+        if savedTransientHUDPosition == nil, let legacyHUDPosition {
+            if let data = try? JSONEncoder().encode(legacyHUDPosition) {
+                defaults.set(data, forKey: Keys.transientHUDPosition)
+            }
         }
         // Loaded into locals first, not `self.llmProvider`/`self.cloudLLMBaseURL`/
         // `self.cloudLLMModel` directly: `self` can't be read (even its own not-yet-assigned
