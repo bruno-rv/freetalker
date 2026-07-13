@@ -7,6 +7,11 @@ final class HUDController {
     private var panel: NSPanel?
     private let settings: AppSettings
     private var screenChangeObserver: NotificationObserverToken?
+    /// Set while `panel`'s origin is the launcher's edge-anchored spot (see
+    /// `launcherAnchoredFrame`) rather than the HUD's own resting position. The next non-recording
+    /// display (e.g. "Processing…") must re-center/restore instead of preserving that borrowed
+    /// origin — otherwise every status bubble stays wherever the launcher happens to live.
+    private var isAnchoredToLauncher = false
     /// Pending auto-hide for a `flash(_:duration:)` call. Cancelled whenever `show`/`flash`/
     /// `hide` runs again (e.g. a new recording starts) so a stale timer can't hide a HUD that's
     /// since been repurposed. See Round 2 Codex finding 6.
@@ -163,6 +168,10 @@ final class HUDController {
             panel.setContentSize(size)
             if isRecordingPanel, let anchored = launcherAnchoredFrame(panelSize: panel.frame.size) {
                 panel.setFrame(anchored, display: true)
+                isAnchoredToLauncher = true
+            } else if isAnchoredToLauncher {
+                isAnchoredToLauncher = false
+                positionForFirstPresentation(panel)
             } else if let visibleFrame {
                 panel.setFrameOrigin(Self.resizedOrigin(
                     preserving: origin,
@@ -176,7 +185,9 @@ final class HUDController {
             self.panel = panel
             if isRecordingPanel, let anchored = launcherAnchoredFrame(panelSize: size) {
                 panel.setFrameOrigin(anchored.origin)
+                isAnchoredToLauncher = true
             } else {
+                isAnchoredToLauncher = false
                 positionForFirstPresentation(panel)
             }
         }
