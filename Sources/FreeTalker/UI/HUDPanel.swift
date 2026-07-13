@@ -8,6 +8,7 @@ final class HUDController {
     private let settings: AppSettings
     private let panelDragState = FloatingPanelDragState()
     private var screenChangeObserver: NotificationObserverToken?
+    private var activeSpaceObserver: NotificationObserverToken?
     /// Pending auto-hide for a `flash(_:duration:)` call. Cancelled whenever `show`/`flash`/
     /// `hide` runs again (e.g. a new recording starts) so a stale timer can't hide a HUD that's
     /// since been repurposed. See Round 2 Codex finding 6.
@@ -34,11 +35,23 @@ final class HUDController {
         ) { [weak self] _ in
             Task { @MainActor in self?.reclampPanel() }
         })
+        activeSpaceObserver = NotificationObserverToken(
+            NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.activeSpaceDidChangeNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in self?.reclampPanel() }
+            }
+        )
     }
 
     deinit {
         if let screenChangeObserver {
             NotificationCenter.default.removeObserver(screenChangeObserver.value)
+        }
+        if let activeSpaceObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(activeSpaceObserver.value)
         }
     }
 
@@ -155,7 +168,12 @@ final class HUDController {
             onBackgroundDragStarted: { [weak self] in self?.panelDragState.begin() },
             onBackgroundDragCompleted: { [weak self] in
                 guard let self else { return }
-                self.panelDragState.finish { self.persistPanelPosition(for: surface) }
+                self.panelDragState.finish(
+                    capturePlacementContext: FloatingPanelPlacementPolicy.captureContext,
+                    persist: { context in
+                        self.persistPanelPosition(for: surface, placementContext: context)
+                    }
+                )
             }
         ))
         let fitting = hosting.fittingSize
@@ -197,8 +215,9 @@ final class HUDController {
 
     private func position(_ panel: NSPanel, for surface: Surface) {
         guard let screen = panel.screen ?? NSScreen.main else { return }
-        let displays = NSScreen.screens.map(Self.displayFrame)
-        let fallback = Self.displayFrame(screen)
+        let placementContext = FloatingPanelPlacementPolicy.captureContext()
+        let displays = placementContext.displays
+        let fallback = Self.displayFrame(screen, in: placementContext)
         let saved = savedPosition(for: surface)
         let restoredOrigin: CGPoint
         if let saved {
@@ -209,7 +228,7 @@ final class HUDController {
                 panelSize: panel.frame.size
             )
         } else {
-            let placementFrame = FloatingPanelPlacementPolicy.usableFrame(for: screen)
+            let placementFrame = fallback.visibleFrame
             switch surface {
             case .recording:
                 restoredOrigin = FloatingPanelGeometry.launcherFrame(
@@ -252,10 +271,12 @@ final class HUDController {
 
     private func reclampPanel() {
         guard let panel, let screen = panel.screen ?? NSScreen.main else { return }
+        let placementContext = FloatingPanelPlacementPolicy.captureContext()
+        let display = Self.displayFrame(screen, in: placementContext)
         let reclampedOrigin = FloatingPanelGeometry.clampedOrigin(
             panel.frame.origin,
             panelSize: panel.frame.size,
-            visibleFrame: FloatingPanelPlacementPolicy.usableFrame(for: screen)
+            visibleFrame: display.visibleFrame
         )
         panel.setFrameOrigin(panelDragState.originForRender(
             liveOrigin: panel.frame.origin,
@@ -263,17 +284,20 @@ final class HUDController {
         ))
     }
 
-    private func persistPanelPosition(for surface: Surface) {
+    private func persistPanelPosition(
+        for surface: Surface,
+        placementContext: FloatingPanelPlacementContext
+    ) {
         guard let panel, let screen = panel.screen ?? NSScreen.main else { return }
-        let placementFrame = FloatingPanelPlacementPolicy.usableFrame(for: screen)
+        let display = Self.displayFrame(screen, in: placementContext)
         panel.setFrameOrigin(FloatingPanelGeometry.clampedOrigin(
             panel.frame.origin,
             panelSize: panel.frame.size,
-            visibleFrame: placementFrame
+            visibleFrame: display.visibleFrame
         ))
         let position = FloatingPanelGeometry.normalizedOrigin(
             frame: panel.frame,
-            display: Self.displayFrame(screen)
+            display: display
         )
         switch surface {
         case .recording:
@@ -283,11 +307,13 @@ final class HUDController {
         }
     }
 
-    private static func displayFrame(_ screen: NSScreen) -> DisplayFrame {
-        let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")]
-            as? NSNumber
-        return DisplayFrame(id: number?.stringValue ?? screen.localizedName,
-                            visibleFrame: FloatingPanelPlacementPolicy.usableFrame(for: screen))
+    private static func displayFrame(
+        _ screen: NSScreen,
+        in placementContext: FloatingPanelPlacementContext
+    ) -> DisplayFrame {
+        let id = FloatingPanelPlacementPolicy.displayID(for: screen)
+        return placementContext.display(id: id)
+            ?? DisplayFrame(id: id, visibleFrame: screen.visibleFrame)
     }
 }
 
