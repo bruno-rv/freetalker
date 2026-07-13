@@ -30,13 +30,26 @@ enum SettingsDestination: String, CaseIterable, Identifiable {
     var imageName: String { rawValue }
 }
 
+enum SettingsSidebarMetrics {
+    static let rowSpacing: CGFloat = 10
+    static let iconSize: CGFloat = 28
+    static let textSize: CGFloat = 14
+    static let horizontalPadding: CGFloat = 10
+    static let verticalPadding: CGFloat = 7
+    static let cornerRadius: CGFloat = 8
+    static let headerSize: CGFloat = 15
+    static let minimumWidth: CGFloat = 200
+    static let idealWidth: CGFloat = 216
+    static let maximumWidth: CGFloat = 240
+}
+
 struct SettingsSidebar: View {
     @Binding var selection: SettingsDestination
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("FreeTalker")
-                .font(.headline)
+                .font(.system(size: SettingsSidebarMetrics.headerSize, weight: .semibold))
                 .padding(.horizontal, 8)
                 .padding(.bottom, 8)
 
@@ -44,26 +57,35 @@ struct SettingsSidebar: View {
                 Button {
                     selection = destination
                 } label: {
-                    HStack(spacing: 8) {
-                        Image(destination.imageName, bundle: SettingsIconResources.bundle)
-                            .resizable()
-                            .interpolation(.high)
-                            .scaledToFit()
-                            .frame(width: 20, height: 20)
-                            .accessibilityHidden(true)
+                    HStack(spacing: SettingsSidebarMetrics.rowSpacing) {
+                        if let icon = SettingsIconResources.image(named: destination.imageName) {
+                            Image(nsImage: icon)
+                                .resizable()
+                                .interpolation(.high)
+                                .scaledToFit()
+                                .frame(
+                                    width: SettingsSidebarMetrics.iconSize,
+                                    height: SettingsSidebarMetrics.iconSize
+                                )
+                                .accessibilityHidden(true)
+                        }
                         Text(destination.title)
+                            .font(.system(size: SettingsSidebarMetrics.textSize, weight: .medium))
+                            .lineLimit(1)
                     }
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 7)
-                        .contentShape(RoundedRectangle(cornerRadius: 6))
+                        .padding(.horizontal, SettingsSidebarMetrics.horizontalPadding)
+                        .padding(.vertical, SettingsSidebarMetrics.verticalPadding)
+                        .contentShape(RoundedRectangle(
+                            cornerRadius: SettingsSidebarMetrics.cornerRadius
+                        ))
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(destination.title)
                 .foregroundStyle(selection == destination ? .primary : .secondary)
                 .background(
                     selection == destination ? Color.accentColor.opacity(0.18) : .clear,
-                    in: RoundedRectangle(cornerRadius: 6)
+                    in: RoundedRectangle(cornerRadius: SettingsSidebarMetrics.cornerRadius)
                 )
                 .accessibilityValue(selection == destination ? "Selected" : "")
             }
@@ -71,17 +93,31 @@ struct SettingsSidebar: View {
             Spacer()
         }
         .padding(12)
-        .frame(minWidth: 180, idealWidth: 196, maxWidth: 220, maxHeight: .infinity, alignment: .topLeading)
+        .frame(
+            minWidth: SettingsSidebarMetrics.minimumWidth,
+            idealWidth: SettingsSidebarMetrics.idealWidth,
+            maxWidth: SettingsSidebarMetrics.maximumWidth,
+            maxHeight: .infinity,
+            alignment: .topLeading
+        )
         .background(Color(nsColor: .windowBackgroundColor))
     }
 }
 
-private enum SettingsIconResources {
+enum SettingsIconResources {
     static let bundle: Bundle = {
         guard let resourceURL = Bundle.main.resourceURL else { return .module }
         let packagedBundle = resourceURL.appendingPathComponent("FreeTalker_FreeTalker.bundle")
         return Bundle(path: packagedBundle.path) ?? .module
     }()
+
+    static func image(
+        named name: String,
+        in bundle: Bundle = SettingsIconResources.bundle
+    ) -> NSImage? {
+        guard let url = bundle.url(forResource: name, withExtension: "png") else { return nil }
+        return NSImage(contentsOf: url)
+    }
 }
 
 struct SettingsPage<Content: View>: View {
@@ -216,6 +252,7 @@ struct SettingsHelpButton: View {
             Text(message)
                 .padding()
                 .frame(maxWidth: 280, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 }

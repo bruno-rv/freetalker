@@ -3,4 +3,5 @@
 FreeTalker.app/
 .DS_Store
 .worktrees/
+/.superpowers/sdd/
 .codex/sdd/features/
