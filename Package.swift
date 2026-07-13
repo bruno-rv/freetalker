@@ -19,7 +19,8 @@ let package = Package(
                 .product(name: "WhisperKit", package: "WhisperKit"),
                 .product(name: "FluidAudio", package: "FluidAudio"),
                 "CSQLite"
-            ]
+            ],
+            resources: [.process("Resources")]
         ),
         .testTarget(
             name: "FreeTalkerTests",

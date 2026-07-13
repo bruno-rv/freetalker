@@ -2,6 +2,8 @@ APP_NAME := FreeTalker
 BUNDLE := $(APP_NAME).app
 CONFIG := release
 BIN := .build/$(CONFIG)/$(APP_NAME)
+RESOURCE_BUNDLE := .build/$(CONFIG)/$(APP_NAME)_$(APP_NAME).bundle
+RESOURCE_BUNDLE_NAME := $(APP_NAME)_$(APP_NAME).bundle
 XCODE_DEVELOPER_DIR ?= /Applications/Xcode.app/Contents/Developer
 
 .PHONY: build test test-preflight app run clean
@@ -26,6 +28,9 @@ app: build
 	mkdir -p $(BUNDLE)/Contents/MacOS
 	mkdir -p $(BUNDLE)/Contents/Resources
 	cp $(BIN) $(BUNDLE)/Contents/MacOS/$(APP_NAME)
+	mkdir -p $(BUNDLE)/Contents/Resources/$(RESOURCE_BUNDLE_NAME)/Contents/Resources
+	cp -R $(RESOURCE_BUNDLE)/. $(BUNDLE)/Contents/Resources/$(RESOURCE_BUNDLE_NAME)/Contents/Resources/
+	cp Assets/SettingsIconsInfo.plist $(BUNDLE)/Contents/Resources/$(RESOURCE_BUNDLE_NAME)/Contents/Info.plist
 	cp Info.plist $(BUNDLE)/Contents/Info.plist
 	cp Assets/AppIcon.icns $(BUNDLE)/Contents/Resources/AppIcon.icns
 	codesign --force --deep -s - $(BUNDLE)
