@@ -176,50 +176,6 @@ struct SettingsCard<Content: View>: View {
     }
 }
 
-struct SettingsRow<Trailing: View>: View {
-    let title: String
-    let detail: String?
-    let helpTitle: String?
-    let helpMessage: String?
-    private let trailing: Trailing
-
-    init(
-        _ title: String,
-        detail: String? = nil,
-        helpTitle: String? = nil,
-        helpMessage: String? = nil,
-        @ViewBuilder trailing: () -> Trailing
-    ) {
-        self.title = title
-        self.detail = detail
-        self.helpTitle = helpTitle
-        self.helpMessage = helpMessage
-        self.trailing = trailing()
-    }
-
-    var body: some View {
-        HStack(alignment: .center, spacing: 16) {
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 5) {
-                    Text(title)
-                    if let helpTitle, let helpMessage {
-                        SettingsHelpButton(title: helpTitle, message: helpMessage)
-                    }
-                }
-                if let detail {
-                    Text(detail)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-            Spacer(minLength: 16)
-            trailing
-        }
-        .padding(.vertical, 8)
-    }
-}
-
 struct SettingsHelpButton: View {
     let title: String
     let message: String

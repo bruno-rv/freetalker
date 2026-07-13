@@ -91,17 +91,25 @@ struct SettingsView: View {
         HStack(spacing: 0) {
             SettingsSidebar(selection: $selection)
             Divider()
-            switch selection {
-            case .general:
+            ZStack {
                 GeneralSettingsView()
-            case .templates:
+                    .opacity(selection == .general ? 1 : 0)
+                    .allowsHitTesting(selection == .general)
+                    .accessibilityHidden(selection != .general)
+
                 TemplatesSettingsView()
-            case .snippets:
+                    .opacity(selection == .templates ? 1 : 0)
+                    .allowsHitTesting(selection == .templates)
+                    .accessibilityHidden(selection != .templates)
+
                 SnippetsSettingsView(
                     store: coordinator.snippetStore,
                     initializationError: coordinator.snippetStoreInitializationError,
                     retry: { coordinator.retrySnippetStoreInitialization() }
                 )
+                .opacity(selection == .snippets ? 1 : 0)
+                .allowsHitTesting(selection == .snippets)
+                .accessibilityHidden(selection != .snippets)
             }
         }
         .frame(minWidth: 780, maxWidth: .infinity, minHeight: 560, maxHeight: .infinity)
