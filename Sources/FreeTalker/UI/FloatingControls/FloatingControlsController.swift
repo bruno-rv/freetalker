@@ -55,6 +55,12 @@ final class FloatingControlsController {
     private let isRecording: () -> Bool
     private var panel: NSPanel?
     private var hostingView: FloatingControlsHostingView?
+    /// Tracks whether `panel` is currently ordered front, so `renderAndPosition()` only calls
+    /// `orderFrontRegardless()` on the show/reappear transitions. Re-asserting front-ordering on
+    /// every hover-driven or AppCoordinator-driven re-render (this runs constantly while
+    /// recording/processing) confuses the hosting view's tracking area and can leave the
+    /// launcher stuck expanded — see the "hover never collapses" regression.
+    private var isPanelVisible = false
     private var state = FloatingControlsHoverState.collapsed
     private var collapseWorkItem: DispatchWorkItem?
     private var cancellables: Set<AnyCancellable> = []
@@ -140,6 +146,7 @@ final class FloatingControlsController {
         panel = nil
         hostingView = nil
         state = .collapsed
+        isPanelVisible = false
     }
 
     func screenConfigurationDidChange() {
@@ -206,6 +213,7 @@ final class FloatingControlsController {
         collapseWorkItem = nil
         state.reduce(.settingDisabled)
         panel?.orderOut(nil)
+        isPanelVisible = false
     }
 
     private func pointerEntered() {
@@ -234,6 +242,7 @@ final class FloatingControlsController {
         guard let panel else { return }
         guard !isRecording() else {
             panel.orderOut(nil)
+            isPanelVisible = false
             return
         }
         var viewCallbacks = callbacks
@@ -263,7 +272,10 @@ final class FloatingControlsController {
             visibleFrame: screen.visibleFrame
         ), display: true)
         hosting.reinstallTrackingArea()
-        panel.orderFrontRegardless()
+        if !isPanelVisible {
+            panel.orderFrontRegardless()
+            isPanelVisible = true
+        }
     }
 
     private func screenForLauncher() -> NSScreen? {
