@@ -1,8 +1,209 @@
-import CoreGraphics
+import AppKit
 
 struct DisplayFrame: Equatable, Sendable {
     let id: String
     let visibleFrame: CGRect
+}
+
+struct FloatingPanelWindowSnapshot: Equatable, Sendable {
+    let ownerPID: pid_t
+    let layer: Int
+    let alpha: Double
+    let bounds: CGRect
+}
+
+struct FloatingPanelSystemSnapshot: Equatable, Sendable {
+    let presentationOptions: NSApplication.PresentationOptions
+    let frontmostPID: pid_t?
+    let ownPID: pid_t
+    let windows: [FloatingPanelWindowSnapshot]
+
+    @MainActor
+    static func capture() -> Self {
+        let windowDictionaries = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] ?? []
+        let windows = windowDictionaries.compactMap { dictionary -> FloatingPanelWindowSnapshot? in
+            guard
+                let ownerPID = (dictionary[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+                let layer = (dictionary[kCGWindowLayer as String] as? NSNumber)?.intValue,
+                let alpha = (dictionary[kCGWindowAlpha as String] as? NSNumber)?.doubleValue,
+                let boundsDictionary = dictionary[kCGWindowBounds as String] as? NSDictionary,
+                let bounds = CGRect(dictionaryRepresentation: boundsDictionary)
+            else { return nil }
+            return FloatingPanelWindowSnapshot(
+                ownerPID: ownerPID,
+                layer: layer,
+                alpha: alpha,
+                bounds: bounds
+            )
+        }
+        return Self(
+            presentationOptions: NSApp.currentSystemPresentationOptions,
+            frontmostPID: NSWorkspace.shared.frontmostApplication?.processIdentifier,
+            ownPID: ProcessInfo.processInfo.processIdentifier,
+            windows: windows
+        )
+    }
+}
+
+struct FloatingPanelPlacementContext: Equatable, Sendable {
+    let displays: [DisplayFrame]
+
+    func display(id: String) -> DisplayFrame? {
+        displays.first { $0.id == id }
+    }
+}
+
+enum FloatingPanelFullscreenClassifier {
+    static func covers(
+        targetDisplayBounds: CGRect,
+        frontmostPID: pid_t?,
+        ownPID: pid_t,
+        windows: [FloatingPanelWindowSnapshot]
+    ) -> Bool {
+        guard
+            let frontmostPID,
+            frontmostPID != ownPID,
+            targetDisplayBounds.width > 0,
+            targetDisplayBounds.height > 0
+        else { return false }
+
+        let targetArea = targetDisplayBounds.width * targetDisplayBounds.height
+        return windows.contains { window in
+            guard
+                window.ownerPID == frontmostPID,
+                window.layer == 0,
+                window.alpha > 0
+            else { return false }
+
+            let intersection = window.bounds.intersection(targetDisplayBounds)
+            let coverage = intersection.isNull
+                ? 0
+                : (intersection.width * intersection.height) / targetArea
+            let tolerance: CGFloat = 1
+            let matchesWithinTolerance =
+                abs(window.bounds.minX - targetDisplayBounds.minX) <= tolerance
+                && abs(window.bounds.minY - targetDisplayBounds.minY) <= tolerance
+                && abs(window.bounds.maxX - targetDisplayBounds.maxX) <= tolerance
+                && abs(window.bounds.maxY - targetDisplayBounds.maxY) <= tolerance
+            return matchesWithinTolerance || coverage >= 0.99
+        }
+    }
+}
+
+enum FloatingPanelPlacementPolicy {
+    static func usableFrame(
+        screenFrame: CGRect,
+        visibleFrame: CGRect,
+        presentationOptions: NSApplication.PresentationOptions
+    ) -> CGRect {
+        usableFrame(
+            screenFrame: screenFrame,
+            visibleFrame: visibleFrame,
+            targetDisplayBounds: screenFrame,
+            snapshot: FloatingPanelSystemSnapshot(
+                presentationOptions: presentationOptions,
+                frontmostPID: nil,
+                ownPID: 0,
+                windows: []
+            )
+        )
+    }
+
+    static func usableFrame(
+        screenFrame: CGRect,
+        visibleFrame: CGRect,
+        targetDisplayBounds: CGRect,
+        snapshot: FloatingPanelSystemSnapshot
+    ) -> CGRect {
+        let nativePresentationHidesDock = !snapshot.presentationOptions.intersection([
+            .autoHideDock, .hideDock
+        ]).isEmpty
+        let foreignFullscreenCoversDisplay = !nativePresentationHidesDock
+            && FloatingPanelFullscreenClassifier.covers(
+                targetDisplayBounds: targetDisplayBounds,
+                frontmostPID: snapshot.frontmostPID,
+                ownPID: snapshot.ownPID,
+                windows: snapshot.windows
+            )
+        guard nativePresentationHidesDock || foreignFullscreenCoversDisplay else {
+            return visibleFrame
+        }
+
+        let upperEdge = min(screenFrame.maxY, visibleFrame.maxY)
+        return CGRect(
+            x: visibleFrame.minX,
+            y: screenFrame.minY,
+            width: visibleFrame.width,
+            height: max(0, upperEdge - screenFrame.minY)
+        )
+    }
+
+    @MainActor
+    static func captureContext() -> FloatingPanelPlacementContext {
+        captureContext(screens: NSScreen.screens, snapshot: .capture())
+    }
+
+    @MainActor
+    static func captureContext(
+        screens: [NSScreen],
+        snapshot: FloatingPanelSystemSnapshot
+    ) -> FloatingPanelPlacementContext {
+        FloatingPanelPlacementContext(displays: screens.map { screen in
+            let displayNumber = screen.deviceDescription[
+                NSDeviceDescriptionKey("NSScreenNumber")
+            ] as? NSNumber
+            let targetDisplayBounds = displayNumber.map {
+                CGDisplayBounds(CGDirectDisplayID($0.uint32Value))
+            } ?? screen.frame
+            return DisplayFrame(
+                id: displayID(for: screen),
+                visibleFrame: usableFrame(
+                    screenFrame: screen.frame,
+                    visibleFrame: screen.visibleFrame,
+                    targetDisplayBounds: targetDisplayBounds,
+                    snapshot: snapshot
+                )
+            )
+        })
+    }
+
+    @MainActor
+    static func displayID(for screen: NSScreen) -> String {
+        let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")]
+            as? NSNumber
+        return number?.stringValue ?? screen.localizedName
+    }
+}
+
+final class FloatingPanelDragState {
+    private(set) var isDragging = false
+
+    func begin() {
+        isDragging = true
+    }
+
+    func originForRender(liveOrigin: CGPoint, restoredOrigin: CGPoint) -> CGPoint {
+        isDragging ? liveOrigin : restoredOrigin
+    }
+
+    func finish(persist: () -> Void) {
+        guard isDragging else { return }
+        persist()
+        isDragging = false
+    }
+
+    func finish(
+        capturePlacementContext: () -> FloatingPanelPlacementContext,
+        persist: (FloatingPanelPlacementContext) -> Void
+    ) {
+        guard isDragging else { return }
+        let placementContext = capturePlacementContext()
+        persist(placementContext)
+        isDragging = false
+    }
 }
 
 enum FloatingPanelGeometry {

@@ -43,10 +43,12 @@ status line shows download progress.
 
 ## Speech models
 
-Settings offers seven multilingual Whisper models, from Tiny and Base through Small,
-Medium, Large v3, and two Large v3 Turbo variants. Smaller models download faster, use
-less disk space, and usually transcribe faster. Larger models favor accuracy, while the
-Turbo variants balance speed and accuracy.
+Settings → Transcription offers seven multilingual Whisper models, from Tiny
+and Base through Small, Medium, Large v3, and two Large v3 Turbo variants.
+Smaller
+models download faster, use less disk space, and usually transcribe faster.
+Larger models favor accuracy, while the Turbo variants balance speed and
+accuracy.
 
 Download a model on demand, then select it to reload the transcription engine. You can
 also delete downloaded models that aren't active. FreeTalker keeps the active model so a
@@ -76,13 +78,34 @@ permissions that macOS previously granted. Relaunch the current
 FreeTalker from the relevant Privacy & Security list, add the current app
 bundle again, enable it, and relaunch.
 
+## Settings
+
+Settings uses a sidebar with eight focused sections:
+
+- **Privacy** — permissions and on-device context.
+- **Recording** — push-to-talk, hands-free recording, Redo Last, and Voice
+  Edit.
+- **Transcription** — microphone input, speech engines, models, live preview,
+  noise reduction, and vocabulary.
+- **Processing** — app rules, automatic template selection, output
+  language, and cloud post-processing.
+- **Launcher** — floating launcher visibility and placement.
+- **Storage** — retention for recovery audio and imported media.
+- **Templates** — create and edit post-processing templates.
+- **Snippets** — reusable Voice Edit expansions and triggers.
+
+Each section uses a generated transparent PNG icon. Settings that need more
+context include a question-mark button that opens a short native explanation;
+the same explanation is available as a hover tip.
+
 ## Running the app
 
 - Menu bar icon → pick the **Active Template** (Clean Dictation, Refined Message, Refined
   Prompt, Email — editable in Settings → Templates).
 - Hold **Right-⌥**, speak (English or Portuguese, auto-detected), release. A small pill HUD
   shows "Recording…" then "Processing…". Turn on **Live preview while recording** in
-  Settings → General and the HUD streams the transcript as you speak, before refinement.
+  Settings → Transcription and the HUD streams the transcript as you speak,
+  before refinement.
 - **Reduce background noise** uses macOS voice processing with the
   system-default microphone. Choosing a specific input device uses verified raw
   capture instead; the HUD reports that noise suppression is unavailable. If
@@ -90,8 +113,8 @@ bundle again, enable it, and relaunch.
   with raw microphone audio.
 - Tap the key instead (under 0.4s) to start **hands-free recording**: it keeps going until you
   tap the key again, click the HUD pill, or press Esc to cancel. Holding the key down is still
-  classic push-to-talk. An auto-stop cap (default 5 minutes, configurable 1–60 in Settings →
-  General) guards against a stuck key.
+  classic push-to-talk. An auto-stop cap (default 5 minutes, configurable 1–60
+  in Settings → Recording) guards against a stuck key.
 - The refined text is pasted at your cursor. If pasting isn't possible, it's left on the
   pasteboard and the HUD says "Copied — paste manually".
 - **Library…** opens the searchable history of past Dictations, with "Re-process with…" to
@@ -100,37 +123,39 @@ bundle again, enable it, and relaunch.
   (`last-dictation.wav`, failed-transcription recordings) alongside the database rows. Choosing
   **Translate…** sends the chosen Library text only to the configured Cloud post-processing
   endpoint.
-- **Library → Recoveries** keeps failed dictation audio locally on this Mac so you can listen,
-  retry with optional language/model/template overrides, or permanently delete it. Recovery
-  audio is never uploaded by the recovery library itself. Settings → General → Recovery controls
-  automatic deletion after 1, 7 (default), 30, or 90 days, or keeps it until you delete it.
+- **Library → Recoveries** keeps failed dictation audio locally on this Mac so
+  you can listen, retry with optional language/model/template overrides, or
+  permanently delete it. Recovery audio is never uploaded by the recovery
+  library itself. Settings → Storage controls automatic deletion after 1, 7
+  (default), 30, or 90 days, or keeps it until you delete it.
 - **Library → Imports** accepts WAV, M4A, MP3, MP4, and MOV from the file picker or drag and drop. FreeTalker extracts video audio, transcribes it with the selected local Whisper model, separates speakers locally, and lets you rename speakers and export TXT, Markdown, SRT, or VTT. Imports default to 7-day retention (configurable in Settings). The source file is never modified or deleted, and imported media, derived audio, transcripts, and speaker data never leave your Mac.
   The media integration suite generates a tiny MOV containing both video and audio, then verifies the production probe and decoder extract normalized 16 kHz mono frames without changing the MOV.
-- An optional **Redo-last key** (Settings → General, unbound by default) re-inserts the newest
-  Library entry at your cursor without re-recording — handy when a paste got dismissed or
-  overwritten.
+- An optional **Redo-last key** (Settings → Recording, unbound by default)
+  re-inserts the newest Library entry at your cursor without re-recording —
+  handy when a paste got dismissed or overwritten.
 
 ## Floating controls and scratchpad
 
-The edge launcher is off by default. In Settings → General → **Floating
-controls**, turn on **Show edge launcher**, choose the left, right, top, or
-bottom **Screen edge**, and use **Position along edge** to place it. Choose
-**Auto**, **English**, or **Portuguese** as the default **Dictation language**.
-Hover over the edge tab to reveal controls for dictation, the Scratchpad,
-Settings, and language; the language choice stays synchronized with the menu
-bar.
+The edge launcher is off by default. In Settings → Launcher, turn on **Show
+edge launcher**, choose its screen edge, and select **Auto**, **English**, or
+**Portuguese** as the default dictation language. Hover over the launcher to
+reveal dictation, Scratchpad, Settings, and language controls.
 
-Drag the recording HUD to keep it out of your way. FreeTalker restores its
-position on the next recording and keeps it visible if the display layout
-changes.
+Drag the collapsed launcher, recording HUD, or temporary status HUD anywhere
+within the usable area. FreeTalker remembers each surface independently for
+each display. A visible Dock and menu bar remain unobstructed. When the Dock is
+auto-hidden, or another app is full-screen on that display, you can move the
+surface to the physical bottom edge. Moving between Spaces or displays
+reclamps each surface without making it an active window.
 
-Set **Default output language** in Settings to **Same as spoken** (the
-default), English, Portuguese, Mandarin Chinese, Hindi, Spanish, Standard
-Arabic, French, or German. The edge launcher and recording HUD can override
-that choice for one recording without changing the default. Named output
-languages are API-only: FreeTalker sends the live transcript to the configured
-Cloud post-processing endpoint. A requested translation never falls back to
-Apple's on-device model, another provider, or automatic source-text insertion.
+Set **Default output language** in Settings → Processing to **Same as spoken**
+(the default), English, Portuguese, Mandarin Chinese, Hindi, Spanish,
+Standard Arabic, French, or German. The edge launcher and recording HUD can
+override that choice for one recording without changing the default. Named
+output languages are API-only: FreeTalker sends the live transcript to the
+configured Cloud post-processing endpoint. A requested translation never
+falls back to Apple's on-device model, another provider, or automatic
+source-text insertion.
 
 Open **Scratchpad…** from the menu bar or the edge launcher. Type directly, or
 place the insertion point or select text and choose **Dictate**; live speech
@@ -140,7 +165,7 @@ clearing supported formatting. Scratchpad text and formatting are saved
 automatically on this Mac.
 
 Scratchpad AI actions require a configured API-backed Cloud post-processing
-provider under Settings → General. **Improve writing**, **Expand**,
+provider under Settings → Processing. **Improve writing**, **Expand**,
 **Condense**, and **Custom instruction** send the selected text to that
 configured cloud endpoint, or send the entire Scratchpad when nothing is
 selected. These actions don't fall back to Apple's on-device model. If the
@@ -169,17 +194,20 @@ pricing" — is still transcribed literally; when in doubt, the model transcribe
 
 ### Context awareness
 
-Settings → Templates → **App Rules** maps an app (by bundle ID) to a Template and/or a forced
-Transcript language, so dictating in Slack can default to Refined Message while Mail defaults to
-Email — a rule can set either half alone or both together. The Active Template is still used
-when no rule's Template half matches; see "Language" below for how the language half fits with
-the pin and the Recording Panel. The frontmost app's identity is also passed to the
-post-processor as context, so refined output can account for where it's headed.
+Settings → Processing → **App Rules** maps an app (by bundle ID)
+to a Template and/or a forced Transcript language, so dictating in Slack can
+default to Refined Message while Mail defaults to Email. A rule can set either
+half alone or both together. The Active Template is still used when no rule's
+Template half matches; see "Language" below for how the language half fits
+with the pin and the Recording Panel. The frontmost app's identity is also
+passed to the post-processor as context, so refined output can account for
+where it's headed.
 
-Settings → General → **Local context** can optionally capture selected text, the focused field,
-the active window's accessibility text, or a one-time active-window screenshot read by Apple
-Vision OCR. The scope defaults to Off and is captured exactly once when dictation stops. Manual
-App Rules always take precedence over the optional automatic local style.
+Settings → Privacy → **Local context** can optionally capture selected text,
+the focused field, the active window's accessibility text, or a one-time
+active-window screenshot read by Apple Vision OCR. The scope defaults to Off
+and is captured exactly once when dictation stops. Manual App Rules always
+take precedence over the optional automatic local style.
 
 Selected text, Focused field, and Active window require Accessibility permission. Window + local
 OCR requires Screen Recording permission only; Accessibility can improve its window metadata but
@@ -200,12 +228,14 @@ post-processing requests; when cloud post-processing is configured, FreeTalker o
 
 ### Voice Edit and snippets
 
-Assign a **Voice Edit key** in Settings → General, select editable text, and press the key. Speak
-the instruction, then press the key again. Voice Edit transcribes the instruction with the local
-WhisperKit engine, resolves any exact snippet trigger from the on-device snippet database, and
-uses Apple's on-device Foundation Model when generation is needed. It always shows a preview of
-the original and proposed text; nothing is replaced until you explicitly confirm. If the app,
-field, selection, or selected text changed, replacement is refused and Copy remains available.
+Assign a **Voice Edit key** in Settings → Recording, select editable text, and
+press the key. Speak the instruction, then press the key again. Voice Edit
+transcribes the instruction with the local WhisperKit engine, resolves any
+exact snippet trigger from the on-device snippet database, and uses Apple's
+on-device Foundation Model when generation is needed. It always shows a
+preview of the original and proposed text; nothing is replaced until you
+explicitly confirm. If the app, field, selection, or selected text changed,
+replacement is refused and Copy remains available.
 
 Create, edit, rename, or delete reusable snippets under Settings → Snippets. Put one trigger phrase
 per line. Matching ignores case, surrounding punctuation, and repeated whitespace, while duplicate
@@ -219,17 +249,20 @@ triggers, and expansions are stored only in FreeTalker's local SQLite database.
 
 ### Custom vocabulary
 
-Settings → Templates → **Vocabulary** takes a list of names, jargon, or acronyms your dictation
-tends to get wrong. Terms bias WhisperKit's decoding toward the right spelling and are also
-enforced as corrections during post-processing, so they hold even if the transcript missed them.
+Settings → Transcription → **Vocabulary** takes a list of names, jargon,
+or acronyms your dictation tends to get wrong. Terms bias WhisperKit's decoding
+toward the right spelling and are also enforced as corrections during
+post-processing, so they hold even if the transcript missed them.
 
 ## Language
 
-The menu bar has an **Auto / English / Portuguese** pin below the Template list, forcing the
-transcript language instead of auto-detecting it. Settings → Templates → **App Rules** can
-override the pin per app, alongside its Template rule. The Recording Panel's EN/PT buttons
-(below) add a one-shot override on top of both, good for a single dictation without changing
-any standing setting. Precedence, most to least specific: **one-shot > app rule > pin > auto**.
+The menu bar has an **Auto / English / Portuguese** pin below the Template list,
+forcing the transcript language instead of auto-detecting it. Settings →
+Processing → **App Rules** can override the pin per app, alongside
+its Template rule. The Recording Panel's EN/PT buttons (below) add a one-shot
+override on top of both, good for a single dictation without changing any
+standing setting. Precedence, most to least specific: **one-shot > app rule >
+pin > auto**.
 
 ## Recording Panel
 
@@ -255,10 +288,11 @@ optionally be pointed at a cloud provider — bring your own API key, nothing is
 live in the macOS Keychain only; they're never written to disk unencrypted, bundled with the
 app, or logged.
 
-- **Cloud STT** — Settings → General → **Transcription engine** toggles between WhisperKit
-  (on-device, default) and Cloud.
-- **Cloud post-processing** — Settings → General → **Cloud post-processing** accepts a
-  provider, base URL, and model. Supported providers are OpenAI-compatible endpoints
+- **Cloud STT** — Settings → Transcription → **Transcription engine**
+  toggles between WhisperKit (on-device, default) and Cloud.
+- **Cloud post-processing** — Settings → Processing → **Cloud
+  post-processing** accepts a provider, base URL, and model. Supported
+  providers are OpenAI-compatible endpoints
   (including [Ollama cloud](https://ollama.com/v1)) and Anthropic. Once a provider has a key,
   endpoint, and model all set, cloud post-processing runs automatically for every Dictation —
   it isn't chosen per Template. A key is optional only for an OpenAI-compatible loopback HTTP
@@ -277,10 +311,6 @@ For fully local LLM post-processing, run Ollama Desktop and use the existing
 OpenAI-compatible BYOK provider with `http://localhost:11434/v1`. Ollama's local endpoint
 doesn't require an API key; FreeTalker omits the Authorization header when the key is empty.
 
-![FreeTalker General settings with permissions, recording controls, microphone, and transcription engine options](docs/settings-general.png)
-*Settings → General: configure permissions, recording controls, microphone input, and the
-transcription engine.*
-
 ![FreeTalker Templates settings with the Refined Message prompt editor](docs/settings-templates.png)
 *Settings → Templates: choose a template and edit its post-processing prompt.*
 
@@ -292,7 +322,8 @@ template without leaving your current app.*
 
 1. `make run`. Confirm the menu bar waveform icon appears (no Dock icon — it's
    `LSUIElement`).
-2. Open Settings → General. Grant Accessibility if prompted; confirm the dot turns green.
+2. Open Settings → Privacy. Grant Accessibility if prompted; confirm the dot
+   turns green.
 3. Click into TextEdit (or any text field). Hold Right-⌥, say a short English sentence,
    release. Confirm: HUD pill appears then disappears, and the refined text is pasted at the
    cursor within a few seconds (first run: WhisperKit downloads the model first — watch the
@@ -305,11 +336,12 @@ template without leaving your current app.*
    appended and the newly refined text is pasted at the cursor.
 7. Settings → Templates: edit a prompt, confirm it persists (re-open Settings). Add a new
    Template, make it Active from the menu bar, dictate, confirm it's used.
-8. Settings → General → "Change…" next to the push-to-talk key, press a different modifier
-   (e.g. Left-⌃), confirm the label updates and that key now triggers recording instead of
-   Right-⌥.
-9. (Optional, BYOK) Settings → General → set a Cloud STT key, or fill in Cloud post-processing
-   (provider, base URL, model, key); dictate and confirm the cloud path is used and the
-   Library row's `engine` reflects it. Then unplug network / clear the key and confirm
-   post-processing failure falls back to the raw transcript being pasted (never silently
-   drops the dictation).
+8. Settings → Recording → "Change…" next to the push-to-talk key, press a
+   different modifier (for example, Left-⌃), confirm the label updates, and
+   confirm that key now triggers recording instead of Right-⌥.
+9. (Optional, BYOK) Set a Cloud STT key under Settings → Transcription, or
+   fill in Cloud post-processing under Settings → Processing. Dictate and
+   confirm the cloud path is used and the Library row's `engine` reflects it.
+   Then unplug the network or clear the key and confirm post-processing failure
+   falls back to the raw transcript being pasted without dropping the
+   dictation.
