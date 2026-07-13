@@ -54,7 +54,8 @@ import Testing
     }
 
     @Test func readmeDocumentsMandatoryLocalOnlyPreview() throws {
-        let readme = try String(contentsOfFile: "README.md", encoding: .utf8)
+        let rawReadme = try String(contentsOfFile: "README.md", encoding: .utf8)
+        let readme = rawReadme.split(whereSeparator: \.isWhitespace).joined(separator: " ")
         #expect(readme.contains("Voice Edit"))
         #expect(readme.contains("always shows a preview"))
         #expect(readme.contains("never sent to a cloud service"))
