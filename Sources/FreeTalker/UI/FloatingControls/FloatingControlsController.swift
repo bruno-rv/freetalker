@@ -60,6 +60,14 @@ final class FloatingControlsController {
     /// every hover-driven or AppCoordinator-driven re-render (this runs constantly while
     /// recording/processing) confuses the hosting view's tracking area and can leave the
     /// launcher stuck expanded — see the "hover never collapses" regression.
+    ///
+    /// `renderAndPosition()` also reuses `hostingView` across re-renders instead of replacing
+    /// `panel.contentView` every time: destroying the hosting view while the cursor is inside its
+    /// tracking area (which happens on every `pointerEntered()`-triggered render) tears down that
+    /// tracking area without AppKit ever delivering a matching `mouseExited`, so `pointerExited()`
+    /// never runs and the collapse timer never gets scheduled. The tracking area itself uses
+    /// `.inVisibleRect`, so it already follows the view's bounds across resizes — it only needs to
+    /// be (re)installed when the hosting view is first created.
     private var isPanelVisible = false
     private var state = FloatingControlsHoverState.collapsed
     private var collapseWorkItem: DispatchWorkItem?
@@ -222,7 +230,6 @@ final class FloatingControlsController {
         state.reduce(.pointerEntered)
         state.reduce(.expansionCompleted)
         renderAndPosition()
-        hostingView?.reinstallTrackingArea()
     }
 
     private func pointerExited() {
@@ -232,10 +239,9 @@ final class FloatingControlsController {
             guard let self else { return }
             self.state.reduce(.collapseDelayElapsed)
             self.renderAndPosition()
-            self.hostingView?.reinstallTrackingArea()
         }
         collapseWorkItem = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: item)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0, execute: item)
     }
 
     private func renderAndPosition() {
@@ -254,15 +260,24 @@ final class FloatingControlsController {
             translationState: presentedTranslationState,
             callbacks: viewCallbacks
         )
-        let hosting = FloatingControlsHostingView(rootView: view)
+        let hosting: FloatingControlsHostingView
+        let isNewHostingView: Bool
+        if let existing = hostingView, existing === panel.contentView {
+            hosting = existing
+            hosting.rootView = view
+            isNewHostingView = false
+        } else {
+            hosting = FloatingControlsHostingView(rootView: view)
+            panel.contentView = hosting
+            hostingView = hosting
+            isNewHostingView = true
+        }
         hosting.onPointerEntered = { [weak self] in self?.pointerEntered() }
         hosting.onPointerExited = { [weak self] in self?.pointerExited() }
         let fitting = hosting.fittingSize
         let size = CGSize(width: max(fitting.width, 14), height: max(fitting.height, 14))
         hosting.frame = NSRect(origin: .zero, size: size)
-        panel.contentView = hosting
         panel.setContentSize(size)
-        hostingView = hosting
 
         guard let screen = screenForLauncher() else { return }
         panel.setFrame(FloatingPanelGeometry.launcherFrame(
@@ -271,7 +286,7 @@ final class FloatingControlsController {
             panelSize: size,
             visibleFrame: screen.visibleFrame
         ), display: true)
-        hosting.reinstallTrackingArea()
+        if isNewHostingView { hosting.reinstallTrackingArea() }
         if !isPanelVisible {
             panel.orderFrontRegardless()
             isPanelVisible = true
