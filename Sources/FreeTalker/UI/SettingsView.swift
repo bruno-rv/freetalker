@@ -85,30 +85,26 @@ struct SettingsView: View {
     static let automaticTemplateHelp = "When no App Rule matches, FreeTalker chooses Email, Refined Message, Clean Dictation, or Refined Prompt. Turn this off to keep the Active Template."
 
     @ObservedObject private var coordinator = AppCoordinator.shared
+    @State private var selection: SettingsDestination = .general
 
     var body: some View {
-        TabView {
-            GeneralSettingsView()
-                .tabItem { Label("General", systemImage: "gearshape") }
-            TemplatesSettingsView()
-                .tabItem { Label("Templates", systemImage: "text.badge.checkmark") }
-            SnippetsSettingsView(
-                store: coordinator.snippetStore,
-                initializationError: coordinator.snippetStoreInitializationError,
-                retry: { coordinator.retrySnippetStoreInitialization() }
-            )
-            .tabItem { Label("Snippets", systemImage: "text.quote") }
+        HStack(spacing: 0) {
+            SettingsSidebar(selection: $selection)
+            Divider()
+            switch selection {
+            case .general:
+                GeneralSettingsView()
+            case .templates:
+                TemplatesSettingsView()
+            case .snippets:
+                SnippetsSettingsView(
+                    store: coordinator.snippetStore,
+                    initializationError: coordinator.snippetStoreInitializationError,
+                    retry: { coordinator.retrySnippetStoreInitialization() }
+                )
+            }
         }
-        .padding(20)
-        // A SINGLE frame call with both min and max: chaining `.frame(maxWidth: .infinity, ...)`
-        // followed by a separate `.frame(minWidth: 520, ...)` (the previous, insufficient fix)
-        // makes the second call the outermost layout container SwiftUI proposes the window's
-        // size to — and since that second call has no maxWidth/maxHeight of its own, it reports
-        // its *ideal* (roughly minimum) size upward, discarding the first call's "fill available
-        // space" entirely. The window itself still resizes/maximizes fine (that's a property of
-        // the Window scene, not this view), but the content stops tracking it. One call with
-        // min *and* max keeps both constraints on the same flexible frame.
-        .frame(minWidth: 520, maxWidth: .infinity, minHeight: 480, maxHeight: .infinity)
+        .frame(minWidth: 780, maxWidth: .infinity, minHeight: 560, maxHeight: .infinity)
     }
 }
 
