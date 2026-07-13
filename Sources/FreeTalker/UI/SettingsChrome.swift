@@ -98,6 +98,40 @@ struct SettingsPage<Content: View>: View {
     }
 }
 
+struct SettingsEditorPage<Content: View>: View {
+    let title: String
+    let subtitle: String?
+    private let content: Content
+
+    init(
+        title: String,
+        subtitle: String? = nil,
+        @ViewBuilder content: () -> Content
+    ) {
+        self.title = title
+        self.subtitle = subtitle
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                    .font(.title2.weight(.semibold))
+                if let subtitle {
+                    Text(subtitle)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            content
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        .padding(24)
+    }
+}
+
 struct SettingsCard<Content: View>: View {
     let title: String
     let subtitle: String?

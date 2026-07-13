@@ -77,7 +77,7 @@ struct SnippetsSettingsView: View {
     }
 
     var body: some View {
-        SettingsPage(title: "Snippets", subtitle: "Manage reusable text snippets") {
+        SettingsEditorPage(title: "Snippets", subtitle: "Manage reusable text snippets") {
             VStack(alignment: .leading, spacing: 12) {
                 if let initializationError {
                     let availability = SnippetStoreAvailabilityPresentation.failure(initializationError)
@@ -131,6 +131,7 @@ struct SnippetsSettingsView: View {
                 }
                 .disabled(store == nil)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
         }
         .task { await reload() }
         .onChange(of: selectedID) { _, id in
