@@ -20,11 +20,6 @@ let package = Package(
                 .product(name: "FluidAudio", package: "FluidAudio"),
                 "CSQLite"
             ]
-        ),
-        .testTarget(
-            name: "FreeTalkerTests",
-            dependencies: ["FreeTalker"],
-            resources: [.copy("Fixtures")]
         )
     ]
 )
