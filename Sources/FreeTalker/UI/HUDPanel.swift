@@ -151,6 +151,9 @@ final class HUDController {
         let size = NSSize(width: max(fitting.width, 60), height: max(fitting.height, 36))
         hosting.frame = NSRect(origin: .zero, size: size)
 
+        let isRecordingPanel: Bool
+        if case .recordingPanel = mode { isRecordingPanel = true } else { isRecordingPanel = false }
+
         let panel: NSPanel
         if let existing = self.panel {
             panel = existing
@@ -158,7 +161,9 @@ final class HUDController {
             let visibleFrame = (panel.screen ?? NSScreen.main)?.visibleFrame
             panel.contentView = hosting
             panel.setContentSize(size)
-            if let visibleFrame {
+            if isRecordingPanel, let anchored = launcherAnchoredFrame(panelSize: panel.frame.size) {
+                panel.setFrame(anchored, display: true)
+            } else if let visibleFrame {
                 panel.setFrameOrigin(Self.resizedOrigin(
                     preserving: origin,
                     panelSize: panel.frame.size,
@@ -169,10 +174,32 @@ final class HUDController {
             panel = Self.makePanel(size: size)
             panel.contentView = hosting
             self.panel = panel
-            positionForFirstPresentation(panel)
+            if isRecordingPanel, let anchored = launcherAnchoredFrame(panelSize: size) {
+                panel.setFrameOrigin(anchored.origin)
+            } else {
+                positionForFirstPresentation(panel)
+            }
         }
 
         panel.orderFrontRegardless()
+    }
+
+    /// While recording, the edge launcher (`FloatingControlsController`) hides itself and the
+    /// recording panel takes over its exact anchored spot instead of the HUD's own saved/default
+    /// position — replacing the launcher icon in place rather than opening a second floating
+    /// widget elsewhere on screen. Returns `nil` when the edge launcher is off, since there's no
+    /// launcher position to take over.
+    private func launcherAnchoredFrame(panelSize: NSSize) -> CGRect? {
+        guard settings.edgeLauncherEnabled else { return nil }
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { $0.frame.contains(mouse) } ?? panel?.screen ?? NSScreen.main
+        guard let screen else { return nil }
+        return FloatingPanelGeometry.launcherFrame(
+            edge: settings.edgeLauncherEdge,
+            position: settings.edgeLauncherPosition,
+            panelSize: panelSize,
+            visibleFrame: screen.visibleFrame
+        )
     }
 
     static func makePanel(size: NSSize) -> NSPanel {

@@ -60,6 +60,7 @@ struct FreeTalkerApp: App {
             outputUpdates: AppCoordinator.shared.objectWillChange
                 .map { _ in () }
                 .eraseToAnyPublisher(),
+            isRecording: { AppCoordinator.shared.isRecording },
             callbacks: .init(
             onDictation: {
                 AppCoordinator.shared.startHandsFreeRecording(destination: .external)

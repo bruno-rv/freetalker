@@ -7,29 +7,29 @@ struct FloatingControlsView: View {
     let translationState: TranslationControlsState
     let callbacks: FloatingControlsController.Callbacks
 
+    /// Fixed regardless of `edge` so the collapsed launcher never balloons on the side edges.
+    private static let collapsedIconDiameter: CGFloat = 26
+
     var body: some View {
         Group {
             if state == .collapsed {
-                Capsule()
-                    .fill(Color.accentColor.gradient)
-                    .frame(width: edge.isVertical ? 8 : 48, height: edge.isVertical ? 48 : 8)
+                Image(systemName: "waveform")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: Self.collapsedIconDiameter, height: Self.collapsedIconDiameter)
+                    .background(Color.accentColor.gradient, in: Circle())
                     .accessibilityLabel("Open FreeTalker controls")
             } else {
-                controlStack
+                // Always horizontal, even on the left/right edges: a vertical stack forces the
+                // text-heavy TranslationControls row to set the panel's width, ballooning it far
+                // past the icon column above it.
+                HStack(spacing: 4) { controls }
                     .padding(6)
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 13))
                     .overlay(RoundedRectangle(cornerRadius: 13).stroke(.tint.opacity(0.45)))
             }
         }
         .padding(3)
-    }
-
-    @ViewBuilder private var controlStack: some View {
-        if edge.isVertical {
-            VStack(spacing: 4) { controls }
-        } else {
-            HStack(spacing: 4) { controls }
-        }
     }
 
     @ViewBuilder private var controls: some View {
@@ -60,8 +60,6 @@ struct FloatingControlsView: View {
 }
 
 extension LauncherEdge {
-    var isVertical: Bool { self == .left || self == .right }
-
     var displayName: String {
         switch self {
         case .left: "Left"
