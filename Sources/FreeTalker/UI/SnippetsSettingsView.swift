@@ -77,8 +77,12 @@ struct SnippetsSettingsView: View {
     }
 
     var body: some View {
-        SettingsEditorPage(title: "Snippets", subtitle: "Manage reusable text snippets") {
+        SettingsEditorPage(title: "Snippets", subtitle: "Voice Edit shortcuts that replace selected text") {
             VStack(alignment: .leading, spacing: 12) {
+                Text("Select text, then say a trigger phrase during Voice Edit — it's replaced with the expansion verbatim, no AI rewrite. Anything else falls through to the normal AI edit.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+
                 if let initializationError {
                     let availability = SnippetStoreAvailabilityPresentation.failure(initializationError)
                     Label(availability.message, systemImage: "exclamationmark.triangle")
@@ -103,8 +107,12 @@ struct SnippetsSettingsView: View {
                     }
                     .frame(minWidth: 180)
 
-                    Form {
+                    // A plain VStack, not a Form: Form collapses a single labeled field into a
+                    // cramped label column against the HSplitView divider (see TemplateEditor
+                    // in SettingsView.swift for the same pattern and rationale).
+                    VStack(alignment: .leading, spacing: 12) {
                         TextField("Name", text: $draft.name)
+                            .textFieldStyle(.roundedBorder)
                             .accessibilityLabel("Snippet name")
                         Text("Trigger phrases (one per line)").font(.headline)
                         TextEditor(text: $draft.triggersText)
@@ -127,6 +135,7 @@ struct SnippetsSettingsView: View {
                                 .disabled(draft.validationMessage != nil)
                         }
                     }
+                    .padding()
                     .frame(minWidth: 320)
                 }
                 .disabled(store == nil)
