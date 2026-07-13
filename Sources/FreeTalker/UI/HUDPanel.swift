@@ -7,11 +7,6 @@ final class HUDController {
     private var panel: NSPanel?
     private let settings: AppSettings
     private var screenChangeObserver: NotificationObserverToken?
-    /// Set while `panel`'s origin is the launcher's edge-anchored spot (see
-    /// `launcherAnchoredFrame`) rather than the HUD's own resting position. The next non-recording
-    /// display (e.g. "Processing…") must re-center/restore instead of preserving that borrowed
-    /// origin — otherwise every status bubble stays wherever the launcher happens to live.
-    private var isAnchoredToLauncher = false
     /// Pending auto-hide for a `flash(_:duration:)` call. Cancelled whenever `show`/`flash`/
     /// `hide` runs again (e.g. a new recording starts) so a stale timer can't hide a HUD that's
     /// since been repurposed. See Round 2 Codex finding 6.
@@ -81,6 +76,11 @@ final class HUDController {
         var onInsertSourceText: () -> Void = {}
     }
 
+    private enum Surface {
+        case recording
+        case transient
+    }
+
     func show(text: String) {
         pendingHide?.cancel()
         pendingHide = nil
@@ -135,6 +135,7 @@ final class HUDController {
     }
 
     private func display(mode: Mode) {
+        let surface = surface(for: mode)
         let callbacks = PanelCallbacks(
             onCancel: { [weak self] in self?.onPanelCancel?() },
             onDone: { [weak self] in self?.onPanelDone?() },
@@ -150,67 +151,25 @@ final class HUDController {
             mode: mode,
             onPillClick: { [weak self] in self?.onPillClick?() },
             panelCallbacks: callbacks,
-            onBackgroundDragCompleted: { [weak self] in self?.persistPanelPosition() }
+            onBackgroundDragCompleted: { [weak self] in self?.persistPanelPosition(for: surface) }
         ))
         let fitting = hosting.fittingSize
         let size = NSSize(width: max(fitting.width, 60), height: max(fitting.height, 36))
         hosting.frame = NSRect(origin: .zero, size: size)
 
-        let isRecordingPanel: Bool
-        if case .recordingPanel = mode { isRecordingPanel = true } else { isRecordingPanel = false }
-
         let panel: NSPanel
         if let existing = self.panel {
             panel = existing
-            let origin = panel.frame.origin
-            let visibleFrame = (panel.screen ?? NSScreen.main)?.visibleFrame
             panel.contentView = hosting
             panel.setContentSize(size)
-            if isRecordingPanel, let anchored = launcherAnchoredFrame(panelSize: panel.frame.size) {
-                panel.setFrame(anchored, display: true)
-                isAnchoredToLauncher = true
-            } else if isAnchoredToLauncher {
-                isAnchoredToLauncher = false
-                positionForFirstPresentation(panel)
-            } else if let visibleFrame {
-                panel.setFrameOrigin(Self.resizedOrigin(
-                    preserving: origin,
-                    panelSize: panel.frame.size,
-                    capturedVisibleFrame: visibleFrame
-                ))
-            }
         } else {
             panel = Self.makePanel(size: size)
             panel.contentView = hosting
             self.panel = panel
-            if isRecordingPanel, let anchored = launcherAnchoredFrame(panelSize: size) {
-                panel.setFrameOrigin(anchored.origin)
-                isAnchoredToLauncher = true
-            } else {
-                isAnchoredToLauncher = false
-                positionForFirstPresentation(panel)
-            }
         }
+        position(panel, for: surface)
 
         panel.orderFrontRegardless()
-    }
-
-    /// While recording, the edge launcher (`FloatingControlsController`) hides itself and the
-    /// recording panel takes over its exact anchored spot instead of the HUD's own saved/default
-    /// position — replacing the launcher icon in place rather than opening a second floating
-    /// widget elsewhere on screen. Returns `nil` when the edge launcher is off, since there's no
-    /// launcher position to take over.
-    private func launcherAnchoredFrame(panelSize: NSSize) -> CGRect? {
-        guard settings.edgeLauncherEnabled else { return nil }
-        let mouse = NSEvent.mouseLocation
-        let screen = NSScreen.screens.first { $0.frame.contains(mouse) } ?? panel?.screen ?? NSScreen.main
-        guard let screen else { return nil }
-        return FloatingPanelGeometry.launcherFrame(
-            edge: settings.edgeLauncherEdge,
-            position: settings.edgeLauncherPosition,
-            panelSize: panelSize,
-            visibleFrame: screen.visibleFrame
-        )
     }
 
     static func makePanel(size: NSSize) -> NSPanel {
@@ -231,18 +190,31 @@ final class HUDController {
         return panel
     }
 
-    private func positionForFirstPresentation(_ panel: NSPanel) {
-        guard let screen = NSScreen.main else { return }
+    private func position(_ panel: NSPanel, for surface: Surface) {
+        guard let screen = panel.screen ?? NSScreen.main else { return }
         let displays = NSScreen.screens.map(Self.displayFrame)
-        let origin: CGPoint
-        if let saved = settings.hudPosition {
-            origin = FloatingPanelGeometry.restoredOrigin(
+        let fallback = Self.displayFrame(screen)
+        let saved = savedPosition(for: surface)
+        if let saved {
+            panel.setFrameOrigin(FloatingPanelGeometry.restoredOrigin(
                 saved: saved,
                 displays: displays,
-                fallback: Self.displayFrame(screen),
+                fallback: fallback,
                 panelSize: panel.frame.size
-            )
-        } else {
+            ))
+            return
+        }
+
+        let origin: CGPoint
+        switch surface {
+        case .recording:
+            origin = FloatingPanelGeometry.launcherFrame(
+                edge: settings.edgeLauncherEdge,
+                position: settings.edgeLauncherPosition,
+                panelSize: panel.frame.size,
+                visibleFrame: screen.visibleFrame
+            ).origin
+        case .transient:
             origin = FloatingPanelGeometry.clampedOrigin(
                 CGPoint(x: screen.visibleFrame.midX - panel.frame.width / 2,
                         y: screen.visibleFrame.minY + 90),
@@ -251,6 +223,23 @@ final class HUDController {
             )
         }
         panel.setFrameOrigin(origin)
+    }
+
+    private func savedPosition(for surface: Surface) -> NormalizedWindowPosition? {
+        switch surface {
+        case .recording:
+            settings.recordingHUDPosition
+        case .transient:
+            settings.transientHUDPosition
+        }
+    }
+
+    private func surface(for mode: Mode) -> Surface {
+        if case .recordingPanel = mode {
+            return .recording
+        } else {
+            return .transient
+        }
     }
 
     private func reclampPanel() {
@@ -262,12 +251,23 @@ final class HUDController {
         ))
     }
 
-    private func persistPanelPosition() {
+    private func persistPanelPosition(for surface: Surface) {
         guard let panel, let screen = panel.screen ?? NSScreen.main else { return }
-        settings.hudPosition = FloatingPanelGeometry.normalizedOrigin(
+        panel.setFrameOrigin(FloatingPanelGeometry.clampedOrigin(
+            panel.frame.origin,
+            panelSize: panel.frame.size,
+            visibleFrame: screen.visibleFrame
+        ))
+        let position = FloatingPanelGeometry.normalizedOrigin(
             frame: panel.frame,
             display: Self.displayFrame(screen)
         )
+        switch surface {
+        case .recording:
+            settings.recordingHUDPosition = position
+        case .transient:
+            settings.transientHUDPosition = position
+        }
     }
 
     private static func displayFrame(_ screen: NSScreen) -> DisplayFrame {

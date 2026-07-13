@@ -148,6 +148,31 @@ struct FloatingPanelGeometryTests {
         #expect(origin == fallback.visibleFrame.origin)
     }
 
+    @Test func legacyLauncherPositionMigratesToSavedPositionOnTheVisibleFrame() {
+        let display = DisplayFrame(id: "main", visibleFrame: screen)
+
+        let saved = FloatingPanelGeometry.legacyLauncherPosition(
+            edge: .bottom,
+            position: 0.25,
+            panelSize: launcherSize,
+            display: display
+        )
+
+        #expect(saved == NormalizedWindowPosition(displayID: "main", x: 0.25, y: 0))
+    }
+
+    @Test func restoredOriginKeepsPanelsInsideTheUsableFrame() {
+        let display = DisplayFrame(id: "main", visibleFrame: screen)
+        let origin = FloatingPanelGeometry.restoredOrigin(
+            saved: NormalizedWindowPosition(displayID: "main", x: 1, y: 1),
+            displays: [display],
+            fallback: display,
+            panelSize: launcherSize
+        )
+
+        #expect(screen.contains(CGRect(origin: origin, size: launcherSize)))
+    }
+
     @Test func oversizedHUDKeepsMinimumDraggableAreaVisible() {
         let visibleFrame = CGRect(x: 100, y: 200, width: 200, height: 100)
         let panelSize = CGSize(width: 400, height: 240)
@@ -163,7 +188,7 @@ struct FloatingPanelGeometryTests {
         #expect(high == CGPoint(x: 252, y: 268))
     }
 
-    @Test func contentResizePreservesAndClampsCurrentOriginInsteadOfRecentering() {
+    @Test func contentResizeKeepsNormallySizedPanelInsideTheUsableFrame() {
         let visibleFrame = CGRect(x: 100, y: 200, width: 600, height: 400)
 
         let origin = FloatingPanelGeometry.clampedOrigin(
@@ -172,7 +197,7 @@ struct FloatingPanelGeometryTests {
             visibleFrame: visibleFrame
         )
 
-        #expect(origin == CGPoint(x: 652, y: 568))
+        #expect(origin == CGPoint(x: 460, y: 500))
         #expect(origin != CGPoint(x: 280, y: 350))
     }
 }

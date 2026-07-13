@@ -49,9 +49,7 @@ final class FloatingControlsController {
     private let outputUpdates: AnyPublisher<Void, Never>
     private let cloudSnapshot: () -> CloudLLMSettingsSnapshot
     private let notificationCenter: NotificationCenter
-    /// While a recording is active the HUD's recording panel takes over this same edge-anchored
-    /// spot (see `HUDController.launcherAnchoredFrame`) — showing both at once would double up
-    /// on the same corner of the screen.
+    /// The launcher hides while recording so it never competes with the recording HUD.
     private let isRecording: () -> Bool
     private var panel: NSPanel?
     private var hostingView: FloatingControlsHostingView?
@@ -114,11 +112,11 @@ final class FloatingControlsController {
             Task { @MainActor in self?.screenConfigurationDidChange() }
         })
         settings.$edgeLauncherEnabled
-            .combineLatest(settings.$edgeLauncherEdge, settings.$edgeLauncherPosition)
+            .combineLatest(settings.$launcherPanelPosition)
             .combineLatest(settings.$languagePin)
             .sink { [weak self] launcherSettings, languagePin in
                 guard let self else { return }
-                let (enabled, _, _) = launcherSettings
+                let (enabled, _) = launcherSettings
                 self.presentedLanguagePin = languagePin
                 self.refreshTranslationState()
                 if enabled { self.show() } else { self.hideForDisabledSetting() }
@@ -205,6 +203,7 @@ final class FloatingControlsController {
         panel.backgroundColor = .clear
         panel.hasShadow = true
         panel.ignoresMouseEvents = false
+        panel.isMovableByWindowBackground = false
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
         return panel
     }
@@ -274,18 +273,30 @@ final class FloatingControlsController {
         }
         hosting.onPointerEntered = { [weak self] in self?.pointerEntered() }
         hosting.onPointerExited = { [weak self] in self?.pointerExited() }
+        hosting.allowsCollapsedDrag = state == .collapsed
+        hosting.onCollapsedDragCompleted = { [weak self] in self?.persistPanelPosition() }
         let fitting = hosting.fittingSize
         let size = CGSize(width: max(fitting.width, 14), height: max(fitting.height, 14))
         hosting.frame = NSRect(origin: .zero, size: size)
         panel.setContentSize(size)
 
-        guard let screen = screenForLauncher() else { return }
-        panel.setFrame(FloatingPanelGeometry.launcherFrame(
-            edge: settings.edgeLauncherEdge,
-            position: settings.edgeLauncherPosition,
-            panelSize: size,
-            visibleFrame: screen.visibleFrame
-        ), display: true)
+        guard let fallbackScreen = screenForLauncher() else { return }
+        let displays = NSScreen.screens.map(Self.displayFrame)
+        let fallback = Self.displayFrame(fallbackScreen)
+        if settings.launcherPanelPosition == nil {
+            settings.launcherPanelPosition = FloatingPanelGeometry.legacyLauncherPosition(
+                edge: settings.edgeLauncherEdge,
+                position: settings.edgeLauncherPosition,
+                panelSize: size,
+                display: fallback
+            )
+        }
+        panel.setFrameOrigin(FloatingPanelGeometry.restoredOrigin(
+            saved: settings.launcherPanelPosition,
+            displays: displays,
+            fallback: fallback,
+            panelSize: size
+        ))
         if isNewHostingView { hosting.reinstallTrackingArea() }
         if !isPanelVisible {
             panel.orderFrontRegardless()
@@ -296,6 +307,26 @@ final class FloatingControlsController {
     private func screenForLauncher() -> NSScreen? {
         let mouse = NSEvent.mouseLocation
         return NSScreen.screens.first { $0.frame.contains(mouse) } ?? panel?.screen ?? NSScreen.main
+    }
+
+    private func persistPanelPosition() {
+        guard let panel, let screen = panel.screen ?? NSScreen.main else { return }
+        panel.setFrameOrigin(FloatingPanelGeometry.clampedOrigin(
+            panel.frame.origin,
+            panelSize: panel.frame.size,
+            visibleFrame: screen.visibleFrame
+        ))
+        settings.launcherPanelPosition = FloatingPanelGeometry.normalizedOrigin(
+            frame: panel.frame,
+            display: Self.displayFrame(screen)
+        )
+    }
+
+    private static func displayFrame(_ screen: NSScreen) -> DisplayFrame {
+        let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")]
+            as? NSNumber
+        return DisplayFrame(id: number?.stringValue ?? screen.localizedName,
+                            visibleFrame: screen.visibleFrame)
     }
 }
 
@@ -312,6 +343,8 @@ private final class FloatingControlsPanel: NSPanel {
 final class FloatingControlsHostingView: NSHostingView<FloatingControlsView> {
     var onPointerEntered: (() -> Void)?
     var onPointerExited: (() -> Void)?
+    var onCollapsedDragCompleted: (() -> Void)?
+    var allowsCollapsedDrag = false
     private var pointerTrackingArea: NSTrackingArea?
 
     override func updateTrackingAreas() {
@@ -334,4 +367,17 @@ final class FloatingControlsHostingView: NSHostingView<FloatingControlsView> {
     override func mouseEntered(with event: NSEvent) { onPointerEntered?() }
     override func mouseExited(with event: NSEvent) { onPointerExited?() }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        allowsCollapsedDrag ? self : super.hitTest(point)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard allowsCollapsedDrag else {
+            super.mouseDown(with: event)
+            return
+        }
+        window?.performDrag(with: event)
+        onCollapsedDragCompleted?()
+    }
 }

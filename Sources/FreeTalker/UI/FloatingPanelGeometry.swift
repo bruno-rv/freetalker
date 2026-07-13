@@ -70,6 +70,23 @@ enum FloatingPanelGeometry {
         )
     }
 
+    static func legacyLauncherPosition(
+        edge: LauncherEdge,
+        position: Double,
+        panelSize: CGSize,
+        display: DisplayFrame
+    ) -> NormalizedWindowPosition {
+        normalizedOrigin(
+            frame: launcherFrame(
+                edge: edge,
+                position: position,
+                panelSize: panelSize,
+                visibleFrame: display.visibleFrame
+            ),
+            display: display
+        )
+    }
+
     static func restoredOrigin(
         saved: NormalizedWindowPosition?,
         displays: [DisplayFrame],
@@ -100,16 +117,30 @@ enum FloatingPanelGeometry {
         visibleFrame: CGRect,
         minimumVisible: CGSize = CGSize(width: 48, height: 32)
     ) -> CGPoint {
-        let visibleWidth = min(panelSize.width, minimumVisible.width)
-        let visibleHeight = min(panelSize.height, minimumVisible.height)
-        let minimumX = visibleFrame.minX - panelSize.width + visibleWidth
-        let maximumX = visibleFrame.maxX - visibleWidth
-        let minimumY = visibleFrame.minY - panelSize.height + visibleHeight
-        let maximumY = visibleFrame.maxY - visibleHeight
+        let horizontalBounds: (minimum: CGFloat, maximum: CGFloat)
+        if panelSize.width <= visibleFrame.width {
+            horizontalBounds = (visibleFrame.minX, visibleFrame.maxX - panelSize.width)
+        } else {
+            let visibleWidth = min(panelSize.width, minimumVisible.width)
+            horizontalBounds = (
+                visibleFrame.minX - panelSize.width + visibleWidth,
+                visibleFrame.maxX - visibleWidth
+            )
+        }
+        let verticalBounds: (minimum: CGFloat, maximum: CGFloat)
+        if panelSize.height <= visibleFrame.height {
+            verticalBounds = (visibleFrame.minY, visibleFrame.maxY - panelSize.height)
+        } else {
+            let visibleHeight = min(panelSize.height, minimumVisible.height)
+            verticalBounds = (
+                visibleFrame.minY - panelSize.height + visibleHeight,
+                visibleFrame.maxY - visibleHeight
+            )
+        }
 
         return CGPoint(
-            x: min(max(origin.x, minimumX), maximumX),
-            y: min(max(origin.y, minimumY), maximumY)
+            x: min(max(origin.x, horizontalBounds.minimum), horizontalBounds.maximum),
+            y: min(max(origin.y, verticalBounds.minimum), verticalBounds.maximum)
         )
     }
 

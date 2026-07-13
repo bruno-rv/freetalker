@@ -6,4 +6,8 @@ struct NormalizedWindowPosition: Codable, Equatable, Sendable {
     let displayID: String?
     let x: Double
     let y: Double
+
+    var isValid: Bool {
+        x.isFinite && y.isFinite
+    }
 }
