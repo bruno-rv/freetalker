@@ -1106,7 +1106,7 @@ private struct TemplatesSettingsView: View {
     @State private var selectedID: String?
 
     var body: some View {
-        SettingsPage(title: "Templates", subtitle: "Create and refine reusable dictation formats") {
+        SettingsEditorPage(title: "Templates", subtitle: "Create and refine reusable dictation formats") {
             HSplitView {
                 List(selection: $selectedID) {
                     ForEach(store.templates) { template in
