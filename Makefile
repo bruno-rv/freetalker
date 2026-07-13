@@ -5,6 +5,10 @@ BIN := .build/$(CONFIG)/$(APP_NAME)
 RESOURCE_BUNDLE := .build/$(CONFIG)/$(APP_NAME)_$(APP_NAME).bundle
 RESOURCE_BUNDLE_NAME := $(APP_NAME)_$(APP_NAME).bundle
 XCODE_DEVELOPER_DIR ?= /Applications/Xcode.app/Contents/Developer
+# Ad-hoc by default so plain `make app` is unchanged. Set to a real identity (see
+# scripts/make-signing-cert.sh) so TCC grants survive rebuilds instead of being orphaned by
+# ad-hoc signing's per-build signature.
+CODESIGN_IDENTITY ?= -
 
 .PHONY: build test test-preflight app run clean
 
@@ -33,12 +37,14 @@ app: build
 	cp Assets/SettingsIconsInfo.plist $(BUNDLE)/Contents/Resources/$(RESOURCE_BUNDLE_NAME)/Contents/Info.plist
 	cp Info.plist $(BUNDLE)/Contents/Info.plist
 	cp Assets/AppIcon.icns $(BUNDLE)/Contents/Resources/AppIcon.icns
-	codesign --force --deep -s - $(BUNDLE)
+	codesign --force --deep -s "$(CODESIGN_IDENTITY)" $(BUNDLE)
 	@echo "Built $(BUNDLE). Launch with: open $(BUNDLE)"
+ifeq ($(CODESIGN_IDENTITY),-)
 	@echo "NOTE: ad-hoc signing (-s -) gives this build a signature that differs from the"
 	@echo "previous one whenever the binary changed. If PTT or hotkey capture stop responding"
 	@echo "after this rebuild, remove FreeTalker from System Settings > Privacy & Security >"
 	@echo "Accessibility (and Input Monitoring) and re-add it, even if it still shows as on."
+endif
 
 run: app
 	open $(BUNDLE)
