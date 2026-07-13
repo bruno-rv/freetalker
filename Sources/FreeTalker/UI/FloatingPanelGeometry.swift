@@ -1,8 +1,56 @@
-import CoreGraphics
+import AppKit
 
 struct DisplayFrame: Equatable, Sendable {
     let id: String
     let visibleFrame: CGRect
+}
+
+enum FloatingPanelPlacementPolicy {
+    static func usableFrame(
+        screenFrame: CGRect,
+        visibleFrame: CGRect,
+        presentationOptions: NSApplication.PresentationOptions
+    ) -> CGRect {
+        let dockIsUnavailable = !presentationOptions.intersection([
+            .autoHideDock, .hideDock, .fullScreen
+        ]).isEmpty
+        guard dockIsUnavailable else { return visibleFrame }
+
+        let upperEdge = min(screenFrame.maxY, visibleFrame.maxY)
+        return CGRect(
+            x: visibleFrame.minX,
+            y: screenFrame.minY,
+            width: visibleFrame.width,
+            height: max(0, upperEdge - screenFrame.minY)
+        )
+    }
+
+    @MainActor
+    static func usableFrame(for screen: NSScreen) -> CGRect {
+        usableFrame(
+            screenFrame: screen.frame,
+            visibleFrame: screen.visibleFrame,
+            presentationOptions: NSApp.currentSystemPresentationOptions
+        )
+    }
+}
+
+final class FloatingPanelDragState {
+    private(set) var isDragging = false
+
+    func begin() {
+        isDragging = true
+    }
+
+    func originForRender(liveOrigin: CGPoint, restoredOrigin: CGPoint) -> CGPoint {
+        isDragging ? liveOrigin : restoredOrigin
+    }
+
+    func finish(persist: () -> Void) {
+        guard isDragging else { return }
+        persist()
+        isDragging = false
+    }
 }
 
 enum FloatingPanelGeometry {

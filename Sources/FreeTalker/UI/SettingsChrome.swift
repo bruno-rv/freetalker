@@ -45,12 +45,14 @@ struct SettingsSidebar: View {
                     selection = destination
                 } label: {
                     HStack(spacing: 8) {
-                        Image(destination.imageName, bundle: SettingsIconResources.bundle)
-                            .resizable()
-                            .interpolation(.high)
-                            .scaledToFit()
-                            .frame(width: 20, height: 20)
-                            .accessibilityHidden(true)
+                        if let icon = SettingsIconResources.image(named: destination.imageName) {
+                            Image(nsImage: icon)
+                                .resizable()
+                                .interpolation(.high)
+                                .scaledToFit()
+                                .frame(width: 20, height: 20)
+                                .accessibilityHidden(true)
+                        }
                         Text(destination.title)
                     }
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -76,12 +78,20 @@ struct SettingsSidebar: View {
     }
 }
 
-private enum SettingsIconResources {
+enum SettingsIconResources {
     static let bundle: Bundle = {
         guard let resourceURL = Bundle.main.resourceURL else { return .module }
         let packagedBundle = resourceURL.appendingPathComponent("FreeTalker_FreeTalker.bundle")
         return Bundle(path: packagedBundle.path) ?? .module
     }()
+
+    static func image(
+        named name: String,
+        in bundle: Bundle = SettingsIconResources.bundle
+    ) -> NSImage? {
+        guard let url = bundle.url(forResource: name, withExtension: "png") else { return nil }
+        return NSImage(contentsOf: url)
+    }
 }
 
 struct SettingsPage<Content: View>: View {
