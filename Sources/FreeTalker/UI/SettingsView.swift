@@ -220,11 +220,12 @@ private struct GeneralSettingsView: View {
     @State private var capturingHotKey = false
     @State private var captureSession: HotKeyCapture.Session?
     /// Set when re-recording the PTT key is refused because it would collide with, or
-    /// shadow-engage before, the bound Redo Last key. See HotKeySpec.swift constraint helpers.
+    /// shadow-engage before, the bound Insert Last Dictation key. See HotKeySpec.swift constraint
+    /// helpers.
     @State private var hotKeyRecorderMessage: String?
-    @State private var capturingRedoHotKey = false
-    @State private var redoCaptureSession: HotKeyCapture.Session?
-    @State private var redoRecorderMessage: String?
+    @State private var capturingInsertLastDictationHotKey = false
+    @State private var insertLastDictationCaptureSession: HotKeyCapture.Session?
+    @State private var insertLastDictationRecorderMessage: String?
     @State private var capturingVoiceEditHotKey = false
     @State private var voiceEditCaptureSession: HotKeyCapture.Session?
     @State private var voiceEditRecorderMessage: String?
@@ -612,29 +613,30 @@ private struct GeneralSettingsView: View {
                         .foregroundStyle(.red)
                 }
                 HStack {
-                    Text("Redo-last key: \(settings.redoHotKeySpec?.displayLabel ?? "Unbound")")
+                    Text("Insert Last Dictation key: \(settings.insertLastDictationHotKeySpec?.displayLabel ?? "Unbound")")
                     SettingsHelpButton(
-                        title: "Redo-last key",
-                        message: "Redo Last re-inserts your latest dictation at the cursor. Bind a different key from push-to-talk."
+                        title: "Insert Last Dictation key",
+                        message: "Inserts your latest processed dictation from the Library at the cursor, using a brief clipboard swap (your clipboard is restored). Bind a different key from push-to-talk."
                     )
                     Spacer()
                     Button("Clear") {
-                        // AppCoordinator re-plumbs the tap itself on any hotKeySpec/redoHotKeySpec
-                        // change (see its Combine subscriptions) — no manual call needed here.
-                        settings.redoHotKeySpec = nil
-                        redoRecorderMessage = nil
+                        // AppCoordinator re-plumbs the tap itself on any
+                        // hotKeySpec/insertLastDictationHotKeySpec change (see its Combine
+                        // subscriptions) — no manual call needed here.
+                        settings.insertLastDictationHotKeySpec = nil
+                        insertLastDictationRecorderMessage = nil
                     }
-                    .disabled(settings.redoHotKeySpec == nil)
-                    Button(capturingRedoHotKey ? "Press a key or combination… (⎋ cancels)" : "Change…") {
-                        beginRedoCapture()
+                    .disabled(settings.insertLastDictationHotKeySpec == nil)
+                    Button(capturingInsertLastDictationHotKey ? "Press a key or combination… (⎋ cancels)" : "Change…") {
+                        beginInsertLastDictationCapture()
                     }
-                    .disabled(capturingRedoHotKey)
+                    .disabled(capturingInsertLastDictationHotKey)
                 }
-                Text("Re-inserts your latest dictation at the cursor")
+                Text("Re-inserts your most recent processed dictation at the cursor — nothing is re-recorded or re-processed.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                if let redoRecorderMessage {
-                    Text(redoRecorderMessage)
+                if let insertLastDictationRecorderMessage {
+                    Text(insertLastDictationRecorderMessage)
                         .font(.caption)
                         .foregroundStyle(.red)
                 }
@@ -1055,51 +1057,53 @@ private struct GeneralSettingsView: View {
                 captureSession = nil
             }
             guard let spec else { return } // Escape cancelled the capture.
-            if let redo = settings.redoHotKeySpec {
-                if HotKeySpec.collides(spec, redo) {
-                    hotKeyRecorderMessage = "Same as the Redo-last key — pick a different chord."
+            if let insertLastDictation = settings.insertLastDictationHotKeySpec {
+                if HotKeySpec.collides(spec, insertLastDictation) {
+                    hotKeyRecorderMessage = "Same as the Insert Last Dictation key — pick a different chord."
                     return
                 }
-                if HotKeySpec.redoShadowsHeldPTT(pttSpec: spec, redoSpec: redo) {
-                    hotKeyRecorderMessage = "Would trigger before the Redo-last key — pick a different chord."
+                if HotKeySpec.insertLastDictationShadowsHeldPTT(pttSpec: spec, insertLastDictationSpec: insertLastDictation) {
+                    hotKeyRecorderMessage = "Would trigger before the Insert Last Dictation key — pick a different chord."
                     return
                 }
             }
             hotKeyRecorderMessage = nil
-            // AppCoordinator re-plumbs the tap itself on any hotKeySpec/redoHotKeySpec change
-            // (see its Combine subscriptions) — no manual call needed here.
+            // AppCoordinator re-plumbs the tap itself on any
+            // hotKeySpec/insertLastDictationHotKeySpec change (see its Combine subscriptions) —
+            // no manual call needed here.
             settings.hotKeySpec = spec
         }
     }
 
-    private func beginRedoCapture() {
-        capturingRedoHotKey = true
+    private func beginInsertLastDictationCapture() {
+        capturingInsertLastDictationHotKey = true
         NSApp.activate()
         NSApp.windows.first(where: { $0.title == "Settings" })?.makeKeyAndOrderFront(nil)
         let session = HotKeyCapture.Session()
-        redoCaptureSession = session
+        insertLastDictationCaptureSession = session
         session.start { spec in
             defer {
-                capturingRedoHotKey = false
-                redoCaptureSession = nil
+                capturingInsertLastDictationHotKey = false
+                insertLastDictationCaptureSession = nil
             }
             guard let spec else { return } // Escape cancelled the capture.
-            guard HotKeySpec.isValidRedoSpec(spec) else {
-                redoRecorderMessage = "Redo needs a key, not just modifiers."
+            guard HotKeySpec.isValidInsertLastDictationSpec(spec) else {
+                insertLastDictationRecorderMessage = "Insert Last Dictation needs a key, not just modifiers."
                 return
             }
             guard !HotKeySpec.collides(spec, settings.hotKeySpec) else {
-                redoRecorderMessage = "Same as the push-to-talk key — pick a different chord."
+                insertLastDictationRecorderMessage = "Same as the push-to-talk key — pick a different chord."
                 return
             }
-            guard !HotKeySpec.redoShadowsHeldPTT(pttSpec: settings.hotKeySpec, redoSpec: spec) else {
-                redoRecorderMessage = "Would trigger push-to-talk before this key — pick a different chord."
+            guard !HotKeySpec.insertLastDictationShadowsHeldPTT(pttSpec: settings.hotKeySpec, insertLastDictationSpec: spec) else {
+                insertLastDictationRecorderMessage = "Would trigger push-to-talk before this key — pick a different chord."
                 return
             }
-            redoRecorderMessage = nil
-            // AppCoordinator re-plumbs the tap itself on any hotKeySpec/redoHotKeySpec change
-            // (see its Combine subscriptions) — no manual call needed here.
-            settings.redoHotKeySpec = spec
+            insertLastDictationRecorderMessage = nil
+            // AppCoordinator re-plumbs the tap itself on any
+            // hotKeySpec/insertLastDictationHotKeySpec change (see its Combine subscriptions) —
+            // no manual call needed here.
+            settings.insertLastDictationHotKeySpec = spec
         }
     }
 
@@ -1115,14 +1119,14 @@ private struct GeneralSettingsView: View {
                 voiceEditCaptureSession = nil
             }
             guard let spec else { return }
-            guard HotKeySpec.isValidRedoSpec(spec) else {
+            guard HotKeySpec.isValidInsertLastDictationSpec(spec) else {
                 voiceEditRecorderMessage = "Voice Edit needs a key, not just modifiers."
                 return
             }
             guard HotKeySpec.validActionSpec(
                 spec,
                 pttSpec: settings.hotKeySpec,
-                otherActionSpec: settings.redoHotKeySpec
+                otherActionSpec: settings.insertLastDictationHotKeySpec
             ) != nil else {
                 voiceEditRecorderMessage = "This conflicts with another hotkey — pick a different chord."
                 return

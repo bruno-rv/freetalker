@@ -268,7 +268,7 @@ final class Database {
     /// Scans every row via `sqlite3_step`, throwing unless the loop ends at a clean `SQLITE_DONE`
     /// EOF — a `SQLITE_BUSY`/`SQLITE_ERROR`/etc. mid-scan (`.other`, see `classifyStep`) is a
     /// failure, not "no more rows", so callers (notably `latestDictation()`, which
-    /// `AppCoordinator.redoLast()` depends on to distinguish "empty Library" from "Library
+    /// `AppCoordinator.insertLastDictation()` depends on to distinguish "empty Library" from "Library
     /// unavailable") never silently see a truncated result as a normal empty/short one. See
     /// Round 1 Codex finding 2.
     private func readAll(_ stmt: OpaquePointer?) throws -> [Dictation] {
