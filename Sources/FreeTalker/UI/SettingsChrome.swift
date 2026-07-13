@@ -2,7 +2,12 @@ import AppKit
 import SwiftUI
 
 enum SettingsDestination: String, CaseIterable, Identifiable {
-    case general
+    case privacy
+    case recording
+    case transcription
+    case processing
+    case launcher
+    case storage
     case templates
     case snippets
 
@@ -10,19 +15,19 @@ enum SettingsDestination: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .general: "General"
+        case .privacy: "Privacy"
+        case .recording: "Recording"
+        case .transcription: "Transcription"
+        case .processing: "Processing"
+        case .launcher: "Launcher"
+        case .storage: "Storage"
         case .templates: "Templates"
         case .snippets: "Snippets"
         }
     }
 
-    var systemImage: String {
-        switch self {
-        case .general: "gearshape"
-        case .templates: "text.badge.checkmark"
-        case .snippets: "text.quote"
-        }
-    }
+    /// Generated sidebar artwork is decorative; the destination title remains its accessible name.
+    var imageName: String { rawValue }
 }
 
 struct SettingsSidebar: View {
@@ -39,13 +44,22 @@ struct SettingsSidebar: View {
                 Button {
                     selection = destination
                 } label: {
-                    Label(destination.title, systemImage: destination.systemImage)
+                    HStack(spacing: 8) {
+                        Image(destination.imageName, bundle: SettingsIconResources.bundle)
+                            .resizable()
+                            .interpolation(.high)
+                            .scaledToFit()
+                            .frame(width: 20, height: 20)
+                            .accessibilityHidden(true)
+                        Text(destination.title)
+                    }
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 8)
                         .padding(.vertical, 7)
                         .contentShape(RoundedRectangle(cornerRadius: 6))
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel(destination.title)
                 .foregroundStyle(selection == destination ? .primary : .secondary)
                 .background(
                     selection == destination ? Color.accentColor.opacity(0.18) : .clear,
@@ -60,6 +74,14 @@ struct SettingsSidebar: View {
         .frame(minWidth: 180, idealWidth: 196, maxWidth: 220, maxHeight: .infinity, alignment: .topLeading)
         .background(Color(nsColor: .windowBackgroundColor))
     }
+}
+
+private enum SettingsIconResources {
+    static let bundle: Bundle = {
+        guard let resourceURL = Bundle.main.resourceURL else { return .module }
+        let packagedBundle = resourceURL.appendingPathComponent("FreeTalker_FreeTalker.bundle")
+        return Bundle(path: packagedBundle.path) ?? .module
+    }()
 }
 
 struct SettingsPage<Content: View>: View {

@@ -85,18 +85,18 @@ struct SettingsView: View {
     static let automaticTemplateHelp = "When no App Rule matches, FreeTalker chooses Email, Refined Message, Clean Dictation, or Refined Prompt. Turn this off to keep the Active Template."
 
     @ObservedObject private var coordinator = AppCoordinator.shared
-    @State private var selection: SettingsDestination = .general
+    @State private var selection: SettingsDestination = .privacy
 
     var body: some View {
         HStack(spacing: 0) {
             SettingsSidebar(selection: $selection)
             Divider()
             ZStack {
-                GeneralSettingsView()
-                    .opacity(selection == .general ? 1 : 0)
-                    .allowsHitTesting(selection == .general)
-                    .disabled(selection != .general)
-                    .accessibilityHidden(selection != .general)
+                GeneralSettingsView(destination: selection)
+                    .opacity(selection.isSettingsPage ? 1 : 0)
+                    .allowsHitTesting(selection.isSettingsPage)
+                    .disabled(!selection.isSettingsPage)
+                    .accessibilityHidden(!selection.isSettingsPage)
 
                 TemplatesSettingsView()
                     .opacity(selection == .templates ? 1 : 0)
@@ -116,6 +116,17 @@ struct SettingsView: View {
             }
         }
         .frame(minWidth: 780, maxWidth: .infinity, minHeight: 560, maxHeight: .infinity)
+    }
+}
+
+private extension SettingsDestination {
+    var isSettingsPage: Bool {
+        switch self {
+        case .privacy, .recording, .transcription, .processing, .launcher, .storage:
+            true
+        case .templates, .snippets:
+            false
+        }
     }
 }
 
@@ -196,6 +207,7 @@ struct InputMonitoringPermissionPresentation: Equatable {
 }
 
 private struct GeneralSettingsView: View {
+    let destination: SettingsDestination
     @ObservedObject private var settings = AppSettings.shared
     @ObservedObject private var coordinator = AppCoordinator.shared
     @ObservedObject private var speechModelStore = AppCoordinator.shared.speechModelStore
@@ -243,14 +255,62 @@ private struct GeneralSettingsView: View {
     private let refreshTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     var body: some View {
-        SettingsPage(title: "General", subtitle: "Recording, transcription, and language preferences") {
-            permissionsCard
-            contextAndAutomationCard
-            recordingCard
-            floatingControlsCard
-            storageCard
-            audioAndTranscriptionCard
-            cloudProcessingCard
+        ZStack {
+            settingsPage(
+                .privacy,
+                title: "Privacy",
+                subtitle: "Permissions and on-device context"
+            ) {
+                permissionsCard
+                SettingsCard(title: "Local privacy", subtitle: "Choose what on-device context FreeTalker may use") {
+                    localContextSection
+                }
+            }
+
+            settingsPage(
+                .recording,
+                title: "Recording",
+                subtitle: "Configure dictation shortcuts and hands-free recording"
+            ) {
+                recordingCard
+            }
+
+            settingsPage(
+                .transcription,
+                title: "Transcription",
+                subtitle: "Select audio input, speech recognition, and vocabulary preferences"
+            ) {
+                audioAndTranscriptionCard
+            }
+
+            settingsPage(
+                .processing,
+                title: "Context & Processing",
+                subtitle: "Choose dictation context, automation, and cloud post-processing"
+            ) {
+                contextAndAutomationCard
+                cloudProcessingCard
+                SettingsCard(title: "Output language", subtitle: "Choose the language FreeTalker uses after processing") {
+                    outputLanguagePicker
+                        .padding(.vertical, 12)
+                }
+            }
+
+            settingsPage(
+                .launcher,
+                title: "Launcher",
+                subtitle: "Show a compact launcher at the edge of the screen"
+            ) {
+                floatingControlsCard
+            }
+
+            settingsPage(
+                .storage,
+                title: "Storage",
+                subtitle: "Choose how long local recordings and imports are retained"
+            ) {
+                storageCard
+            }
         }
         .confirmationDialog(
             "Delete \(modelPendingDeletion?.displayName ?? "speech model")?",
@@ -299,6 +359,19 @@ private struct GeneralSettingsView: View {
             inputMonitoringAuthorized = Permissions.isInputMonitoringAuthorized()
             screenRecordingAuthorization = Permissions.screenRecordingAuthorization()
         }
+    }
+
+    private func settingsPage<Content: View>(
+        _ page: SettingsDestination,
+        title: String,
+        subtitle: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        SettingsPage(title: title, subtitle: subtitle, content: content)
+            .opacity(destination == page ? 1 : 0)
+            .allowsHitTesting(destination == page)
+            .disabled(destination != page)
+            .accessibilityHidden(destination != page)
     }
 
     @ViewBuilder
@@ -379,9 +452,7 @@ private struct GeneralSettingsView: View {
 
     @ViewBuilder
     private var contextAndAutomationCard: some View {
-        SettingsCard(title: "Context and automation", subtitle: "How FreeTalker selects and applies dictation context") {
-            localContextSection
-            Divider()
+        SettingsCard(title: "Automation", subtitle: "How FreeTalker selects and applies dictation formats") {
             automaticTemplateSection
             Divider()
             appRulesSection
@@ -645,8 +716,6 @@ private struct GeneralSettingsView: View {
             }
             .padding(.vertical, 8)
             .disabled(!settings.edgeLauncherEnabled)
-            outputLanguagePicker
-                .padding(.vertical, 8)
         }
     }
 
