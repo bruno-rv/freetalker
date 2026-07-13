@@ -310,8 +310,8 @@ struct HUDView: View {
                 Text(text)
                     .lineLimit(Self.lineLimit(for: text))
                     .truncationMode(.head)
-                    .multilineTextAlignment(.leading)
-                    .frame(maxWidth: 320, alignment: .leading)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 320, maxHeight: .infinity)
                     .onTapGesture(perform: onPillClick)
             case .recordingPanel(let state):
                 VStack(alignment: .leading, spacing: 4) {
