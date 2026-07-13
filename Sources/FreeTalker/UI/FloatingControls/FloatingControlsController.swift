@@ -67,6 +67,7 @@ final class FloatingControlsController {
     /// `.inVisibleRect`, so it already follows the view's bounds across resizes — it only needs to
     /// be (re)installed when the hosting view is first created.
     private var isPanelVisible = false
+    private let panelDragState = FloatingPanelDragState()
     private var state = FloatingControlsHoverState.collapsed
     private var collapseWorkItem: DispatchWorkItem?
     private var cancellables: Set<AnyCancellable> = []
@@ -274,7 +275,11 @@ final class FloatingControlsController {
         hosting.onPointerEntered = { [weak self] in self?.pointerEntered() }
         hosting.onPointerExited = { [weak self] in self?.pointerExited() }
         hosting.allowsCollapsedDrag = state == .collapsed
-        hosting.onCollapsedDragCompleted = { [weak self] in self?.persistPanelPosition() }
+        hosting.onCollapsedDragStarted = { [weak self] in self?.panelDragState.begin() }
+        hosting.onCollapsedDragCompleted = { [weak self] in
+            guard let self else { return }
+            self.panelDragState.finish { self.persistPanelPosition() }
+        }
         let fitting = hosting.fittingSize
         let size = CGSize(width: max(fitting.width, 14), height: max(fitting.height, 14))
         hosting.frame = NSRect(origin: .zero, size: size)
@@ -291,11 +296,15 @@ final class FloatingControlsController {
                 display: fallback
             )
         }
-        panel.setFrameOrigin(FloatingPanelGeometry.restoredOrigin(
+        let restoredOrigin = FloatingPanelGeometry.restoredOrigin(
             saved: settings.launcherPanelPosition,
             displays: displays,
             fallback: fallback,
             panelSize: size
+        )
+        panel.setFrameOrigin(panelDragState.originForRender(
+            liveOrigin: panel.frame.origin,
+            restoredOrigin: restoredOrigin
         ))
         if isNewHostingView { hosting.reinstallTrackingArea() }
         if !isPanelVisible {
@@ -311,10 +320,11 @@ final class FloatingControlsController {
 
     private func persistPanelPosition() {
         guard let panel, let screen = panel.screen ?? NSScreen.main else { return }
+        let placementFrame = FloatingPanelPlacementPolicy.usableFrame(for: screen)
         panel.setFrameOrigin(FloatingPanelGeometry.clampedOrigin(
             panel.frame.origin,
             panelSize: panel.frame.size,
-            visibleFrame: screen.visibleFrame
+            visibleFrame: placementFrame
         ))
         settings.launcherPanelPosition = FloatingPanelGeometry.normalizedOrigin(
             frame: panel.frame,
@@ -326,7 +336,7 @@ final class FloatingControlsController {
         let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")]
             as? NSNumber
         return DisplayFrame(id: number?.stringValue ?? screen.localizedName,
-                            visibleFrame: screen.visibleFrame)
+                            visibleFrame: FloatingPanelPlacementPolicy.usableFrame(for: screen))
     }
 }
 
@@ -343,6 +353,7 @@ private final class FloatingControlsPanel: NSPanel {
 final class FloatingControlsHostingView: NSHostingView<FloatingControlsView> {
     var onPointerEntered: (() -> Void)?
     var onPointerExited: (() -> Void)?
+    var onCollapsedDragStarted: (() -> Void)?
     var onCollapsedDragCompleted: (() -> Void)?
     var allowsCollapsedDrag = false
     private var pointerTrackingArea: NSTrackingArea?
@@ -377,7 +388,9 @@ final class FloatingControlsHostingView: NSHostingView<FloatingControlsView> {
             super.mouseDown(with: event)
             return
         }
-        window?.performDrag(with: event)
-        onCollapsedDragCompleted?()
+        guard let window else { return }
+        onCollapsedDragStarted?()
+        defer { onCollapsedDragCompleted?() }
+        window.performDrag(with: event)
     }
 }

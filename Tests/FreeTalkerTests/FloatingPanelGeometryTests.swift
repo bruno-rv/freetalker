@@ -1,4 +1,4 @@
-import CoreGraphics
+import AppKit
 import Testing
 @testable import FreeTalker
 
@@ -199,5 +199,74 @@ struct FloatingPanelGeometryTests {
 
         #expect(origin == CGPoint(x: 460, y: 500))
         #expect(origin != CGPoint(x: 280, y: 350))
+    }
+
+    @Test func visibleDockAndMenuBarRemainExcludedFromPlacement() {
+        let screenFrame = CGRect(x: 0, y: 0, width: 1_440, height: 900)
+        let visibleFrame = CGRect(x: 0, y: 70, width: 1_440, height: 806)
+
+        let placementFrame = FloatingPanelPlacementPolicy.usableFrame(
+            screenFrame: screenFrame,
+            visibleFrame: visibleFrame,
+            presentationOptions: []
+        )
+
+        #expect(placementFrame == visibleFrame)
+    }
+
+    @Test(arguments: [
+        NSApplication.PresentationOptions.autoHideDock,
+        .hideDock,
+        .fullScreen
+    ])
+    func hiddenDockUsesPhysicalScreenBottomWhileStillExcludingMenuBar(
+        presentationOptions: NSApplication.PresentationOptions
+    ) {
+        let screenFrame = CGRect(x: 0, y: 0, width: 1_440, height: 900)
+        let visibleFrame = CGRect(x: 0, y: 70, width: 1_440, height: 806)
+
+        let placementFrame = FloatingPanelPlacementPolicy.usableFrame(
+            screenFrame: screenFrame,
+            visibleFrame: visibleFrame,
+            presentationOptions: presentationOptions
+        )
+
+        #expect(placementFrame == CGRect(x: 0, y: 0, width: 1_440, height: 876))
+    }
+
+    @Test func launcherRerenderDuringDragKeepsTheLivePanelOrigin() {
+        let dragState = FloatingPanelDragState()
+        let liveOrigin = CGPoint(x: 410, y: 30)
+        let staleSavedOrigin = CGPoint(x: 80, y: 140)
+        var persistedOrigin: CGPoint?
+
+        dragState.begin()
+        let renderOrigin = dragState.originForRender(
+            liveOrigin: liveOrigin,
+            restoredOrigin: staleSavedOrigin
+        )
+        dragState.finish { persistedOrigin = renderOrigin }
+
+        #expect(renderOrigin == liveOrigin)
+        #expect(persistedOrigin == liveOrigin)
+        #expect(!dragState.isDragging)
+    }
+
+    @Test func hudRerenderDuringDragKeepsTheLivePanelOrigin() {
+        let dragState = FloatingPanelDragState()
+        let liveOrigin = CGPoint(x: 620, y: 12)
+        let staleSavedOrigin = CGPoint(x: 480, y: 190)
+        var wasDraggingWhilePersisting = false
+
+        dragState.begin()
+        let renderOrigin = dragState.originForRender(
+            liveOrigin: liveOrigin,
+            restoredOrigin: staleSavedOrigin
+        )
+        dragState.finish { wasDraggingWhilePersisting = dragState.isDragging }
+
+        #expect(renderOrigin == liveOrigin)
+        #expect(wasDraggingWhilePersisting)
+        #expect(!dragState.isDragging)
     }
 }

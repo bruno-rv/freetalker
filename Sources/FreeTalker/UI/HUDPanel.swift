@@ -6,6 +6,7 @@ import SwiftUI
 final class HUDController {
     private var panel: NSPanel?
     private let settings: AppSettings
+    private let panelDragState = FloatingPanelDragState()
     private var screenChangeObserver: NotificationObserverToken?
     /// Pending auto-hide for a `flash(_:duration:)` call. Cancelled whenever `show`/`flash`/
     /// `hide` runs again (e.g. a new recording starts) so a stale timer can't hide a HUD that's
@@ -151,7 +152,11 @@ final class HUDController {
             mode: mode,
             onPillClick: { [weak self] in self?.onPillClick?() },
             panelCallbacks: callbacks,
-            onBackgroundDragCompleted: { [weak self] in self?.persistPanelPosition(for: surface) }
+            onBackgroundDragStarted: { [weak self] in self?.panelDragState.begin() },
+            onBackgroundDragCompleted: { [weak self] in
+                guard let self else { return }
+                self.panelDragState.finish { self.persistPanelPosition(for: surface) }
+            }
         ))
         let fitting = hosting.fittingSize
         let size = NSSize(width: max(fitting.width, 60), height: max(fitting.height, 36))
@@ -195,34 +200,37 @@ final class HUDController {
         let displays = NSScreen.screens.map(Self.displayFrame)
         let fallback = Self.displayFrame(screen)
         let saved = savedPosition(for: surface)
+        let restoredOrigin: CGPoint
         if let saved {
-            panel.setFrameOrigin(FloatingPanelGeometry.restoredOrigin(
+            restoredOrigin = FloatingPanelGeometry.restoredOrigin(
                 saved: saved,
                 displays: displays,
                 fallback: fallback,
                 panelSize: panel.frame.size
-            ))
-            return
-        }
-
-        let origin: CGPoint
-        switch surface {
-        case .recording:
-            origin = FloatingPanelGeometry.launcherFrame(
-                edge: settings.edgeLauncherEdge,
-                position: settings.edgeLauncherPosition,
-                panelSize: panel.frame.size,
-                visibleFrame: screen.visibleFrame
-            ).origin
-        case .transient:
-            origin = FloatingPanelGeometry.clampedOrigin(
-                CGPoint(x: screen.visibleFrame.midX - panel.frame.width / 2,
-                        y: screen.visibleFrame.minY + 90),
-                panelSize: panel.frame.size,
-                visibleFrame: screen.visibleFrame
             )
+        } else {
+            let placementFrame = FloatingPanelPlacementPolicy.usableFrame(for: screen)
+            switch surface {
+            case .recording:
+                restoredOrigin = FloatingPanelGeometry.launcherFrame(
+                    edge: settings.edgeLauncherEdge,
+                    position: settings.edgeLauncherPosition,
+                    panelSize: panel.frame.size,
+                    visibleFrame: placementFrame
+                ).origin
+            case .transient:
+                restoredOrigin = FloatingPanelGeometry.clampedOrigin(
+                    CGPoint(x: placementFrame.midX - panel.frame.width / 2,
+                            y: placementFrame.minY + 90),
+                    panelSize: panel.frame.size,
+                    visibleFrame: placementFrame
+                )
+            }
         }
-        panel.setFrameOrigin(origin)
+        panel.setFrameOrigin(panelDragState.originForRender(
+            liveOrigin: panel.frame.origin,
+            restoredOrigin: restoredOrigin
+        ))
     }
 
     private func savedPosition(for surface: Surface) -> NormalizedWindowPosition? {
@@ -244,19 +252,24 @@ final class HUDController {
 
     private func reclampPanel() {
         guard let panel, let screen = panel.screen ?? NSScreen.main else { return }
-        panel.setFrameOrigin(FloatingPanelGeometry.clampedOrigin(
+        let reclampedOrigin = FloatingPanelGeometry.clampedOrigin(
             panel.frame.origin,
             panelSize: panel.frame.size,
-            visibleFrame: screen.visibleFrame
+            visibleFrame: FloatingPanelPlacementPolicy.usableFrame(for: screen)
+        )
+        panel.setFrameOrigin(panelDragState.originForRender(
+            liveOrigin: panel.frame.origin,
+            restoredOrigin: reclampedOrigin
         ))
     }
 
     private func persistPanelPosition(for surface: Surface) {
         guard let panel, let screen = panel.screen ?? NSScreen.main else { return }
+        let placementFrame = FloatingPanelPlacementPolicy.usableFrame(for: screen)
         panel.setFrameOrigin(FloatingPanelGeometry.clampedOrigin(
             panel.frame.origin,
             panelSize: panel.frame.size,
-            visibleFrame: screen.visibleFrame
+            visibleFrame: placementFrame
         ))
         let position = FloatingPanelGeometry.normalizedOrigin(
             frame: panel.frame,
@@ -274,7 +287,7 @@ final class HUDController {
         let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")]
             as? NSNumber
         return DisplayFrame(id: number?.stringValue ?? screen.localizedName,
-                            visibleFrame: screen.visibleFrame)
+                            visibleFrame: FloatingPanelPlacementPolicy.usableFrame(for: screen))
     }
 }
 
@@ -301,6 +314,7 @@ struct HUDView: View {
     let mode: HUDController.Mode
     var onPillClick: () -> Void = {}
     var panelCallbacks: HUDController.PanelCallbacks = .init()
+    var onBackgroundDragStarted: () -> Void = {}
     var onBackgroundDragCompleted: () -> Void = {}
 
     var body: some View {
@@ -356,7 +370,10 @@ struct HUDView: View {
         .font(.system(size: 13, weight: .medium))
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
-        .background(HUDDragSurface(onDragCompleted: onBackgroundDragCompleted))
+        .background(HUDDragSurface(
+            onDragStarted: onBackgroundDragStarted,
+            onDragCompleted: onBackgroundDragCompleted
+        ))
         .background(.regularMaterial, in: Capsule())
     }
 
@@ -436,21 +453,25 @@ struct HUDView: View {
 }
 
 private struct HUDDragSurface: NSViewRepresentable {
+    let onDragStarted: () -> Void
     let onDragCompleted: () -> Void
 
     func makeNSView(context: Context) -> HUDDragView {
-        HUDDragView(onDragCompleted: onDragCompleted)
+        HUDDragView(onDragStarted: onDragStarted, onDragCompleted: onDragCompleted)
     }
 
     func updateNSView(_ view: HUDDragView, context: Context) {
+        view.onDragStarted = onDragStarted
         view.onDragCompleted = onDragCompleted
     }
 }
 
 private final class HUDDragView: NSView {
+    var onDragStarted: () -> Void
     var onDragCompleted: () -> Void
 
-    init(onDragCompleted: @escaping () -> Void) {
+    init(onDragStarted: @escaping () -> Void, onDragCompleted: @escaping () -> Void) {
+        self.onDragStarted = onDragStarted
         self.onDragCompleted = onDragCompleted
         super.init(frame: .zero)
     }
@@ -461,7 +482,9 @@ private final class HUDDragView: NSView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func mouseDown(with event: NSEvent) {
-        window?.performDrag(with: event)
-        onDragCompleted()
+        guard let window else { return }
+        onDragStarted()
+        defer { onDragCompleted() }
+        window.performDrag(with: event)
     }
 }
