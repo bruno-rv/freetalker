@@ -110,6 +110,7 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
         window.minSize = NSSize(width: 520, height: 360)
         window.contentView = scratchpadView
         window.isReleasedWhenClosed = false
+        window.center()
         AppLifecycleWindowPolicy.configureFocusableUtilityWindow(window)
         super.init(window: window)
         window.delegate = self
