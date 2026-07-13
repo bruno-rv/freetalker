@@ -45,6 +45,27 @@ menu-bar-only, plus the microphone usage string), and ad-hoc codesigns the bundl
 First launch will download the WhisperKit `large-v3-turbo` model (~1 GB) — the menu bar
 status line shows download progress.
 
+### Stable signing identity (optional)
+
+Ad-hoc signing (`-s -`) gives every build a different signature, so macOS treats each
+rebuild as a new app and can drop TCC grants (Accessibility, Input Monitoring, Microphone)
+that were previously approved — see "Permissions walkthrough" below. To make grants
+survive rebuilds and self-updates:
+
+```sh
+scripts/make-signing-cert.sh   # once: creates a self-signed "FreeTalker Dev" cert
+```
+
+Then, in Keychain Access, trust the cert for code signing (the script prints the exact
+steps — macOS requires this GUI confirmation, it can't be scripted). Build with:
+
+```sh
+make app CODESIGN_IDENTITY="FreeTalker Dev"
+```
+
+To have "Check for Updates…" rebuilds use the same identity, record it once at the repo
+root: `echo "FreeTalker Dev" > .codesign-identity`.
+
 ## Speech models
 
 Settings → Transcription offers seven multilingual Whisper models, from Tiny

@@ -162,6 +162,12 @@ private struct MenuBarContentView: View {
                 NSApplication.shared.activate(ignoringOtherApps: true)
                 openWindow(id: "settings")
             }
+            Button("Check for Updates…") {
+                Task {
+                    let report = await SelfUpdater.check()
+                    presentSelfUpdateResult(report)
+                }
+            }
 
             Divider()
 
@@ -176,6 +182,49 @@ private struct MenuBarContentView: View {
         ("en", "English"),
         ("pt", "Portuguese")
     ]
+}
+
+/// Activates FreeTalker before presenting — mirrors the "Settings…" button above. Without
+/// this an `LSUIElement` app's alert can appear behind the frontmost app with no focus.
+@MainActor
+private func presentSelfUpdateResult(_ report: SelfUpdater.CheckReport) {
+    NSApplication.shared.activate(ignoringOtherApps: true)
+    let alert = NSAlert()
+    switch report.availability {
+    case .upToDate:
+        alert.messageText = "You're up to date"
+        if let hash = report.currentShortHash {
+            alert.informativeText = "Running \(hash)."
+        }
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+
+    case .unavailable(let reason):
+        alert.messageText = "Updates unavailable"
+        alert.informativeText = reason
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+
+    case .blockedByLocalChanges:
+        alert.messageText = "Update skipped"
+        alert.informativeText = "The repo has local changes, update skipped."
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+
+    case .available(let behindCount):
+        alert.messageText = "Update available"
+        let commitWord = behindCount == 1 ? "commit" : "commits"
+        if let hash = report.currentShortHash {
+            alert.informativeText = "You're on \(hash), \(behindCount) \(commitWord) behind."
+        } else {
+            alert.informativeText = "\(behindCount) \(commitWord) behind origin/main."
+        }
+        alert.addButton(withTitle: "Update")
+        alert.addButton(withTitle: "Later")
+        if alert.runModal() == .alertFirstButtonReturn, let repoPath = report.repoPath {
+            SelfUpdater.performUpdate(repoPath: repoPath)
+        }
+    }
 }
 
 private struct SettingsWindowConfigurator: NSViewRepresentable {
