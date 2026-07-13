@@ -216,8 +216,7 @@ struct FloatingPanelGeometryTests {
 
     @Test(arguments: [
         NSApplication.PresentationOptions.autoHideDock,
-        .hideDock,
-        .fullScreen
+        .hideDock
     ])
     func hiddenDockUsesPhysicalScreenBottomWhileStillExcludingMenuBar(
         presentationOptions: NSApplication.PresentationOptions
@@ -268,5 +267,154 @@ struct FloatingPanelGeometryTests {
         #expect(renderOrigin == liveOrigin)
         #expect(wasDraggingWhilePersisting)
         #expect(!dragState.isDragging)
+    }
+
+    @Test func frontmostForeignFullscreenWindowOpensThePhysicalBottom() {
+        let screenFrame = CGRect(x: 0, y: 0, width: 1_440, height: 900)
+        let visibleFrame = CGRect(x: 0, y: 70, width: 1_440, height: 806)
+        let snapshot = FloatingPanelSystemSnapshot(
+            presentationOptions: [],
+            frontmostPID: 200,
+            ownPID: 100,
+            windows: [window(pid: 200, bounds: screenFrame)]
+        )
+
+        let placementFrame = FloatingPanelPlacementPolicy.usableFrame(
+            screenFrame: screenFrame,
+            visibleFrame: visibleFrame,
+            targetDisplayBounds: screenFrame,
+            snapshot: snapshot
+        )
+
+        #expect(placementFrame == CGRect(x: 0, y: 0, width: 1_440, height: 876))
+    }
+
+    @Test func fullscreenClassifierIgnoresIneligibleWindows() {
+        let display = CGRect(x: 0, y: 0, width: 1_440, height: 900)
+        let candidates = [
+            window(pid: 200, bounds: CGRect(x: 100, y: 100, width: 900, height: 700)),
+            window(pid: 201, bounds: display),
+            window(pid: 200, layer: 1, bounds: display),
+            window(pid: 200, alpha: 0, bounds: display)
+        ]
+
+        for candidate in candidates {
+            #expect(!FloatingPanelFullscreenClassifier.covers(
+                targetDisplayBounds: display,
+                frontmostPID: 200,
+                ownPID: 100,
+                windows: [candidate]
+            ))
+        }
+    }
+
+    @Test func fullscreenClassifierUsesTheTargetDisplayInMultiDisplayLayouts() {
+        let primary = CGRect(x: 0, y: 0, width: 1_440, height: 900)
+        let secondary = CGRect(x: 1_440, y: 0, width: 1_920, height: 1_080)
+        let windows = [window(pid: 200, bounds: secondary)]
+
+        #expect(!FloatingPanelFullscreenClassifier.covers(
+            targetDisplayBounds: primary,
+            frontmostPID: 200,
+            ownPID: 100,
+            windows: windows
+        ))
+        #expect(FloatingPanelFullscreenClassifier.covers(
+            targetDisplayBounds: secondary,
+            frontmostPID: 200,
+            ownPID: 100,
+            windows: windows
+        ))
+    }
+
+    @Test func fullscreenClassifierAcceptsOnePointToleranceAndNinetyNinePercentCoverage() {
+        let display = CGRect(x: 0, y: 0, width: 1_440, height: 900)
+        let onePointInset = display.insetBy(dx: 1, dy: 1)
+        let ninetyNinePercent = CGRect(x: 0, y: 0, width: 1_425.6, height: 900)
+
+        for bounds in [onePointInset, ninetyNinePercent] {
+            #expect(FloatingPanelFullscreenClassifier.covers(
+                targetDisplayBounds: display,
+                frontmostPID: 200,
+                ownPID: 100,
+                windows: [window(pid: 200, bounds: bounds)]
+            ))
+        }
+    }
+
+    @Test func dragCompletionCapturesOneFreshContextAndReusesThatInstance() {
+        let dragState = FloatingPanelDragState()
+        let dragStartContext = FloatingPanelPlacementContext(displays: [
+            DisplayFrame(
+                id: "main",
+                visibleFrame: CGRect(x: 0, y: 70, width: 1_440, height: 806)
+            )
+        ])
+        let completionContext = FloatingPanelPlacementContext(displays: [
+            DisplayFrame(
+                id: "main",
+                visibleFrame: CGRect(x: 0, y: 0, width: 1_440, height: 876)
+            )
+        ])
+        var currentContext = dragStartContext
+        var captureCount = 0
+        var contextUsedForClamp: FloatingPanelPlacementContext?
+        var contextUsedForNormalization: FloatingPanelPlacementContext?
+
+        dragState.begin()
+        currentContext = completionContext
+        dragState.finish(
+            capturePlacementContext: {
+                captureCount += 1
+                return currentContext
+            },
+            persist: { context in
+                contextUsedForClamp = context
+                contextUsedForNormalization = context
+            }
+        )
+
+        #expect(captureCount == 1)
+        #expect(contextUsedForClamp == completionContext)
+        #expect(contextUsedForNormalization == completionContext)
+        #expect(!dragState.isDragging)
+    }
+
+    @Test func fullscreenPresentationOnlyOpensTheCoveredDisplayBottom() {
+        let primaryScreen = CGRect(x: 0, y: 0, width: 1_440, height: 900)
+        let secondaryScreen = CGRect(x: 1_440, y: 0, width: 1_920, height: 1_080)
+        let primaryVisible = CGRect(x: 0, y: 70, width: 1_440, height: 806)
+        let secondaryVisible = CGRect(x: 1_440, y: 70, width: 1_920, height: 986)
+        let snapshot = FloatingPanelSystemSnapshot(
+            presentationOptions: [.fullScreen],
+            frontmostPID: 200,
+            ownPID: 100,
+            windows: [window(pid: 200, bounds: primaryScreen)]
+        )
+
+        let primaryPlacement = FloatingPanelPlacementPolicy.usableFrame(
+            screenFrame: primaryScreen,
+            visibleFrame: primaryVisible,
+            targetDisplayBounds: primaryScreen,
+            snapshot: snapshot
+        )
+        let secondaryPlacement = FloatingPanelPlacementPolicy.usableFrame(
+            screenFrame: secondaryScreen,
+            visibleFrame: secondaryVisible,
+            targetDisplayBounds: secondaryScreen,
+            snapshot: snapshot
+        )
+
+        #expect(primaryPlacement.minY == primaryScreen.minY)
+        #expect(secondaryPlacement == secondaryVisible)
+    }
+
+    private func window(
+        pid: pid_t,
+        layer: Int = 0,
+        alpha: Double = 1,
+        bounds: CGRect
+    ) -> FloatingPanelWindowSnapshot {
+        FloatingPanelWindowSnapshot(ownerPID: pid, layer: layer, alpha: alpha, bounds: bounds)
     }
 }

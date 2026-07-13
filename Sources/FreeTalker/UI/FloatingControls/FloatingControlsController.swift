@@ -72,6 +72,7 @@ final class FloatingControlsController {
     private var collapseWorkItem: DispatchWorkItem?
     private var cancellables: Set<AnyCancellable> = []
     private var screenObserver: FloatingControlsObserverToken?
+    private var activeSpaceObserver: FloatingControlsObserverToken?
     private(set) var presentedLanguagePin: String?
     private(set) var presentedTranslationState: TranslationControlsState
 
@@ -101,6 +102,9 @@ final class FloatingControlsController {
 
     deinit {
         if let screenObserver { NotificationCenter.default.removeObserver(screenObserver.value) }
+        if let activeSpaceObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(activeSpaceObserver.value)
+        }
     }
 
     func start() {
@@ -112,6 +116,15 @@ final class FloatingControlsController {
         ) { [weak self] _ in
             Task { @MainActor in self?.screenConfigurationDidChange() }
         })
+        activeSpaceObserver = FloatingControlsObserverToken(
+            NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.activeSpaceDidChangeNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in self?.screenConfigurationDidChange() }
+            }
+        )
         settings.$edgeLauncherEnabled
             .combineLatest(settings.$launcherPanelPosition)
             .combineLatest(settings.$languagePin)
@@ -148,6 +161,10 @@ final class FloatingControlsController {
         if let screenObserver {
             NotificationCenter.default.removeObserver(screenObserver.value)
             self.screenObserver = nil
+        }
+        if let activeSpaceObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(activeSpaceObserver.value)
+            self.activeSpaceObserver = nil
         }
         panel?.orderOut(nil)
         panel = nil
@@ -278,7 +295,12 @@ final class FloatingControlsController {
         hosting.onCollapsedDragStarted = { [weak self] in self?.panelDragState.begin() }
         hosting.onCollapsedDragCompleted = { [weak self] in
             guard let self else { return }
-            self.panelDragState.finish { self.persistPanelPosition() }
+            self.panelDragState.finish(
+                capturePlacementContext: FloatingPanelPlacementPolicy.captureContext,
+                persist: { context in
+                    self.persistPanelPosition(placementContext: context)
+                }
+            )
         }
         let fitting = hosting.fittingSize
         let size = CGSize(width: max(fitting.width, 14), height: max(fitting.height, 14))
@@ -286,8 +308,9 @@ final class FloatingControlsController {
         panel.setContentSize(size)
 
         guard let fallbackScreen = screenForLauncher() else { return }
-        let displays = NSScreen.screens.map(Self.displayFrame)
-        let fallback = Self.displayFrame(fallbackScreen)
+        let placementContext = FloatingPanelPlacementPolicy.captureContext()
+        let displays = placementContext.displays
+        let fallback = Self.displayFrame(fallbackScreen, in: placementContext)
         if settings.launcherPanelPosition == nil {
             settings.launcherPanelPosition = FloatingPanelGeometry.legacyLauncherPosition(
                 edge: settings.edgeLauncherEdge,
@@ -318,25 +341,27 @@ final class FloatingControlsController {
         return NSScreen.screens.first { $0.frame.contains(mouse) } ?? panel?.screen ?? NSScreen.main
     }
 
-    private func persistPanelPosition() {
+    private func persistPanelPosition(placementContext: FloatingPanelPlacementContext) {
         guard let panel, let screen = panel.screen ?? NSScreen.main else { return }
-        let placementFrame = FloatingPanelPlacementPolicy.usableFrame(for: screen)
+        let display = Self.displayFrame(screen, in: placementContext)
         panel.setFrameOrigin(FloatingPanelGeometry.clampedOrigin(
             panel.frame.origin,
             panelSize: panel.frame.size,
-            visibleFrame: placementFrame
+            visibleFrame: display.visibleFrame
         ))
         settings.launcherPanelPosition = FloatingPanelGeometry.normalizedOrigin(
             frame: panel.frame,
-            display: Self.displayFrame(screen)
+            display: display
         )
     }
 
-    private static func displayFrame(_ screen: NSScreen) -> DisplayFrame {
-        let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")]
-            as? NSNumber
-        return DisplayFrame(id: number?.stringValue ?? screen.localizedName,
-                            visibleFrame: FloatingPanelPlacementPolicy.usableFrame(for: screen))
+    private static func displayFrame(
+        _ screen: NSScreen,
+        in placementContext: FloatingPanelPlacementContext
+    ) -> DisplayFrame {
+        let id = FloatingPanelPlacementPolicy.displayID(for: screen)
+        return placementContext.display(id: id)
+            ?? DisplayFrame(id: id, visibleFrame: screen.visibleFrame)
     }
 }
 
