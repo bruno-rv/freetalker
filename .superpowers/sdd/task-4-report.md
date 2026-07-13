@@ -39,4 +39,3 @@ were not staged or committed.
 - RED: focused tests failed on missing preview ownership, capture ownership, and storage failure APIs.
 - GREEN: focused review regression suite passed 42 tests in 3 suites; full `make test` passed
   169 tests in 17 suites.
-
