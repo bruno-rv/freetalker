@@ -85,7 +85,16 @@ struct SettingsView: View {
     static let automaticTemplateHelp = "When no App Rule matches, FreeTalker chooses Email, Refined Message, Clean Dictation, or Refined Prompt. Turn this off to keep the Active Template."
 
     @ObservedObject private var coordinator = AppCoordinator.shared
-    @State private var selection: SettingsDestination = .privacy
+    @ObservedObject private var navigator = SettingsNavigator.shared
+    @State private var selection: SettingsDestination
+
+    /// Seeds the initial tab from `SettingsNavigator.shared.pendingDestination` so a caller that
+    /// sets it before opening the "settings" window scene lands directly on that tab, with no
+    /// flash of the default Privacy tab first. `.onChange` below handles the case where the
+    /// window is already open and someone re-navigates it.
+    init() {
+        _selection = State(initialValue: SettingsNavigator.shared.pendingDestination ?? .privacy)
+    }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -113,9 +122,23 @@ struct SettingsView: View {
                 .allowsHitTesting(selection == .snippets)
                 .disabled(selection != .snippets)
                 .accessibilityHidden(selection != .snippets)
+
+                SettingsEditorPage(title: "Library", subtitle: "Browse, translate, and delete past dictations") {
+                    LibraryView()
+                }
+                .opacity(selection == .library ? 1 : 0)
+                .allowsHitTesting(selection == .library)
+                .disabled(selection != .library)
+                .accessibilityHidden(selection != .library)
             }
         }
         .frame(minWidth: 780, maxWidth: .infinity, minHeight: 560, maxHeight: .infinity)
+        .onAppear { navigator.pendingDestination = nil }
+        .onChange(of: navigator.pendingDestination) { _, newValue in
+            guard let newValue else { return }
+            selection = newValue
+            navigator.pendingDestination = nil
+        }
     }
 }
 
@@ -124,7 +147,7 @@ private extension SettingsDestination {
         switch self {
         case .privacy, .recording, .transcription, .processing, .launcher, .storage:
             true
-        case .templates, .snippets:
+        case .templates, .snippets, .library:
             false
         }
     }

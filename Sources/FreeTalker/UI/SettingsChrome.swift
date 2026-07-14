@@ -10,6 +10,7 @@ enum SettingsDestination: String, CaseIterable, Identifiable {
     case storage
     case templates
     case snippets
+    case library
 
     var id: Self { self }
 
@@ -23,11 +24,23 @@ enum SettingsDestination: String, CaseIterable, Identifiable {
         case .storage: "Storage"
         case .templates: "Templates"
         case .snippets: "Snippets"
+        case .library: "Library"
         }
     }
 
     /// Generated sidebar artwork is decorative; the destination title remains its accessible name.
     var imageName: String { rawValue }
+}
+
+/// Lets any part of the app (e.g. the menu bar's "Library…" item) open the Settings window
+/// pre-selected to a specific tab. `SettingsView` seeds its initial `selection` from
+/// `pendingDestination` and also observes it for changes while already open, so setting this
+/// then opening/activating the "settings" window scene navigates there either way.
+@MainActor
+final class SettingsNavigator: ObservableObject {
+    static let shared = SettingsNavigator()
+    @Published var pendingDestination: SettingsDestination?
+    private init() {}
 }
 
 enum SettingsSidebarMetrics {

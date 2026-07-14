@@ -86,15 +86,6 @@ struct FreeTalkerApp: App {
             MenuBarContentView()
         }
 
-        Window("Library", id: "library") {
-            LibraryView()
-        }
-        // Explicit rather than relying on `.automatic`: ties the window's resizable range
-        // directly to its content's `.frame(minWidth:maxWidth:minHeight:maxHeight:)` (see
-        // LibraryView/SettingsView), so the min size the content declares is also the window's
-        // minimum, and the max-infinity is honored on maximize/full-screen. See Task 1.
-        .windowResizability(.contentSize)
-
         Window("Settings", id: "settings") {
             SettingsView()
                 .background(SettingsWindowConfigurator())
@@ -156,7 +147,11 @@ private struct MenuBarContentView: View {
 
             Divider()
 
-            Button("Library…") { openWindow(id: "library") }
+            Button("Library…") {
+                SettingsNavigator.shared.pendingDestination = .library
+                NSApplication.shared.activate(ignoringOtherApps: true)
+                openWindow(id: "settings")
+            }
             Button("Scratchpad…") { ScratchpadWindowController.shared.open() }
             Button("Settings…") {
                 NSApplication.shared.activate(ignoringOtherApps: true)
