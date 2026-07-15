@@ -3,6 +3,31 @@ import Testing
 @testable import FreeTalker
 
 @Suite struct RecoveryRetryTests {
+    @MainActor @Test func recoveredDictationMustPersistBeforeItsAudioCanBeFinalized() throws {
+        let dictation = RecoveryDictation(
+            language: "pt", template: "Clean", transcript: "raw", refined: "refined", engine: "WhisperKit"
+        )
+        var persisted: RecoveryDictation?
+
+        try AppCoordinator.persistRecoveredDictation(dictation) { persisted = $0 }
+
+        #expect(persisted == dictation)
+    }
+
+    @MainActor @Test func recoveredDictationPersistenceFailureIsClassifiedAsPersisting() {
+        let dictation = RecoveryDictation(
+            language: "pt", template: "Clean", transcript: "raw", refined: "refined", engine: "WhisperKit"
+        )
+
+        do {
+            try AppCoordinator.persistRecoveredDictation(dictation) { _ in throw RetryTestError.database }
+            Issue.record("Expected persistence failure")
+        } catch AppCoordinator.PipelineError.recordFailed {
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+    }
+
     @Test func recoveryLocalProcessorUsesExactLocalModelAndNoCloudBoundary() async throws {
         let local = RecoveryLocalTranscriberProbe()
         let cloudSTT = CloudBoundaryProbe()

@@ -39,7 +39,7 @@ final class AppCoordinator: ObservableObject {
               peak.isFinite, rms.isFinite,
               peak >= 0, rms >= 0,
               peak > deadSignalFloor || rms > deadSignalFloor else {
-            return "No microphone audio detected"
+            return "Recording failed — no microphone audio was captured"
         }
         return nil
     }
@@ -1240,40 +1240,67 @@ final class AppCoordinator: ObservableObject {
         let hudGeneration = recordingHUDWillPresent()
         hud.show(text: Self.contextPermissionHint(for: contextCapture.limitation) ?? "Processing…")
 
-        Task {
-            let resolvedCapture = await resolveWindowOCR(
-                scope: contextScope,
-                capture: contextCapture,
-                target: contextTarget
-            )
-            if let hint = Self.contextPermissionHint(for: resolvedCapture.limitation) {
-                hud.show(text: hint)
-            }
-            let resolved = Self.resolveContextAwareTemplate(
-                automaticStyleEnabled: automaticStyleEnabled,
-                capture: resolvedCapture,
-                rules: appRules,
-                templates: templates,
-                activeTemplateID: activeTemplateID
-            )
-            await runPipeline(
+        guard let recoveryStore else {
+            lastError = "Could not save recording for processing"
+            hud.flash("Recording could not be saved — transcription not started")
+            isProcessing = false
+            recordingHUDDidReachTerminalState(generation: hudGeneration)
+            return
+        }
+        let recoveryService = RecoveryCaptureService(directory: Self.recoveryDirectory, store: recoveryStore)
+        do {
+            try Self.stageCaptureBeforeLaunching(
                 samples: samples,
-                engine: engine,
-                engineName: engineName,
-                template: resolved.template,
-                appName: appName,
-                target: insertionTarget,
-                forcedLanguage: forcedLanguage,
-                outputLanguage: capturedOutputLanguage,
-                cloudSnapshot: capturedCloudSnapshot,
-                skipPostProcessing: skipPostProcessing,
-                processor: processor,
-                localContext: Self.localContextForProcessor(
-                    isCloudConfigured: !(processor is AppleFMProcessor),
-                    capture: resolvedCapture
-                ),
-                hudGeneration: hudGeneration
+                stage: { try recoveryService.stageProvisional(samples: $0, capturedAt: Date()) },
+                launch: { staged in
+                    Task {
+                        guard let recovery = await registerProvisionalAudio(staged, service: recoveryService) else {
+                            isProcessing = false
+                            recordingHUDDidReachTerminalState(generation: hudGeneration)
+                            return
+                        }
+                        let resolvedCapture = await resolveWindowOCR(
+                            scope: contextScope,
+                            capture: contextCapture,
+                            target: contextTarget
+                        )
+                        if let hint = Self.contextPermissionHint(for: resolvedCapture.limitation) {
+                            hud.show(text: hint)
+                        }
+                        let resolved = Self.resolveContextAwareTemplate(
+                            automaticStyleEnabled: automaticStyleEnabled,
+                            capture: resolvedCapture,
+                            rules: appRules,
+                            templates: templates,
+                            activeTemplateID: activeTemplateID
+                        )
+                        await runPipeline(
+                            samples: samples,
+                            engine: engine,
+                            engineName: engineName,
+                            template: resolved.template,
+                            appName: appName,
+                            target: insertionTarget,
+                            forcedLanguage: forcedLanguage,
+                            outputLanguage: capturedOutputLanguage,
+                            cloudSnapshot: capturedCloudSnapshot,
+                            skipPostProcessing: skipPostProcessing,
+                            processor: processor,
+                            localContext: Self.localContextForProcessor(
+                                isCloudConfigured: !(processor is AppleFMProcessor),
+                                capture: resolvedCapture
+                            ),
+                            recovery: recovery,
+                            hudGeneration: hudGeneration
+                        )
+                    }
+                }
             )
+        } catch {
+            lastError = "Failed to save recording: \(error.localizedDescription)"
+            hud.flash("Recording could not be saved — transcription not started")
+            isProcessing = false
+            recordingHUDDidReachTerminalState(generation: hudGeneration)
         }
     }
 
@@ -1575,6 +1602,7 @@ final class AppCoordinator: ObservableObject {
     static func runExternalPipelineTask<Result>(
         operation: () async throws -> Result,
         onSuccess: (Result) async -> Void,
+        onCancellation: () async -> Void,
         onEmptyTranscript: () async -> Void,
         onRecordFailure: () async -> Void,
         onTranslationFailure: (OutputTranslationFailure) async -> Void,
@@ -1583,9 +1611,9 @@ final class AppCoordinator: ObservableObject {
         do {
             await onSuccess(try await operation())
         } catch is CancellationError {
-            return
+            await onCancellation()
         } catch where Task.isCancelled {
-            return
+            await onCancellation()
         } catch PipelineError.emptyTranscript {
             await onEmptyTranscript()
         } catch PipelineError.recordFailed(_) {
@@ -1600,15 +1628,16 @@ final class AppCoordinator: ObservableObject {
     static func runScratchpadPipelineTask<Result>(
         operation: () async throws -> Result,
         onSuccess: (Result) async -> Void,
+        onCancellation: () async -> Void,
         onTranslationFailure: (OutputTranslationFailure) async -> Void,
         onFailure: (Error) async -> Void
     ) async {
         do {
             await onSuccess(try await operation())
         } catch is CancellationError {
-            return
+            await onCancellation()
         } catch where Task.isCancelled {
-            return
+            await onCancellation()
         } catch let failure as OutputTranslationFailure {
             await onTranslationFailure(failure)
         } catch {
@@ -1616,7 +1645,56 @@ final class AppCoordinator: ObservableObject {
         }
     }
 
-    private func runPipeline(samples: [Float], engine: any TranscriptionEngine, engineName: String, template: Template, appName: String?, target: InsertionTarget?, forcedLanguage: String?, outputLanguage: OutputLanguage, cloudSnapshot: CloudLLMSettingsSnapshot, skipPostProcessing: Bool, processor: (any PostProcessor)? = nil, localContext: LocalProcessingContext? = nil, hudGeneration: UUID) async {
+    private struct ForegroundRecovery {
+        let service: RecoveryCaptureService
+        let capture: ProvisionalRecoveryCapture
+    }
+
+    nonisolated static func stageCaptureBeforeLaunching<Capture>(
+        samples: [Float],
+        stage: ([Float]) throws -> Capture,
+        launch: (Capture) -> Void
+    ) rethrows {
+        launch(try stage(samples))
+    }
+
+    private func registerProvisionalAudio(
+        _ staged: StagedRecoveryCapture,
+        service: RecoveryCaptureService
+    ) async -> ForegroundRecovery? {
+        do {
+            let capture = try await service.registerProvisional(staged)
+            try? await jobLibraryStore?.refresh()
+            return ForegroundRecovery(service: service, capture: capture)
+        } catch {
+            lastError = "Recording saved for recovery, but could not be queued: \(error.localizedDescription)"
+            hud.flash("Recording saved for recovery — transcription not started")
+            return nil
+        }
+    }
+
+    private func failForegroundRecovery(_ recovery: ForegroundRecovery, failure: JobFailure) async {
+        do {
+            try await recovery.service.failProvisional(recovery.capture, failure: failure)
+            try? await jobLibraryStore?.refresh()
+        } catch {
+            lastError = "Failed to finalize recovery audio: \(error.localizedDescription)"
+        }
+    }
+
+    private func completeForegroundRecovery(_ recovery: ForegroundRecovery) async -> Bool {
+        do {
+            try await recovery.service.completeProvisional(recovery.capture)
+            try? await jobLibraryStore?.refresh()
+            return true
+        } catch {
+            lastError = "Dictation saved, but recovery cleanup failed: \(error.localizedDescription)"
+            try? await jobLibraryStore?.refresh()
+            return false
+        }
+    }
+
+    private func runPipeline(samples: [Float], engine: any TranscriptionEngine, engineName: String, template: Template, appName: String?, target: InsertionTarget?, forcedLanguage: String?, outputLanguage: OutputLanguage, cloudSnapshot: CloudLLMSettingsSnapshot, skipPostProcessing: Bool, processor: (any PostProcessor)? = nil, localContext: LocalProcessingContext? = nil, recovery: ForegroundRecovery, hudGeneration: UUID) async {
         defer {
             isProcessing = false
             recordingHUDDidReachTerminalState(generation: hudGeneration)
@@ -1633,6 +1711,10 @@ final class AppCoordinator: ObservableObject {
                 )
             },
             onSuccess: { result in
+                guard await completeForegroundRecovery(recovery) else {
+                    hud.flash("Dictation saved — recovery cleanup failed")
+                    return
+                }
                 if let fallbackReason = result.fallbackReason {
                     logPostProcessingFallback(fallbackReason)
                 }
@@ -1648,21 +1730,33 @@ final class AppCoordinator: ObservableObject {
                     hud.hide()
                 }
             },
+            onCancellation: {
+                await failForegroundRecovery(recovery, failure: JobFailure(
+                    stage: .transcribing,
+                    message: "Processing was interrupted"
+                ))
+                hud.flash("Processing interrupted — audio saved")
+            },
             onEmptyTranscript: {
-                let saved = await preserveFailedAudio(samples, failure: JobFailure(stage: .transcribing, message: "Empty transcript"))
-                hud.flash(saved ? "Transcription failed — audio saved" : "Transcription failed — audio could NOT be saved")
+                await failForegroundRecovery(recovery, failure: JobFailure(stage: .transcribing, message: "Empty transcript"))
+                hud.flash("Transcription failed — audio saved")
             },
             onRecordFailure: {
-                hud.flash("Library save failed")
+                await failForegroundRecovery(recovery, failure: JobFailure(stage: .persisting, message: "Library save failed"))
+                hud.flash("Library save failed — audio saved")
             },
             onTranslationFailure: { failure in
+                await failForegroundRecovery(recovery, failure: JobFailure(
+                    stage: .postProcessing,
+                    message: failure.localizedDescription
+                ))
                 let message = handleOutputTranslationFailure(failure, externalTarget: target)
                 lastError = message
             },
             onFailure: { error in
                 lastError = "Transcription failed: \(error.localizedDescription)"
-                let saved = await preserveFailedAudio(samples, failure: JobFailure(stage: .transcribing, message: error.localizedDescription))
-                hud.flash(saved ? "Transcription failed — audio saved" : "Transcription failed — audio could NOT be saved")
+                await failForegroundRecovery(recovery, failure: JobFailure(stage: .transcribing, message: error.localizedDescription))
+                hud.flash("Transcription failed — audio saved")
             }
         )
     }
@@ -1713,47 +1807,87 @@ final class AppCoordinator: ObservableObject {
         )
         let processor = outputLanguage == .sameAsSpoken ? resolveActiveProcessor() : nil
 
-        Task {
-            defer {
-                isProcessing = false
-                recordingHUDDidReachTerminalState(generation: hudGeneration)
-            }
-            await Self.runScratchpadPipelineTask(
-                operation: {
-                    try await destinationLifecycle.runAsync(
-                        destination: .scratchpad(token),
-                        process: {
-                            try await transcribeAndRefine(
-                                samples: samples, engine: engine, engineName: engineName,
-                                context: context, appName: nil,
-                                skipPostProcessing: skipPostProcessing, processor: processor,
-                                translator: TranslationService(), localContext: nil
-                            )
-                        },
-                        text: { $0.refined },
-                        external: { _ in }
-                    )
-                },
-                onSuccess: { result, accepted in
-                    if let fallbackReason = result.fallbackReason {
-                        logPostProcessingFallback(fallbackReason)
+        guard let recoveryStore else {
+            lastError = "Could not save recording for processing"
+            hud.flash("Recording could not be saved — transcription not started")
+            isProcessing = false
+            recordingHUDDidReachTerminalState(generation: hudGeneration)
+            return
+        }
+        let recoveryService = RecoveryCaptureService(directory: Self.recoveryDirectory, store: recoveryStore)
+        do {
+            try Self.stageCaptureBeforeLaunching(
+                samples: samples,
+                stage: { try recoveryService.stageProvisional(samples: $0, capturedAt: Date()) },
+                launch: { staged in
+                    Task {
+                        defer {
+                            isProcessing = false
+                            recordingHUDDidReachTerminalState(generation: hudGeneration)
+                        }
+                        guard let recovery = await registerProvisionalAudio(staged, service: recoveryService) else { return }
+                        await Self.runScratchpadPipelineTask(
+                            operation: {
+                                try await destinationLifecycle.runAsync(
+                                    destination: .scratchpad(token),
+                                    process: {
+                                        try await transcribeAndRefine(
+                                            samples: samples, engine: engine, engineName: engineName,
+                                            context: context, appName: nil,
+                                            skipPostProcessing: skipPostProcessing, processor: processor,
+                                            translator: TranslationService(), localContext: nil
+                                        )
+                                    },
+                                    text: { $0.refined },
+                                    external: { _ in }
+                                )
+                            },
+                            onSuccess: { result, accepted in
+                                guard await completeForegroundRecovery(recovery) else {
+                                    hud.flash("Dictation ready — recovery cleanup failed")
+                                    return
+                                }
+                                if let fallbackReason = result.fallbackReason {
+                                    logPostProcessingFallback(fallbackReason)
+                                }
+                                if accepted {
+                                    hud.hide()
+                                } else {
+                                    hud.flash("Dictation ready — reopen Scratchpad to recover it")
+                                }
+                            },
+                            onCancellation: {
+                                await failForegroundRecovery(recovery, failure: JobFailure(
+                                    stage: .transcribing,
+                                    message: "Processing was interrupted"
+                                ))
+                            },
+                            onTranslationFailure: { failure in
+                                await failForegroundRecovery(recovery, failure: JobFailure(
+                                    stage: .postProcessing,
+                                    message: failure.localizedDescription
+                                ))
+                                let message = handleOutputTranslationFailure(failure)
+                                lastError = message
+                            },
+                            onFailure: { error in
+                                let message = error is PipelineError ? "Transcription failed" : "Transcription failed: \(error.localizedDescription)"
+                                lastError = message
+                                await failForegroundRecovery(recovery, failure: JobFailure(
+                                    stage: .transcribing,
+                                    message: error.localizedDescription
+                                ))
+                                hud.flash(message)
+                            }
+                        )
                     }
-                    if accepted {
-                        hud.hide()
-                    } else {
-                        hud.flash("Dictation ready — reopen Scratchpad to recover it")
-                    }
-                },
-                onTranslationFailure: { failure in
-                    let message = handleOutputTranslationFailure(failure)
-                    lastError = message
-                },
-                onFailure: { error in
-                    let message = error is PipelineError ? "Transcription failed" : "Transcription failed: \(error.localizedDescription)"
-                    lastError = message
-                    hud.flash(message)
                 }
             )
+        } catch {
+            lastError = "Failed to save recording: \(error.localizedDescription)"
+            hud.flash("Recording could not be saved — transcription not started")
+            isProcessing = false
+            recordingHUDDidReachTerminalState(generation: hudGeneration)
         }
     }
 
@@ -2040,20 +2174,6 @@ final class AppCoordinator: ObservableObject {
         }
     }
 
-    private func preserveFailedAudio(_ samples: [Float], failure: JobFailure) async -> Bool {
-        guard let jobLibraryStore else { return false }
-        do {
-            _ = try await jobLibraryStore.preserve(
-                samples: samples,
-                metadata: RecoveryMetadata(capturedAt: Date(), failure: failure)
-            )
-            return true
-        } catch {
-            lastError = "Failed to save recovery audio: \(error.localizedDescription)"
-            return false
-        }
-    }
-
     func launchRecoveryWorkflows() async {
         guard let recoveryStore else { return }
         let pipeline = RecoveryRetryPipeline(
@@ -2080,6 +2200,8 @@ final class AppCoordinator: ObservableObject {
         }
         recoveryRunner = runner
         jobLibraryStore?.configureRetry { [weak runner] id in await runner?.enqueue(id) }
+        _ = try? await RecoveryCaptureService(directory: Self.recoveryDirectory, store: recoveryStore)
+            .reconcileStagedProvisionalCaptures()
         await pipeline.retryPendingSourceCleanup()
         _ = try? await recoveryStore.recoverInterruptedJobs(kind: .recovery)
         _ = try? await RecoveryRetentionService(directory: Self.recoveryDirectory, store: recoveryStore)
@@ -2149,13 +2271,34 @@ final class AppCoordinator: ObservableObject {
             configuration: configuration,
             defaultModel: AppSettings.shared.whisperModel
         )
-        return RecoveryDictation(
+        let dictation = RecoveryDictation(
             language: transcription.language,
             template: template.name,
             transcript: transcription.text,
             refined: transcription.text,
             engine: "WhisperKit"
         )
+        try Self.persistRecoveredDictation(dictation)
+        return dictation
+    }
+
+    static func persistRecoveredDictation(
+        _ dictation: RecoveryDictation,
+        record: (RecoveryDictation) throws -> Void = { dictation in
+            try LibraryStore.shared.record(
+                language: dictation.language,
+                template: dictation.template,
+                transcript: dictation.transcript,
+                refined: dictation.refined,
+                engine: dictation.engine
+            )
+        }
+    ) throws {
+        do {
+            try record(dictation)
+        } catch {
+            throw PipelineError.recordFailed(error)
+        }
     }
 
     private func purgeRecoveries(retention: RecoveryRetention) async {

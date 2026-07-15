@@ -227,19 +227,20 @@ struct OutputTranslationPipelineTests {
         #expect(coordinator.pendingOutputTranslationFailures().isEmpty)
     }
 
-    @Test func externalOuterTaskHandlerTreatsCancellationAsSilentCleanup() async {
+    @Test func externalOuterTaskHandlerExposesCancellationForRecoveryFinalization() async {
         var events: [String] = []
 
         await AppCoordinator.runExternalPipelineTask(
             operation: { () async throws -> Int in throw CancellationError() },
             onSuccess: { _ in events.append("success") },
+            onCancellation: { events.append("cancellation") },
             onEmptyTranscript: { events.append("empty") },
             onRecordFailure: { events.append("record") },
             onTranslationFailure: { _ in events.append("translation") },
             onFailure: { _ in events.append("failure") }
         )
 
-        #expect(events.isEmpty)
+        #expect(events == ["cancellation"])
     }
 
     private static let template = Template(id: "plain", name: "Plain", prompt: "Clean it")

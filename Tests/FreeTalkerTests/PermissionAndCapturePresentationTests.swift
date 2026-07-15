@@ -32,14 +32,14 @@ import Testing
     }
 
     @Test func capturedAudioRejectsEmptyAndDeadMicrophoneSignal() {
-        #expect(AppCoordinator.capturedAudioIssue(sampleCount: 0, peak: 0, rms: 0) == "No microphone audio detected")
-        #expect(AppCoordinator.capturedAudioIssue(sampleCount: 16_000, peak: 0, rms: 0) == "No microphone audio detected")
-        #expect(AppCoordinator.capturedAudioIssue(sampleCount: 16_000, peak: 1e-8, rms: 1e-9) == "No microphone audio detected")
+        #expect(AppCoordinator.capturedAudioIssue(sampleCount: 0, peak: 0, rms: 0) == "Recording failed — no microphone audio was captured")
+        #expect(AppCoordinator.capturedAudioIssue(sampleCount: 16_000, peak: 0, rms: 0) == "Recording failed — no microphone audio was captured")
+        #expect(AppCoordinator.capturedAudioIssue(sampleCount: 16_000, peak: 1e-8, rms: 1e-9) == "Recording failed — no microphone audio was captured")
     }
 
     @Test func capturedAudioRejectsNonfiniteMetrics() {
-        #expect(AppCoordinator.capturedAudioIssue(sampleCount: 16_000, peak: .nan, rms: 0) == "No microphone audio detected")
-        #expect(AppCoordinator.capturedAudioIssue(sampleCount: 16_000, peak: 1, rms: .infinity) == "No microphone audio detected")
+        #expect(AppCoordinator.capturedAudioIssue(sampleCount: 16_000, peak: .nan, rms: 0) == "Recording failed — no microphone audio was captured")
+        #expect(AppCoordinator.capturedAudioIssue(sampleCount: 16_000, peak: 1, rms: .infinity) == "Recording failed — no microphone audio was captured")
     }
 
     @Test func capturedAudioAllowsQuietAndNormalFiniteSignal() {

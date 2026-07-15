@@ -3,6 +3,120 @@ import Testing
 @testable import FreeTalker
 
 @Suite struct RecoveryStorageTests {
+    @Test func stopStagesDurableAudioBeforeLaunchingAsyncRegistration() throws {
+        let fixture = try RecoveryFixture()
+        let service = RecoveryCaptureService(directory: fixture.directory, store: fixture.store)
+        var events: [String] = []
+        var launchedCapture: StagedRecoveryCapture?
+
+        try AppCoordinator.stageCaptureBeforeLaunching(
+            samples: [0.25],
+            stage: { samples in
+                events.append("stage")
+                return try service.stageProvisional(samples: samples, capturedAt: Date())
+            },
+            launch: { capture in
+                events.append("launch")
+                #expect(FileManager.default.fileExists(atPath: capture.source.reference))
+                launchedCapture = capture
+            }
+        )
+
+        #expect(events == ["stage", "launch"])
+        #expect(launchedCapture != nil)
+    }
+
+    @Test func launchReconcilesAudioStagedBeforeRegistration() async throws {
+        let fixture = try RecoveryFixture()
+        let service = RecoveryCaptureService(directory: fixture.directory, store: fixture.store)
+        let staged = try service.stageProvisional(
+            samples: [0.25],
+            capturedAt: Date(timeIntervalSince1970: 8_000)
+        )
+
+        let captures = try await service.reconcileStagedProvisionalCaptures()
+
+        #expect(captures.map(\.source) == [staged.source])
+        let job = try #require(try await fixture.store.job(id: captures[0].id))
+        #expect(job.state == .processing(stage: .preparing))
+        #expect(FileManager.default.fileExists(atPath: staged.source.reference))
+    }
+
+    @Test func launchIgnoresUnmarkedOrphanWAV() async throws {
+        let fixture = try RecoveryFixture()
+        let orphan = fixture.directory.appendingPathComponent("\(UUID().uuidString).wav")
+        try Data("orphan".utf8).write(to: orphan)
+        let service = RecoveryCaptureService(directory: fixture.directory, store: fixture.store)
+
+        #expect(try await service.reconcileStagedProvisionalCaptures().isEmpty)
+        #expect(try await fixture.store.jobs(kind: .recovery).isEmpty)
+        #expect(FileManager.default.fileExists(atPath: orphan.path))
+    }
+
+    @Test func provisionalRegistrationFailureKeepsStagedAudioForLaunchReconciliation() async throws {
+        let directory = try TemporaryDirectory()
+        let service = RecoveryCaptureService(directory: directory.url, store: FailingRecoveryStore())
+        let staged = try service.stageProvisional(samples: [0.25], capturedAt: Date())
+
+        await #expect(throws: RecoveryTestError.databaseFailure) {
+            try await service.registerProvisional(staged)
+        }
+
+        #expect(FileManager.default.fileExists(atPath: staged.source.reference))
+    }
+
+    @Test func provisionalCaptureAtomicallyWritesWAVAndCreatesLiveProcessingJob() async throws {
+        let fixture = try RecoveryFixture()
+        let now = Date(timeIntervalSince1970: 9_000)
+        let service = RecoveryCaptureService(directory: fixture.directory, store: fixture.store)
+
+        let capture = try await service.preserveProvisional(samples: [0, 0.5, -0.5], capturedAt: now)
+
+        let job = try #require(try await fixture.store.job(id: capture.id))
+        #expect(job.state == .processing(stage: .preparing))
+        #expect(job.createdAt == now)
+        #expect(job.source.reference == capture.source.reference)
+        #expect(FileManager.default.fileExists(atPath: capture.source.reference))
+    }
+
+    @Test func provisionalFailureLeavesSameAudioRecoverableAndRetryable() async throws {
+        let fixture = try RecoveryFixture()
+        let service = RecoveryCaptureService(directory: fixture.directory, store: fixture.store)
+        let capture = try await service.preserveProvisional(samples: [0.25], capturedAt: Date())
+        let failure = JobFailure(stage: .transcribing, message: "cancelled")
+
+        try await service.failProvisional(capture, failure: failure)
+
+        let job = try #require(try await fixture.store.job(id: capture.id))
+        #expect(job.state == .failed(failure))
+        #expect(FileManager.default.fileExists(atPath: capture.source.reference))
+    }
+
+    @Test func provisionalCompletionRemovesJobAndExactAudio() async throws {
+        let fixture = try RecoveryFixture()
+        let service = RecoveryCaptureService(directory: fixture.directory, store: fixture.store)
+        let capture = try await service.preserveProvisional(samples: [0.25], capturedAt: Date())
+
+        try await service.completeProvisional(capture)
+
+        #expect(try await fixture.store.job(id: capture.id) == nil)
+        #expect(!FileManager.default.fileExists(atPath: capture.source.reference))
+    }
+
+    @Test func provisionalCompletionCannotRaceAProcessorThatAlreadyClaimedTheJob() async throws {
+        let fixture = try RecoveryFixture()
+        let service = RecoveryCaptureService(directory: fixture.directory, store: fixture.store)
+        let capture = try await service.preserveProvisional(samples: [0.25], capturedAt: Date())
+        _ = try await fixture.store.beginAttempt(jobID: capture.id, configuration: .init())
+
+        await #expect(throws: JobStoreError.invalidTransition) {
+            try await service.completeProvisional(capture)
+        }
+
+        #expect(try await fixture.store.job(id: capture.id) != nil)
+        #expect(FileManager.default.fileExists(atPath: capture.source.reference))
+    }
+
     @Test func captureAtomicallyWritesWAVAndCreatesFailedJob() async throws {
         let fixture = try RecoveryFixture()
         let now = Date(timeIntervalSince1970: 10_000)
@@ -263,6 +377,9 @@ import Testing
 private enum RecoveryTestError: Error { case databaseFailure }
 
 private actor FailingRecoveryStore: RecoveryJobStoring {
+    func createProvisionalRecovery(source: JobSource, capturedAt: Date) throws -> TranscriptionJob { throw RecoveryTestError.databaseFailure }
+    func failProvisionalRecovery(id: UUID, failure: JobFailure) throws { throw RecoveryTestError.databaseFailure }
+    func deleteProvisionalRecovery(id: UUID, expectedSourceReference: String) throws -> Bool { throw RecoveryTestError.databaseFailure }
     func createRecovery(source: JobSource, metadata: RecoveryMetadata) throws -> TranscriptionJob { throw RecoveryTestError.databaseFailure }
     func claimExpiredRecoveries(cutoff: Date, claimedAt: Date) throws -> [RecoveryPurgeClaim] { [] }
     func claimedRecoveries() throws -> [RecoveryPurgeClaim] { [] }

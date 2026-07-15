@@ -147,11 +147,6 @@ private struct MenuBarContentView: View {
 
             Divider()
 
-            Button("Library…") {
-                SettingsNavigator.shared.pendingDestination = .library
-                NSApplication.shared.activate(ignoringOtherApps: true)
-                openWindow(id: "settings")
-            }
             Button("Scratchpad…") { ScratchpadWindowController.shared.open() }
             Button("Settings…") {
                 NSApplication.shared.activate(ignoringOtherApps: true)

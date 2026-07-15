@@ -86,6 +86,73 @@ actor TranscriptionJobStore {
         )
     }
 
+    func createProvisionalRecovery(source: JobSource, capturedAt: Date) throws -> TranscriptionJob {
+        if let existing = try recoveryJob(sourceReference: source.reference) { return existing }
+        let id = UUID()
+        let statement = try prepare("""
+        INSERT INTO transcription_jobs
+            (id, kind, source_reference, source_bookmark, state, progress, created_at, updated_at,
+             started_at, failure_stage)
+        VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?);
+        """)
+        defer { sqlite3_finalize(statement) }
+        bind(id.uuidString, to: 1, in: statement)
+        bind(JobKind.recovery.rawValue, to: 2, in: statement)
+        bind(source.reference, to: 3, in: statement)
+        bind(source.bookmark, to: 4, in: statement)
+        bind(JobState.Kind.processing.rawValue, to: 5, in: statement)
+        sqlite3_bind_double(statement, 6, capturedAt.timeIntervalSince1970)
+        sqlite3_bind_double(statement, 7, capturedAt.timeIntervalSince1970)
+        sqlite3_bind_double(statement, 8, capturedAt.timeIntervalSince1970)
+        bind(JobStage.preparing.rawValue, to: 9, in: statement)
+        try stepDone(statement)
+        return TranscriptionJob(
+            id: id, kind: .recovery, source: source, state: .processing(stage: .preparing), progress: 0,
+            createdAt: capturedAt, updatedAt: capturedAt, startedAt: capturedAt, completedAt: nil,
+            expiresAt: nil, result: nil, needsSourceCleanup: false, sourceCleanupError: nil
+        )
+    }
+
+    private func recoveryJob(sourceReference: String) throws -> TranscriptionJob? {
+        let statement = try prepare("""
+        SELECT id FROM transcription_jobs
+        WHERE kind = 'recovery' AND source_reference = ?
+        ORDER BY created_at LIMIT 1;
+        """)
+        defer { sqlite3_finalize(statement) }
+        bind(sourceReference, to: 1, in: statement)
+        switch sqlite3_step(statement) {
+        case SQLITE_ROW:
+            guard let id = UUID(uuidString: text(statement, 0)) else {
+                throw JobStoreError.corruptData("Invalid recovery identity")
+            }
+            return try job(id: id)
+        case SQLITE_DONE: return nil
+        default: throw sqlError()
+        }
+    }
+
+    func failProvisionalRecovery(id: UUID, failure: JobFailure) throws {
+        try transition(id, from: .processing, to: .failed(failure))
+    }
+
+    func deleteProvisionalRecovery(id: UUID, expectedSourceReference: String) throws -> Bool {
+        let statement = try prepare("""
+        DELETE FROM transcription_jobs
+        WHERE id = ? AND kind = 'recovery' AND state = 'processing'
+          AND source_reference = ? AND purge_claimed_at IS NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM job_attempts
+              WHERE job_id = transcription_jobs.id AND completed_at IS NULL
+          );
+        """)
+        defer { sqlite3_finalize(statement) }
+        bind(id.uuidString, to: 1, in: statement)
+        bind(expectedSourceReference, to: 2, in: statement)
+        try stepDone(statement)
+        return sqlite3_changes(handle) == 1
+    }
+
     func claimExpiredRecoveries(cutoff: Date, claimedAt: Date) throws -> [RecoveryPurgeClaim] {
         let statement = try prepare("""
         UPDATE transcription_jobs

@@ -257,17 +257,18 @@ struct ScratchpadRecordingTests {
         #expect(coordinator.pendingScratchpadRecording(for: token) == nil)
     }
 
-    @Test func scratchpadOuterTaskHandlerTreatsCancellationAsSilentCleanup() async {
+    @Test func scratchpadOuterTaskHandlerExposesCancellationForRecoveryFinalization() async {
         var events: [String] = []
 
         await AppCoordinator.runScratchpadPipelineTask(
             operation: { () async throws -> Int in throw CancellationError() },
             onSuccess: { _ in events.append("success") },
+            onCancellation: { events.append("cancellation") },
             onTranslationFailure: { _ in events.append("translation") },
             onFailure: { _ in events.append("failure") }
         )
 
-        #expect(events.isEmpty)
+        #expect(events == ["cancellation"])
     }
 
     @Test func windowIsNormalFocusableAndFormattingToolbarIsAccessible() {
