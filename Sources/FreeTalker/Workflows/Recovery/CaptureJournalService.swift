@@ -351,6 +351,7 @@ struct CaptureJournalService: Sendable {
             assetKind: session.assetKind, failureMessage: session.failureMessage,
             contentHash: session.contentHash
         )
+        SmokeCheckpoint.hit(.postLibraryCommitted)
     }
 
     func resumeCleanup(captureID: UUID) async throws {
@@ -370,6 +371,7 @@ struct CaptureJournalService: Sendable {
                 assetKind: session.assetKind, failureMessage: session.failureMessage,
                 contentHash: session.contentHash
             )
+            SmokeCheckpoint.hit(.cancelIntent)
         }
         if fileSystem.exists(session.directory) {
             try fileSystem.remove(session.directory)

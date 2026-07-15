@@ -136,6 +136,7 @@ final class Database {
             guard let inserted = try dictation(id: sqlite3_last_insert_rowid(handle)) else {
                 throw DatabaseError.sqlFailed("Inserted Library dictation could not be read")
             }
+            if captureID != nil { SmokeCheckpoint.hit(.postLibraryInsert) }
             return inserted
         }
         guard let captureID, let existing = try dictations(captureID: captureID).first else {

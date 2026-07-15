@@ -63,6 +63,7 @@ final class CaptureJournalWriter: @unchecked Sendable {
         var processing = false
         var needsBootstrap = true
         var didNotifyFailure = false
+        var failurePersistence: Task<Void, Never>?
         var canonicalContentHash: String?
         var diagnostics: CaptureDiagnostics
     }
@@ -134,15 +135,14 @@ final class CaptureJournalWriter: @unchecked Sendable {
             }
             return .accepted
         }
-        if let notify {
-            Task { onFailure(notify) }
-        }
-        if let overflowError {
-            Task {
-                // The audio callback remains I/O-free. Persist durable failure ownership
-                // on the journal task so a crash after overflow cannot leave only RAM state.
+        if let overflowError, let notify {
+            let persistence = Task { [self] in
+                // The audio callback remains I/O-free. Durable evidence is completed before
+                // the coordinator is notified, and finish/stop can join this owned task.
                 try? await recordUnrecoverableFailure(overflowError)
+                onFailure(notify)
             }
+            lock.withLock { state.failurePersistence = persistence }
         }
         if startWorker { launchWorker() }
         return result
@@ -164,7 +164,10 @@ final class CaptureJournalWriter: @unchecked Sendable {
             case .finishing: return nil
             }
         }
-        if let immediate { return try immediate.get() }
+        if let immediate {
+            await waitForFailurePersistence()
+            return try immediate.get()
+        }
         if startWorker { launchWorker() }
 
         while true {
@@ -175,7 +178,10 @@ final class CaptureJournalWriter: @unchecked Sendable {
                 case .active, .finishing: nil
                 }
             }
-            if let terminal { return try terminal.get() }
+            if let terminal {
+                await waitForFailurePersistence()
+                return try terminal.get()
+            }
             try await Task.sleep(for: .milliseconds(1))
         }
     }
@@ -214,6 +220,11 @@ final class CaptureJournalWriter: @unchecked Sendable {
         lock.withLock { state.canonicalContentHash }
     }
 
+    func waitForFailurePersistence() async {
+        let persistence = lock.withLock { state.failurePersistence }
+        await persistence?.value
+    }
+
     func stop() async {
         lock.withLock {
             switch state.status {
@@ -227,6 +238,7 @@ final class CaptureJournalWriter: @unchecked Sendable {
         while lock.withLock({ state.workerRunning || state.processing }) {
             await Task.yield()
         }
+        await waitForFailurePersistence()
     }
 
     private func launchWorker() {

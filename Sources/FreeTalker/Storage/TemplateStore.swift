@@ -19,8 +19,7 @@ final class TemplateStore: ObservableObject {
     private let fileURL: URL
 
     private init() {
-        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        let dir = support.appendingPathComponent("FreeTalker", isDirectory: true)
+        let dir = FreeTalkerPaths.applicationSupport
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         fileURL = dir.appendingPathComponent("templates.json")
 

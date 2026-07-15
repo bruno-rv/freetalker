@@ -172,6 +172,7 @@ final class JobLibraryStore: ObservableObject {
         guard newlyClaimed || alreadyClaimed else {
             throw JobStoreError.invalidTransition
         }
+        SmokeCheckpoint.hit(.deleteClaim)
         let result = try await RecoveryRetentionService(
             directory: recoveryDirectory, store: store, ledger: store
         )
@@ -280,6 +281,7 @@ final class JobLibraryStore: ObservableObject {
             assetKind: session.assetKind, failureMessage: session.failureMessage,
             contentHash: session.contentHash
         )
+        SmokeCheckpoint.hit(.deleteClaim)
         try await CaptureJournalService(
             fileSystem: LocalJournalFileSystem(), ledger: store
         ).resumeCleanup(captureID: item.id)

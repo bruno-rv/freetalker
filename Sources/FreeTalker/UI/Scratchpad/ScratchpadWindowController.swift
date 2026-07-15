@@ -432,8 +432,7 @@ final class ScratchpadWindowController: NSWindowController, NSWindowDelegate, Sc
     }
 
     private static var defaultDocumentURL: URL {
-        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("FreeTalker", isDirectory: true)
+        let support = FreeTalkerPaths.applicationSupport
         try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
         return support.appendingPathComponent("scratchpad.rtf")
     }

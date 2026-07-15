@@ -175,6 +175,7 @@ struct RecoveryCaptureService: Sendable {
         guard job.id == staged.captureID else {
             throw RecoveryFinalizationError.captureIdentityMismatch
         }
+        SmokeCheckpoint.hit(.postJobCreate)
         if let ledger {
             guard let session else {
                 throw RecoveryFinalizationError.captureIdentityMismatch
@@ -219,6 +220,7 @@ struct RecoveryCaptureService: Sendable {
                 failureMessage: session.failureMessage,
                 contentHash: session.contentHash
             )
+            SmokeCheckpoint.hit(.postLibraryCommitted)
         } else {
             guard session.state == .libraryCommitted,
                   session.libraryDictationID == dictationID else {

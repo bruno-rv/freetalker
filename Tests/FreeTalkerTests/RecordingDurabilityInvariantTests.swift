@@ -98,26 +98,90 @@ private final class InvariantJobClock: JobClock, @unchecked Sendable {
         #expect(FreeTalkerPaths.resolveApplicationSupport(
             environment: allowed, fallback: fallback,
             isMountedVolume: { $0.path.hasPrefix("/Volumes/FreeTalkerSmoke/") },
+            hasSafeComponents: { _ in true },
             debugBuild: true
         ).path == mounted.path)
         #expect(FreeTalkerPaths.resolveApplicationSupport(
             environment: ["FREETALKER_SMOKE_ROOT": mounted.path], fallback: fallback,
-            isMountedVolume: { _ in true }, debugBuild: true
+            isMountedVolume: { _ in true }, hasSafeComponents: { _ in true },
+            debugBuild: true
         ) == fallback)
         #expect(FreeTalkerPaths.resolveApplicationSupport(
             environment: allowed, fallback: fallback,
-            isMountedVolume: { _ in true }, debugBuild: false
+            isMountedVolume: { _ in true }, hasSafeComponents: { _ in true },
+            debugBuild: false
         ) == fallback)
         #expect(FreeTalkerPaths.resolveApplicationSupport(
             environment: [
                 "FREETALKER_ALLOW_ISOLATED_SMOKE": "1",
                 "FREETALKER_SMOKE_ROOT": "relative/path",
-            ], fallback: fallback, isMountedVolume: { _ in true }, debugBuild: true
+            ], fallback: fallback, isMountedVolume: { _ in true },
+            hasSafeComponents: { _ in true }, debugBuild: true
+        ) == fallback)
+        #expect(FreeTalkerPaths.resolveApplicationSupport(
+            environment: [
+                "FREETALKER_ALLOW_ISOLATED_SMOKE": "1",
+                "FREETALKER_SMOKE_ROOT": "/Volumes/FreeTalkerSmoke/../escape",
+            ], fallback: fallback, isMountedVolume: { _ in true },
+            hasSafeComponents: { _ in true }, debugBuild: true
         ) == fallback)
         #expect(FreeTalkerPaths.resolveApplicationSupport(
             environment: allowed, fallback: fallback,
-            isMountedVolume: { _ in false }, debugBuild: true
+            isMountedVolume: { _ in false }, hasSafeComponents: { _ in true },
+            debugBuild: true
         ) == fallback)
+        #expect(FreeTalkerPaths.resolveApplicationSupport(
+            environment: allowed, fallback: fallback,
+            isMountedVolume: { _ in true }, hasSafeComponents: { _ in false },
+            debugBuild: true
+        ) == fallback)
+    }
+
+    @Test("isolation path component validation rejects symlinks")
+    func smokeIsolationRejectsSymlinkComponents() throws {
+        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "smoke-path-\(UUID().uuidString)", isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let real = temporary.appendingPathComponent("real", isDirectory: true)
+        let link = temporary.appendingPathComponent("link", isDirectory: true)
+        try FileManager.default.createDirectory(at: real, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: real)
+        #expect(FreeTalkerPaths.hasNoSymlinkComponents(real, beneath: temporary))
+        #expect(!FreeTalkerPaths.hasNoSymlinkComponents(link, beneath: temporary))
+    }
+
+    @Test("smoke checkpoints require debug isolation and an explicitly named boundary")
+    func smokeCheckpointConfigurationFailsClosed() {
+        let environment = [
+            "FREETALKER_ALLOW_ISOLATED_SMOKE": "1",
+            "FREETALKER_SMOKE_ROOT": "/Volumes/FreeTalkerSmoke/session",
+            "FREETALKER_SMOKE_CHECKPOINTS": "post-job-create,cancel-intent",
+        ]
+        let isolatedRoot = URL(fileURLWithPath: "/Volumes/FreeTalkerSmoke/session")
+        #expect(SmokeCheckpoint.shouldEmit(
+            .postJobCreate, environment: environment,
+            applicationSupport: isolatedRoot, debugBuild: true
+        ))
+        #expect(!SmokeCheckpoint.shouldEmit(
+            .postLibraryInsert, environment: environment,
+            applicationSupport: isolatedRoot, debugBuild: true
+        ))
+        #expect(!SmokeCheckpoint.shouldEmit(
+            .postJobCreate, environment: environment,
+            applicationSupport: isolatedRoot, debugBuild: false
+        ))
+        #expect(!SmokeCheckpoint.shouldEmit(
+            .postJobCreate,
+            environment: ["FREETALKER_SMOKE_CHECKPOINTS": "post-job-create"],
+            applicationSupport: isolatedRoot,
+            debugBuild: true
+        ))
+        #expect(!SmokeCheckpoint.shouldEmit(
+            .postJobCreate, environment: environment,
+            applicationSupport: URL(fileURLWithPath: "/Users/test/Library/Application Support/FreeTalker"),
+            debugBuild: true
+        ))
     }
 
     @Test(
@@ -140,7 +204,10 @@ private final class InvariantJobClock: JobClock, @unchecked Sendable {
 
     @Test(
         "real persistent side effect faults retain validated ownership after reopen",
-        arguments: PersistentFaultBoundary.allCases.filter { !$0.isAdmissionBoundary }
+        arguments: PersistentFaultBoundary.allCases.filter {
+            !$0.isAdmissionBoundary && !$0.isSilentBoundary && !$0.isCancelBoundary
+                && $0 != .overflowFailureMarker
+        }
     )
     func persistentFaultMatrix(boundary: PersistentFaultBoundary) async throws {
         let harness = try RecordingDurabilityHarness()
@@ -148,15 +215,53 @@ private final class InvariantJobClock: JobClock, @unchecked Sendable {
 
         let evidence = try await harness.reopenAndReconcile(captureID: captureID)
 
-        if boundary.isCancelBoundary {
-            #expect(
-                evidence.durableCount >= 1 || evidence.isExplicitlyDisposed,
-                "boundary: \(boundary.rawValue)"
-            )
-        } else {
-            #expect(evidence.durableCount >= 1, "boundary: \(boundary.rawValue)")
-        }
+        #expect(evidence.durableCount >= 1, "boundary: \(boundary.rawValue)")
         #expect(evidence.libraryRows <= 1, "boundary: \(boundary.rawValue)")
+    }
+
+    @Test("overflow failure persistence is drained before completion")
+    func overflowFailureIsDurable() async throws {
+        let harness = try RecordingDurabilityHarness()
+        let captureID = try await harness.inject(.overflowFailureMarker, destination: .external)
+        let evidence = try await harness.reopenAndReconcile(captureID: captureID)
+        #expect(evidence.durableCount >= 1)
+    }
+
+    @Test(
+        "every silent fault remains visible for both destinations",
+        arguments: PersistentFaultBoundary.allCases.filter(\.isSilentBoundary),
+        RecordingDurabilityHarness.Destination.allCases
+    )
+    func silentFaultMatrix(
+        boundary: PersistentFaultBoundary,
+        destination: RecordingDurabilityHarness.Destination
+    ) async throws {
+        let harness = try RecordingDurabilityHarness()
+        let captureID = try await harness.inject(boundary, destination: destination)
+        let evidence = try await harness.reopenAndReconcile(captureID: captureID)
+        #expect(evidence.visibleSilentOrDamaged, "\(boundary.rawValue) \(destination.rawValue)")
+        #expect(evidence.durableCount >= 1)
+        #expect(evidence.libraryRows == 0)
+        #expect(evidence.recoveryJobs == 0)
+    }
+
+    @Test(
+        "every cancellation fault converges to terminal cleanup for both destinations",
+        arguments: PersistentFaultBoundary.allCases.filter(\.isCancelBoundary),
+        RecordingDurabilityHarness.Destination.allCases
+    )
+    func cancellationFaultMatrix(
+        boundary: PersistentFaultBoundary,
+        destination: RecordingDurabilityHarness.Destination
+    ) async throws {
+        let harness = try RecordingDurabilityHarness()
+        let captureID = try await harness.inject(boundary, destination: destination)
+        let evidence = try await harness.reopenAndReconcile(captureID: captureID)
+        #expect(evidence.isExplicitlyDisposed, "\(boundary.rawValue) \(destination.rawValue)")
+        #expect(evidence.durableCount == 0)
+        #expect(evidence.libraryRows == 0)
+        #expect(evidence.recoveryJobs == 0)
+        #expect(evidence.visibleRecoveries == 0)
     }
 
     @Test(
@@ -173,20 +278,24 @@ private final class InvariantJobClock: JobClock, @unchecked Sendable {
         defer { try? FileManager.default.removeItem(at: root) }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let database = root.appendingPathComponent("jobs.sqlite")
-        let store = try TranscriptionJobStore(databaseURL: database, clock: SystemJobClock())
         let directory = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        let fileSystem = PersistentFaultFileSystem(
-            base: LocalJournalFileSystem(), boundary: boundary
-        )
-        fileSystem.arm()
         let request = CaptureStartRequest(
             id: UUID(), directory: directory, capturedAt: Date(), sampleRate: 16_000,
             channelCount: 1, inputDeviceUID: nil, destination: "external"
         )
-        await #expect(throws: (any Error).self) {
-            try await CaptureJournalService(fileSystem: fileSystem, ledger: store).prepare(request)
+        do {
+            let store = try TranscriptionJobStore(databaseURL: database, clock: SystemJobClock())
+            let fileSystem = PersistentFaultFileSystem(
+                base: LocalJournalFileSystem(), boundary: boundary
+            )
+            fileSystem.arm()
+            await #expect(throws: (any Error).self) {
+                try await CaptureJournalService(fileSystem: fileSystem, ledger: store)
+                    .prepare(request)
+            }
         }
-        #expect(try await store.session(id: request.id) == nil)
+        let reopened = try TranscriptionJobStore(databaseURL: database, clock: SystemJobClock())
+        #expect(try await reopened.session(id: request.id) == nil)
         #expect(!FileManager.default.fileExists(atPath: directory.path))
     }
 
@@ -204,10 +313,15 @@ private final class InvariantJobClock: JobClock, @unchecked Sendable {
         #expect(second.durableCount >= 1)
     }
 
-    @Test("silent and explicitly cancelled attempts converge after restart")
-    func silentAndCancelledConverge() async throws {
+    @Test(
+        "silent and explicitly cancelled attempts converge after restart for both destinations",
+        arguments: RecordingDurabilityHarness.Destination.allCases
+    )
+    func silentAndCancelledConverge(
+        destination: RecordingDurabilityHarness.Destination
+    ) async throws {
         let silentHarness = try RecordingDurabilityHarness()
-        let silent = try await silentHarness.createSilent(destination: .scratchpad)
+        let silent = try await silentHarness.createSilent(destination: destination)
         let silentEvidence = try await silentHarness.reopenAndReconcile(captureID: silent)
         #expect(silentEvidence.visibleSilentOrDamaged)
         #expect(silentEvidence.durableCount >= 1)
@@ -217,7 +331,7 @@ private final class InvariantJobClock: JobClock, @unchecked Sendable {
         #expect(silentEvidence.libraryRows == 0)
 
         let cancelledHarness = try RecordingDurabilityHarness()
-        let cancelled = try await cancelledHarness.createInterruptedCancellation()
+        let cancelled = try await cancelledHarness.createInterruptedCancellation(destination: destination)
         let cancelledEvidence = try await cancelledHarness.reopenAndReconcile(captureID: cancelled)
         #expect(cancelledEvidence.isExplicitlyDisposed)
         #expect(cancelledEvidence.libraryRows == 0)
@@ -409,12 +523,17 @@ final class RecordingDurabilityHarness: @unchecked Sendable {
         return captureID
     }
 
-    func inject(_ boundary: PersistentFaultBoundary) async throws -> UUID {
-        if boundary.isSilentBoundary { return try await injectSilent(boundary) }
-        if boundary.isCancelBoundary { return try await injectCancellation(boundary) }
+    func inject(
+        _ boundary: PersistentFaultBoundary,
+        destination: Destination = .external
+    ) async throws -> UUID {
+        if boundary.isSilentBoundary {
+            return try await injectSilent(boundary, destination: destination)
+        }
+        if boundary.isCancelBoundary {
+            return try await injectCancellation(boundary, destination: destination)
+        }
         let captureID = UUID()
-        let destination: Destination = boundary.rawValue.hashValue.isMultiple(of: 2)
-            ? .external : .scratchpad
         let directory = recoveryRoot.appendingPathComponent(captureID.uuidString, isDirectory: true)
         let store = try TranscriptionJobStore(databaseURL: jobsDatabase, clock: SystemJobClock())
         let faultFS = PersistentFaultFileSystem(base: fileSystem, boundary: boundary)
@@ -436,6 +555,7 @@ final class RecordingDurabilityHarness: @unchecked Sendable {
         if boundary == .overflowFailureMarker {
             #expect(active.writer.enqueue(Array(repeating: 0.25, count: 128_001)) == .overflow)
             await #expect(throws: (any Error).self) { try await service.finish(active) }
+            await active.writer.waitForFailurePersistence()
             let marker = directory.appendingPathComponent("capture-failure.marker")
             for _ in 0..<2_000 where !fileSystem.exists(marker) {
                 try await Task.sleep(for: .milliseconds(1))
@@ -502,10 +622,25 @@ final class RecordingDurabilityHarness: @unchecked Sendable {
         await #expect(throws: (any Error).self) {
             try await completion.completeJournalCapture(capture, captureID: captureID)
         }
+        if boundary == .sessionDirectorySync {
+            let events = faultFS.events
+            let removed = try #require(events.firstIndex {
+                $0 == "media-remove:\(directory.path)"
+            })
+            let synchronized = try #require(events.indices.first {
+                $0 > removed && events[$0] == "directory-sync:\(directory.path)"
+            })
+            let fault = try #require(events.firstIndex { $0 == "fault:sessionDirectorySync" })
+            #expect(removed < synchronized)
+            #expect(synchronized < fault)
+        }
         return captureID
     }
 
-    private func injectSilent(_ boundary: PersistentFaultBoundary) async throws -> UUID {
+    private func injectSilent(
+        _ boundary: PersistentFaultBoundary,
+        destination: Destination
+    ) async throws -> UUID {
         let captureID = UUID()
         let directory = recoveryRoot.appendingPathComponent(captureID.uuidString, isDirectory: true)
         let store = try TranscriptionJobStore(databaseURL: jobsDatabase, clock: SystemJobClock())
@@ -516,7 +651,7 @@ final class RecordingDurabilityHarness: @unchecked Sendable {
         )
         let active = try await service.prepare(.init(
             id: captureID, directory: directory, capturedAt: Date(), sampleRate: 16_000,
-            channelCount: 1, inputDeviceUID: "silent-fault", destination: "scratchpad"
+            channelCount: 1, inputDeviceUID: "silent-fault", destination: destination.rawValue
         ))
         #expect(active.writer.enqueue(Array(repeating: 0, count: 8_001)) == .accepted)
         try await waitForCommittedSegment(store: store, captureID: captureID)
@@ -530,7 +665,10 @@ final class RecordingDurabilityHarness: @unchecked Sendable {
         return captureID
     }
 
-    private func injectCancellation(_ boundary: PersistentFaultBoundary) async throws -> UUID {
+    private func injectCancellation(
+        _ boundary: PersistentFaultBoundary,
+        destination: Destination
+    ) async throws -> UUID {
         let captureID = UUID()
         let directory = recoveryRoot.appendingPathComponent(captureID.uuidString, isDirectory: true)
         let store = try TranscriptionJobStore(databaseURL: jobsDatabase, clock: SystemJobClock())
@@ -542,7 +680,7 @@ final class RecordingDurabilityHarness: @unchecked Sendable {
         let active = try await service.prepare(.init(
             id: captureID, directory: directory, capturedAt: Date(), sampleRate: 16_000,
             channelCount: 1, inputDeviceUID: "cancel-fault",
-            destination: boundary.rawValue.hashValue.isMultiple(of: 2) ? "external" : "scratchpad"
+            destination: destination.rawValue
         ))
         #expect(active.writer.enqueue(Array(repeating: 0.25, count: 8_001)) == .accepted)
         _ = try await service.finish(active)
@@ -571,8 +709,8 @@ final class RecordingDurabilityHarness: @unchecked Sendable {
         return captureID
     }
 
-    func createInterruptedCancellation() async throws -> UUID {
-        let captureID = try await interrupt(destination: .external, at: .stagedCanonical)
+    func createInterruptedCancellation(destination: Destination) async throws -> UUID {
+        let captureID = try await interrupt(destination: destination, at: .stagedCanonical)
         let store = try TranscriptionJobStore(databaseURL: jobsDatabase, clock: SystemJobClock())
         let session = try #require(try await store.session(id: captureID))
         try await store.transition(
@@ -718,52 +856,56 @@ final class RecordingDurabilityHarness: @unchecked Sendable {
         let processCalls = LockedInteger()
         let audioLoads = LockedInteger()
         let clock = InvariantJobClock(Date(timeIntervalSince1970: 10_000))
-        let staleStore = try TranscriptionJobStore(
-            databaseURL: jobsDatabase, clock: clock
-        )
-        try await staleStore.transition(
-            captureID, from: .processing,
-            to: .failed(.init(stage: .persisting, message: "stale runner"))
-        )
-        try await staleStore.transition(captureID, from: .failed, to: .queued)
-        _ = try await staleStore.claimQueuedJob(
-            captureID, kind: .recovery, owner: UUID(), leaseDuration: -1
-        )
+        do {
+            let staleStore = try TranscriptionJobStore(
+                databaseURL: jobsDatabase, clock: clock
+            )
+            try await staleStore.transition(
+                captureID, from: .processing,
+                to: .failed(.init(stage: .persisting, message: "stale runner"))
+            )
+            try await staleStore.transition(captureID, from: .failed, to: .queued)
+            _ = try await staleStore.claimQueuedJob(
+                captureID, kind: .recovery, owner: UUID(), leaseDuration: -1
+            )
+        }
         clock.advance(2)
-        let store = try TranscriptionJobStore(databaseURL: jobsDatabase, clock: clock)
-        #expect(try await store.recoverStaleJobs(kind: .recovery) == 1)
-        let libraryPath = libraryDatabase
-        let root = recoveryRoot
-        let pipeline = RecoveryRetryPipeline(
-            directory: recoveryRoot,
-            store: store,
-            loadSamples: { _ in audioLoads.increment(); return [] },
-            processDictation: { _, _, _ in
-                processCalls.increment()
-                return RecoveryDictation(
-                    language: "en", template: "Default", transcript: "unexpected",
-                    refined: "unexpected", engine: "unexpected"
-                )
-            },
-            libraryDictationID: { id in
-                try Database(path: libraryPath).dictations(captureID: id).first?.id
-            },
-            finalizeJournalCapture: { id, _ in
-                guard let job = try await store.job(id: id) else { return false }
-                try await RecoveryCaptureService(
-                    directory: root, store: store, ledger: store,
-                    libraryDictationID: { capture in
-                        try Database(path: libraryPath).dictations(captureID: capture).first?.id
-                    }
-                ).completeJournalCapture(
-                    .init(id: job.id, source: job.source), captureID: id
-                )
-                return true
-            }
-        )
-        try await pipeline.execute(
-            jobID: captureID, configuration: .init(), cancellation: CancellationToken()
-        )
+        do {
+            let store = try TranscriptionJobStore(databaseURL: jobsDatabase, clock: clock)
+            #expect(try await store.recoverStaleJobs(kind: .recovery) == 1)
+            let libraryPath = libraryDatabase
+            let root = recoveryRoot
+            let pipeline = RecoveryRetryPipeline(
+                directory: recoveryRoot,
+                store: store,
+                loadSamples: { _ in audioLoads.increment(); return [] },
+                processDictation: { _, _, _ in
+                    processCalls.increment()
+                    return RecoveryDictation(
+                        language: "en", template: "Default", transcript: "unexpected",
+                        refined: "unexpected", engine: "unexpected"
+                    )
+                },
+                libraryDictationID: { id in
+                    try Database(path: libraryPath).dictations(captureID: id).first?.id
+                },
+                finalizeJournalCapture: { id, _ in
+                    guard let job = try await store.job(id: id) else { return false }
+                    try await RecoveryCaptureService(
+                        directory: root, store: store, ledger: store,
+                        libraryDictationID: { capture in
+                            try Database(path: libraryPath).dictations(captureID: capture).first?.id
+                        }
+                    ).completeJournalCapture(
+                        .init(id: job.id, source: job.source), captureID: id
+                    )
+                    return true
+                }
+            )
+            try await pipeline.execute(
+                jobID: captureID, configuration: .init(), cancellation: CancellationToken()
+            )
+        }
         _ = try await reopenAndReconcile(captureID: captureID)
         let evidence = try await reopenAndReconcile(captureID: captureID)
         return RetryResult(
@@ -824,6 +966,8 @@ private final class PersistentFaultFileSystem: JournalFileSystem, @unchecked Sen
     private var canonicalRenameObserved = false
     private var silentSegmentRemoved = false
     private var cancelledDirectoryRemoved = false
+    private var mediaRemovalDirectory: URL?
+    private var eventStorage: [String] = []
 
     init(base: any JournalFileSystem, boundary: PersistentFaultBoundary) {
         self.base = base
@@ -832,10 +976,12 @@ private final class PersistentFaultFileSystem: JournalFileSystem, @unchecked Sen
     }
 
     func arm() { lock.withLock { armed = true } }
+    var events: [String] { lock.withLock { eventStorage } }
     private func fire(_ candidate: PersistentFaultBoundary) throws {
         let shouldThrow = lock.withLock { () -> Bool in
             guard armed, boundary == candidate else { return false }
             armed = false
+            eventStorage.append("fault:\(candidate.rawValue)")
             return true
         }
         if shouldThrow { throw PersistentInjectedFault(boundary: boundary) }
@@ -871,12 +1017,16 @@ private final class PersistentFaultFileSystem: JournalFileSystem, @unchecked Sen
     }
     func synchronizeDirectory(_ url: URL) throws {
         try base.synchronizeDirectory(url)
+        lock.withLock { eventStorage.append("directory-sync:\(url.standardizedFileURL.path)") }
         try fire(.prepareParentSync)
         if boundary == .segmentDirectorySync,
            lock.withLock({ segmentRenameObserved }) { try fire(.segmentDirectorySync) }
         if boundary == .canonicalDirectorySync,
            lock.withLock({ canonicalRenameObserved }) { try fire(.canonicalDirectorySync) }
-        if boundary == .sessionDirectorySync { try fire(.sessionDirectorySync) }
+        if boundary == .sessionDirectorySync,
+           lock.withLock({ mediaRemovalDirectory == url.standardizedFileURL }) {
+            try fire(.sessionDirectorySync)
+        }
         if boundary == .silentDirectorySync,
            lock.withLock({ silentSegmentRemoved }) { try fire(.silentDirectorySync) }
         if boundary == .cancelParentSync,
@@ -887,10 +1037,20 @@ private final class PersistentFaultFileSystem: JournalFileSystem, @unchecked Sen
     func remove(_ url: URL) throws {
         try base.remove(url)
         if url.pathExtension == "wav", url.lastPathComponent.hasPrefix("segment-") {
-            lock.withLock { silentSegmentRemoved = true }
+            lock.withLock {
+                silentSegmentRemoved = true
+                mediaRemovalDirectory = url.deletingLastPathComponent().standardizedFileURL
+                eventStorage.append("media-remove:\(mediaRemovalDirectory!.path)")
+            }
             try fire(.segmentRemove)
             try fire(.silentSegmentRemove)
-        } else if url.pathExtension == "wav" { try fire(.canonicalRemove) }
+        } else if url.pathExtension == "wav" {
+            lock.withLock {
+                mediaRemovalDirectory = url.deletingLastPathComponent().standardizedFileURL
+                eventStorage.append("media-remove:\(mediaRemovalDirectory!.path)")
+            }
+            try fire(.canonicalRemove)
+        }
         else {
             lock.withLock { cancelledDirectoryRemoved = true }
             try fire(.cancelDirectoryRemove)

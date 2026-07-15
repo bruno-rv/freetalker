@@ -147,12 +147,7 @@ struct FluidAudioBackend: SpeakerDiarizationBackend {
         }
     }
 
-    private static let defaultModelsDirectory = FileManager.default.urls(
-        for: .applicationSupportDirectory,
-        in: .userDomainMask
-    )[0]
-        .appendingPathComponent("FreeTalker", isDirectory: true)
-        .appendingPathComponent("models/fluidaudio", isDirectory: true)
+    private static let defaultModelsDirectory = FreeTalkerPaths.fluidAudioModels
 }
 
 typealias LocalFluidAudioDiarizer = FluidAudioDiarizer<FluidAudioBackend>

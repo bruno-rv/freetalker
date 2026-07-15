@@ -21,45 +21,57 @@ confirmed journal segment.
    mkdir -m 700 /Volumes/FreeTalkerSmoke/session
    ```
 
-2. Build and launch the DEBUG executable with both isolation opt-ins. Release
-   builds ignore these variables, relative paths fail closed, and roots outside
-   a mounted `/Volumes/...` volume fail closed:
+2. Build the DEBUG executable and define the only supported launch and isolation
+   verification commands. Release builds ignore these variables, relative paths
+   fail closed, and roots outside a real mounted `/Volumes/...` volume fail
+   closed:
 
    ```zsh
    DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build
-   env FREETALKER_ALLOW_ISOLATED_SMOKE=1 \
-     FREETALKER_SMOKE_ROOT=/Volumes/FreeTalkerSmoke/session \
-     .build/debug/FreeTalker &
-   APP_PID=$!
+   SMOKE_ROOT=/Volumes/FreeTalkerSmoke/session
+   launch_smoke() {
+     env FREETALKER_ALLOW_ISOLATED_SMOKE=1 \
+       FREETALKER_SMOKE_ROOT="$SMOKE_ROOT" \
+       .build/debug/FreeTalker &
+     APP_PID=$!
+     for _ in {1..100}; do
+       kill -0 "$APP_PID" 2>/dev/null || return 1
+       test -e "$SMOKE_ROOT/jobs.db" -a -e "$SMOKE_ROOT/library.db" && break
+       sleep 0.1
+     done
+   }
+   verify_smoke_root() {
+     test "$(stat -f '%m' "$SMOKE_ROOT")" = /Volumes/FreeTalkerSmoke
+     lsof -p "$APP_PID" | grep -F "$SMOKE_ROOT/jobs.db"
+     lsof -p "$APP_PID" | grep -F "$SMOKE_ROOT/library.db"
+     sqlite3 "$SMOKE_ROOT/jobs.db" '.databases' | grep -F "$SMOKE_ROOT/jobs.db"
+     sqlite3 "$SMOKE_ROOT/library.db" '.databases' | grep -F "$SMOKE_ROOT/library.db"
+   }
+   relaunch_and_verify() { launch_smoke && verify_smoke_root; }
+   relaunch_and_verify
    ```
 
-3. Verify isolation before recording. Stop immediately if either database is
-   outside the sparse image:
-
-   ```zsh
-   lsof -p "$APP_PID" | grep '/Volumes/FreeTalkerSmoke/session'
-   test -e /Volumes/FreeTalkerSmoke/session/jobs.db
-   test -e /Volumes/FreeTalkerSmoke/session/library.db
-   sqlite3 /Volumes/FreeTalkerSmoke/session/jobs.db '.databases'
-   sqlite3 /Volumes/FreeTalkerSmoke/session/library.db '.databases'
-   ```
+3. The launch is invalid unless `verify_smoke_root` succeeds. Stop immediately
+   if either database is outside the sparse image. Run `relaunch_and_verify`
+   after every clean quit or force-quit in this protocol; a bare `open`, direct
+   executable launch, or Finder relaunch does not preserve isolation.
 
 4. Back up both isolated databases before lock/corruption tests, after quitting
-   the app cleanly:
+   the app cleanly, then perform the exact isolated relaunch and verification:
 
    ```zsh
    kill "$APP_PID"; wait "$APP_PID" 2>/dev/null || true
-   sqlite3 /Volumes/FreeTalkerSmoke/session/jobs.db \
-     ".backup '/Volumes/FreeTalkerSmoke/jobs.backup.db'"
-   sqlite3 /Volumes/FreeTalkerSmoke/session/library.db \
-     ".backup '/Volumes/FreeTalkerSmoke/library.backup.db'"
+   sqlite3 "$SMOKE_ROOT/jobs.db" ".backup '/Volumes/FreeTalkerSmoke/jobs.backup.db'"
+   sqlite3 "$SMOKE_ROOT/library.db" ".backup '/Volumes/FreeTalkerSmoke/library.backup.db'"
+   relaunch_and_verify
    ```
-3. Connect a known-good microphone. In System Settings, confirm FreeTalker has
+
+5. Connect a known-good microphone. In System Settings, confirm FreeTalker has
    Microphone and Accessibility permission.
-4. Open **Library → Recoveries** and note its initial rows. Record the app
+6. Open **Library → Recoveries** and note its initial rows. Record the app
    version, macOS version, input device, destination, timestamps, and screenshots
    before and after every relaunch.
-5. For each capture, save its Recovery message, exported file hash and duration,
+7. For each capture, save its Recovery message, exported file hash and duration,
    Library row count, and any recovery-health message. A non-empty accepted
    External or Scratchpad capture must always have at least one owner: active
    journal evidence, a visible Recovery, or one Library row.
@@ -91,21 +103,20 @@ boundary. Do not press Cancel or Escape first.
    can be retried or exported, or is already present exactly once in Library.
 2. Repeat with Scratchpad. Confirm the same ownership invariant and that a
    successful retry restores the intended Scratchpad result.
-3. For repeatable processing boundaries, launch the isolated DEBUG executable
-   under LLDB and set regex breakpoints on real functions (no hidden pause hook
-   is assumed):
+3. For exact processing and cleanup boundaries, first quit the normally launched
+   app, then launch the isolated DEBUG executable under LLDB using the stable
+   DEBUG-only checkpoint symbol:
 
    ```zsh
    lldb .build/debug/FreeTalker
-   (lldb) settings set target.env-vars FREETALKER_ALLOW_ISOLATED_SMOKE=1 FREETALKER_SMOKE_ROOT=/Volumes/FreeTalkerSmoke/session
-   (lldb) breakpoint set -r 'RecoveryRetryPipeline.*execute'
-   (lldb) breakpoint set -r 'RecoveryCaptureService.*completeJournalCapture'
-   (lldb) breakpoint set -r 'RecoveryCaptureService.*cleanupLibraryCommittedSession'
+   (lldb) settings set target.env-vars FREETALKER_ALLOW_ISOLATED_SMOKE=1 FREETALKER_SMOKE_ROOT=/Volumes/FreeTalkerSmoke/session FREETALKER_SMOKE_CHECKPOINTS=post-job-create,post-library-insert,post-library-committed,delete-claim,cancel-intent
+   (lldb) breakpoint set --name freetalker_smoke_checkpoint
    (lldb) run
    ```
 
-   When the chosen breakpoint stops, obtain the exact process ID with
-   `process status`, then terminate from a second Terminal only after verifying
+   At each stop, use `frame variable name` to read the checkpoint C string.
+   Continue until the named boundary under test, obtain the exact PID with
+   `process status`, and terminate from a second Terminal only after verifying
    there is exactly one FreeTalker process:
 
    ```zsh
@@ -114,25 +125,29 @@ boundary. Do not press Cancel or Escape first.
    kill -9 "$PIDS[1]"
    ```
 
-   Repeat after job creation/lease, Library insert, `libraryCommitted`, and
-   cleanup. If symbol breakpoints are unavailable, mark the stage **not
-   executed** rather than estimating timing.
+   Detach the dead LLDB process, then run `relaunch_and_verify` before inspecting
+   Recoveries or Library. Repeat at `post-job-create`, `post-library-insert`,
+   `post-library-committed`, `delete-claim`, and `cancel-intent`. The checkpoint
+   is inert unless DEBUG isolation resolves to the exact configured root, and
+   the symbol is absent from release builds.
 4. Launch FreeTalker twice during recovery setup. Confirm setup/reconciliation is
    single-flight, the stale runner stops, and one visible result remains.
 
 ## Recovery actions and ownership
 
-1. On a valid Recovery, choose Retry Processing. Relaunch once during retry if a
-   deterministic test hook is available. Confirm one Library row at most.
+1. On a valid Recovery, choose Retry Processing. Stop at the
+   `post-library-insert` checkpoint, kill the exact PID, then run
+   `relaunch_and_verify`. Confirm one Library row at most.
 2. Export a valid Recovery to a new destination. Verify the exported WAV opens,
    has non-zero duration and audible content, and record its SHA-256 hash.
 3. Delete the source Recovery. Confirm the independently exported copy remains
    readable and unchanged.
 4. On a damaged/quarantined row, confirm only safe actions are offered. Export
    Artifact must never expose an outside-root or symbolic-link target.
-5. Delete a recoverable row and relaunch during cleanup if a pause hook exists.
-   Confirm durable disposition/claim intent prevents resurrection. Confirm
-   automatic retention never removes the last recoverable copy.
+5. Delete a recoverable row. Stop at `delete-claim`, kill the exact PID, then run
+   `relaunch_and_verify`. Confirm durable disposition/claim intent prevents
+   resurrection. Confirm automatic retention never removes the last recoverable
+   copy.
 
 ## Legacy and orphan inventory
 
@@ -182,12 +197,16 @@ confirm content-hash and lineage deduplication creates no duplicate row.
    restore the SQLite backup. Never run these commands against `~/Library`:
 
    ```zsh
+   kill -9 "$APP_PID"; wait "$APP_PID" 2>/dev/null || true
    printf 'corrupt-test-only\n' > /Volumes/FreeTalkerSmoke/session/jobs.db
    rm -f /Volumes/FreeTalkerSmoke/session/jobs.db-{wal,shm}
-   # relaunch, capture the unavailable-health evidence, quit again
+   relaunch_and_verify
+   # capture the unavailable-health evidence, then quit the isolated app
+   kill "$APP_PID"; wait "$APP_PID" 2>/dev/null || true
    cp /Volumes/FreeTalkerSmoke/jobs.backup.db \
      /Volumes/FreeTalkerSmoke/session/jobs.db
    chmod 600 /Volumes/FreeTalkerSmoke/session/jobs.db
+   relaunch_and_verify
    ```
 
    On disposable copies only, corrupt one store/artifact. Confirm store-wide
@@ -197,11 +216,12 @@ confirm content-hash and lineage deduplication creates no duplicate row.
 
 ## Explicit cancellation
 
-1. Start External recording, speak past one segment, press Escape/Cancel, and
-   immediately relaunch during cleanup if a test hook exists. Confirm the
-   persisted cancellation intent resumes and neither Recovery nor Library
-   resurrects the intentionally discarded capture.
-2. Repeat in Scratchpad.
+1. Start External recording, speak past one segment, press Escape/Cancel, stop
+   at `cancel-intent`, kill the exact PID, then run `relaunch_and_verify`.
+   Confirm the persisted cancellation intent resumes and neither Recovery nor
+   Library resurrects the intentionally discarded capture.
+2. Repeat the same `cancel-intent` checkpoint, exact-PID kill, and
+   `relaunch_and_verify` sequence in Scratchpad.
 3. Voice Edit is intentionally transient and is outside this durability
    guarantee; Escape/Cancel there discards the edit workflow as designed.
 
@@ -215,7 +235,7 @@ confirm content-hash and lineage deduplication creates no duplicate row.
   Retry Processing action.
 - Retry, Export, Delete, retention, legacy import, health retry, and explicit
   cancellation converge after relaunch without deleting an uncommitted last copy.
-- Record unexecuted hardware- or hook-dependent steps explicitly; do not report
+- Record unexecuted hardware-dependent steps explicitly; do not report
   this protocol as passed unless every required executable step was observed.
 
 Finally quit FreeTalker, remove only the test image, and detach it:
