@@ -87,6 +87,35 @@ struct RecoveryImportDispositionStore: Sendable {
         try commitExact(payload(descriptor), to: dispositionURL(descriptor))
     }
 
+    func registerOwnedSource(id: UUID, source: URL) throws {
+        let descriptor = try descriptor(
+            id: id, source: source, defaultScope: .capture(id)
+        )
+        try commitExact(
+            ownershipPayload(
+                id: id, path: source.standardizedFileURL.path,
+                hash: descriptor.contentHash
+            ),
+            to: ownershipURL(id: id)
+        )
+    }
+
+    func ownsSource(id: UUID, source: URL, requireCurrentHash: Bool = true) throws -> Bool {
+        let marker = ownershipURL(id: id)
+        guard codec.fileSystem.exists(marker) else { return false }
+        let fields = String(decoding: try codec.fileSystem.read(marker), as: UTF8.self)
+            .split(separator: "\n", omittingEmptySubsequences: false)
+        guard fields.count == 4, fields[0] == "v1", fields[1] == id.uuidString,
+              fields[2] == source.standardizedFileURL.path else { return false }
+        let hash = String(fields[3])
+        guard hash.count == 64, hash.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else {
+            return false
+        }
+        if requireCurrentHash, try codec.hashFile(source) != hash { return false }
+        guard let descriptor = try descriptor(id: id) else { return false }
+        return descriptor.id == id && descriptor.contentHash == hash
+    }
+
     func descriptor(
         id: UUID, source: URL, defaultScope: RecoveryImportScope
     ) throws -> RecoveryImportDescriptor {
@@ -163,6 +192,14 @@ struct RecoveryImportDispositionStore: Sendable {
                 ".recovery-disposition-capture-\(id.uuidString)-\(descriptor.contentHash).marker"
             )
         }
+    }
+
+    private func ownershipURL(id: UUID) -> URL {
+        directory.appendingPathComponent(".recovery-ownership-\(id.uuidString).marker")
+    }
+
+    private func ownershipPayload(id: UUID, path: String, hash: String) -> Data {
+        Data("v1\n\(id.uuidString)\n\(path)\n\(hash)".utf8)
     }
 
     private func payload(_ descriptor: RecoveryImportDescriptor) -> Data {

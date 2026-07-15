@@ -121,6 +121,7 @@ struct RecoveryCaptureService: Sendable {
             source: staged.source,
             capturedAt: staged.capturedAt
         )
+        try registerOwnership(id: job.id, source: URL(fileURLWithPath: job.source.reference))
         if FileManager.default.fileExists(atPath: staged.marker.path) {
             try FileManager.default.removeItem(at: staged.marker)
         }
@@ -304,9 +305,17 @@ struct RecoveryCaptureService: Sendable {
     }
 
     func preserve(samples: [Float], metadata: RecoveryMetadata) async throws -> UUID {
-        try await writeCapture(samples: samples) { source in
+        let job = try await writeCapture(samples: samples) { source in
             try await store.createRecovery(source: source, metadata: metadata)
-        }.id
+        }
+        try registerOwnership(id: job.id, source: URL(fileURLWithPath: job.source.reference))
+        return job.id
+    }
+
+    private func registerOwnership(id: UUID, source: URL) throws {
+        try RecoveryImportDispositionStore(
+            directory: directory, fileSystem: journalFileSystem
+        ).registerOwnedSource(id: id, source: source)
     }
 
     private func writeCapture(

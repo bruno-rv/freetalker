@@ -129,7 +129,9 @@ final class JobLibraryStore: ObservableObject {
                 recoveryRoot: recoveryDirectory
             )
         }
-        let represented = Set(projected.map(\.id))
+        let represented = Set(captureRows.flatMap { session in
+            [session.id, session.recoveryJobID].compactMap { $0 }
+        })
         projected += recoveryJobs.compactMap { job in
             guard !represented.contains(job.id) else { return nil }
             return RecoveryItem(session: nil, job: job, recoveryRoot: recoveryDirectory)
@@ -164,10 +166,11 @@ final class JobLibraryStore: ObservableObject {
         guard newlyClaimed || alreadyClaimed else {
             throw JobStoreError.invalidTransition
         }
-        _ = try await RecoveryRetentionService(
+        let result = try await RecoveryRetentionService(
             directory: recoveryDirectory, store: store, ledger: store
         )
-            .purgeExpired(now: Date(), retention: .never)
+            .purgeClaim(id: id)
+        guard result.deletedJobIDs.contains(id) else { throw JobStoreError.invalidTransition }
         try await refresh()
     }
 
@@ -219,7 +222,7 @@ final class JobLibraryStore: ObservableObject {
                     .standardizedFileURL
             && diagnosticValues?.isRegularFile == true
             && diagnosticValues?.isSymbolicLink != true
-        guard let retained = item.artifactURL
+        guard let retained = item.artifactURL ?? item.audioURL
                 ?? (validDiagnostics ? diagnostics : nil) else {
             throw CaptureJournalError.failed("Recovery has no owned artifact to dispose")
         }

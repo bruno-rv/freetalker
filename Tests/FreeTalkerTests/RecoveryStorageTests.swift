@@ -232,8 +232,8 @@ import Testing
         #expect(job.state == .failed(.init(stage: .transcribing, message: "no speech")))
         #expect(FileManager.default.fileExists(atPath: job.source.reference))
         let files = try FileManager.default.contentsOfDirectory(at: fixture.directory, includingPropertiesForKeys: nil)
-        #expect(files.count == 1)
-        #expect(files[0].pathExtension == "wav")
+        let audioFiles = files.filter { $0.pathExtension == "wav" }
+        #expect(audioFiles.count == 1)
         #expect(try Data(contentsOf: URL(fileURLWithPath: job.source.reference)).prefix(4) == Data("RIFF".utf8))
     }
 
@@ -337,6 +337,47 @@ import Testing
         #expect(!FileManager.default.fileExists(atPath: committedDirectory.path))
         #expect(try await fixture.store.job(id: failedID) != nil)
         #expect(FileManager.default.fileExists(atPath: failedSource))
+    }
+
+    @Test func claimedDeletesConvergeBeforeUnrelatedMalformedCommittedCleanupFailure() async throws {
+        let fixture = try RecoveryFixture()
+        let first = try await fixture.failedRecovery(createdAt: .distantPast)
+        let second = try await fixture.failedRecovery(createdAt: .distantPast)
+        let firstSource = try #require(try await fixture.store.job(id: first)).source.reference
+        let secondSource = try #require(try await fixture.store.job(id: second)).source.reference
+        #expect(try await fixture.store.claimRecoveryForDeletion(id: first, claimedAt: Date()))
+        #expect(try await fixture.store.claimRecoveryForDeletion(id: second, claimedAt: Date()))
+        let malformedID = UUID()
+        let malformedDirectory = fixture.temp.url.appendingPathComponent("malformed", isDirectory: true)
+        try FileManager.default.createDirectory(at: malformedDirectory, withIntermediateDirectories: false)
+        _ = try await fixture.store.createCapture(.init(
+            id: malformedID, directory: malformedDirectory, capturedAt: Date(),
+            sampleRate: 16_000, channelCount: 1, inputDeviceUID: nil,
+            destination: "external"
+        ))
+        try await fixture.store.transition(
+            id: malformedID, from: .capturing, to: .libraryCommitted,
+            recoveryJobID: nil, libraryDictationID: 7, assetKind: .audio,
+            failureMessage: nil, contentHash: nil
+        )
+
+        await #expect(throws: RecoveryFinalizationError.captureIdentityMismatch) {
+            _ = try await RecoveryRetentionService(
+                directory: fixture.directory, store: fixture.store, ledger: fixture.store
+            ).purgeExpired(now: Date(), retention: .never)
+        }
+
+        let reopened = try TranscriptionJobStore(
+            databaseURL: fixture.temp.url.appendingPathComponent("jobs.sqlite"),
+            clock: SystemJobClock()
+        )
+        #expect(try await reopened.job(id: first) == nil)
+        #expect(try await reopened.job(id: second) == nil)
+        #expect(try await reopened.claimedRecoveries().isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: firstSource))
+        #expect(!FileManager.default.fileExists(atPath: secondSource))
+        #expect(try await reopened.session(id: malformedID)?.state == .libraryCommitted)
+        #expect(FileManager.default.fileExists(atPath: malformedDirectory.path))
     }
 
     @Test func neverRetentionDoesNothing() async throws {
@@ -523,6 +564,8 @@ import Testing
         let owned = linkedRoot.appendingPathComponent("\(UUID().uuidString).wav")
         try Data("owned".utf8).write(to: owned)
         let job = try await store.createRecovery(source: .init(reference: owned.path), metadata: .init(capturedAt: .distantPast, failure: .init(stage: .transcribing, message: "x")))
+        try RecoveryImportDispositionStore(directory: linkedRoot)
+            .registerOwnedSource(id: job.id, source: owned)
         #expect(try await store.claimRecoveryForDeletion(id: job.id, claimedAt: Date()))
 
         _ = try await RecoveryRetentionService(directory: linkedRoot, store: store)
@@ -776,12 +819,21 @@ private final class RecoveryFixture: @unchecked Sendable {
         let created = try await store.create(kind: .recovery, source: .init(reference: sourceReference), now: createdAt)
         try await store.transition(created.id, from: .queued, to: .processing(stage: .preparing))
         try await store.transition(created.id, from: .processing, to: .failed(.init(stage: .transcribing, message: "failed")))
+        let source = URL(fileURLWithPath: sourceReference)
+        let values = try? source.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+        if source.deletingLastPathComponent().standardizedFileURL == directory.standardizedFileURL,
+           values?.isRegularFile == true, values?.isSymbolicLink != true,
+           (try? CaptureSegmentCodec(fileSystem: LocalJournalFileSystem()).hashFile(source)) != nil {
+            try RecoveryImportDispositionStore(directory: directory)
+                .registerOwnedSource(id: created.id, source: source)
+        }
         return created.id
     }
 
     func job(kind: JobKind, state: JobState, createdAt: Date) async throws -> UUID {
-        let path = directory.appendingPathComponent("\(UUID().uuidString).wav").path
-        try Data("audio".utf8).write(to: URL(fileURLWithPath: path))
+        let source = directory.appendingPathComponent("\(UUID().uuidString).wav")
+        let path = source.path
+        try Data("audio".utf8).write(to: source)
         let created = try await store.create(kind: kind, source: .init(reference: path), now: createdAt)
         if state != .queued {
             if state.kind == .cancelled { try await store.transition(created.id, from: .queued, to: state) }
@@ -789,6 +841,10 @@ private final class RecoveryFixture: @unchecked Sendable {
                 try await store.transition(created.id, from: .queued, to: .processing(stage: .preparing))
                 try await store.transition(created.id, from: .processing, to: state)
             }
+        }
+        if kind == .recovery {
+            try RecoveryImportDispositionStore(directory: directory)
+                .registerOwnedSource(id: created.id, source: source)
         }
         return created.id
     }

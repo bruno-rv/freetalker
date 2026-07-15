@@ -376,6 +376,9 @@ import Testing
         let job = try await fixture.makeFailedRecovery()
         try WAVEncoder.encode(samples: [0.2], sampleRate: 16_000)
             .write(to: URL(fileURLWithPath: job.source.reference))
+        let source = URL(fileURLWithPath: job.source.reference)
+        try RecoveryImportDispositionStore(directory: fixture.database.directory)
+            .registerOwnedSource(id: job.id, source: source)
         let library = JobLibraryStore(
             store: fixture.store,
             recoveryDirectory: fixture.database.directory,

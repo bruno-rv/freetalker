@@ -76,6 +76,89 @@ import Testing
         #expect(library.startNewRecording(id: id))
         #expect(calls == 1)
     }
+
+    @Test @MainActor func crossIdentityJobSourceCannotExportOrDeleteAnotherRecoveryAudio() async throws {
+        let fixture = try RecoveryActionFixture()
+        let first = try await fixture.failedRecovery(samples: [0.15])
+        let second = try await fixture.failedRecovery(samples: [0.15])
+        try await fixture.store.updateRecoverySource(
+            id: first.id, expectedSourceReference: first.source.reference,
+            source: second.source
+        )
+        let library = JobLibraryStore(store: fixture.store, recoveryDirectory: fixture.root)
+        try await library.refresh()
+
+        let corrupted = try #require(library.recoveryItems.first { $0.id == first.id })
+        #expect(corrupted.audioURL == nil)
+        #expect(corrupted.availableActions == [.delete])
+        await #expect(throws: Error.self) {
+            try await library.delete(id: first.id)
+        }
+        #expect(FileManager.default.fileExists(atPath: second.source.reference))
+        #expect(try await fixture.store.job(id: second.id) != nil)
+    }
+
+    @Test @MainActor func libraryCommittedSessionIdentitySuppressesFallbackJobProjection() async throws {
+        let fixture = try RecoveryActionFixture()
+        let job = try await fixture.failedRecovery()
+        let directory = fixture.root.appendingPathComponent(job.id.uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        _ = try await fixture.store.createCapture(.init(
+            id: job.id, directory: directory, capturedAt: Date(), sampleRate: 16_000,
+            channelCount: 1, inputDeviceUID: nil, destination: "external"
+        ))
+        try await fixture.store.transition(
+            id: job.id, from: .capturing, to: .libraryCommitted,
+            recoveryJobID: job.id, libraryDictationID: 42, assetKind: .audio,
+            failureMessage: nil, contentHash: nil
+        )
+        let library = JobLibraryStore(store: fixture.store, recoveryDirectory: fixture.root)
+
+        try await library.refresh()
+
+        #expect(!library.recoveryItems.contains { $0.id == job.id })
+    }
+
+    @Test @MainActor func stagedLedgerOnlyAudioCanExportAndDeleteAcrossReopen() async throws {
+        let fixture = try RecoveryActionFixture()
+        let id = try await fixture.stagedCapture()
+        let library = JobLibraryStore(store: fixture.store, recoveryDirectory: fixture.root)
+        try await library.refresh()
+        let item = try #require(library.recoveryItems.first { $0.id == id })
+        #expect(item.availableActions == [.exportAudio, .delete])
+
+        try await library.delete(id: id)
+
+        let reopened = try TranscriptionJobStore(databaseURL: fixture.database, clock: SystemJobClock())
+        #expect(try await reopened.session(id: id) == nil)
+        #expect(!FileManager.default.fileExists(atPath: fixture.root.appendingPathComponent(id.uuidString).path))
+    }
+
+    @Test @MainActor func directDeleteIsNotBlockedByUnrelatedMalformedCommittedSession() async throws {
+        let fixture = try RecoveryActionFixture()
+        let target = try await fixture.failedRecovery()
+        let targetSource = target.source.reference
+        let malformedID = UUID()
+        let outside = fixture.temp.url.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: false)
+        _ = try await fixture.store.createCapture(.init(
+            id: malformedID, directory: outside, capturedAt: Date(), sampleRate: 16_000,
+            channelCount: 1, inputDeviceUID: nil, destination: "external"
+        ))
+        try await fixture.store.transition(
+            id: malformedID, from: .capturing, to: .libraryCommitted,
+            recoveryJobID: nil, libraryDictationID: 4, assetKind: .audio,
+            failureMessage: nil, contentHash: nil
+        )
+        let library = JobLibraryStore(store: fixture.store, recoveryDirectory: fixture.root)
+        try await library.refresh()
+
+        try await library.delete(id: target.id)
+
+        #expect(try await fixture.store.job(id: target.id) == nil)
+        #expect(!FileManager.default.fileExists(atPath: targetSource))
+        #expect(try await fixture.store.session(id: malformedID)?.state == .libraryCommitted)
+    }
 }
 
 private final class RecoveryActionFixture: @unchecked Sendable {
@@ -126,13 +209,34 @@ private final class RecoveryActionFixture: @unchecked Sendable {
         return id
     }
 
-    func failedRecovery() async throws -> TranscriptionJob {
+    func stagedCapture() async throws -> UUID {
+        let id = UUID()
+        let directory = root.appendingPathComponent(id.uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        let canonical = directory.appendingPathComponent("\(id.uuidString).wav")
+        try WAVEncoder.encode(samples: [0.2], sampleRate: 16_000).write(to: canonical)
+        _ = try await store.createCapture(.init(
+            id: id, directory: directory, capturedAt: Date(), sampleRate: 16_000,
+            channelCount: 1, inputDeviceUID: nil, destination: "external"
+        ))
+        try await store.transition(
+            id: id, from: .capturing, to: .staged, recoveryJobID: nil,
+            libraryDictationID: nil, assetKind: .audio,
+            failureMessage: nil, contentHash: nil
+        )
+        return id
+    }
+
+    func failedRecovery(samples: [Float] = [0.2, -0.1]) async throws -> TranscriptionJob {
         let source = root.appendingPathComponent("\(UUID().uuidString).wav")
-        try WAVEncoder.encode(samples: [0.2, -0.1], sampleRate: 16_000).write(to: source)
-        return try await store.createRecovery(
+        try WAVEncoder.encode(samples: samples, sampleRate: 16_000).write(to: source)
+        let job = try await store.createRecovery(
             source: .init(reference: source.path),
             metadata: .init(capturedAt: Date(), failure: .init(stage: .transcribing, message: "Offline"))
         )
+        try RecoveryImportDispositionStore(directory: root)
+            .registerOwnedSource(id: job.id, source: source)
+        return job
     }
 }
 

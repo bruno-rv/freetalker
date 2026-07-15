@@ -39,10 +39,25 @@ struct RecoveryRetentionService: Sendable {
         let claims = try await store.claimedRecoveries()
         // Recovery audio is never age-expired. A claim is created only by an explicit
         // user Delete action; this method resumes those durable claims after interruption.
+        let result = try await purge(claims)
         try await cleanupLibraryCommittedSessions()
+        return result
+    }
+
+    func purgeClaim(id: UUID) async throws -> PurgeResult {
+        let claims = try await store.claimedRecoveries().filter { $0.id == id }
+        return try await purge(claims)
+    }
+
+    private func purge(_ claims: [RecoveryPurgeClaim]) async throws -> PurgeResult {
         var deleted: [UUID] = []
         for claim in claims {
-            guard let sourceURL = ownedSourceURL(claim.sourceReference, id: claim.id) else {
+            let validator = RecoveryOwnedArtifactValidator(
+                root: lexicalDirectory, id: claim.id, fileManager: .default
+            )
+            let claimedSource = URL(fileURLWithPath: claim.sourceReference)
+            guard let sourceURL = validator.validArtifact(claimedSource)
+                    ?? validator.ownedMissingArtifact(claimedSource) else {
                 try await store.recordPurgeError(
                     id: claim.id,
                     message: "Recovery source is outside the owned directory"
@@ -122,25 +137,4 @@ struct RecoveryRetentionService: Sendable {
         }
     }
 
-    private func ownedSourceURL(_ reference: String, id: UUID) -> URL? {
-        let source = URL(fileURLWithPath: reference).standardizedFileURL
-        guard source.pathExtension == "wav",
-              UUID(uuidString: source.deletingPathExtension().lastPathComponent) != nil else {
-            return nil
-        }
-        let parent = source.deletingLastPathComponent()
-        let direct = parent == lexicalDirectory
-        let nested = parent.lastPathComponent == id.uuidString
-            && source.deletingPathExtension().lastPathComponent == id.uuidString
-            && parent.deletingLastPathComponent() == lexicalDirectory
-        guard direct || nested else { return nil }
-        let resolvedSource = source.resolvingSymlinksInPath()
-        let resolvedParent = resolvedSource.deletingLastPathComponent()
-        let resolvedDirect = resolvedParent == resolvedDirectory
-        let resolvedNested = resolvedParent.lastPathComponent == id.uuidString
-            && resolvedSource.deletingPathExtension().lastPathComponent == id.uuidString
-            && resolvedParent.deletingLastPathComponent() == resolvedDirectory
-        guard resolvedDirect || resolvedNested else { return nil }
-        return source
-    }
 }

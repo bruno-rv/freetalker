@@ -57,6 +57,7 @@ struct RecoveryItem: Identifiable, Equatable, Sendable {
                 actions.insert(.exportAudio)
                 if case .failed = job?.state { actions.insert(.retryProcessing) }
                 if case .failed = job?.state { actions.insert(.delete) }
+                if job == nil, session?.state == .staged { actions.insert(.delete) }
             } else if case .failed = job?.state {
                 actions.insert(.delete)
             }
@@ -83,7 +84,7 @@ struct RecoveryItem: Identifiable, Equatable, Sendable {
     }
 }
 
-private struct RecoveryOwnedArtifactValidator {
+struct RecoveryOwnedArtifactValidator {
     let root: URL
     let resolvedRoot: URL
     let id: UUID
@@ -110,10 +111,25 @@ private struct RecoveryOwnedArtifactValidator {
 
     func validArtifact(_ url: URL) -> URL? {
         let lexical = url.standardizedFileURL
-        guard isOwnedLexically(lexical), isRegularNonSymlink(lexical) else { return nil }
+        guard hasOwnedIdentity(lexical), isRegularNonSymlink(lexical) else { return nil }
         let resolved = lexical.resolvingSymlinksInPath()
         guard isOwnedResolved(resolved) else { return nil }
         return lexical
+    }
+
+    func ownedMissingArtifact(_ url: URL) -> URL? {
+        let lexical = url.standardizedFileURL
+        guard !fileManager.fileExists(atPath: lexical.path) else { return validArtifact(lexical) }
+        let parent = lexical.deletingLastPathComponent()
+        let nested = parent == root.appendingPathComponent(id.uuidString, isDirectory: true)
+        let direct = parent == root
+        guard nested || direct else { return nil }
+        if nested || UUID(uuidString: lexical.deletingPathExtension().lastPathComponent) == id {
+            return lexical
+        }
+        return (try? RecoveryImportDispositionStore(directory: root).ownsSource(
+            id: id, source: lexical, requireCurrentHash: false
+        )) == true ? lexical : nil
     }
 
     func firstArtifact(in directory: URL?) -> URL? {
@@ -134,12 +150,16 @@ private struct RecoveryOwnedArtifactValidator {
         return preferred.lazy.compactMap(validArtifact).first
     }
 
-    private func isOwnedLexically(_ url: URL) -> Bool {
+    private func hasOwnedIdentity(_ url: URL) -> Bool {
         let parent = url.deletingLastPathComponent()
-        let directUUIDArtifact = parent == root
-            && UUID(uuidString: url.deletingPathExtension().lastPathComponent) != nil
-        return directUUIDArtifact
-            || parent == root.appendingPathComponent(id.uuidString, isDirectory: true)
+        if parent == root.appendingPathComponent(id.uuidString, isDirectory: true) {
+            return true
+        }
+        guard parent == root else { return false }
+        let stem = url.deletingPathExtension().lastPathComponent
+        if let directID = UUID(uuidString: stem), directID == id { return true }
+        return (try? RecoveryImportDispositionStore(directory: root)
+            .ownsSource(id: id, source: url)) == true
     }
 
     private func isOwnedResolved(_ url: URL) -> Bool {
