@@ -26,6 +26,7 @@ enum CaptureAdmissionEvent: Equatable {
     case begin(captureID: UUID, destination: String)
     case prepared(captureID: UUID)
     case preparationFailed(captureID: UUID, message: String)
+    case preparationOwnershipUnknown(captureID: UUID, message: String)
     case stopRequested
     case cancelRequested
     case finalizationFinished(captureID: UUID)
@@ -115,6 +116,11 @@ struct CaptureAdmissionReducer {
             state = .idle
             return .none
 
+        case (.preparing(let expected, _, _, _), .preparationOwnershipUnknown(let captureID, let message))
+            where expected == captureID:
+            state = .cleanupFailed(captureID: captureID, message: message)
+            return .fail(message)
+
         case (.cleanupFailed(let captureID, _), .cancelRequested):
             state = .cancelling(captureID: captureID)
             return .cancel(captureID)
@@ -160,6 +166,11 @@ struct CaptureCleanupRetryGate {
     }
 
     func isInFlight(captureID: UUID) -> Bool { active?.captureID == captureID }
+
+    mutating func invalidate(captureID: UUID) {
+        guard active?.captureID == captureID else { return }
+        active = nil
+    }
 }
 
 enum CaptureCanonicalAudioLoader {

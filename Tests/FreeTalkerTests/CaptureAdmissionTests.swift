@@ -82,6 +82,57 @@ struct CaptureAdmissionTests {
         #expect(!events.snapshot.contains(.removeArtifacts))
     }
 
+    @Test func failedLedgerReadbackLeavesStablePreparationEvidence() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let request = CaptureStartRequest(
+            id: UUID(), directory: root.appendingPathComponent("capture"),
+            capturedAt: Date(), sampleRate: 16_000, channelCount: 1,
+            inputDeviceUID: nil, destination: "external"
+        )
+        let ledger = AdmissionLedger(
+            request: request, events: AdmissionEventLog(),
+            createFailure: .afterCommitReadbackFailure
+        )
+        let service = CaptureJournalService(
+            fileSystem: LocalJournalFileSystem(), ledger: ledger
+        )
+
+        await #expect(throws: UnresolvedCapturePreparationFailure.self) {
+            try await service.prepare(request)
+        }
+
+        let reopened = CaptureJournalService(
+            fileSystem: LocalJournalFileSystem(), ledger: ledger
+        )
+        #expect(reopened.hasPreparationFailureEvidence(request))
+    }
+
+    @Test func preparationEvidenceSurvivesRemovedSessionAndFailedParentSync() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let request = CaptureStartRequest(
+            id: UUID(), directory: root.appendingPathComponent("capture"),
+            capturedAt: Date(), sampleRate: 16_000, channelCount: 1,
+            inputDeviceUID: nil, destination: "external"
+        )
+        let fileSystem = FailFirstTwoParentSyncFileSystem()
+        let ledger = AdmissionLedger(
+            request: request, events: AdmissionEventLog(),
+            createFailure: .beforeCommitReadbackFailure
+        )
+        let service = CaptureJournalService(fileSystem: fileSystem, ledger: ledger)
+
+        await #expect(throws: UnresolvedCapturePreparationFailure.self) {
+            try await service.prepare(request)
+        }
+
+        #expect(!fileSystem.exists(request.directory))
+        #expect(CaptureJournalService(
+            fileSystem: fileSystem, ledger: ledger
+        ).hasPreparationFailureEvidence(request))
+    }
+
     @Test func cancellationIntentPrecedesArtifactsAndLedgerRemoval() async throws {
         let events = AdmissionEventLog()
         let request = CaptureStartRequest(
@@ -297,6 +348,40 @@ struct CaptureAdmissionTests {
         #expect(!gate.isInFlight(captureID: captureID))
     }
 
+    @Test func cancellationInvalidatesLateFailurePreservationCompletion() {
+        let captureID = UUID()
+        var gate = CaptureCleanupRetryGate()
+        let generation = gate.begin(captureID: captureID)!
+        var reducer = CaptureAdmissionReducer()
+        _ = reducer.reduce(.begin(captureID: captureID, destination: "external"))
+        _ = reducer.reduce(.prepared(captureID: captureID))
+        _ = reducer.reduce(.failureHandlingStarted(captureID: captureID))
+        _ = reducer.reduce(.cleanupFailed(captureID: captureID, message: "busy"))
+
+        #expect(reducer.reduce(.cancelRequested) == .cancel(captureID))
+        gate.invalidate(captureID: captureID)
+        let acceptedLateCompletion = gate.finish(
+            captureID: captureID, generation: generation
+        )
+
+        #expect(!acceptedLateCompletion)
+        #expect(reducer.state == .cancelling(captureID: captureID))
+    }
+
+    @Test func unknownPreparationOwnershipKeepsAdmissionBlocked() {
+        let captureID = UUID()
+        var reducer = CaptureAdmissionReducer()
+        _ = reducer.reduce(.begin(captureID: captureID, destination: "external"))
+
+        #expect(reducer.reduce(.preparationOwnershipUnknown(
+            captureID: captureID, message: "readback failed"
+        )) == .fail("readback failed"))
+        #expect(reducer.state == .cleanupFailed(
+            captureID: captureID, message: "readback failed"
+        ))
+        #expect(reducer.state.isActive)
+    }
+
     @Test func failedDamagePreservationCanRetryOrBecomeExplicitCancellation() {
         let captureID = UUID()
         var retry = CaptureAdmissionReducer()
@@ -356,7 +441,10 @@ private func admissionRequest() -> CaptureStartRequest {
     )
 }
 
-private enum AdmissionCreateFailure { case none, beforeCommit, afterCommit }
+private enum AdmissionCreateFailure {
+    case none, beforeCommit, afterCommit
+    case beforeCommitReadbackFailure, afterCommitReadbackFailure
+}
 
 private struct AdmissionFileSystem: JournalFileSystem {
     let events: AdmissionEventLog
@@ -394,7 +482,9 @@ private actor AdmissionLedger: CaptureLedgerStoring {
     }
     func createCapture(_ request: CaptureStartRequest) async throws -> CaptureSession {
         events.append(.createLedger)
-        if createFailure == .beforeCommit { throw AdmissionFailure.injected }
+        if createFailure == .beforeCommit || createFailure == .beforeCommitReadbackFailure {
+            throw AdmissionFailure.injected
+        }
         let session = CaptureSession(
             id: request.id, state: .capturing, directory: request.directory,
             capturedAt: request.capturedAt, sampleRate: request.sampleRate,
@@ -403,7 +493,9 @@ private actor AdmissionLedger: CaptureLedgerStoring {
             assetKind: .audio, failureMessage: nil, contentHash: nil
         )
         stored = session
-        if createFailure == .afterCommit { throw AdmissionFailure.injected }
+        if createFailure == .afterCommit || createFailure == .afterCommitReadbackFailure {
+            throw AdmissionFailure.injected
+        }
         return session
     }
     func recordCommittedSegment(_ segment: CaptureSegment) async throws {}
@@ -422,11 +514,43 @@ private actor AdmissionLedger: CaptureLedgerStoring {
             assetKind: assetKind, failureMessage: failureMessage, contentHash: contentHash
         )
     }
-    func session(id: UUID) async throws -> CaptureSession? { stored }
+    func session(id: UUID) async throws -> CaptureSession? {
+        if createFailure == .beforeCommitReadbackFailure
+            || createFailure == .afterCommitReadbackFailure {
+            throw AdmissionFailure.injected
+        }
+        return stored
+    }
     func unfinishedSessions() async throws -> [CaptureSession] { [] }
     func committedSegments(captureID: UUID) async throws -> [CaptureSegment] { [] }
     func removeCleanedSession(id: UUID) async throws {
         events.append(.removeLedger)
         stored = nil
     }
+}
+
+private final class FailFirstTwoParentSyncFileSystem: JournalFileSystem, @unchecked Sendable {
+    private let local = LocalJournalFileSystem()
+    private let lock = NSLock()
+    private var syncCount = 0
+
+    func createDirectory(_ url: URL) throws { try local.createDirectory(url) }
+    func write(_ data: Data, to url: URL) throws { try local.write(data, to: url) }
+    func append(_ data: Data, to url: URL) throws { try local.append(data, to: url) }
+    func synchronizeFile(_ url: URL) throws { try local.synchronizeFile(url) }
+    func rename(_ source: URL, to destination: URL) throws {
+        try local.rename(source, to: destination)
+    }
+    func synchronizeDirectory(_ url: URL) throws {
+        let shouldFail = lock.withLock {
+            syncCount += 1
+            return syncCount <= 2
+        }
+        if shouldFail { throw AdmissionFailure.injected }
+        try local.synchronizeDirectory(url)
+    }
+    func contents(_ url: URL) throws -> [URL] { try local.contents(url) }
+    func read(_ url: URL) throws -> Data { try local.read(url) }
+    func remove(_ url: URL) throws { try local.remove(url) }
+    func exists(_ url: URL) -> Bool { local.exists(url) }
 }

@@ -5,6 +5,11 @@ struct OwnedCapturePreparationFailure: Error, @unchecked Sendable {
     let message: String
 }
 
+struct UnresolvedCapturePreparationFailure: Error, Sendable {
+    let request: CaptureStartRequest
+    let message: String
+}
+
 struct CaptureJournalService: Sendable {
     let fileSystem: any JournalFileSystem
     let ledger: any CaptureLedgerStoring
@@ -41,8 +46,16 @@ struct CaptureJournalService: Sendable {
         do {
             session = try await ledger.createCapture(request)
         } catch {
-            if let persisted = try await ledger.session(id: request.id) {
-                return makeActive(persisted)
+            do {
+                if let persisted = try await ledger.session(id: request.id) {
+                    return makeActive(persisted)
+                }
+            } catch let readbackError {
+                throw unresolvedPreparationFailure(
+                    request,
+                    message: "Capture commit state is unknown: \(error.localizedDescription); "
+                        + readbackError.localizedDescription
+                )
             }
             try await compensateOrOwnFailedPrepare(request, original: error)
             throw error
@@ -80,22 +93,23 @@ struct CaptureJournalService: Sendable {
             do {
                 session = try await ledger.createCapture(request)
             } catch {
-                if let persisted = try await ledger.session(id: request.id) {
-                    session = persisted
-                } else {
-                    let marker = request.directory.appendingPathComponent(
-                        "capture-preparation-failure.marker"
-                    )
-                    let temporary = request.directory.appendingPathComponent(
-                        ".capture-preparation-failure.\(UUID().uuidString).tmp"
-                    )
-                    try DurableArtifactWriter(fileSystem: fileSystem).commit(
-                        Data("capture \(request.id.uuidString) requires reconciliation".utf8),
-                        temporary: temporary, destination: marker
-                    )
-                    throw CaptureJournalError.failed(
-                        "capture \(request.id.uuidString) preparation and cleanup failed: "
-                            + "\(original.localizedDescription); \(cleanupError.localizedDescription)"
+                do {
+                    if let persisted = try await ledger.session(id: request.id) {
+                        session = persisted
+                    } else {
+                        throw unresolvedPreparationFailure(
+                            request,
+                            message: "Capture preparation and cleanup require reconciliation: "
+                                + "\(original.localizedDescription); \(cleanupError.localizedDescription)"
+                        )
+                    }
+                } catch let unresolved as UnresolvedCapturePreparationFailure {
+                    throw unresolved
+                } catch let readbackError {
+                    throw unresolvedPreparationFailure(
+                        request,
+                        message: "Capture preparation ownership is unknown: "
+                            + "\(cleanupError.localizedDescription); \(readbackError.localizedDescription)"
                     )
                 }
             }
@@ -105,6 +119,43 @@ struct CaptureJournalService: Sendable {
                     + "\(original.localizedDescription); \(cleanupError.localizedDescription)"
             )
         }
+    }
+
+    func hasPreparationFailureEvidence(_ request: CaptureStartRequest) -> Bool {
+        fileSystem.exists(preparationFailureEvidenceURL(request))
+    }
+
+    private func persistPreparationFailureEvidence(_ request: CaptureStartRequest) throws {
+        let destination = preparationFailureEvidenceURL(request)
+        let temporary = destination.deletingLastPathComponent().appendingPathComponent(
+            ".capture-preparation-\(request.id.uuidString).\(UUID().uuidString).tmp"
+        )
+        try DurableArtifactWriter(fileSystem: fileSystem).commit(
+            Data("capture \(request.id.uuidString) requires reconciliation".utf8),
+            temporary: temporary, destination: destination
+        )
+    }
+
+    private func unresolvedPreparationFailure(
+        _ request: CaptureStartRequest,
+        message: String
+    ) -> UnresolvedCapturePreparationFailure {
+        do {
+            try persistPreparationFailureEvidence(request)
+            return UnresolvedCapturePreparationFailure(request: request, message: message)
+        } catch {
+            return UnresolvedCapturePreparationFailure(
+                request: request,
+                message: "\(message); recovery marker could not be persisted: "
+                    + error.localizedDescription
+            )
+        }
+    }
+
+    private func preparationFailureEvidenceURL(_ request: CaptureStartRequest) -> URL {
+        request.directory.deletingLastPathComponent().appendingPathComponent(
+            ".capture-preparation-\(request.id.uuidString).marker"
+        )
     }
 
     func finish(_ active: ActiveCaptureJournal) async throws -> StagedCapture {
