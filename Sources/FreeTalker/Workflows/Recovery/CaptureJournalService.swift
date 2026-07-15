@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 struct OwnedCapturePreparationFailure: Error, @unchecked Sendable {
@@ -10,21 +11,29 @@ struct UnresolvedCapturePreparationFailure: Error, Sendable {
     let message: String
 }
 
+private struct SilentSegmentOwnershipError: LocalizedError {
+    let reason: String
+    var errorDescription: String? { reason }
+}
+
 struct CaptureJournalService: Sendable {
     let fileSystem: any JournalFileSystem
     let ledger: any CaptureLedgerStoring
     let configuration: CaptureJournalWriter.Configuration
     let onFailure: @Sendable (String) -> Void
+    let recoveryRoot: URL?
 
     init(
         fileSystem: any JournalFileSystem,
         ledger: any CaptureLedgerStoring,
         configuration: CaptureJournalWriter.Configuration = .default,
+        recoveryRoot: URL? = nil,
         onFailure: @escaping @Sendable (String) -> Void = { _ in }
     ) {
         self.fileSystem = fileSystem
         self.ledger = ledger
         self.configuration = configuration
+        self.recoveryRoot = recoveryRoot?.standardizedFileURL
         self.onFailure = onFailure
     }
 
@@ -216,11 +225,80 @@ struct CaptureJournalService: Sendable {
     }
 
     private func removeSilentSegments(_ session: CaptureSession) async throws {
-        for segment in try await ledger.committedSegments(captureID: session.id) {
+        let segments = try await ledger.committedSegments(captureID: session.id)
+        try validateSilentSegmentOwnership(session: session, segments: segments)
+        for segment in segments {
             if fileSystem.exists(segment.url) { try fileSystem.remove(segment.url) }
         }
         try fileSystem.synchronizeDirectory(session.directory)
         try await ledger.removeCommittedSegments(captureID: session.id)
+    }
+
+    private func validateSilentSegmentOwnership(
+        session: CaptureSession,
+        segments: [CaptureSegment]
+    ) throws {
+        guard let recoveryRoot else {
+            throw SilentSegmentOwnershipError(
+                reason: "Silent segment cleanup has no recovery root"
+            )
+        }
+        let lexicalRoot = recoveryRoot.standardizedFileURL
+        let resolvedRoot = lexicalRoot.resolvingSymlinksInPath().standardizedFileURL
+        let expectedLexicalDirectory = lexicalRoot.appendingPathComponent(
+            session.id.uuidString, isDirectory: true
+        ).standardizedFileURL
+        let expectedResolvedDirectory = resolvedRoot.appendingPathComponent(
+            session.id.uuidString, isDirectory: true
+        ).standardizedFileURL
+        let lexicalDirectory = session.directory.standardizedFileURL
+        guard lexicalDirectory == expectedLexicalDirectory,
+              lexicalDirectory.resolvingSymlinksInPath().standardizedFileURL
+                == expectedResolvedDirectory else {
+            throw SilentSegmentOwnershipError(
+                reason: "Silent capture directory is outside its owned recovery path"
+            )
+        }
+        try requireDirectoryWithoutSymlink(lexicalDirectory)
+
+        for segment in segments {
+            let lexical = segment.url.standardizedFileURL
+            let expectedName = String(format: "segment-%08d.wav", segment.ordinal)
+            guard segment.captureID == session.id,
+                  segment.ordinal >= 0,
+                  lexical.deletingLastPathComponent() == expectedLexicalDirectory,
+                  lexical.lastPathComponent == expectedName,
+                  lexical.resolvingSymlinksInPath().standardizedFileURL
+                    == expectedResolvedDirectory.appendingPathComponent(expectedName)
+                        .standardizedFileURL else {
+                throw SilentSegmentOwnershipError(
+                    reason: "Silent capture segment is outside its owned recovery path"
+                )
+            }
+            try requireRegularFileWithoutSymlinkIfPresent(lexical)
+        }
+    }
+
+    private func requireDirectoryWithoutSymlink(_ url: URL) throws {
+        var info = stat()
+        guard lstat(url.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFDIR else {
+            throw SilentSegmentOwnershipError(
+                reason: "Silent capture directory is not an owned directory"
+            )
+        }
+    }
+
+    private func requireRegularFileWithoutSymlinkIfPresent(_ url: URL) throws {
+        var info = stat()
+        if lstat(url.path, &info) != 0 {
+            if errno == ENOENT { return }
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        guard (info.st_mode & S_IFMT) == S_IFREG else {
+            throw SilentSegmentOwnershipError(
+                reason: "Silent capture segment is not a regular file"
+            )
+        }
     }
 
     func cancelAndClean(_ active: ActiveCaptureJournal) async throws {

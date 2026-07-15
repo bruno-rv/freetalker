@@ -4,6 +4,84 @@ import Testing
 
 @Suite struct RecoveryReconciliationTests {
     @Test(
+        "silent cleanup rejects every unowned segment path without partial deletion",
+        arguments: UnsafeSilentSegmentCase.allCases
+    )
+    func silentCleanupRejectsUnownedSegments(candidate: UnsafeSilentSegmentCase) async throws {
+        let fixture = try ReconciliationFixture()
+        let id = UUID()
+        let expectedDirectory = fixture.root.appendingPathComponent(id.uuidString, isDirectory: true)
+        let sessionDirectory = candidate == .sessionOutsideRoot
+            ? fixture.temp.url.appendingPathComponent("outside-session", isDirectory: true)
+            : expectedDirectory
+        try fixture.fileSystem.createDirectory(sessionDirectory)
+        _ = try await fixture.store.createCapture(.init(
+            id: id, directory: sessionDirectory, capturedAt: Date(), sampleRate: 16_000,
+            channelCount: 1, inputDeviceUID: "mic", destination: "external"
+        ))
+        let codec = CaptureSegmentCodec(fileSystem: fixture.fileSystem)
+        let valid = sessionDirectory.appendingPathComponent("segment-00000000.wav")
+        let validData = codec.encode([0])
+        try validData.write(to: valid)
+        try await fixture.store.recordCommittedSegment(.init(
+            captureID: id, ordinal: 0, url: valid, sampleCount: 1,
+            contentHash: codec.hash(validData)
+        ))
+
+        let outside = fixture.temp.url.appendingPathComponent("outside-segment.wav")
+        try Data("outside-must-survive".utf8).write(to: outside)
+        let unsafe: URL = switch candidate {
+        case .outsideRoot:
+            outside
+        case .pathTraversal:
+            sessionDirectory.appendingPathComponent("../segment-00000001.wav")
+        case .symlink:
+            sessionDirectory.appendingPathComponent("segment-00000001.wav")
+        case .ordinalMismatch:
+            sessionDirectory.appendingPathComponent("segment-00000002.wav")
+        case .sessionOutsideRoot:
+            sessionDirectory.appendingPathComponent("segment-00000001.wav")
+        }
+        if candidate == .symlink {
+            try FileManager.default.createSymbolicLink(at: unsafe, withDestinationURL: outside)
+        } else if unsafe.standardizedFileURL != outside.standardizedFileURL {
+            try codec.encode([0]).write(to: unsafe.standardizedFileURL)
+        }
+        try await fixture.store.recordCommittedSegment(.init(
+            captureID: id, ordinal: 1, url: unsafe, sampleCount: 1,
+            contentHash: codec.hash(codec.encode([0]))
+        ))
+        let diagnostics = CaptureDiagnostics(
+            peak: 0, rms: 0, inputDeviceUID: "mic", routeFailure: nil
+        )
+        try DurableArtifactWriter(fileSystem: fixture.fileSystem).commit(
+            try JSONEncoder().encode(diagnostics),
+            temporary: sessionDirectory.appendingPathComponent("diagnostics.tmp"),
+            destination: sessionDirectory.appendingPathComponent("capture-diagnostics.json")
+        )
+        try await fixture.store.transition(
+            id: id, from: .capturing, to: .silent, recoveryJobID: nil,
+            libraryDictationID: nil, assetKind: .silent,
+            failureMessage: SilentCapturePresentation.message, contentHash: nil
+        )
+
+        let report = await fixture.reconciler().reconcile()
+
+        #expect(report.failed == 1)
+        #expect(report.failures.first?.message.contains("Silent capture") == true)
+        #expect(FileManager.default.fileExists(atPath: valid.path))
+        #expect(FileManager.default.fileExists(atPath: unsafe.path))
+        #expect(try Data(contentsOf: outside) == Data("outside-must-survive".utf8))
+        #expect(try await fixture.store.committedSegments(captureID: id).count == 2)
+        #expect(try await fixture.store.session(id: id)?.state == .silent)
+        #expect(try await fixture.store.session(id: id)?.failureMessage == SilentCapturePresentation.message)
+        #expect(try CaptureJournalService(
+            fileSystem: fixture.fileSystem, ledger: fixture.store
+        ).loadSilentDiagnostics(try #require(try await fixture.store.session(id: id))) == diagnostics)
+        #expect(try await fixture.store.jobs(kind: .recovery).isEmpty)
+    }
+
+    @Test(
         "silent segment cleanup converges after every durable boundary failure",
         arguments: SilentCleanupBoundary.allCases
     )
@@ -15,7 +93,8 @@ import Testing
         let ledger = SilentCleanupFaultLedger(base: fixture.store, boundary: boundary)
         let service = CaptureJournalService(
             fileSystem: fileSystem, ledger: ledger,
-            configuration: .init(segmentFrames: 4, maximumQueuedFrames: 16)
+            configuration: .init(segmentFrames: 4, maximumQueuedFrames: 16),
+            recoveryRoot: fixture.root
         )
         let active = try await service.prepare(.init(
             id: id, directory: directory, capturedAt: Date(), sampleRate: 16_000,
@@ -484,6 +563,14 @@ enum SilentCleanupBoundary: CaseIterable, Sendable {
     case removeSegment
     case synchronizeDirectory
     case removeMetadata
+}
+
+enum UnsafeSilentSegmentCase: CaseIterable, Sendable {
+    case outsideRoot
+    case pathTraversal
+    case symlink
+    case ordinalMismatch
+    case sessionOutsideRoot
 }
 
 private final class SilentCleanupFaultFileSystem: JournalFileSystem, @unchecked Sendable {

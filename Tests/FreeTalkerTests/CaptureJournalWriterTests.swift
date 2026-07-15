@@ -55,16 +55,23 @@ import Testing
 
     @Test("journal service records silent capture diagnostics without an audio artifact")
     func serviceSilentCapture() async throws {
-        let root = FileManager.default.temporaryDirectory
+        let recoveryRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("capture-silent-\(UUID().uuidString)", isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? FileManager.default.removeItem(at: recoveryRoot) }
+        let captureID = UUID()
+        let root = recoveryRoot.appendingPathComponent(captureID.uuidString, isDirectory: true)
         let ledger = MemoryCaptureLedger()
         let fileSystem = LocalJournalFileSystem()
         let service = CaptureJournalService(
             fileSystem: fileSystem, ledger: ledger,
-            configuration: .init(segmentFrames: 4, maximumQueuedFrames: 16)
+            configuration: .init(segmentFrames: 4, maximumQueuedFrames: 16),
+            recoveryRoot: recoveryRoot
         )
-        let request = captureRequest(directory: root)
+        let request = CaptureStartRequest(
+            id: captureID, directory: root, capturedAt: Date(timeIntervalSince1970: 100),
+            sampleRate: 16_000, channelCount: 1, inputDeviceUID: "test-mic",
+            destination: "test"
+        )
         let active = try await service.prepare(request)
         #expect(active.writer.enqueue(Array(repeating: 0, count: 8)) == .accepted)
         #expect(await active.writer.committedSnapshot().count == 2)

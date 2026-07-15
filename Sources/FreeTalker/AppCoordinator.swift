@@ -1200,6 +1200,7 @@ final class AppCoordinator: ObservableObject {
         )
         let service = CaptureJournalService(
             fileSystem: LocalJournalFileSystem(), ledger: recoveryStore,
+            recoveryRoot: Self.recoveryDirectory,
             onFailure: { [weak self] message in
                 Task { @MainActor in
                     self?.handleJournalConsumerFailure(
@@ -1795,7 +1796,8 @@ final class AppCoordinator: ObservableObject {
             )
             active.writer.updateDiagnostics(diagnostics)
             let service = CaptureJournalService(
-                fileSystem: LocalJournalFileSystem(), ledger: recoveryStore
+                fileSystem: LocalJournalFileSystem(), ledger: recoveryStore,
+                recoveryRoot: Self.recoveryDirectory
             )
             journalFinalizationTask = Task {
                 var ownershipTransitionCompleted = false

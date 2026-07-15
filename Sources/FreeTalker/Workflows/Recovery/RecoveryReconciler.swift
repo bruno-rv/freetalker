@@ -133,7 +133,9 @@ actor RecoveryReconciler {
                         failureMessage: SilentCapturePresentation.message,
                         contentHash: nil
                     )
-                    try await CaptureJournalService(fileSystem: fileSystem, ledger: ledger)
+                    try await CaptureJournalService(
+                        fileSystem: fileSystem, ledger: ledger, recoveryRoot: directory
+                    )
                         .resumeSilentCleanup(captureID: current.id)
                 } else {
                     let segments = try await ledger.committedSegments(captureID: current.id)
@@ -192,7 +194,9 @@ actor RecoveryReconciler {
                 try await CaptureJournalService(fileSystem: fileSystem, ledger: ledger)
                     .resumeCleanup(captureID: current.id)
             case .silent:
-                try await CaptureJournalService(fileSystem: fileSystem, ledger: ledger)
+                try await CaptureJournalService(
+                    fileSystem: fileSystem, ledger: ledger, recoveryRoot: directory
+                )
                     .resumeSilentCleanup(captureID: current.id)
             case .processing, .libraryCommitted:
                 break
