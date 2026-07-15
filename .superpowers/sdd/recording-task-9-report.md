@@ -129,6 +129,9 @@ open-failure runs use a separate bounded unavailable-state verifier: it requires
 exactly one launched DEBUG process, both isolation environment values, the real
 mounted smoke root, no live production-path handles, and explicit confirmation
 of the Recovery warning, Retry Recovery Setup, and Recoveries Unavailable UI.
+The DEBUG executable is canonicalized once before launch, and that same resolved
+path is used for direct launch, LLDB launch, and `lsof` text-vnode comparison so
+SwiftPM's `.build/debug` symlink cannot cause a false mismatch.
 It deliberately does not require a jobs database handle or successful SQLite
 open. After removing WAL/SHM companions and restoring the SQLite backup, the
 normal verifier is required again and the operator must confirm health recovery.

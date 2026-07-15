@@ -28,6 +28,9 @@ confirmed journal segment.
 
    ```zsh
    DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build
+   DEBUG_EXEC=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' \
+     "$PWD/.build/debug/FreeTalker")
+   test -x "$DEBUG_EXEC" || { print -u2 'resolved DEBUG executable is missing'; exit 1; }
    SMOKE_ROOT=/Volumes/FreeTalkerSmoke/session
    wait_for_file() {
      local path="$1"
@@ -59,7 +62,7 @@ confirmed journal segment.
    launch_smoke() {
      env FREETALKER_ALLOW_ISOLATED_SMOKE=1 \
        FREETALKER_SMOKE_ROOT="$SMOKE_ROOT" \
-       .build/debug/FreeTalker &
+       "$DEBUG_EXEC" &
      APP_PID=$!
      kill -0 "$APP_PID" 2>/dev/null || return 1
      wait_for_file "$SMOKE_ROOT/jobs.db" || return 1
@@ -67,7 +70,7 @@ confirmed journal segment.
    launch_unavailable_smoke() {
      env FREETALKER_ALLOW_ISOLATED_SMOKE=1 \
        FREETALKER_SMOKE_ROOT="$SMOKE_ROOT" \
-       .build/debug/FreeTalker &
+       "$DEBUG_EXEC" &
      APP_PID=$!
      for _ in {1..100}; do
        kill -0 "$APP_PID" 2>/dev/null && return 0
@@ -95,7 +98,7 @@ confirmed journal segment.
      ps eww -p "$APP_PID" | grep -F 'FREETALKER_ALLOW_ISOLATED_SMOKE=1' >/dev/null || return 1
      ps eww -p "$APP_PID" | grep -F "FREETALKER_SMOKE_ROOT=$SMOKE_ROOT" >/dev/null || return 1
      lsof -a -p "$APP_PID" -d txt -Fn |
-       grep -Fx "n$PWD/.build/debug/FreeTalker" >/dev/null || return 1
+       grep -Fx "n$DEBUG_EXEC" >/dev/null || return 1
      if lsof -p "$APP_PID" | grep -F "$HOME/Library/Application Support/FreeTalker"; then
        print -u2 'refusing unavailable test: live production-path handle detected'
        return 1
@@ -179,7 +182,7 @@ boundary. Do not press Cancel or Escape first.
    DEBUG-only checkpoint symbol:
 
    ```zsh
-   lldb .build/debug/FreeTalker
+   lldb "$DEBUG_EXEC"
    (lldb) settings set target.env-vars FREETALKER_ALLOW_ISOLATED_SMOKE=1 FREETALKER_SMOKE_ROOT=/Volumes/FreeTalkerSmoke/session FREETALKER_SMOKE_CHECKPOINTS=post-job-create,post-library-insert,post-library-committed,delete-claim,cancel-intent
    (lldb) breakpoint set --name freetalker_smoke_checkpoint
    (lldb) run
