@@ -124,7 +124,14 @@ the process's resolved Application Support root to equal the configured isolated
 root. Fresh bootstrap waits for jobs storage with an asserted timeout, then tells
 the operator to open Library before separately waiting for and verifying its lazy
 database. No pre-initialization Library file handle is assumed. The release
-executable exports no checkpoint symbol.
+executable exports no checkpoint symbol. Expected jobs-store corruption and
+open-failure runs use a separate bounded unavailable-state verifier: it requires
+exactly one launched DEBUG process, both isolation environment values, the real
+mounted smoke root, no live production-path handles, and explicit confirmation
+of the Recovery warning, Retry Recovery Setup, and Recoveries Unavailable UI.
+It deliberately does not require a jobs database handle or successful SQLite
+open. After removing WAL/SHM companions and restoring the SQLite backup, the
+normal verifier is required again and the operator must confirm health recovery.
 
 ## Verification
 

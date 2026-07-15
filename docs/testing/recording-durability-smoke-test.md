@@ -38,6 +38,24 @@ confirmed journal segment.
      print -u2 "timed out waiting for $path"
      return 1
    }
+   wait_for_exact_app() {
+     local pids
+     for _ in {1..100}; do
+       pids=($(pgrep -x FreeTalker))
+       (( ${#pids[@]} == 1 && pids[1] == APP_PID )) && return 0
+       sleep 0.1
+     done
+     print -u2 'timed out waiting for exactly the launched FreeTalker process'
+     return 1
+   }
+   wait_for_jobs_handle() {
+     for _ in {1..100}; do
+       lsof -p "$APP_PID" 2>/dev/null | grep -F "$SMOKE_ROOT/jobs.db" >/dev/null && return 0
+       sleep 0.1
+     done
+     print -u2 'timed out waiting for isolated jobs.db process handle'
+     return 1
+   }
    launch_smoke() {
      env FREETALKER_ALLOW_ISOLATED_SMOKE=1 \
        FREETALKER_SMOKE_ROOT="$SMOKE_ROOT" \
@@ -46,16 +64,51 @@ confirmed journal segment.
      kill -0 "$APP_PID" 2>/dev/null || return 1
      wait_for_file "$SMOKE_ROOT/jobs.db" || return 1
    }
+   launch_unavailable_smoke() {
+     env FREETALKER_ALLOW_ISOLATED_SMOKE=1 \
+       FREETALKER_SMOKE_ROOT="$SMOKE_ROOT" \
+       .build/debug/FreeTalker &
+     APP_PID=$!
+     for _ in {1..100}; do
+       kill -0 "$APP_PID" 2>/dev/null && return 0
+       sleep 0.1
+     done
+     print -u2 'timed out waiting for unavailable-state app launch'
+     return 1
+   }
    verify_jobs_root() {
-     test "$(stat -f '%m' "$SMOKE_ROOT")" = /Volumes/FreeTalkerSmoke
-     lsof -p "$APP_PID" | grep -F "$SMOKE_ROOT/jobs.db"
-     sqlite3 "$SMOKE_ROOT/jobs.db" '.databases' | grep -F "$SMOKE_ROOT/jobs.db"
+     wait_for_exact_app || return 1
+     test "$(stat -f '%m' "$SMOKE_ROOT")" = /Volumes/FreeTalkerSmoke || return 1
+     wait_for_jobs_handle || return 1
+     sqlite3 "$SMOKE_ROOT/jobs.db" '.databases' |
+       grep -F "$SMOKE_ROOT/jobs.db" >/dev/null || return 1
    }
    verify_library_root() {
      wait_for_file "$SMOKE_ROOT/library.db" || return 1
-     sqlite3 "$SMOKE_ROOT/library.db" '.databases' | grep -F "$SMOKE_ROOT/library.db"
+     sqlite3 "$SMOKE_ROOT/library.db" '.databases' |
+       grep -F "$SMOKE_ROOT/library.db" >/dev/null || return 1
+   }
+   verify_recovery_unavailable() {
+     wait_for_exact_app || return 1
+     test "$(stat -f '%m' "$SMOKE_ROOT")" = /Volumes/FreeTalkerSmoke || return 1
+     test "$(realpath "$SMOKE_ROOT")" = "$SMOKE_ROOT" || return 1
+     ps eww -p "$APP_PID" | grep -F 'FREETALKER_ALLOW_ISOLATED_SMOKE=1' >/dev/null || return 1
+     ps eww -p "$APP_PID" | grep -F "FREETALKER_SMOKE_ROOT=$SMOKE_ROOT" >/dev/null || return 1
+     lsof -a -p "$APP_PID" -d txt -Fn |
+       grep -Fx "n$PWD/.build/debug/FreeTalker" >/dev/null || return 1
+     if lsof -p "$APP_PID" | grep -F "$HOME/Library/Application Support/FreeTalker"; then
+       print -u2 'refusing unavailable test: live production-path handle detected'
+       return 1
+     fi
+     print 'Open menu-bar FreeTalker → Library → Recoveries.'
+     read -q 'REPLY?Confirm the warning and Retry Recovery Setup button are visible, and Recoveries says Unavailable [y/N] '
+     print
+     [[ "$REPLY" == [yY] ]] || { print -u2 'Recovery Unavailable UI not confirmed'; return 1; }
    }
    relaunch_and_verify() { launch_smoke && verify_jobs_root; }
+   relaunch_unavailable_and_verify() {
+     launch_unavailable_smoke && verify_recovery_unavailable
+   }
    relaunch_and_verify || exit 1
    ```
 
@@ -81,7 +134,7 @@ confirmed journal segment.
    kill "$APP_PID"; wait "$APP_PID" 2>/dev/null || true
    sqlite3 "$SMOKE_ROOT/jobs.db" ".backup '/Volumes/FreeTalkerSmoke/jobs.backup.db'"
    sqlite3 "$SMOKE_ROOT/library.db" ".backup '/Volumes/FreeTalkerSmoke/library.backup.db'"
-   relaunch_and_verify
+   relaunch_and_verify || exit 1
    ```
 
 5. Connect a known-good microphone. In System Settings, confirm FreeTalker has
@@ -194,7 +247,10 @@ confirm content-hash and lineage deduplication creates no duplicate row.
    Remove the filler immediately after the expected error with `rm -f "$FILL"`.
 2. Exhaust only that disposable volume during segment persistence and again
    during final assembly. Confirm recording stops visibly, committed evidence is
-   retained, and relaunch reports an actionable unavailable/degraded state.
+   retained, and recovery reports an actionable unavailable/degraded state. If
+   the jobs store is expected to be unopenable after relaunch, use
+   `relaunch_unavailable_and_verify || exit 1`; do not use the normal verifier
+   until space is restored and Retry Recovery Setup succeeds.
 3. Test a real locked jobs database by keeping this interactive transaction open
    in Terminal A while attempting recording in the app, then type `ROLLBACK;`:
 
@@ -203,11 +259,14 @@ confirm content-hash and lineage deduplication creates no duplicate row.
    sqlite> BEGIN EXCLUSIVE;
    sqlite> SELECT count(*) FROM capture_sessions;
    # attempt recording in FreeTalker now
-   sqlite> ROLLBACK;
+   # leave this transaction open until the verifier below completes
    ```
 
-   Confirm the first admission is blocked and Retry Recovery Setup succeeds
-   after rollback.
+   Confirm the first admission is blocked, then run
+   `verify_recovery_unavailable || exit 1` while the lock is held. Type
+   `ROLLBACK;`, choose Retry Recovery Setup, and run
+   `verify_jobs_root || exit 1`. Confirm the warning clears and Recoveries no
+   longer says Unavailable.
    Confirm External and Scratchpad admission is blocked while health is
    unavailable, the exact operation is shown, and Retry Recovery Setup recovers
    after access is restored.
@@ -216,16 +275,23 @@ confirm content-hash and lineage deduplication creates no duplicate row.
 
    ```zsh
    kill -9 "$APP_PID"; wait "$APP_PID" 2>/dev/null || true
-   printf 'corrupt-test-only\n' > /Volumes/FreeTalkerSmoke/session/jobs.db
-   rm -f /Volumes/FreeTalkerSmoke/session/jobs.db-{wal,shm}
-   relaunch_and_verify
-   # capture the unavailable-health evidence, then quit the isolated app
+   printf 'corrupt-test-only\n' > "$SMOKE_ROOT/jobs.db"
+   rm -f "$SMOKE_ROOT/jobs.db-wal" "$SMOKE_ROOT/jobs.db-shm"
+   relaunch_unavailable_and_verify || exit 1
    kill "$APP_PID"; wait "$APP_PID" 2>/dev/null || true
+   rm -f "$SMOKE_ROOT/jobs.db" "$SMOKE_ROOT/jobs.db-wal" "$SMOKE_ROOT/jobs.db-shm"
    cp /Volumes/FreeTalkerSmoke/jobs.backup.db \
-     /Volumes/FreeTalkerSmoke/session/jobs.db
-   chmod 600 /Volumes/FreeTalkerSmoke/session/jobs.db
-   relaunch_and_verify
+     "$SMOKE_ROOT/jobs.db"
+   chmod 600 "$SMOKE_ROOT/jobs.db"
+   relaunch_and_verify || exit 1
    ```
+
+   After restoration, open **Library → Recoveries**, run
+   `verify_library_root || exit 1`, and confirm the warning is gone, Recoveries
+   no longer says Unavailable, and recording admission is enabled. The
+   unavailable verifier intentionally never requires a `jobs.db` process handle
+   or successful SQLite open; the normal verifier after restoration requires
+   both.
 
    On disposable copies only, corrupt one store/artifact. Confirm store-wide
    failure reports unavailable and blocks admission; item-local corruption is
