@@ -77,7 +77,7 @@ import Testing
         #expect(FileManager.default.fileExists(atPath: marker.path))
 
         let second = await fixture.reconciler().reconcile()
-        #expect(second.duplicates == 1)
+        #expect(second.duplicates == 2) // marker plus normalized owned UUID artifact
         #expect(try await fixture.store.jobs(kind: .recovery).count == 1)
     }
 
@@ -143,6 +143,206 @@ import Testing
         #expect(report.failed == 0)
         #expect(report.failures.isEmpty)
     }
+
+    @Test("capturing ledger segments are assembled and become visible after reopen")
+    func interruptedSegmentsBecomeVisible() async throws {
+        let fixture = try ReconciliationFixture()
+        let id = UUID()
+        let sessionDirectory = fixture.root.appendingPathComponent(id.uuidString, isDirectory: true)
+        try fixture.fileSystem.createDirectory(sessionDirectory)
+        _ = try await fixture.store.createCapture(.init(
+            id: id, directory: sessionDirectory, capturedAt: Date(), sampleRate: 16_000,
+            channelCount: 1, inputDeviceUID: nil, destination: "external"
+        ))
+        let codec = CaptureSegmentCodec(fileSystem: fixture.fileSystem)
+        for (ordinal, samples) in [[Float(0.2), 0.1], [0.3]].enumerated() {
+            let url = sessionDirectory.appendingPathComponent(String(format: "segment-%08d.wav", ordinal))
+            let data = codec.encode(samples)
+            try data.write(to: url)
+            try await fixture.store.recordCommittedSegment(.init(
+                captureID: id, ordinal: ordinal, url: url, sampleCount: samples.count,
+                contentHash: codec.hash(data)
+            ))
+        }
+
+        let reopened = try fixture.reopen()
+        let report = await reopened.reconciler().reconcile()
+        #expect(report.failed == 0)
+        #expect(try await reopened.store.session(id: id)?.state == .processing)
+        #expect(try await reopened.store.job(id: id) != nil)
+        #expect(FileManager.default.fileExists(atPath: sessionDirectory.appendingPathComponent("\(id.uuidString).wav").path))
+    }
+
+    @Test("Library identity wins over loose UUID audio without creating Recovery")
+    func looseUUIDLibraryIdentityWins() async throws {
+        let fixture = try ReconciliationFixture()
+        let id = UUID()
+        let audio = fixture.root.appendingPathComponent("\(id.uuidString).wav")
+        try WAVEncoder.encode(samples: Array(repeating: 0.2, count: 1_600), sampleRate: 16_000).write(to: audio)
+        let report = await fixture.reconciler(libraryDictationID: { candidate in candidate == id ? 73 : nil }).reconcile()
+        #expect(report.imported == 0)
+        #expect(try await fixture.store.job(id: id) == nil)
+        #expect(!FileManager.default.fileExists(atPath: audio.path))
+    }
+
+    @Test("pending temporary audio is retained until durable owned registration")
+    func pendingTemporaryEvidenceIsRetained() async throws {
+        let fixture = try ReconciliationFixture()
+        let id = UUID()
+        let temporary = fixture.root.appendingPathComponent(".\(id.uuidString).tmp")
+        let marker = fixture.root.appendingPathComponent("\(id.uuidString).pending")
+        try WAVEncoder.encode(samples: Array(repeating: 0.1, count: 1_600), sampleRate: 16_000).write(to: temporary)
+        try Data("0".utf8).write(to: marker)
+        let report = await fixture.reconciler().reconcile()
+        #expect(report.imported == 1)
+        #expect(FileManager.default.fileExists(atPath: temporary.path))
+        #expect(!FileManager.default.fileExists(atPath: marker.path))
+        let job = try #require(try await fixture.store.job(id: id))
+        #expect(FileManager.default.fileExists(atPath: job.source.reference))
+        #expect(job.source.reference != temporary.path)
+    }
+
+    @MainActor @Test("production launch gate coalesces concurrent launches")
+    func launchGateCoalescesConcurrentCalls() async {
+        let gate = RecoveryLaunchGate()
+        let probe = LaunchGateProbe()
+        async let first: Void = gate.run { await probe.enter() }
+        async let second: Void = gate.run { await probe.enter() }
+        _ = await (first, second)
+        #expect(await probe.count == 1)
+    }
+
+    @Test("canonical registration uses exact same-session retry schedule")
+    func canonicalRegistrationRetriesExactly() async throws {
+        let fixture = try ReconciliationFixture()
+        let id = UUID()
+        let sessionDirectory = fixture.root.appendingPathComponent(id.uuidString, isDirectory: true)
+        try fixture.fileSystem.createDirectory(sessionDirectory)
+        let canonical = sessionDirectory.appendingPathComponent("\(id.uuidString).wav")
+        let codec = CaptureSegmentCodec(fileSystem: fixture.fileSystem)
+        try codec.encode(Array(repeating: 0.2, count: 1_600)).write(to: canonical)
+        _ = try await fixture.store.createCapture(.init(
+            id: id, directory: sessionDirectory, capturedAt: Date(), sampleRate: 16_000,
+            channelCount: 1, inputDeviceUID: nil, destination: "external"
+        ))
+        let probe = ReconciliationRetryProbe(failures: 2)
+        let report = await fixture.reconciler(
+            retrySleep: { await probe.record($0) },
+            beforeRegistrationAttempt: { try await probe.attempt() }
+        ).reconcile()
+        #expect(report.failed == 0)
+        #expect(await probe.delays == [.zero, .milliseconds(250), .seconds(1)])
+        #expect(try await fixture.store.job(id: id) != nil)
+    }
+
+    @Test("pending temporary survives exhausted registration then converges on reopen")
+    func pendingTemporaryFailureConverges() async throws {
+        let fixture = try ReconciliationFixture()
+        let id = UUID()
+        let temporary = fixture.root.appendingPathComponent(".\(id.uuidString).tmp")
+        let marker = fixture.root.appendingPathComponent("\(id.uuidString).pending")
+        try WAVEncoder.encode(samples: Array(repeating: 0.1, count: 1_600), sampleRate: 16_000).write(to: temporary)
+        try Data("0".utf8).write(to: marker)
+        let probe = ReconciliationRetryProbe(failures: 3)
+        let failed = await fixture.reconciler(
+            retrySleep: { _ in }, beforeRegistrationAttempt: { try await probe.attempt() }
+        ).reconcile()
+        #expect(failed.failed == 1)
+        #expect(FileManager.default.fileExists(atPath: temporary.path))
+        #expect(FileManager.default.fileExists(atPath: marker.path))
+
+        let reopened = try fixture.reopen()
+        let recovered = await reopened.reconciler().reconcile()
+        #expect(recovered.failed == 0)
+        #expect(try await reopened.store.job(id: id) != nil)
+        #expect(FileManager.default.fileExists(atPath: temporary.path))
+    }
+
+    @Test("Library identity cleans capturing and staged canonical sessions before registration")
+    func libraryWinsForPreRegistrationSessions() async throws {
+        for staged in [false, true] {
+            let fixture = try ReconciliationFixture()
+            let id = UUID()
+            let sessionDirectory = fixture.root.appendingPathComponent(id.uuidString, isDirectory: true)
+            try fixture.fileSystem.createDirectory(sessionDirectory)
+            let canonical = sessionDirectory.appendingPathComponent("\(id.uuidString).wav")
+            let codec = CaptureSegmentCodec(fileSystem: fixture.fileSystem)
+            try codec.encode(Array(repeating: 0.2, count: 1_600)).write(to: canonical)
+            _ = try await fixture.store.createCapture(.init(
+                id: id, directory: sessionDirectory, capturedAt: Date(), sampleRate: 16_000,
+                channelCount: 1, inputDeviceUID: nil, destination: "external"
+            ))
+            if staged {
+                try await fixture.store.transition(
+                    id: id, from: .capturing, to: .staged, recoveryJobID: nil,
+                    libraryDictationID: nil, assetKind: .audio, failureMessage: nil,
+                    contentHash: try codec.hashFile(canonical)
+                )
+            }
+            let report = await fixture.reconciler(
+                libraryDictationID: { candidate in candidate == id ? 91 : nil }
+            ).reconcile()
+            #expect(report.failed == 0)
+            #expect(try await fixture.store.session(id: id) == nil)
+            #expect(try await fixture.store.job(id: id) == nil)
+            #expect(!FileManager.default.fileExists(atPath: canonical.path))
+        }
+    }
+
+    @Test("capturing failure marker becomes visible durable quarantine")
+    func capturingFailureMarkerBecomesVisible() async throws {
+        let fixture = try ReconciliationFixture()
+        let id = UUID()
+        let sessionDirectory = fixture.root.appendingPathComponent(id.uuidString, isDirectory: true)
+        try fixture.fileSystem.createDirectory(sessionDirectory)
+        let marker = sessionDirectory.appendingPathComponent("capture-failure.marker")
+        try Data("writer failure".utf8).write(to: marker)
+        _ = try await fixture.store.createCapture(.init(
+            id: id, directory: sessionDirectory, capturedAt: Date(), sampleRate: 16_000,
+            channelCount: 1, inputDeviceUID: nil, destination: "external"
+        ))
+        let reopened = try fixture.reopen()
+        let report = await reopened.reconciler().reconcile()
+        #expect(report.failed == 0)
+        #expect(try await reopened.store.session(id: id)?.state == .damaged)
+        #expect(try await reopened.store.session(id: id)?.assetKind == .quarantined)
+        #expect(try await reopened.store.job(id: id) != nil)
+    }
+
+    @Test("exhausted registration I/O failure does not block a later valid item")
+    func registrationFailureIsPerItem() async throws {
+        let fixture = try ReconciliationFixture()
+        try WAVEncoder.encode(
+            samples: Array(repeating: 0.1, count: 1_600), sampleRate: 16_000
+        ).write(to: fixture.root.appendingPathComponent("failed-000-io.wav"))
+        try WAVEncoder.encode(
+            samples: Array(repeating: 0.2, count: 1_600), sampleRate: 16_000
+        ).write(to: fixture.root.appendingPathComponent("failed-999-valid.wav"))
+        let probe = ReconciliationRetryProbe(failures: 3)
+        let report = await fixture.reconciler(
+            retrySleep: { _ in }, beforeRegistrationAttempt: { try await probe.attempt() }
+        ).reconcile()
+        #expect(report.failed == 1)
+        #expect(report.imported == 1)
+        #expect(try await fixture.store.jobs(kind: .recovery).count == 1)
+    }
+}
+
+private actor LaunchGateProbe {
+    private(set) var count = 0
+    func enter() async { count += 1; await Task.yield() }
+}
+
+private actor ReconciliationRetryProbe {
+    private let failures: Int
+    private(set) var attempts = 0
+    private(set) var delays: [Duration] = []
+    init(failures: Int) { self.failures = failures }
+    func record(_ delay: Duration) { delays.append(delay) }
+    func attempt() throws {
+        attempts += 1
+        if attempts <= failures { throw CocoaError(.fileWriteUnknown) }
+    }
 }
 
 private struct InventoryFailingFileSystem: JournalFileSystem {
@@ -188,11 +388,14 @@ final class ReconciliationFixture: @unchecked Sendable {
     }
 
     func reconciler(
-        libraryDictationID: @escaping @Sendable (UUID) async throws -> Int64? = { _ in nil }
+        libraryDictationID: @escaping @Sendable (UUID) async throws -> Int64? = { _ in nil },
+        retrySleep: @escaping @Sendable (Duration) async -> Void = { _ in },
+        beforeRegistrationAttempt: @escaping @Sendable () async throws -> Void = {}
     ) -> RecoveryReconciler {
         RecoveryReconciler(
             directory: root, store: store, ledger: store, fileSystem: fileSystem,
-            libraryDictationID: libraryDictationID
+            libraryDictationID: libraryDictationID, retrySleep: retrySleep,
+            beforeRegistrationAttempt: beforeRegistrationAttempt
         )
     }
 }

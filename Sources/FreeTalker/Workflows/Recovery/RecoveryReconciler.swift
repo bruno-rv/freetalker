@@ -13,6 +13,8 @@ actor RecoveryReconciler {
     private let fileSystem: any JournalFileSystem
     private let libraryDictationID: @Sendable (UUID) async throws -> Int64?
     private let importer: LegacyRecoveryImporter
+    private let registrationRetrier: RecoveryRegistrationRetrier
+    private let beforeRegistrationAttempt: @Sendable () async throws -> Void
     private var activeReconciliation: Task<RecoveryReconciliationReport, Never>?
 
     init(
@@ -24,17 +26,21 @@ actor RecoveryReconciler {
         retrySleep: @escaping @Sendable (Duration) async -> Void = { delay in
             guard delay > .zero else { return }
             do { try await Task.sleep(for: delay) } catch { return }
-        }
+        },
+        beforeRegistrationAttempt: @escaping @Sendable () async throws -> Void = {}
     ) {
         self.directory = directory.standardizedFileURL
         self.store = store
         self.ledger = ledger
         self.fileSystem = fileSystem
         self.libraryDictationID = libraryDictationID
+        self.beforeRegistrationAttempt = beforeRegistrationAttempt
+        registrationRetrier = RecoveryRegistrationRetrier(sleep: retrySleep)
         importer = LegacyRecoveryImporter(
-            store: store,
+            store: store, ledger: ledger, ownedDirectory: directory.standardizedFileURL,
             codec: CaptureSegmentCodec(fileSystem: fileSystem),
-            retrier: RecoveryRegistrationRetrier(sleep: retrySleep)
+            retrier: RecoveryRegistrationRetrier(sleep: retrySleep),
+            beforeRegistrationAttempt: beforeRegistrationAttempt
         )
     }
 
@@ -69,6 +75,7 @@ actor RecoveryReconciler {
 
         for item in rootItems {
             do {
+                guard fileSystem.exists(item) else { continue }
                 if Self.preparationCaptureID(item) != nil {
                     try await reconcilePreparationMarker(item, report: &report)
                 } else if Self.isPendingMarker(item) {
@@ -91,37 +98,135 @@ actor RecoveryReconciler {
         _ session: CaptureSession, report: inout RecoveryReconciliationReport
     ) async {
         do {
-            let canonical = session.directory.appendingPathComponent("\(session.id.uuidString).wav")
-            if (session.state == .capturing || session.state == .staged),
-               fileSystem.exists(canonical) {
-                try await importCanonical(canonical, id: session.id)
-            }
             if let libraryID = try await libraryDictationID(session.id) {
-                if session.state == .processing {
-                    try await ledger.transition(
-                        id: session.id, from: .processing, to: .libraryCommitted,
-                        recoveryJobID: session.recoveryJobID, libraryDictationID: libraryID,
-                        assetKind: session.assetKind, failureMessage: session.failureMessage,
-                        contentHash: session.contentHash
+                try await reconcileLibraryOwnedSession(session, libraryID: libraryID)
+                return
+            }
+            let canonical = session.directory.appendingPathComponent("\(session.id.uuidString).wav")
+            let current = try await ledger.session(id: session.id) ?? session
+            switch current.state {
+            case .capturing:
+                if fileSystem.exists(canonical) {
+                    try await importCanonical(canonical, id: current.id)
+                } else {
+                    let segments = try await ledger.committedSegments(captureID: current.id)
+                    if !segments.isEmpty {
+                        do {
+                            let assembled = try CaptureSegmentCodec(fileSystem: fileSystem)
+                                .assemble(segments: segments, canonicalURL: canonical)
+                            try await ledger.transition(
+                                id: current.id, from: .capturing, to: .staged,
+                                recoveryJobID: nil, libraryDictationID: nil,
+                                assetKind: .audio, failureMessage: nil,
+                                contentHash: assembled.contentHash
+                            )
+                            try await registerCanonical(canonical, id: current.id)
+                        } catch {
+                            try await quarantineJournal(
+                                current, fallback: segments.first?.url,
+                                message: "Interrupted capture segments are damaged: \(error.localizedDescription)"
+                            )
+                        }
+                    } else {
+                        let failureMarker = current.directory.appendingPathComponent("capture-failure.marker")
+                        if fileSystem.exists(failureMarker) {
+                            try await quarantineJournal(
+                                current, fallback: failureMarker,
+                                message: "Capture journal failed before recoverable audio was committed"
+                            )
+                        }
+                    }
+                }
+            case .staged:
+                if fileSystem.exists(canonical) {
+                    try await registerCanonical(canonical, id: current.id)
+                } else {
+                    try await quarantineJournal(
+                        current, fallback: nil,
+                        message: "Staged recovery audio is missing"
                     )
                 }
-                if let current = try await ledger.session(id: session.id),
-                   current.state == .libraryCommitted {
-                    try await RecoveryCaptureService(
-                        directory: directory, store: store, ledger: ledger,
-                        journalFileSystem: fileSystem, libraryDictationID: libraryDictationID
-                    ).resumeLibraryCommittedCapture(captureID: session.id)
-                }
+            case .damaged:
+                let items = fileSystem.exists(current.directory)
+                    ? try fileSystem.contents(current.directory) : []
+                let fallback = fileSystem.exists(canonical) ? canonical
+                    : items.first(where: { $0.lastPathComponent == "capture-failure.marker" })
+                        ?? items.first(where: { CaptureSegmentCodec.ordinal(from: $0) != nil })
+                try await quarantineJournal(
+                    current, fallback: fallback,
+                    message: current.failureMessage ?? "Capture journal is damaged"
+                )
+            case .processing, .libraryCommitted, .silent, .cancelling:
+                break
             }
         } catch {
             report.recordFailure(session.directory, error)
         }
     }
 
+    private func reconcileLibraryOwnedSession(
+        _ snapshot: CaptureSession, libraryID: Int64
+    ) async throws {
+        guard var current = try await ledger.session(id: snapshot.id) else { return }
+        if current.state == .cancelling {
+            try await CaptureJournalService(fileSystem: fileSystem, ledger: ledger)
+                .resumeCleanup(captureID: current.id)
+            return
+        }
+        if current.state != .libraryCommitted {
+            try await ledger.transition(
+                id: current.id, from: current.state, to: .libraryCommitted,
+                recoveryJobID: current.recoveryJobID, libraryDictationID: libraryID,
+                assetKind: current.assetKind, failureMessage: current.failureMessage,
+                contentHash: current.contentHash
+            )
+            guard let persisted = try await ledger.session(id: current.id) else { return }
+            current = persisted
+        }
+        guard current.state == .libraryCommitted,
+              current.libraryDictationID == libraryID else {
+            throw RecoveryFinalizationError.captureIdentityMismatch
+        }
+        try await RecoveryCaptureService(
+            directory: directory, store: store, ledger: ledger,
+            journalFileSystem: fileSystem, libraryDictationID: libraryDictationID
+        ).resumeLibraryCommittedCapture(captureID: current.id)
+    }
+
+    private func quarantineJournal(
+        _ session: CaptureSession, fallback: URL?, message: String
+    ) async throws {
+        if session.state == .capturing || session.state == .staged {
+            try await ledger.transition(
+                id: session.id, from: session.state, to: .damaged,
+                recoveryJobID: session.recoveryJobID ?? session.id, libraryDictationID: nil,
+                assetKind: .quarantined, failureMessage: message,
+                contentHash: session.contentHash
+            )
+        }
+        let source = fallback ?? session.directory.appendingPathComponent("capture-failure.marker")
+        if !fileSystem.exists(source) {
+            let temporary = source.deletingLastPathComponent().appendingPathComponent(
+                ".capture-failure.\(UUID().uuidString).tmp"
+            )
+            try DurableArtifactWriter(fileSystem: fileSystem).commit(
+                Data(message.utf8), temporary: temporary, destination: source
+            )
+        }
+        _ = try await importer.importAudio(
+            source, preferredID: session.id, forceQuarantine: true
+        )
+    }
+
     private func reconcilePreparationMarker(
         _ marker: URL, report: inout RecoveryReconciliationReport
     ) async throws {
         guard let id = Self.preparationCaptureID(marker) else { return }
+        if try await libraryDictationID(id) != nil {
+            try fileSystem.remove(marker)
+            try fileSystem.synchronizeDirectory(marker.deletingLastPathComponent())
+            return
+        }
         let existed = try await ledger.session(id: id) != nil
         let captureDirectory = directory.appendingPathComponent(id.uuidString)
         try await createDamagedOwnership(
@@ -138,14 +243,17 @@ actor RecoveryReconciler {
         guard let captureID = UUID(uuidString: stem) else { return }
         let finalAudio = directory.appendingPathComponent("\(stem).wav")
         let temporaryAudio = directory.appendingPathComponent(".\(stem).tmp")
-        if !fileSystem.exists(finalAudio), fileSystem.exists(temporaryAudio) {
-            try fileSystem.rename(temporaryAudio, to: finalAudio)
-            try fileSystem.synchronizeDirectory(directory)
-        }
-        guard fileSystem.exists(finalAudio) else {
+        let source = fileSystem.exists(finalAudio) ? finalAudio : temporaryAudio
+        guard fileSystem.exists(source) else {
             throw CaptureJournalError.invalidWAV(finalAudio.path)
         }
-        report.add(try await importer.importAudio(finalAudio, preferredID: captureID))
+        if try await libraryDictationID(captureID) != nil {
+            try await cleanupLibraryOwnedLoose(captureID, artifact: finalAudio)
+            try fileSystem.remove(marker)
+            try fileSystem.synchronizeDirectory(directory)
+            return
+        }
+        report.add(try await importer.importAudio(source, preferredID: captureID))
         try fileSystem.remove(marker)
         try fileSystem.synchronizeDirectory(directory)
     }
@@ -154,6 +262,10 @@ actor RecoveryReconciler {
         _ sessionDirectory: URL, report: inout RecoveryReconciliationReport
     ) async throws {
         guard let id = Self.directoryCaptureID(sessionDirectory) else { return }
+        if try await libraryDictationID(id) != nil {
+            try await cleanupLibraryOwnedLoose(id, artifact: sessionDirectory)
+            return
+        }
         let items = try fileSystem.contents(sessionDirectory).sorted { $0.path < $1.path }
         let canonical = sessionDirectory.appendingPathComponent("\(id.uuidString).wav")
         if fileSystem.exists(canonical) {
@@ -201,6 +313,10 @@ actor RecoveryReconciler {
     ) async throws {
         let stem = audio.deletingPathExtension().lastPathComponent
         if let id = UUID(uuidString: stem) {
+            if try await libraryDictationID(id) != nil {
+                try await cleanupLibraryOwnedLoose(id, artifact: audio)
+                return
+            }
             report.add(try await importer.importAudio(audio, preferredID: id))
         } else if stem.hasPrefix("failed-") {
             report.add(try await importer.importAudio(audio))
@@ -233,26 +349,40 @@ actor RecoveryReconciler {
         catch { throw RecoveryReconciliationOperationError(operation: "register orphan recovery", underlying: error) }
     }
 
+    private func cleanupLibraryOwnedLoose(_ id: UUID, artifact: URL) async throws {
+        if let job = try await store.job(id: id) {
+            _ = try await store.deleteCommittedRecovery(
+                id: id, expectedSourceReference: job.source.reference
+            )
+        }
+        if fileSystem.exists(artifact) { try fileSystem.remove(artifact) }
+        try fileSystem.synchronizeDirectory(artifact.deletingLastPathComponent())
+    }
+
     private func registerCanonical(_ audio: URL, id: UUID) async throws {
-        let job = if let existing = try await store.job(id: id) {
-            existing
-        } else {
-            try await store.createProvisionalRecovery(
-                id: id, source: JobSource(reference: audio.path), capturedAt: Date()
-            )
-        }
-        if let session = try await ledger.session(id: id), session.state == .staged {
-            try await ledger.transition(
-                id: id, from: .staged, to: .processing, recoveryJobID: job.id,
-                libraryDictationID: nil, assetKind: .audio,
-                failureMessage: session.failureMessage, contentHash: session.contentHash
-            )
-        }
-        if case .processing = job.state {
-            try await store.failProvisionalRecovery(
-                id: id,
-                failure: JobFailure(stage: .preparing, message: "Interrupted recording is ready to retry")
-            )
+        try await registrationRetrier.run {
+            try await self.beforeRegistrationAttempt()
+            var job = if let existing = try await self.store.job(id: id) {
+                existing
+            } else {
+                try await self.store.createProvisionalRecovery(
+                    id: id, source: JobSource(reference: audio.path), capturedAt: Date()
+                )
+            }
+            if let session = try await self.ledger.session(id: id), session.state == .staged {
+                try await self.ledger.transition(
+                    id: id, from: .staged, to: .processing, recoveryJobID: job.id,
+                    libraryDictationID: nil, assetKind: .audio,
+                    failureMessage: session.failureMessage, contentHash: session.contentHash
+                )
+                job = try await self.store.job(id: id) ?? job
+            }
+            if case .processing = job.state {
+                try await self.store.failProvisionalRecovery(
+                    id: id,
+                    failure: JobFailure(stage: .preparing, message: "Interrupted recording is ready to retry")
+                )
+            }
         }
     }
 
@@ -271,25 +401,16 @@ actor RecoveryReconciler {
         if session.state == .capturing {
             do {
                 try await ledger.transition(
-                    id: id, from: .capturing, to: .damaged, recoveryJobID: nil,
+                    id: id, from: .capturing, to: .damaged, recoveryJobID: id,
                     libraryDictationID: nil, assetKind: .quarantined,
                     failureMessage: message, contentHash: nil
                 )
             } catch { throw RecoveryReconciliationOperationError(operation: "mark ownership damaged", underlying: error) }
         }
         do {
-            let job = if let existing = try await store.job(id: id) {
-                existing
-            } else {
-                try await store.createProvisionalRecovery(
-                    id: id, source: JobSource(reference: source.path), capturedAt: Date()
-                )
-            }
-            if case .processing = job.state {
-                try await store.failProvisionalRecovery(
-                    id: id, failure: JobFailure(stage: .preparing, message: message)
-                )
-            }
+            _ = try await importer.importAudio(
+                source, preferredID: id, forceQuarantine: true
+            )
         } catch { throw RecoveryReconciliationOperationError(operation: "register damaged recovery", underlying: error) }
     }
 

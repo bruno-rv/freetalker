@@ -233,10 +233,13 @@ extension TranscriptionJobStore: CaptureLedgerStoring {
         return switch (from, to) {
         case (.capturing, .staged), (.capturing, .silent),
              (.capturing, .damaged), (.capturing, .cancelling),
+             (.capturing, .libraryCommitted),
              (.staged, .processing), (.staged, .damaged), (.staged, .cancelling),
+             (.staged, .libraryCommitted),
              (.processing, .libraryCommitted), (.processing, .damaged),
              (.processing, .cancelling), (.damaged, .cancelling),
-             (.silent, .cancelling), (.libraryCommitted, .cancelling): true
+             (.damaged, .libraryCommitted), (.silent, .cancelling),
+             (.silent, .libraryCommitted), (.libraryCommitted, .cancelling): true
         default: false
         }
     }

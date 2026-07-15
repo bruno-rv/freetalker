@@ -206,6 +206,7 @@ final class AppCoordinator: ObservableObject {
     private var recoveryStoreInitializationError: String?
     let jobLibraryStore: JobLibraryStore?
     private var recoveryRunner: LocalJobRunner?
+    private let recoveryLaunchGate = RecoveryLaunchGate()
     private var mediaImportRunner: LocalJobRunner?
     private var recoveryRetentionTask: Task<Void, Never>?
     private let localJobExecutionAuthority = LocalJobExecutionAuthority()
@@ -2896,6 +2897,13 @@ final class AppCoordinator: ObservableObject {
     }
 
     func launchRecoveryWorkflows() async {
+        await recoveryLaunchGate.run { [weak self] in
+            await self?.performLaunchRecoveryWorkflows()
+        }
+    }
+
+    private func performLaunchRecoveryWorkflows() async {
+        guard recoveryRunner == nil else { return }
         guard let recoveryStore else {
             let message = recoveryStoreInitializationError ?? "Recovery store is unavailable"
             recoveryReconciliationReport = RecoveryReconciliationReport(storeFailure: message)

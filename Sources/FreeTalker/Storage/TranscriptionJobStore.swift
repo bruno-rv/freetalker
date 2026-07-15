@@ -143,6 +143,28 @@ actor TranscriptionJobStore {
         try transition(id, from: .processing, to: .failed(failure))
     }
 
+    func updateRecoverySource(
+        id: UUID,
+        expectedSourceReference: String,
+        source: JobSource
+    ) throws {
+        let statement = try prepare("""
+        UPDATE transcription_jobs
+        SET source_reference = ?, source_bookmark = ?, updated_at = ?
+        WHERE id = ? AND kind = 'recovery' AND source_reference = ?
+          AND state IN ('processing', 'failed');
+        """)
+        defer { sqlite3_finalize(statement) }
+        bind(source.reference, to: 1, in: statement)
+        bind(source.bookmark, to: 2, in: statement)
+        sqlite3_bind_double(statement, 3, clock.now.timeIntervalSince1970)
+        bind(id.uuidString, to: 4, in: statement)
+        bind(expectedSourceReference, to: 5, in: statement)
+        try stepDone(statement)
+        if sqlite3_changes(handle) == 1 { return }
+        guard try job(id: id)?.source == source else { throw JobStoreError.invalidTransition }
+    }
+
     func deleteProvisionalRecovery(id: UUID, expectedSourceReference: String) throws -> Bool {
         let statement = try prepare("""
         DELETE FROM transcription_jobs
