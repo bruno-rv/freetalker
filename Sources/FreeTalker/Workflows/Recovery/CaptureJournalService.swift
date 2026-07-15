@@ -73,6 +73,21 @@ struct CaptureJournalService: Sendable {
         try await cancelAndClean(session: current)
     }
 
+    func preserveFailure(_ active: ActiveCaptureJournal, message: String) async throws {
+        await active.writer.stop()
+        guard let current = try await ledger.session(id: active.session.id) else {
+            throw CaptureJournalError.missingCapture(active.session.id)
+        }
+        guard current.state != .damaged else { return }
+        try await ledger.transition(
+            id: current.id, from: current.state, to: .damaged,
+            recoveryJobID: current.recoveryJobID,
+            libraryDictationID: current.libraryDictationID,
+            assetKind: .damaged, failureMessage: message,
+            contentHash: current.contentHash
+        )
+    }
+
     func markProcessing(captureID: UUID, recoveryJobID: UUID) async throws {
         guard let session = try await ledger.session(id: captureID) else {
             throw CaptureJournalError.missingCapture(captureID)

@@ -11,16 +11,48 @@ final class AppCoordinator: ObservableObject {
         case none, dictation, voiceEdit
         var requiresDurableJournal: Bool { self == .dictation }
     }
-    enum CaptureDecision: Equatable { case start, stop, busy(CaptureOwner) }
+    enum CaptureDecision: Equatable {
+        case start, stop, busy(CaptureOwner)
+        var allowsStart: Bool { self == .start }
+    }
     enum TranslationRecoveryHUDOwner: Equatable { case none, recovery, recording }
     enum RecordingHUDEarlyTerminal: CaseIterable {
         case voiceEditEscape
         case externalDeadAudio
         case scratchpadDeadAudio
     }
+    struct CaptureStopSettingsSnapshot: Equatable {
+        let oneShotLanguage: String?
+        let outputLanguage: OutputLanguage
+        let cloudSnapshot: CloudLLMSettingsSnapshot
+    }
+
+    nonisolated static func captureStopSettingsSnapshot(
+        oneShotLanguage: String?,
+        selectedOutput: OutputLanguage?,
+        defaultOutput: OutputLanguage,
+        cloudSnapshot: CloudLLMSettingsSnapshot
+    ) -> CaptureStopSettingsSnapshot {
+        CaptureStopSettingsSnapshot(
+            oneShotLanguage: oneShotLanguage,
+            outputLanguage: selectedOutput ?? defaultOutput,
+            cloudSnapshot: cloudSnapshot
+        )
+    }
 
     nonisolated static func captureStartDecision(current: CaptureOwner, requested: CaptureOwner) -> CaptureDecision {
         current == .none ? .start : .busy(current)
+    }
+
+    nonisolated static func captureStartDecision(
+        current: CaptureOwner,
+        requested: CaptureOwner,
+        admissionState: CaptureAdmissionState
+    ) -> CaptureDecision {
+        guard !admissionState.isActive else {
+            return .busy(current == .none ? .dictation : current)
+        }
+        return captureStartDecision(current: current, requested: requested)
     }
 
     nonisolated static func capturePressDecision(current: CaptureOwner, pressed: CaptureOwner) -> CaptureDecision {
@@ -130,12 +162,28 @@ final class AppCoordinator: ObservableObject {
     private let audioCapture = AudioCapture()
     private var captureAdmission = CaptureAdmissionReducer()
     private var activeCaptureJournal: ActiveCaptureJournal?
+    private var journalFinalizationTask: Task<Void, Never>?
     private var journalFailureHandled = false
     private struct PendingStopRequest {
+        let destination: RecordingDestination
         let snapshot: (app: NSRunningApplication?, target: InsertionTarget?, contextTarget: ContextTargetSnapshot)?
         let skipPostProcessing: Bool
+        let oneShotLanguage: String?
+        let outputLanguage: OutputLanguage
+        let cloudSnapshot: CloudLLMSettingsSnapshot
     }
     private var pendingStopRequest: PendingStopRequest?
+    private struct PendingCaptureCleanup {
+        enum Completion {
+            case cancellation
+            case startFailure(String)
+        }
+        let active: ActiveCaptureJournal
+        let service: CaptureJournalService
+        let destination: RecordingDestination
+        let completion: Completion
+    }
+    private var pendingCaptureCleanup: PendingCaptureCleanup?
     private let hud = HUDController()
     private let recoveryStore: TranscriptionJobStore?
     let jobLibraryStore: JobLibraryStore?
@@ -147,6 +195,15 @@ final class AppCoordinator: ObservableObject {
     private var permissionPollTimer: Timer?
 
     private static let logger = Logger(subsystem: "org.freetalker.app", category: "capture")
+
+    @discardableResult
+    private func reduceCaptureAdmission(
+        _ event: CaptureAdmissionEvent
+    ) -> CaptureAdmissionAction {
+        let action = captureAdmission.reduce(event)
+        hotKeyManager.isCaptureLifecycleActive = captureAdmission.state.isActive
+        return action
+    }
 
     var activeSTTEngine: any TranscriptionEngine {
         AppSettings.shared.sttEngine == .whisperKit ? whisperEngine : cloudSTTEngine
@@ -376,7 +433,13 @@ final class AppCoordinator: ObservableObject {
     }
 
     private func handleVoiceEditHotKey() {
-        switch Self.capturePressDecision(current: captureOwner, pressed: .voiceEdit) {
+        let decision = captureAdmission.state.isActive
+            ? Self.captureStartDecision(
+                current: captureOwner, requested: .voiceEdit,
+                admissionState: captureAdmission.state
+            )
+            : Self.capturePressDecision(current: captureOwner, pressed: .voiceEdit)
+        switch decision {
         case .stop:
             finishVoiceEditInstructionRecording()
             return
@@ -396,7 +459,10 @@ final class AppCoordinator: ObservableObject {
     }
 
     private func beginVoiceEditInstructionRecording() {
-        guard Self.captureStartDecision(current: captureOwner, requested: .voiceEdit) == .start,
+        guard Self.captureStartDecision(
+            current: captureOwner, requested: .voiceEdit,
+            admissionState: captureAdmission.state
+        ) == .start,
               !isProcessing else {
             hud.flash("Finish the current recording first")
             pendingVoiceEditSelection = nil
@@ -917,6 +983,11 @@ final class AppCoordinator: ObservableObject {
             recordingHUDDidEndEarly(.voiceEditEscape)
             return
         }
+        if captureAdmission.state.isActive {
+            recordingState = .idle
+            cancelRecording()
+            return
+        }
         let (newState, action) = RecordingStateMachine.transition(state: recordingState, event: .esc, currentGeneration: recordingGeneration)
         recordingState = newState
         switch action {
@@ -1019,10 +1090,16 @@ final class AppCoordinator: ObservableObject {
     /// capture-start failure, so the caller never commits the state transition for a recording
     /// that never actually started.
     private func beginCapture(destination: RecordingDestination) -> Bool {
-        guard Self.captureStartDecision(current: captureOwner, requested: .dictation) == .start else {
+        if pendingCaptureCleanup != nil {
+            retryPendingCaptureCleanup()
             return false
         }
-        guard captureAdmission.state == .idle else { return false }
+        guard Self.captureStartDecision(
+            current: captureOwner, requested: .dictation,
+            admissionState: captureAdmission.state
+        ) == .start else {
+            return false
+        }
         recordingDestination = nil
         oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .clear)
         let micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
@@ -1053,9 +1130,10 @@ final class AppCoordinator: ObservableObject {
         recordingGeneration += 1
         pendingStopRequest = nil
         journalFailureHandled = false
-        _ = captureAdmission.reduce(.begin(destination: destination.journalIdentifier))
-
         let captureID = UUID()
+        _ = reduceCaptureAdmission(.begin(
+            captureID: captureID, destination: destination.journalIdentifier
+        ))
         let request = CaptureStartRequest(
             id: captureID,
             directory: Self.recoveryDirectory.appendingPathComponent(
@@ -1081,6 +1159,7 @@ final class AppCoordinator: ObservableObject {
                 self?.completeCaptureAdmission(active, service: service)
             } catch {
                 self?.failCaptureAdmission(
+                    captureID: captureID,
                     destination: destination,
                     message: "Could not prepare recording storage: \(error.localizedDescription)"
                 )
@@ -1093,7 +1172,7 @@ final class AppCoordinator: ObservableObject {
         _ active: ActiveCaptureJournal,
         service: CaptureJournalService
     ) {
-        let action = captureAdmission.reduce(.prepared(captureID: active.session.id))
+        let action = reduceCaptureAdmission(.prepared(captureID: active.session.id))
         switch action {
         case .cancel:
             Task { await cleanCancelledAdmission(active, service: service) }
@@ -1113,36 +1192,58 @@ final class AppCoordinator: ObservableObject {
                     let pending = pendingStopRequest
                     pendingStopRequest = nil
                     stopAndTranscribe(
-                        preSnapshotted: pending?.snapshot,
-                        skipPostProcessing: pending?.skipPostProcessing ?? false
+                        stopRequest: pending
                     )
                 }
             } catch {
+                let message = Self.captureStartFailureMessage(
+                    errorDescription: error.localizedDescription
+                )
+                _ = reduceCaptureAdmission(.cancelRequested)
                 Task {
-                    try? await service.cancelAndClean(active)
-                    failCaptureAdmission(
-                        destination: recordingDestination ?? .external,
-                        message: Self.captureStartFailureMessage(
-                            errorDescription: error.localizedDescription
+                    let destination = recordingDestination ?? .external
+                    do {
+                        try await service.cancelAndClean(active)
+                        _ = reduceCaptureAdmission(.cleanupFinished(
+                            captureID: active.session.id
+                        ))
+                        activeCaptureJournal = nil
+                        captureOwner = .none
+                        destinationLifecycle.failStart(destination, message: message)
+                        recordingState = .idle
+                        recordingOutputSelection.resolveTerminal()
+                        lastError = message
+                        hud.flash(message)
+                        recordingHUDDidReachTerminalState()
+                    } catch {
+                        retainFailedCleanup(
+                            active: active, service: service,
+                            destination: destination,
+                            completion: .startFailure(message),
+                            cleanupError: error
                         )
-                    )
+                    }
                 }
             }
-        case .none, .finish, .fail:
+        case .none, .finish, .preserveFailure, .fail:
             break
         }
     }
 
     private func failCaptureAdmission(
+        captureID: UUID,
         destination: RecordingDestination,
         message: String
     ) {
-        let cancellationRequested: Bool = if case .preparing(_, _, true) = captureAdmission.state {
+        let cancellationRequested: Bool = if case .preparing(_, _, _, true) = captureAdmission.state {
             true
         } else {
             false
         }
-        _ = captureAdmission.reduce(.preparationFailed(message))
+        let action = reduceCaptureAdmission(.preparationFailed(
+            captureID: captureID, message: message
+        ))
+        guard action != .none else { return }
         pendingStopRequest = nil
         recordingState = .idle
         captureOwner = .none
@@ -1163,11 +1264,77 @@ final class AppCoordinator: ObservableObject {
     ) async {
         do {
             try await service.cancelAndClean(active)
-            _ = captureAdmission.reduce(.cleanupFinished)
+            _ = reduceCaptureAdmission(.cleanupFinished(captureID: active.session.id))
+            activeCaptureJournal = nil
+            captureOwner = .none
+            pendingCaptureCleanup = nil
             finishCancellationPresentation()
         } catch {
-            lastError = "Could not finish cancelling recording: \(error.localizedDescription)"
-            hud.flash("Recording cancellation needs recovery")
+            retainFailedCleanup(
+                active: active, service: service,
+                destination: recordingDestination ?? .external,
+                completion: .cancellation,
+                cleanupError: error
+            )
+        }
+    }
+
+    private func retainFailedCleanup(
+        active: ActiveCaptureJournal,
+        service: CaptureJournalService,
+        destination: RecordingDestination,
+        completion: PendingCaptureCleanup.Completion,
+        cleanupError: Error
+    ) {
+        let operation = switch completion {
+        case .cancellation: "Recording cancellation"
+        case .startFailure(let message): message
+        }
+        let detail = "\(operation) cleanup failed: \(cleanupError.localizedDescription)"
+        _ = reduceCaptureAdmission(.cleanupFailed(
+            captureID: active.session.id, message: detail
+        ))
+        activeCaptureJournal = active
+        pendingCaptureCleanup = PendingCaptureCleanup(
+            active: active, service: service, destination: destination,
+            completion: completion
+        )
+        lastError = detail
+        hud.flash("Recording cleanup needs retry — recovery retained")
+    }
+
+    private func retryPendingCaptureCleanup() {
+        guard let pending = pendingCaptureCleanup else { return }
+        Task {
+            do {
+                try await pending.service.resumeCleanup(
+                    captureID: pending.active.session.id
+                )
+                _ = reduceCaptureAdmission(.cleanupFinished(
+                    captureID: pending.active.session.id
+                ))
+                pendingCaptureCleanup = nil
+                activeCaptureJournal = nil
+                captureOwner = .none
+                switch pending.completion {
+                case .cancellation:
+                    finishCancellationPresentation()
+                case .startFailure(let message):
+                    destinationLifecycle.failStart(
+                        pending.destination, message: message
+                    )
+                    recordingOutputSelection.resolveTerminal()
+                    hud.flash("Recording cleanup completed — try again")
+                    recordingHUDDidReachTerminalState()
+                }
+            } catch {
+                retainFailedCleanup(
+                    active: pending.active, service: pending.service,
+                    destination: pending.destination,
+                    completion: pending.completion,
+                    cleanupError: error
+                )
+            }
         }
     }
 
@@ -1186,25 +1353,46 @@ final class AppCoordinator: ObservableObject {
     ) {
         guard AudioCapture.consumerFailureAction(for: result) == .escalate else { return }
         guard !journalFailureHandled else { return }
+        guard let active = activeCaptureJournal, let recoveryStore else { return }
         journalFailureHandled = true
+        guard reduceCaptureAdmission(.failureHandlingStarted(
+            captureID: active.session.id
+        )) == .preserveFailure(active.session.id) else { return }
         recordingState = .idle
-        captureOwner = .none
         invalidateCapTimer()
         stopLivePreview()
         _ = audioCapture.stop()
-        activeCaptureJournal = nil
         let message = "Recording stopped because audio could not be saved"
         lastError = message
-        let destination = destinationLifecycle.take()
-        if case .scratchpad = destination {
-            _ = try? Self.routeDestinationEvent(
-                .failure(message), destination: destination,
-                router: scratchpadRecordingRouter
-            ) {}
+        let service = CaptureJournalService(
+            fileSystem: LocalJournalFileSystem(), ledger: recoveryStore
+        )
+        Task {
+            do {
+                try await service.preserveFailure(active, message: message)
+                guard captureAdmission.state.captureID == active.session.id else { return }
+                _ = reduceCaptureAdmission(.failureHandled(captureID: active.session.id))
+                activeCaptureJournal = nil
+                captureOwner = .none
+                let destination = destinationLifecycle.take()
+                if case .scratchpad = destination {
+                    _ = try? Self.routeDestinationEvent(
+                        .failure(message), destination: destination,
+                        router: scratchpadRecordingRouter
+                    ) {}
+                }
+                recordingOutputSelection.resolveTerminal()
+                hud.flash("Recording stopped — captured audio kept for recovery")
+                recordingHUDDidReachTerminalState()
+            } catch {
+                let detail = "\(message): \(error.localizedDescription)"
+                _ = reduceCaptureAdmission(.cleanupFailed(
+                    captureID: active.session.id, message: detail
+                ))
+                lastError = detail
+                hud.flash("Recording failure retained — recovery needs attention")
+            }
         }
-        hud.flash("Recording stopped — captured audio kept for recovery")
-        recordingOutputSelection.resolveTerminal()
-        recordingHUDDidReachTerminalState()
     }
 
     /// pttRecording -> locked side effect (Amendment B2/B3): snapshots the clamped duration cap
@@ -1304,26 +1492,58 @@ final class AppCoordinator: ObservableObject {
     /// synchronous, at key-up, before any `await`. `skipPostProcessing` (Feature 3's "Raw"
     /// button) rides straight through to `processDictation` — the raw flag is pipeline config,
     /// not lifecycle, so it isn't part of the state machine.
+    private func makeStopRequest(
+        preSnapshotted: (app: NSRunningApplication?, target: InsertionTarget?, contextTarget: ContextTargetSnapshot)?,
+        skipPostProcessing: Bool
+    ) -> PendingStopRequest {
+        let destination = recordingDestination ?? .external
+        let snapshot = preSnapshotted ?? Self.externalStopSnapshot(for: destination) {
+            let app = NSWorkspace.shared.frontmostApplication
+            return (
+                app: app,
+                target: Insertion.snapshotTarget(app: app),
+                contextTarget: snapshotContextTarget(app: app)
+            )
+        }
+        let settings = Self.captureStopSettingsSnapshot(
+            oneShotLanguage: oneShotLanguage,
+            selectedOutput: recordingOutputSelection.current,
+            defaultOutput: AppSettings.shared.defaultOutputLanguage,
+            cloudSnapshot: AppSettings.shared.cloudLLMSnapshot
+        )
+        return PendingStopRequest(
+            destination: destination, snapshot: snapshot,
+            skipPostProcessing: skipPostProcessing,
+            oneShotLanguage: settings.oneShotLanguage,
+            outputLanguage: settings.outputLanguage,
+            cloudSnapshot: settings.cloudSnapshot
+        )
+    }
+
     private func stopAndTranscribe(
         preSnapshotted: (app: NSRunningApplication?, target: InsertionTarget?, contextTarget: ContextTargetSnapshot)? = nil,
         skipPostProcessing: Bool = false,
-        stoppedCapture: (samples: [Float], peak: Float, rms: Float)? = nil
+        stoppedCapture: (samples: [Float], peak: Float, rms: Float)? = nil,
+        stopRequest suppliedStopRequest: PendingStopRequest? = nil
     ) {
+        let stopRequest = suppliedStopRequest ?? makeStopRequest(
+            preSnapshotted: preSnapshotted,
+            skipPostProcessing: skipPostProcessing
+        )
         if case .preparing = captureAdmission.state {
-            _ = captureAdmission.reduce(.stopRequested)
-            pendingStopRequest = PendingStopRequest(
-                snapshot: preSnapshotted, skipPostProcessing: skipPostProcessing
-            )
+            _ = reduceCaptureAdmission(.stopRequested)
+            pendingStopRequest = stopRequest
             return
         }
 
         if stoppedCapture == nil, let active = activeCaptureJournal,
            let recoveryStore {
-            _ = captureAdmission.reduce(.stopRequested)
+            guard reduceCaptureAdmission(.stopRequested) == .finish(active.session.id) else {
+                return
+            }
             journalFailureHandled = true
             invalidateCapTimer()
             stopLivePreview()
-            captureOwner = .none
             let samples = audioCapture.stop()
             let (peak, rms) = AudioLevel.peakAndRMS(samples)
             let diagnostics = CaptureDiagnostics(
@@ -1332,11 +1552,10 @@ final class AppCoordinator: ObservableObject {
                 routeFailure: nil
             )
             active.writer.updateDiagnostics(diagnostics)
-            activeCaptureJournal = nil
             let service = CaptureJournalService(
                 fileSystem: LocalJournalFileSystem(), ledger: recoveryStore
             )
-            Task {
+            journalFinalizationTask = Task {
                 do {
                     let downstreamSamples: [Float]
                     if diagnostics.indicatesSilence {
@@ -1344,18 +1563,36 @@ final class AppCoordinator: ObservableObject {
                         downstreamSamples = samples
                     } else {
                         let staged = try await service.finish(active)
-                        downstreamSamples = try CaptureSegmentCodec(
-                            fileSystem: LocalJournalFileSystem()
-                        ).decode(staged.canonicalAudioURL)
+                        let url = staged.canonicalAudioURL
+                        downstreamSamples = try await CaptureCanonicalAudioLoader.load {
+                            try CaptureSegmentCodec(
+                                fileSystem: LocalJournalFileSystem()
+                            ).decode(url)
+                        }
                     }
-                    captureAdmission = CaptureAdmissionReducer()
+                    guard captureAdmission.state == .finalizing(
+                        captureID: active.session.id
+                    ) else { return }
+                    _ = reduceCaptureAdmission(.finalizationFinished(
+                        captureID: active.session.id
+                    ))
+                    journalFinalizationTask = nil
+                    activeCaptureJournal = nil
+                    captureOwner = .none
                     stopAndTranscribe(
-                        preSnapshotted: preSnapshotted,
-                        skipPostProcessing: skipPostProcessing,
-                        stoppedCapture: (downstreamSamples, peak, rms)
+                        stoppedCapture: (downstreamSamples, peak, rms),
+                        stopRequest: stopRequest
                     )
                 } catch {
-                    captureAdmission = CaptureAdmissionReducer()
+                    guard captureAdmission.state == .finalizing(
+                        captureID: active.session.id
+                    ) else { return }
+                    _ = reduceCaptureAdmission(.failureHandled(
+                        captureID: active.session.id
+                    ))
+                    journalFinalizationTask = nil
+                    activeCaptureJournal = nil
+                    captureOwner = .none
                     let message = "Recording was preserved, but could not be prepared for processing"
                     lastError = "\(message): \(error.localizedDescription)"
                     let destination = destinationLifecycle.take()
@@ -1373,21 +1610,22 @@ final class AppCoordinator: ObservableObject {
             return
         }
 
-        let capturedOneShotLanguage = oneShotLanguage
-        let capturedOutputLanguage = recordingOutputSelection.current ?? AppSettings.shared.defaultOutputLanguage
-        let capturedCloudSnapshot = AppSettings.shared.cloudLLMSnapshot
+        let capturedOneShotLanguage = stopRequest.oneShotLanguage
+        let capturedOutputLanguage = stopRequest.outputLanguage
+        let capturedCloudSnapshot = stopRequest.cloudSnapshot
         defer {
             oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .clear)
             recordingOutputSelection.resolveTerminal()
         }
 
-        let destination = destinationLifecycle.take()
+        _ = destinationLifecycle.take()
+        let destination = stopRequest.destination
 
         if case .scratchpad(let token) = destination {
             stopAndTranscribeToScratchpad(
                 token: token, forcedLanguage: capturedOneShotLanguage,
                 outputLanguage: capturedOutputLanguage, cloudSnapshot: capturedCloudSnapshot,
-                skipPostProcessing: skipPostProcessing,
+                skipPostProcessing: stopRequest.skipPostProcessing,
                 stoppedCapture: stoppedCapture
             )
             return
@@ -1396,9 +1634,10 @@ final class AppCoordinator: ObservableObject {
         // The destination and context target are the first stop-time reads. Keep this before
         // audio teardown, logging, file I/O, and every async boundary so later focus changes
         // cannot redirect AX reads or OCR to another window.
-        let frontmostApp = preSnapshotted?.app ?? NSWorkspace.shared.frontmostApplication
-        let insertionTarget = preSnapshotted?.target ?? Insertion.snapshotTarget(app: frontmostApp)
-        let contextTarget = preSnapshotted?.contextTarget ?? snapshotContextTarget(app: frontmostApp)
+        let frontmostApp = stopRequest.snapshot?.app
+        let insertionTarget = stopRequest.snapshot?.target
+        let contextTarget = stopRequest.snapshot?.contextTarget
+            ?? snapshotContextTarget(app: frontmostApp)
 
         invalidateCapTimer()
         stopLivePreview()
@@ -1508,7 +1747,7 @@ final class AppCoordinator: ObservableObject {
                             forcedLanguage: forcedLanguage,
                             outputLanguage: capturedOutputLanguage,
                             cloudSnapshot: capturedCloudSnapshot,
-                            skipPostProcessing: skipPostProcessing,
+                            skipPostProcessing: stopRequest.skipPostProcessing,
                             processor: processor,
                             localContext: Self.localContextForProcessor(
                                 isCloudConfigured: !(processor is AppleFMProcessor),
@@ -1566,18 +1805,19 @@ final class AppCoordinator: ObservableObject {
 
     private func cancelRecording() {
         if case .preparing = captureAdmission.state {
-            _ = captureAdmission.reduce(.cancelRequested)
+            _ = reduceCaptureAdmission(.cancelRequested)
             pendingStopRequest = nil
-            captureOwner = .none
             stopLivePreview()
             invalidateCapTimer()
             return
         }
         if let active = activeCaptureJournal, let recoveryStore {
-            _ = captureAdmission.reduce(.cancelRequested)
+            guard reduceCaptureAdmission(.cancelRequested) == .cancel(active.session.id) else {
+                return
+            }
             journalFailureHandled = true
-            captureOwner = .none
-            activeCaptureJournal = nil
+            journalFinalizationTask?.cancel()
+            journalFinalizationTask = nil
             _ = audioCapture.stop()
             stopLivePreview()
             invalidateCapTimer()

@@ -30,6 +30,9 @@ final class HotKeyManager {
     /// synchronous (unlike `onKeyDown`/`onKeyUp`, dispatched via `Task { @MainActor in ... }`)
     /// since the swallow/pass decision has to be made before the tap callback returns.
     var isRecording = false
+    /// Keeps Escape routed to capture cancellation while durable admission or terminal journal
+    /// work still owns the capture, even after the recording gesture itself has ended.
+    var isCaptureLifecycleActive = false
 
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
@@ -54,8 +57,12 @@ final class HotKeyManager {
         Thread.isMainThread
     }
 
-    nonisolated static func shouldSwallowEscape(keyCode: UInt16, isRecording: Bool) -> Bool {
-        keyCode == escapeKeyCode && isRecording
+    nonisolated static func shouldSwallowEscape(
+        keyCode: UInt16,
+        isRecording: Bool,
+        isCaptureLifecycleActive: Bool = false
+    ) -> Bool {
+        keyCode == escapeKeyCode && (isRecording || isCaptureLifecycleActive)
     }
 
     /// Combined per-event dispatch outcome for the production two-matcher-on-one-tap scheme (PTT
@@ -264,7 +271,11 @@ final class HotKeyManager {
         // Esc (Amendment B1): checked ahead of the hotkey matcher below since Esc is never the
         // configured hotkey itself. Swallowed only while recording — see `shouldSwallowEscape`.
         if keyCode == Self.escapeKeyCode {
-            if type == .keyDown, Self.shouldSwallowEscape(keyCode: keyCode, isRecording: isRecording) {
+            if type == .keyDown, Self.shouldSwallowEscape(
+                keyCode: keyCode,
+                isRecording: isRecording,
+                isCaptureLifecycleActive: isCaptureLifecycleActive
+            ) {
                 escapeIsSwallowed = true
                 Task { @MainActor in self.onEscape?() }
                 return nil

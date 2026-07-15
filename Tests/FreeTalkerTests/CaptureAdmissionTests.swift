@@ -65,7 +65,7 @@ struct CaptureAdmissionTests {
         let captureID = UUID()
         var reducer = CaptureAdmissionReducer()
 
-        #expect(reducer.reduce(.begin(destination: "external")) == .none)
+        #expect(reducer.reduce(.begin(captureID: captureID, destination: "external")) == .none)
         #expect(reducer.reduce(.stopRequested) == .none)
         #expect(reducer.reduce(.prepared(captureID: captureID)) == .startAndStop(captureID))
         #expect(reducer.state == .recording(captureID: captureID))
@@ -74,7 +74,7 @@ struct CaptureAdmissionTests {
     @Test func cancelDuringPreparationCleansWithoutStartingEngine() {
         let captureID = UUID()
         var reducer = CaptureAdmissionReducer()
-        _ = reducer.reduce(.begin(destination: "external"))
+        _ = reducer.reduce(.begin(captureID: captureID, destination: "external"))
 
         #expect(reducer.reduce(.cancelRequested) == .none)
         #expect(reducer.reduce(.prepared(captureID: captureID)) == .cancel(captureID))
@@ -84,14 +84,14 @@ struct CaptureAdmissionTests {
     @Test func cancelWinsWhenStopAndCancelArriveDuringPreparation() {
         let captureID = UUID()
         var stopThenCancel = CaptureAdmissionReducer()
-        _ = stopThenCancel.reduce(.begin(destination: "external"))
+        _ = stopThenCancel.reduce(.begin(captureID: captureID, destination: "external"))
         _ = stopThenCancel.reduce(.stopRequested)
         _ = stopThenCancel.reduce(.cancelRequested)
 
         #expect(stopThenCancel.reduce(.prepared(captureID: captureID)) == .cancel(captureID))
 
         var cancelThenStop = CaptureAdmissionReducer()
-        _ = cancelThenStop.reduce(.begin(destination: "external"))
+        _ = cancelThenStop.reduce(.begin(captureID: captureID, destination: "external"))
         _ = cancelThenStop.reduce(.cancelRequested)
         _ = cancelThenStop.reduce(.stopRequested)
 
@@ -99,20 +99,134 @@ struct CaptureAdmissionTests {
     }
 
     @Test func preparationFailureReturnsReducerToIdle() {
+        let captureID = UUID()
         var reducer = CaptureAdmissionReducer()
-        _ = reducer.reduce(.begin(destination: "external"))
+        _ = reducer.reduce(.begin(captureID: captureID, destination: "external"))
 
-        #expect(reducer.reduce(.preparationFailed("disk full")) == .fail("disk full"))
+        #expect(reducer.reduce(.preparationFailed(captureID: captureID, message: "disk full")) == .fail("disk full"))
         #expect(reducer.state == .idle)
     }
 
     @Test func engineStartFailureAfterPreparationReturnsReducerToIdle() {
+        let captureID = UUID()
         var reducer = CaptureAdmissionReducer()
-        _ = reducer.reduce(.begin(destination: "external"))
-        _ = reducer.reduce(.prepared(captureID: UUID()))
+        _ = reducer.reduce(.begin(captureID: captureID, destination: "external"))
+        _ = reducer.reduce(.prepared(captureID: captureID))
 
-        #expect(reducer.reduce(.preparationFailed("engine failed")) == .fail("engine failed"))
+        #expect(reducer.reduce(.preparationFailed(captureID: captureID, message: "engine failed")) == .fail("engine failed"))
         #expect(reducer.state == .idle)
+    }
+
+    @Test func stalePreparationCompletionCannotTakeOverAnewCapture() {
+        let current = UUID()
+        var reducer = CaptureAdmissionReducer()
+        _ = reducer.reduce(.begin(captureID: current, destination: "external"))
+
+        #expect(reducer.reduce(.prepared(captureID: UUID())) == .none)
+        #expect(reducer.state.captureID == current)
+    }
+
+    @Test func writerFailureResetsOnlyAfterDurableFailureHandlingAndAllowsNextAdmission() {
+        let first = UUID()
+        var reducer = CaptureAdmissionReducer()
+        _ = reducer.reduce(.begin(captureID: first, destination: "external"))
+        _ = reducer.reduce(.prepared(captureID: first))
+
+        #expect(reducer.reduce(.failureHandlingStarted(captureID: first)) == .preserveFailure(first))
+        #expect(reducer.state == .finalizing(captureID: first))
+        #expect(reducer.reduce(.failureHandled(captureID: first)) == .none)
+        #expect(reducer.state == .idle)
+
+        let second = UUID()
+        _ = reducer.reduce(.begin(captureID: second, destination: "external"))
+        #expect(reducer.state.captureID == second)
+    }
+
+    @Test func finalizationAndCancellationBlockEveryNewCaptureUntilTerminal() {
+        let captureID = UUID()
+        var reducer = CaptureAdmissionReducer()
+        _ = reducer.reduce(.begin(captureID: captureID, destination: "external"))
+        _ = reducer.reduce(.prepared(captureID: captureID))
+        _ = reducer.reduce(.stopRequested)
+
+        #expect(reducer.state == .finalizing(captureID: captureID))
+        #expect(!AppCoordinator.captureStartDecision(
+            current: .dictation, requested: .voiceEdit,
+            admissionState: reducer.state
+        ).allowsStart)
+        _ = reducer.reduce(.finalizationFinished(captureID: captureID))
+        #expect(reducer.state == .idle)
+
+        _ = reducer.reduce(.begin(captureID: captureID, destination: "external"))
+        _ = reducer.reduce(.cancelRequested)
+        #expect(!AppCoordinator.captureStartDecision(
+            current: .dictation, requested: .voiceEdit,
+            admissionState: reducer.state
+        ).allowsStart)
+        _ = reducer.reduce(.prepared(captureID: captureID))
+        _ = reducer.reduce(.cleanupFinished(captureID: captureID))
+        #expect(reducer.state == .idle)
+    }
+
+    @Test func cleanupFailureKeepsOwnershipUntilSuccessfulResume() {
+        let captureID = UUID()
+        var reducer = CaptureAdmissionReducer()
+        _ = reducer.reduce(.begin(captureID: captureID, destination: "external"))
+        _ = reducer.reduce(.cancelRequested)
+        _ = reducer.reduce(.prepared(captureID: captureID))
+
+        #expect(reducer.reduce(.cleanupFailed(captureID: captureID, message: "disk busy")) == .fail("disk busy"))
+        #expect(reducer.state == .cleanupFailed(captureID: captureID, message: "disk busy"))
+        #expect(reducer.reduce(.cleanupFinished(captureID: captureID)) == .none)
+        #expect(reducer.state == .idle)
+    }
+
+    @Test func escapeDispatchRemainsActiveAfterStopDuringPreparation() {
+        #expect(HotKeyManager.shouldSwallowEscape(
+            keyCode: HotKeyManager.escapeKeyCode,
+            isRecording: false,
+            isCaptureLifecycleActive: true
+        ))
+        #expect(!HotKeyManager.shouldSwallowEscape(
+            keyCode: HotKeyManager.escapeKeyCode,
+            isRecording: false,
+            isCaptureLifecycleActive: false
+        ))
+    }
+
+    @Test func canonicalAudioLoadingRunsOffTheMainActor() async throws {
+        let ranOnMain = LockedFlag()
+        let samples = try await CaptureCanonicalAudioLoader.load {
+            ranOnMain.set(Thread.isMainThread)
+            return [0.25, -0.25]
+        }
+
+        #expect(samples == [0.25, -0.25])
+        #expect(!ranOnMain.value)
+    }
+
+    @Test func stopSettingsRemainTheStopTimeValuesAfterSettingsChange() {
+        let stopCloud = CloudLLMSettingsSnapshot(
+            provider: .openAICompatible, baseURL: "https://stop.example", model: "stop",
+            key: "stop-key", vocabulary: ["stop"]
+        )
+        let snapshot = AppCoordinator.captureStopSettingsSnapshot(
+            oneShotLanguage: "pt", selectedOutput: .french,
+            defaultOutput: .german, cloudSnapshot: stopCloud
+        )
+
+        let laterCloud = CloudLLMSettingsSnapshot(
+            provider: .anthropic, baseURL: "https://later.example", model: "later",
+            key: "later-key", vocabulary: ["later"]
+        )
+        _ = AppCoordinator.captureStopSettingsSnapshot(
+            oneShotLanguage: nil, selectedOutput: nil,
+            defaultOutput: .spanish, cloudSnapshot: laterCloud
+        )
+
+        #expect(snapshot.oneShotLanguage == "pt")
+        #expect(snapshot.outputLanguage == .french)
+        #expect(snapshot.cloudSnapshot == stopCloud)
     }
 
     @Test func recordingDestinationsDeclareDurableJournalPolicy() {
@@ -135,6 +249,13 @@ private final class AdmissionEventLog: @unchecked Sendable {
     private var events: [AdmissionEvent] = []
     func append(_ event: AdmissionEvent) { lock.withLock { events.append(event) } }
     var snapshot: [AdmissionEvent] { lock.withLock { events } }
+}
+
+private final class LockedFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = false
+    var value: Bool { lock.withLock { storage } }
+    func set(_ value: Bool) { lock.withLock { storage = value } }
 }
 
 private enum AdmissionFailure: Error { case injected }
