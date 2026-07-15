@@ -51,7 +51,19 @@ extension TranscriptionJobStore: CaptureLedgerStoring {
             destination: request.destination, recoveryJobID: nil, libraryDictationID: nil,
             assetKind: .audio, failureMessage: nil, contentHash: nil
         )
-        guard stored == expected else { throw JobStoreError.invalidTransition }
+        guard stored.id == expected.id,
+              stored.state == expected.state,
+              stored.directory.standardizedFileURL.path == expected.directory.standardizedFileURL.path,
+              abs(stored.capturedAt.timeIntervalSince1970 - expected.capturedAt.timeIntervalSince1970) < 0.000_001,
+              stored.sampleRate == expected.sampleRate,
+              stored.channelCount == expected.channelCount,
+              stored.inputDeviceUID == expected.inputDeviceUID,
+              stored.destination == expected.destination,
+              stored.recoveryJobID == nil,
+              stored.libraryDictationID == nil,
+              stored.assetKind == .audio,
+              stored.failureMessage == nil,
+              stored.contentHash == nil else { throw JobStoreError.invalidTransition }
         return stored
     }
 

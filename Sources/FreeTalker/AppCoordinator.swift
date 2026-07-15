@@ -92,6 +92,7 @@ final class AppCoordinator: ObservableObject {
     @Published private(set) var isRecording = false
     @Published private(set) var isProcessing = false
     @Published private(set) var lastError: String?
+    @Published private(set) var recoveryReconciliationReport: RecoveryReconciliationReport?
     private var pendingOutputTranslationFailuresStorage: [OutputTranslationFailure] = []
     private lazy var translationRecoveryController = makeTranslationRecoveryController()
     weak var translationRecoveryPresentationRouter: (any TranslationRecoveryPresentationRouting)?
@@ -202,6 +203,7 @@ final class AppCoordinator: ObservableObject {
     private var pendingFailurePreservation: PendingFailurePreservation?
     private let hud = HUDController()
     private let recoveryStore: TranscriptionJobStore?
+    private var recoveryStoreInitializationError: String?
     let jobLibraryStore: JobLibraryStore?
     private var recoveryRunner: LocalJobRunner?
     private var mediaImportRunner: LocalJobRunner?
@@ -235,7 +237,14 @@ final class AppCoordinator: ObservableObject {
         speechModelDownloadCoordinator = downloadCoordinator
         speechModelStore = modelStore
         whisperEngine = WhisperKitEngine(downloadCoordinator: downloadCoordinator)
-        let recoveryStore = try? Self.makeRecoveryStore()
+        let recoveryStore: TranscriptionJobStore?
+        do {
+            recoveryStore = try Self.makeRecoveryStore()
+            recoveryStoreInitializationError = nil
+        } catch {
+            recoveryStore = nil
+            recoveryStoreInitializationError = error.localizedDescription
+        }
         self.recoveryStore = recoveryStore
         do {
             snippetStore = try Self.makeSnippetStore()
@@ -2887,12 +2896,28 @@ final class AppCoordinator: ObservableObject {
     }
 
     func launchRecoveryWorkflows() async {
-        guard let recoveryStore else { return }
-        do {
-            try await makeJournalRecoveryService(store: recoveryStore)
-                .resumeLibraryCommittedCaptures()
-        } catch {
-            lastError = "Recovery cleanup needs attention: \(error.localizedDescription)"
+        guard let recoveryStore else {
+            let message = recoveryStoreInitializationError ?? "Recovery store is unavailable"
+            recoveryReconciliationReport = RecoveryReconciliationReport(storeFailure: message)
+            lastError = "Recovery storage needs attention: \(message)"
+            return
+        }
+        let reconciler = RecoveryReconciler(
+            directory: Self.recoveryDirectory,
+            store: recoveryStore,
+            ledger: recoveryStore,
+            libraryDictationID: { captureID in
+                try await MainActor.run {
+                    try LibraryStore.shared.dictations(captureID: captureID).first?.id
+                }
+            }
+        )
+        var reconciliation = await reconciler.reconcile()
+        recoveryReconciliationReport = reconciliation
+        if let failure = reconciliation.storeFailure {
+            lastError = "Recovery reconciliation needs attention: \(failure)"
+        } else if reconciliation.failed > 0 {
+            lastError = "Recovery reconciliation could not restore \(reconciliation.failed) item(s)"
         }
         let pipeline = RecoveryRetryPipeline(
             directory: Self.recoveryDirectory,
@@ -2932,21 +2957,36 @@ final class AppCoordinator: ObservableObject {
             kind: .recovery,
             executorFinalizesJob: true,
             finalizationFailure: pipeline.failFinalization,
-            didChange: { [weak jobLibraryStore] _ in try? await jobLibraryStore?.refresh() },
+            didChange: { [weak jobLibraryStore] _ in
+                do { try await jobLibraryStore?.refresh() }
+                catch { print("FreeTalker: recovery Library refresh failed: \(error)") }
+            },
             executionAuthority: localJobExecutionAuthority
         ) { job, token in
             try await pipeline.execute(jobID: job.id, configuration: nil, cancellation: token)
         }
         recoveryRunner = runner
         jobLibraryStore?.configureRetry { [weak runner] id in await runner?.enqueue(id) }
-        _ = try? await RecoveryCaptureService(directory: Self.recoveryDirectory, store: recoveryStore)
-            .reconcileStagedProvisionalCaptures()
         await pipeline.retryPendingSourceCleanup()
-        _ = try? await recoveryStore.recoverInterruptedJobs(kind: .recovery)
-        _ = try? await RecoveryRetentionService(directory: Self.recoveryDirectory, store: recoveryStore)
-            .purgeExpired(now: Date(), retention: AppSettings.shared.recoveryRetention)
+        do {
+            _ = try await recoveryStore.recoverInterruptedJobs(kind: .recovery)
+        } catch {
+            reconciliation.recordFailure(Self.recoveryDirectory, error)
+        }
+        do {
+            _ = try await RecoveryRetentionService(directory: Self.recoveryDirectory, store: recoveryStore)
+                .purgeExpired(now: Date(), retention: AppSettings.shared.recoveryRetention)
+        } catch {
+            reconciliation.recordFailure(Self.recoveryDirectory, error)
+        }
+        recoveryReconciliationReport = reconciliation
         await runner.resumeQueuedJobs()
-        try? await jobLibraryStore?.refresh()
+        do {
+            try await jobLibraryStore?.refresh()
+        } catch {
+            reconciliation.recordFailure(Self.recoveryDirectory, error)
+            recoveryReconciliationReport = reconciliation
+        }
     }
 
     func launchMediaImportWorkflows() async {

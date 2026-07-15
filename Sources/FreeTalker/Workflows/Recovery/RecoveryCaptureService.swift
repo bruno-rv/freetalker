@@ -245,6 +245,17 @@ struct RecoveryCaptureService: Sendable {
         }
     }
 
+    func resumeLibraryCommittedCapture(captureID: UUID) async throws {
+        guard let ledger,
+              let session = try await ledger.session(id: captureID),
+              session.state == .libraryCommitted else { return }
+        guard let dictationID = try await libraryDictationID(captureID),
+              dictationID == session.libraryDictationID else {
+            throw RecoveryFinalizationError.libraryOwnershipMissing(captureID)
+        }
+        try await cleanupLibraryCommittedSession(session)
+    }
+
     private func cleanupLibraryCommittedSession(_ session: CaptureSession) async throws {
         guard session.state == .libraryCommitted, let ledger else {
             throw JobStoreError.invalidTransition

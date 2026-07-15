@@ -164,7 +164,7 @@ struct RecoveryRetryPipeline: Sendable {
         return source
     }
 
-    private static func loadPCM(from url: URL) throws -> [Float] {
+    static func loadPCM(from url: URL) throws -> [Float] {
         let file = try AVAudioFile(forReading: url)
         let format = file.processingFormat
         guard let buffer = AVAudioPCMBuffer(

@@ -108,7 +108,11 @@ import Testing
 
         await #expect(throws: (any Error).self) { try await service.prepare(request) }
 
-        #expect(fileSystem.events == [.createDirectory(root.path), .synchronizeDirectory(parent.path)])
+        #expect(fileSystem.events == [
+            .createDirectory(root.path),
+            .synchronizeDirectory(parent.path),
+            .synchronizeDirectory(parent.path), // compensated removal is durable too
+        ])
         #expect(await ledger.session(id: request.id) == nil)
     }
 
