@@ -68,11 +68,6 @@ struct RecoveryRetryPipeline: Sendable {
         guard let job = try await store.job(id: jobID), job.kind == .recovery else {
             throw JobStoreError.jobNotFound
         }
-        if let libraryID = try await libraryDictationID(jobID) {
-            try cancellation.checkCancellation()
-            try await cancellation.beginFinalization()
-            if try await finalizeJournalCapture(jobID, libraryID) { return }
-        }
         let attempt: JobAttempt
         if let unfinished = try await store.latestUnfinishedAttempt(jobID: jobID) {
             attempt = unfinished
@@ -82,6 +77,16 @@ struct RecoveryRetryPipeline: Sendable {
             } else {
                 attempt = try await store.beginAttempt(jobID: jobID, configuration: configuration ?? AttemptConfiguration())
             }
+        }
+        if let libraryID = try await libraryDictationID(jobID) {
+            try cancellation.checkCancellation()
+            try await cancellation.beginFinalization()
+            if try await finalizeJournalCapture(jobID, libraryID) { return }
+            try await completeAttemptAndJob(
+                jobID: jobID, attemptID: attempt.id, cancellation: cancellation
+            )
+            await cleanSource(for: job)
+            return
         }
         do {
             try cancellation.checkCancellation()
@@ -104,9 +109,9 @@ struct RecoveryRetryPipeline: Sendable {
             } else { try? await store.finishAttempt(attempt.id, result: result) }
             throw error
         }
-        if let owner = cancellation.owner, let leased = store as? any RecoveryLeaseStoring {
-            try await leased.completeOwnedAttemptAndJob(jobID: jobID, owner: owner, attemptID: attempt.id)
-        } else { try await store.completeAttemptAndMarkJobReady(jobID: jobID, attemptID: attempt.id) }
+        try await completeAttemptAndJob(
+            jobID: jobID, attemptID: attempt.id, cancellation: cancellation
+        )
         await cleanSource(for: job)
     }
 
@@ -132,6 +137,22 @@ struct RecoveryRetryPipeline: Sendable {
             try await store.completeSourceCleanup(jobID: job.id)
         } catch {
             try? await store.recordSourceCleanupError(jobID: job.id, message: error.localizedDescription)
+        }
+    }
+
+    private func completeAttemptAndJob(
+        jobID: UUID,
+        attemptID: Int64,
+        cancellation: CancellationToken
+    ) async throws {
+        if let owner = cancellation.owner, let leased = store as? any RecoveryLeaseStoring {
+            try await leased.completeOwnedAttemptAndJob(
+                jobID: jobID, owner: owner, attemptID: attemptID
+            )
+        } else {
+            try await store.completeAttemptAndMarkJobReady(
+                jobID: jobID, attemptID: attemptID
+            )
         }
     }
 

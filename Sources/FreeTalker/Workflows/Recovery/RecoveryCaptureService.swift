@@ -225,6 +225,32 @@ struct RecoveryCaptureService: Sendable {
             }
         }
 
+        guard let committed = try await ledger.session(id: captureID) else {
+            throw RecoveryFinalizationError.captureIdentityMismatch
+        }
+        try await cleanupLibraryCommittedSession(committed)
+    }
+
+    func resumeLibraryCommittedCaptures() async throws {
+        guard let ledger else {
+            throw RecoveryFinalizationError.captureIdentityMismatch
+        }
+        for session in try await ledger.unfinishedSessions()
+        where session.state == .libraryCommitted {
+            guard let dictationID = try await libraryDictationID(session.id),
+                  dictationID == session.libraryDictationID else {
+                throw RecoveryFinalizationError.libraryOwnershipMissing(session.id)
+            }
+            try await cleanupLibraryCommittedSession(session)
+        }
+    }
+
+    private func cleanupLibraryCommittedSession(_ session: CaptureSession) async throws {
+        guard session.state == .libraryCommitted, let ledger else {
+            throw JobStoreError.invalidTransition
+        }
+        let captureID = session.id
+
         let canonical = session.directory.appendingPathComponent("\(captureID.uuidString).wav")
         if journalFileSystem.exists(canonical) { try journalFileSystem.remove(canonical) }
         for segment in try await ledger.committedSegments(captureID: captureID) {
@@ -233,14 +259,19 @@ struct RecoveryCaptureService: Sendable {
         if journalFileSystem.exists(session.directory) {
             try journalFileSystem.synchronizeDirectory(session.directory)
         }
-        let removed = try await store.deleteCommittedRecovery(
-            id: capture.id,
-            expectedSourceReference: capture.source.reference
-        )
-        if !removed {
-            // Only a completed prior retry may have removed the exact recovery identity.
-            guard try await store.job(id: capture.id) == nil else {
+        if let recoveryJobID = session.recoveryJobID,
+           let job = try await store.job(id: recoveryJobID) {
+            guard job.source.reference == canonical.path else {
                 throw RecoveryFinalizationError.recoveryJobMismatch
+            }
+            let removed = try await store.deleteCommittedRecovery(
+                id: recoveryJobID,
+                expectedSourceReference: job.source.reference
+            )
+            if !removed {
+                guard try await store.job(id: recoveryJobID) == nil else {
+                    throw RecoveryFinalizationError.recoveryJobMismatch
+                }
             }
         }
         try await ledger.removeCleanedSession(id: captureID)

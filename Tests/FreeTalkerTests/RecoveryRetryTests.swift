@@ -127,19 +127,21 @@ import Testing
 
     @Test func libraryInsertDurableThenThrowIsFoundOnRestartWithoutRetranscription() async throws {
         let fixture = try await RetryFixture()
-        let library = DurableLibraryProbe()
+        let library = try PersistentRetryLibrary(
+            url: fixture.directory.appendingPathComponent("library.sqlite")
+        )
         let pipeline = RecoveryRetryPipeline(
             directory: fixture.directory,
             store: fixture.store,
             loadSamples: { _ in [0.1] },
             processDictation: { _, _, captureID in
-                try await library.persistThenThrow(captureID: captureID)
+                try library.persistThenThrow(captureID: captureID)
             },
             libraryDictationID: { captureID in
-                await library.dictationID(captureID: captureID)
+                library.dictationID(captureID: captureID)
             },
             finalizeJournalCapture: { captureID, libraryID in
-                await library.finalize(captureID: captureID, libraryID: libraryID)
+                library.finalize(captureID: captureID, libraryID: libraryID)
             }
         )
 
@@ -149,13 +151,72 @@ import Testing
                 cancellation: CancellationToken()
             )
         }
-        try await pipeline.execute(
+        let reopened = try TranscriptionJobStore(
+            databaseURL: fixture.databaseURL, clock: SystemJobClock()
+        )
+        #expect(try await reopened.recoverInterruptedJobs(kind: .recovery) == 1)
+        try await reopened.transition(
+            fixture.job.id, from: .queued, to: .processing(stage: .preparing)
+        )
+        let relaunched = RecoveryRetryPipeline(
+            directory: fixture.directory,
+            store: reopened,
+            loadSamples: { _ in
+                Issue.record("Relaunch must not reload Library-owned audio")
+                return []
+            },
+            processDictation: { _, _, captureID in
+                try library.persistThenThrow(captureID: captureID)
+            },
+            libraryDictationID: { captureID in library.dictationID(captureID: captureID) },
+            finalizeJournalCapture: { captureID, libraryID in
+                library.finalize(captureID: captureID, libraryID: libraryID)
+            }
+        )
+        try await relaunched.execute(
             jobID: fixture.job.id, configuration: .init(),
             cancellation: CancellationToken()
         )
 
-        #expect(await library.processCount == 1)
-        #expect(await library.finalizationCount == 1)
+        #expect(library.processCount == 1)
+        #expect(library.finalizationCount == 1)
+        #expect(try library.count(captureID: fixture.job.id) == 1)
+    }
+
+    @Test func libraryOwnedRecoveryWithoutJournalFinalizerUsesOneRunnerFinalizationAndNoTranscription() async throws {
+        let fixture = try await RetryFixture()
+        try await fixture.store.transition(
+            fixture.job.id, from: .processing,
+            to: .failed(.init(stage: .persisting, message: "restart"))
+        )
+        try await fixture.store.transition(fixture.job.id, from: .failed, to: .queued)
+        let probe = RetryProbe()
+        let pipeline = RecoveryRetryPipeline(
+            directory: fixture.directory,
+            store: fixture.store,
+            loadSamples: { _ in
+                Issue.record("Library-owned recovery must not reload audio")
+                return []
+            },
+            processDictation: probe.process,
+            libraryDictationID: { _ in 77 },
+            finalizeJournalCapture: { _, _ in false }
+        )
+        let runner = LocalJobRunner(
+            store: fixture.store, kind: .recovery,
+            executorFinalizesJob: true
+        ) { job, token in
+            try await pipeline.execute(
+                jobID: job.id, configuration: nil, cancellation: token
+            )
+        }
+
+        await runner.enqueue(fixture.job.id)
+        await runner.waitUntilIdle()
+
+        #expect(probe.configurations.isEmpty)
+        #expect(try await fixture.store.job(id: fixture.job.id)?.state == .ready)
+        #expect(!FileManager.default.fileExists(atPath: fixture.source.path))
     }
 
     @Test func interruptedRetryResumesTheSameAttemptWithPersistedOverrides() async throws {
@@ -298,25 +359,44 @@ private actor CloudBoundaryProbe {
     func call() { calls += 1 }
 }
 
-private actor DurableLibraryProbe {
-    private var storedCaptureID: UUID?
-    private(set) var processCount = 0
-    private(set) var finalizationCount = 0
+private final class PersistentRetryLibrary: @unchecked Sendable {
+    private let lock = NSLock()
+    let url: URL
+    private var storedProcessCount = 0
+    private var storedFinalizationCount = 0
+    var processCount: Int { lock.withLock { storedProcessCount } }
+    var finalizationCount: Int { lock.withLock { storedFinalizationCount } }
+
+    init(url: URL) throws {
+        self.url = url
+        _ = try Database(path: url)
+    }
 
     func persistThenThrow(captureID: UUID) throws -> RecoveryDictation {
-        processCount += 1
-        storedCaptureID = captureID
+        lock.withLock { storedProcessCount += 1 }
+        let db = try Database(path: url)
+        _ = try db.insertDictation(.init(
+            timestamp: Date(timeIntervalSince1970: 55),
+            sourceLanguage: SourceLanguage("en"),
+            requestedOutputLanguage: .sameAsSpoken,
+            template: "Clean", transcript: "raw", refined: "refined",
+            engine: "local", sourceID: nil
+        ), captureID: captureID)
         throw RetryTestError.database
     }
 
     func dictationID(captureID: UUID) -> Int64? {
-        storedCaptureID == captureID ? 123 : nil
+        try? Database(path: url).dictations(captureID: captureID).first?.id
     }
 
     func finalize(captureID: UUID, libraryID: Int64) -> Bool {
-        guard storedCaptureID == captureID, libraryID == 123 else { return false }
-        finalizationCount += 1
+        guard dictationID(captureID: captureID) == libraryID else { return false }
+        lock.withLock { storedFinalizationCount += 1 }
         return true
+    }
+
+    func count(captureID: UUID) throws -> Int {
+        try Database(path: url).dictations(captureID: captureID).count
     }
 }
 
@@ -371,6 +451,7 @@ private struct RetryFixture {
     let directory: URL
     let source: URL
     let store: TranscriptionJobStore
+    let databaseURL: URL
     let job: TranscriptionJob
 
     init() async throws {
@@ -378,7 +459,8 @@ private struct RetryFixture {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         source = directory.appending(path: "\(UUID().uuidString).wav")
         try Data([1, 2, 3]).write(to: source)
-        store = try TranscriptionJobStore(databaseURL: directory.appending(path: "jobs.sqlite"), clock: SystemJobClock())
+        databaseURL = directory.appending(path: "jobs.sqlite")
+        store = try TranscriptionJobStore(databaseURL: databaseURL, clock: SystemJobClock())
         job = try await store.create(kind: .recovery, source: .init(reference: source.path), now: Date())
         try await store.transition(job.id, from: .queued, to: .processing(stage: .preparing))
     }

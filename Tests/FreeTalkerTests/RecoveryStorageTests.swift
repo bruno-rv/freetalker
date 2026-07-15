@@ -94,7 +94,7 @@ import Testing
 
     @Test func journalCompletionKeepsRecoveryUntilLibraryOwnershipThenDeletesMediaJobAndLedgerInOrder() async throws {
         let fixture = try await JournalCompletionFixture()
-        let libraryID: Int64 = 41
+        let libraryID = fixture.libraryID
         let service = fixture.service(libraryID: libraryID)
 
         try await service.completeJournalCapture(
@@ -138,7 +138,7 @@ import Testing
         for _ in boundaries { fixtures.append(try await JournalCompletionFixture()) }
         for (boundary, fixture) in zip(boundaries, fixtures) {
             fixture.events.armFailure(boundary)
-            let service = fixture.service(libraryID: 91)
+            let service = fixture.service(libraryID: fixture.libraryID)
 
             do {
                 try await service.completeJournalCapture(
@@ -154,17 +154,65 @@ import Testing
             let recoveryLedgerExists = try await fixture.store.session(id: fixture.captureID) != nil
             #expect(libraryOwnsCapture || recoveryJobExists || recoveryLedgerExists)
 
-            do {
-                try await service.completeJournalCapture(
+            let reopened = try TranscriptionJobStore(
+                databaseURL: fixture.databaseURL, clock: SystemJobClock()
+            )
+            let resumed = RecoveryCaptureService(
+                directory: fixture.temp.url, store: reopened, ledger: reopened,
+                journalFileSystem: LocalJournalFileSystem(),
+                libraryDictationID: { id in try fixture.library.lookup(captureID: id) }
+            )
+            let reopenedSession = try await reopened.session(id: fixture.captureID)
+            if reopenedSession == nil {
+                // The final ledger delete committed before the injected throw.
+            } else if reopenedSession?.state == .libraryCommitted {
+                try await resumed.resumeLibraryCommittedCaptures()
+            } else {
+                try await resumed.completeJournalCapture(
                     fixture.capture, captureID: fixture.captureID
                 )
-            } catch {
-                Issue.record("retry failed at \(boundary) after \(fixture.events.values): \(error)")
-                return
             }
-            #expect(try await fixture.store.job(id: fixture.captureID) == nil)
-            #expect(try await fixture.store.session(id: fixture.captureID) == nil)
+            #expect(try await reopened.job(id: fixture.captureID) == nil)
+            #expect(try await reopened.session(id: fixture.captureID) == nil)
+            #expect(try fixture.library.count(captureID: fixture.captureID) == 1)
         }
+    }
+
+    @Test func startupResumesLedgerOnlyCleanupAfterRecoveryJobDeleteCommittedThenThrew() async throws {
+        let fixture = try await JournalCompletionFixture()
+        try await fixture.store.transition(
+            fixture.captureID, from: .processing,
+            to: .failed(.init(stage: .persisting, message: "stale lease"))
+        )
+        try await fixture.store.transition(fixture.captureID, from: .failed, to: .queued)
+        _ = try await fixture.store.claimQueuedJob(
+            fixture.captureID, kind: .recovery, owner: UUID(), leaseDuration: 300
+        )
+        fixture.events.armFailure("delete-job")
+        let service = fixture.service(libraryID: fixture.libraryID)
+
+        await #expect(throws: InjectedRecoveryFinalizationFailure.self) {
+            try await service.completeJournalCapture(
+                fixture.capture, captureID: fixture.captureID
+            )
+        }
+        #expect(try await fixture.store.job(id: fixture.captureID) == nil)
+        #expect(try await fixture.store.session(id: fixture.captureID)?.state == .libraryCommitted)
+
+        let reopened = try TranscriptionJobStore(
+            databaseURL: fixture.databaseURL, clock: SystemJobClock()
+        )
+        let resumed = RecoveryCaptureService(
+            directory: fixture.temp.url,
+            store: reopened,
+            ledger: reopened,
+            journalFileSystem: LocalJournalFileSystem(),
+            libraryDictationID: { id in try fixture.library.lookup(captureID: id) }
+        )
+        try await resumed.resumeLibraryCommittedCaptures()
+
+        #expect(try await reopened.job(id: fixture.captureID) == nil)
+        #expect(try await reopened.session(id: fixture.captureID) == nil)
     }
 
     @Test func captureAtomicallyWritesWAVAndCreatesFailedJob() async throws {
@@ -485,15 +533,15 @@ private struct RecordingRecoveryFileSystem: JournalFileSystem {
     func synchronizeFile(_ url: URL) throws { try base.synchronizeFile(url) }
     func rename(_ source: URL, to destination: URL) throws { try base.rename(source, to: destination) }
     func synchronizeDirectory(_ url: URL) throws {
-        try events.record("sync:\(url.path)", boundary: "sync")
         try base.synchronizeDirectory(url)
+        try events.record("sync:\(url.path)", boundary: "sync")
     }
     func contents(_ url: URL) throws -> [URL] { try base.contents(url) }
     func read(_ url: URL) throws -> Data { try base.read(url) }
     func remove(_ url: URL) throws {
         let boundary = url.lastPathComponent.hasPrefix("segment-") ? "segment" : "canonical"
-        try events.record("remove:\(url.path)", boundary: boundary)
         try base.remove(url)
+        try events.record("remove:\(url.path)", boundary: boundary)
     }
     func exists(_ url: URL) -> Bool { base.exists(url) }
 }
@@ -501,6 +549,9 @@ private struct RecordingRecoveryFileSystem: JournalFileSystem {
 private struct JournalCompletionFixture {
     let temp: TemporaryDirectory
     let store: TranscriptionJobStore
+    let databaseURL: URL
+    let library: PersistentCaptureLibrary
+    let libraryID: Int64
     let captureID: UUID
     let sessionDirectory: URL
     let canonical: URL
@@ -518,8 +569,13 @@ private struct JournalCompletionFixture {
         segment = sessionDirectory.appendingPathComponent("segment-00000000.wav")
         try Data([1]).write(to: canonical)
         try Data([2]).write(to: segment)
+        databaseURL = temp.url.appendingPathComponent("jobs.sqlite")
+        library = try PersistentCaptureLibrary(
+            url: temp.url.appendingPathComponent("library.sqlite")
+        )
+        libraryID = try library.insert(captureID: captureID)
         store = try TranscriptionJobStore(
-            databaseURL: temp.url.appendingPathComponent("jobs.sqlite"),
+            databaseURL: databaseURL,
             clock: SystemJobClock()
         )
         let capturedAt = Date(timeIntervalSince1970: 12_345)
@@ -558,9 +614,37 @@ private struct JournalCompletionFixture {
             journalFileSystem: RecordingRecoveryFileSystem(events: events),
             libraryDictationID: { id in
                 try events.record("lookup:\(id.uuidString)", boundary: "lookup")
-                return libraryID
+                guard libraryID != nil else { return nil }
+                return try library.lookup(captureID: id)
             }
         )
+    }
+}
+
+private final class PersistentCaptureLibrary: @unchecked Sendable {
+    let url: URL
+    init(url: URL) throws {
+        self.url = url
+        _ = try Database(path: url)
+    }
+
+    func insert(captureID: UUID) throws -> Int64 {
+        let db = try Database(path: url)
+        return try db.insertDictation(.init(
+            timestamp: Date(timeIntervalSince1970: 12_345),
+            sourceLanguage: SourceLanguage("en"),
+            requestedOutputLanguage: .sameAsSpoken,
+            template: "Clean", transcript: "raw", refined: "refined",
+            engine: "local", sourceID: nil
+        ), captureID: captureID).id
+    }
+
+    func lookup(captureID: UUID) throws -> Int64? {
+        try Database(path: url).dictations(captureID: captureID).first?.id
+    }
+
+    func count(captureID: UUID) throws -> Int {
+        try Database(path: url).dictations(captureID: captureID).count
     }
 }
 
@@ -573,8 +657,11 @@ private struct EventingRecoveryStore: RecoveryJobStoring {
     func failProvisionalRecovery(id: UUID, failure: JobFailure) async throws { try await base.failProvisionalRecovery(id: id, failure: failure) }
     func deleteProvisionalRecovery(id: UUID, expectedSourceReference: String) async throws -> Bool { try await base.deleteProvisionalRecovery(id: id, expectedSourceReference: expectedSourceReference) }
     func deleteCommittedRecovery(id: UUID, expectedSourceReference: String) async throws -> Bool {
+        let removed = try await base.deleteCommittedRecovery(
+            id: id, expectedSourceReference: expectedSourceReference
+        )
         try events.record("delete-job:\(id.uuidString)", boundary: "delete-job")
-        return try await base.deleteCommittedRecovery(id: id, expectedSourceReference: expectedSourceReference)
+        return removed
     }
     func createRecovery(source: JobSource, metadata: RecoveryMetadata) async throws -> TranscriptionJob { try await base.createRecovery(source: source, metadata: metadata) }
     func claimExpiredRecoveries(cutoff: Date, claimedAt: Date) async throws -> [RecoveryPurgeClaim] { try await base.claimExpiredRecoveries(cutoff: cutoff, claimedAt: claimedAt) }
@@ -589,17 +676,17 @@ private struct EventingCaptureLedger: CaptureLedgerStoring {
     func createCapture(_ request: CaptureStartRequest) async throws -> CaptureSession { try await base.createCapture(request) }
     func recordCommittedSegment(_ segment: CaptureSegment) async throws { try await base.recordCommittedSegment(segment) }
     func transition(id: UUID, from: CaptureSessionState, to: CaptureSessionState, recoveryJobID: UUID?, libraryDictationID: Int64?, assetKind: RecoveryAssetKind, failureMessage: String?, contentHash: String?) async throws {
+        try await base.transition(id: id, from: from, to: to, recoveryJobID: recoveryJobID, libraryDictationID: libraryDictationID, assetKind: assetKind, failureMessage: failureMessage, contentHash: contentHash)
         if to == .libraryCommitted {
             try events.record("ledger-commit:\(id.uuidString)", boundary: "ledger-commit")
         }
-        try await base.transition(id: id, from: from, to: to, recoveryJobID: recoveryJobID, libraryDictationID: libraryDictationID, assetKind: assetKind, failureMessage: failureMessage, contentHash: contentHash)
     }
     func session(id: UUID) async throws -> CaptureSession? { try await base.session(id: id) }
     func unfinishedSessions() async throws -> [CaptureSession] { try await base.unfinishedSessions() }
     func committedSegments(captureID: UUID) async throws -> [CaptureSegment] { try await base.committedSegments(captureID: captureID) }
     func removeCleanedSession(id: UUID) async throws {
-        try events.record("delete-ledger:\(id.uuidString)", boundary: "delete-ledger")
         try await base.removeCleanedSession(id: id)
+        try events.record("delete-ledger:\(id.uuidString)", boundary: "delete-ledger")
     }
 }
 

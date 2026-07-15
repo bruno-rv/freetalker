@@ -2888,6 +2888,12 @@ final class AppCoordinator: ObservableObject {
 
     func launchRecoveryWorkflows() async {
         guard let recoveryStore else { return }
+        do {
+            try await makeJournalRecoveryService(store: recoveryStore)
+                .resumeLibraryCommittedCaptures()
+        } catch {
+            lastError = "Recovery cleanup needs attention: \(error.localizedDescription)"
+        }
         let pipeline = RecoveryRetryPipeline(
             directory: Self.recoveryDirectory,
             store: recoveryStore,
