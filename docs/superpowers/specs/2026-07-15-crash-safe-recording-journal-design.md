@@ -6,8 +6,8 @@ Status: Approved 2026-07-15
 ## Objective
 
 Guarantee that every accepted recording containing audio is always represented
-by one durable state: an active capture journal, a visible retryable Recovery,
-or a committed Library dictation.
+by at least one durable state: an active capture journal, a visible retryable
+Recovery, or a committed Library dictation.
 
 Silent capture attempts must remain visible with a specific explanation rather
 than disappearing without a trace.
@@ -30,8 +30,8 @@ those recordings remain invisible.
 
 ## Durability invariant
 
-For every capture identity, exactly one of these states owns the latest
-recoverable representation:
+For every capture identity, at least one of these states owns a recoverable
+representation:
 
 ```text
 capturing journal
@@ -41,13 +41,18 @@ capturing journal
     -> cleaned
 ```
 
-A transition may be retried after interruption. It must not create duplicate
-Library dictations, discard the last audio copy, or leave the capture absent
-from both the journal and durable stores.
+A transition may be retried after interruption. Temporary overlap between
+Recovery and Library is required because their SQLite databases and the file
+system cannot commit atomically. Capture identity and reconciliation prevent
+duplicate visible dictations. A transition must never discard the last audio
+copy or leave the capture absent from every durable store.
 
-Sudden power loss may discard samples still inside the current in-memory audio
-buffer. Every fully committed journal segment and the capture's durable ledger
-record must survive.
+Power-loss protection is best effort within macOS and storage-hardware
+guarantees. FreeTalker synchronizes files, parent directories, and SQLite with
+full durability settings, but hardware caches can still lose acknowledged
+writes. Sudden power loss may also discard samples inside the current in-memory
+audio buffer. Every segment confirmed by the journal protocol and the capture's
+ledger record must be recoverable after tested interruption boundaries.
 
 ## Capture identity and ledger
 
@@ -99,16 +104,31 @@ If committed audio remains effectively silent during the initial observation
 window, FreeTalker:
 
 1. Records input-device and route diagnostics.
-2. Restarts the capture engine once.
-3. Ends the attempt if the restarted engine still produces no signal.
-4. Keeps a visible failed-capture row stating **No microphone signal was
-   captured**.
+2. Warns that no microphone signal has been detected yet.
+3. Restarts the capture engine once only when an input-route or engine fault
+   corroborates the silence.
+4. Keeps recording when silence is the only signal so an intentional pause is
+   not treated as failure.
+5. At Stop, keeps a visible failed-capture row stating **No microphone signal
+   was captured** when the complete attempt remains below the existing signal
+   floor.
 
 The failed row provides **Start New Recording** and diagnostic detail. It does
 not provide **Retry Processing** because no transcriptable audio exists.
 
 The watchdog must not classify ordinary pauses as failure after valid signal
 has been observed. Existing captured-audio quality checks remain a final guard.
+
+## Workflow scope
+
+The durability guarantee covers external dictation and Scratchpad recording,
+which are expected to create Library or Recovery items. Voice Edit remains an
+explicitly transient editing workflow and does not create a Library recovery
+record.
+
+Escape or Cancel remains an explicit discard request. Cancellation intent is
+persisted before cleanup, and interrupted cleanup resumes idempotently after
+relaunch so a crash cannot create an unknown orphan.
 
 ## Recovery states and user experience
 
@@ -229,9 +249,11 @@ settings apply only after a durable Library commit or explicit deletion.
 
 ## Success criteria
 
-The feature is complete when every accepted non-empty recording remains in an
-active journal, visible Recovery, or committed Library item across crashes,
-force quits, downstream failures, and tested power-loss boundaries. Silent
-capture attempts remain visible with an accurate explanation. Existing legacy
-and orphaned audio becomes discoverable without duplication, and no automatic
-cleanup removes the final recoverable audio copy before durable Library commit.
+The feature is complete when every accepted non-empty external or Scratchpad
+recording remains in at least one active journal, visible Recovery, or committed
+Library item across crashes, force quits, downstream failures, and tested
+power-loss boundaries. Temporary overlap is reconciled by capture identity.
+Silent capture attempts remain visible with an accurate explanation. Existing
+legacy and orphaned audio becomes discoverable without duplication, and no
+automatic cleanup removes the final recoverable audio copy before durable
+Library commit.
