@@ -73,6 +73,8 @@ final class CaptureJournalWriter: @unchecked Sendable {
     private let ledger: any CaptureLedgerStoring
     private let codec: CaptureSegmentCodec
     private let configuration: Configuration
+    private let failurePersistenceStart: @Sendable () async -> Void
+    private let onFailurePersistenceWait: @Sendable () -> Void
     private let onFailure: @Sendable (String) -> Void
     private let lock = NSLock()
     private var state: State
@@ -84,6 +86,8 @@ final class CaptureJournalWriter: @unchecked Sendable {
         codec: CaptureSegmentCodec? = nil,
         configuration: Configuration = .default,
         diagnostics: CaptureDiagnostics? = nil,
+        failurePersistenceStart: @escaping @Sendable () async -> Void = {},
+        onFailurePersistenceWait: @escaping @Sendable () -> Void = {},
         onFailure: @escaping @Sendable (String) -> Void = { _ in }
     ) {
         precondition(configuration.segmentFrames > 0)
@@ -93,6 +97,8 @@ final class CaptureJournalWriter: @unchecked Sendable {
         self.ledger = ledger
         self.codec = codec ?? CaptureSegmentCodec(fileSystem: fileSystem)
         self.configuration = configuration
+        self.failurePersistenceStart = failurePersistenceStart
+        self.onFailurePersistenceWait = onFailurePersistenceWait
         self.onFailure = onFailure
         state = State(diagnostics: diagnostics ?? CaptureDiagnostics(
             peak: 0, rms: 0, inputDeviceUID: session.inputDeviceUID, routeFailure: nil
@@ -103,8 +109,6 @@ final class CaptureJournalWriter: @unchecked Sendable {
         guard !samples.isEmpty else { return .accepted }
         let copied = samples.withUnsafeBufferPointer { Array($0) }
         var startWorker = false
-        var notify: String?
-        var overflowError: CaptureJournalError?
         let result: EnqueueResult = lock.withLock {
             switch state.status {
             case .failed(let error): return .failed(String(describing: error))
@@ -117,10 +121,14 @@ final class CaptureJournalWriter: @unchecked Sendable {
                 )
                 state.status = .failed(error)
                 state.queue.removeAll(keepingCapacity: false)
-                overflowError = error
                 if !state.didNotifyFailure {
                     state.didNotifyFailure = true
-                    notify = String(describing: error)
+                    let notification = String(describing: error)
+                    state.failurePersistence = Task { [self] in
+                        await failurePersistenceStart()
+                        try? await recordUnrecoverableFailure(error)
+                        onFailure(notification)
+                    }
                 }
                 return .overflow
             }
@@ -134,15 +142,6 @@ final class CaptureJournalWriter: @unchecked Sendable {
                 startWorker = true
             }
             return .accepted
-        }
-        if let overflowError, let notify {
-            let persistence = Task { [self] in
-                // The audio callback remains I/O-free. Durable evidence is completed before
-                // the coordinator is notified, and finish/stop can join this owned task.
-                try? await recordUnrecoverableFailure(overflowError)
-                onFailure(notify)
-            }
-            lock.withLock { state.failurePersistence = persistence }
         }
         if startWorker { launchWorker() }
         return result
@@ -222,6 +221,7 @@ final class CaptureJournalWriter: @unchecked Sendable {
 
     func waitForFailurePersistence() async {
         let persistence = lock.withLock { state.failurePersistence }
+        if persistence != nil { onFailurePersistenceWait() }
         await persistence?.value
     }
 

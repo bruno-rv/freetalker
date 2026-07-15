@@ -131,6 +131,54 @@ import Testing
         #expect(staged.sampleCount == 8_127)
     }
 
+    @Test("overflow atomically publishes persistence before finish and stop can observe failure")
+    func overflowPersistenceIsJoinableAcrossFinishStopRace() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "capture-overflow-race-\(UUID().uuidString)", isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileSystem = LocalJournalFileSystem()
+        let ledger = MemoryCaptureLedger()
+        let request = captureRequest(directory: root)
+        try fileSystem.createDirectory(root)
+        let session = try await ledger.createCapture(request)
+        let persistenceGate = AsyncTestGate()
+        let joins = LockedTestCounter()
+        let completions = LockedTestCounter()
+        let callbacks = LockedTestCounter()
+        let marker = root.appendingPathComponent("capture-failure.marker")
+        let writer = CaptureJournalWriter(
+            session: session, fileSystem: fileSystem, ledger: ledger,
+            configuration: .init(segmentFrames: 4, maximumQueuedFrames: 4),
+            failurePersistenceStart: { await persistenceGate.pause() },
+            onFailurePersistenceWait: { joins.increment() },
+            onFailure: { _ in
+                #expect(fileSystem.exists(marker))
+                callbacks.increment()
+            }
+        )
+
+        #expect(writer.enqueue(Array(repeating: 0.25, count: 5)) == .overflow)
+        await persistenceGate.waitUntilPaused()
+        let finish = Task {
+            do { _ = try await writer.finish(); return false }
+            catch { completions.increment(); return true }
+        }
+        let stop = Task { await writer.stop(); completions.increment() }
+        for _ in 0..<10_000 where joins.value < 2 { await Task.yield() }
+        #expect(joins.value == 2)
+        #expect(completions.value == 0)
+
+        await persistenceGate.release()
+        #expect(await finish.value)
+        await stop.value
+
+        #expect(fileSystem.exists(marker))
+        #expect(await ledger.session(id: request.id)?.state == .damaged)
+        #expect(callbacks.value == 1)
+        #expect(completions.value == 2)
+    }
+
     @Test("canonical WAV assembles committed segments in ordinal order")
     func orderedAssembly() async throws {
         let fixture = try await JournalWriterFixture(segmentFrames: 4)
@@ -305,6 +353,39 @@ actor MemoryCaptureLedger: CaptureLedgerStoring {
 }
 
 enum TestLedgerError: Error { case conflict, injected }
+
+private actor AsyncTestGate {
+    private var paused = false
+    private var released = false
+    private var pauseWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func pause() async {
+        paused = true
+        pauseWaiters.forEach { $0.resume() }
+        pauseWaiters.removeAll()
+        guard !released else { return }
+        await withCheckedContinuation { releaseWaiters.append($0) }
+    }
+
+    func waitUntilPaused() async {
+        guard !paused else { return }
+        await withCheckedContinuation { pauseWaiters.append($0) }
+    }
+
+    func release() {
+        released = true
+        releaseWaiters.forEach { $0.resume() }
+        releaseWaiters.removeAll()
+    }
+}
+
+private final class LockedTestCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = 0
+    var value: Int { lock.withLock { storage } }
+    func increment() { lock.withLock { storage += 1 } }
+}
 
 private final class StreamingProbeFileSystem: JournalFileSystem, @unchecked Sendable {
     private let base = LocalJournalFileSystem()

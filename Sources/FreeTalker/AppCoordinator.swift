@@ -2964,10 +2964,11 @@ final class AppCoordinator: ObservableObject {
     }
 
     private static var mediaImportsDirectory: URL {
-        applicationSupportDirectory.appendingPathComponent("media-imports", isDirectory: true)
+        FreeTalkerPaths.mediaImportsDirectory
     }
 
     private static func makeRecoveryStore() throws -> TranscriptionJobStore {
+        try FreeTalkerPaths.requireValidConfiguration()
         try FileManager.default.createDirectory(at: applicationSupportDirectory, withIntermediateDirectories: true)
         return try TranscriptionJobStore(
             databaseURL: FreeTalkerPaths.jobsDatabase,
@@ -2976,8 +2977,9 @@ final class AppCoordinator: ObservableObject {
     }
 
     private static func makeSnippetStore() throws -> SnippetStore {
+        try FreeTalkerPaths.requireValidConfiguration()
         try FileManager.default.createDirectory(at: applicationSupportDirectory, withIntermediateDirectories: true)
-        return try SnippetStore(databaseURL: FreeTalkerPaths.jobsDatabase)
+        return try SnippetStore(databaseURL: FreeTalkerPaths.snippetsDatabase)
     }
 
     private static func snippetStoreErrorMessage(_ error: Error) -> String {

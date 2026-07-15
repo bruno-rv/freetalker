@@ -33,7 +33,10 @@ Two genuine product failures were then reproduced:
    `capture-failure.marker`. `CaptureJournalWriter` now owns one awaitable
    marker-and-ledger persistence task, completes it before failure notification,
    and drains it from `finish` and `stop`, while keeping `enqueue` free of
-   filesystem and SQLite I/O.
+   filesystem and SQLite I/O. Task publication and the failed state now occur
+   under the same lock. A deterministic barrier test pauses persistence, races
+   both `finish` and `stop`, and proves neither returns before marker, damaged
+   ledger state, and the subsequently ordered notification are complete.
 2. **Directory-create acknowledgement loss:** `createDirectory` could durably
    succeed and then throw before the preparation compensation boundary, leaving
    an unowned directory. `CaptureJournalService.prepare` now runs the same
@@ -102,10 +105,14 @@ FREETALKER_ALLOW_ISOLATED_SMOKE=1
 FREETALKER_SMOKE_ROOT=/Volumes/<mounted-volume>/<absolute-path>
 ```
 
-Release builds ignore the variables. Relative, traversing, non-`/Volumes`, fake
-directory, symlink-component, unmounted, or single-variable configurations fall
-back to the normal app container. The mount check uses macOS's mounted-volume
-inventory and exact volume containment.
+Release builds ignore the variables. In DEBUG, neither variable means an ordinary
+production run. If either variable is present, partial or invalid configuration
+never falls back to live data: typed resolution exposes a configuration error,
+all app-owned paths resolve beneath a deliberately unusable `/dev/null` sentinel,
+and recovery setup reports unavailable. Tests cover partial variables, relative
+and traversing roots, fake directories, symlink components, and unmounted
+`/Volumes` paths without creating the production directory. The mount check uses
+macOS's mounted-volume inventory and exact volume containment.
 
 The smoke document now includes executable `hdiutil` APFS sparse-image commands,
 DEBUG launch and path verification, SQLite `.backup`, real exclusive lock,
@@ -114,15 +121,18 @@ image, stable DEBUG-only checkpoints after job creation, Library insert,
 `libraryCommitted`, delete claim, and cancel intent, exact-one-PID force quit,
 exact isolated relaunch verification, cleanup, and detach. Checkpoints require
 the process's resolved Application Support root to equal the configured isolated
-root. The release executable exports no checkpoint symbol.
+root. Fresh bootstrap waits for jobs storage with an asserted timeout, then tells
+the operator to open Library before separately waiting for and verifying its lazy
+database. No pre-initialization Library file handle is assumed. The release
+executable exports no checkpoint symbol.
 
 ## Verification
 
 ```text
-RecordingDurabilityInvariantTests: 16 tests; 19 ordinary post-effect cases,
+RecordingDurabilityInvariantTests: 17 tests; 19 ordinary post-effect cases,
   1 overflow scenario, 10 silent cases, 8 cancellation cases, 12 lifecycle
   cases, 2 ordinary destination flows, and 2 preparation cases passed
-make test: exit 0 (747 listed tests)
+make test: exit 0 (749 listed tests)
 swift build -c release: exit 0
 release `nm` checkpoint-symbol absence: confirmed
 make app: exit 0

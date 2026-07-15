@@ -105,7 +105,7 @@ private final class InvariantJobClock: JobClock, @unchecked Sendable {
             environment: ["FREETALKER_SMOKE_ROOT": mounted.path], fallback: fallback,
             isMountedVolume: { _ in true }, hasSafeComponents: { _ in true },
             debugBuild: true
-        ) == fallback)
+        ) != fallback)
         #expect(FreeTalkerPaths.resolveApplicationSupport(
             environment: allowed, fallback: fallback,
             isMountedVolume: { _ in true }, hasSafeComponents: { _ in true },
@@ -117,24 +117,73 @@ private final class InvariantJobClock: JobClock, @unchecked Sendable {
                 "FREETALKER_SMOKE_ROOT": "relative/path",
             ], fallback: fallback, isMountedVolume: { _ in true },
             hasSafeComponents: { _ in true }, debugBuild: true
-        ) == fallback)
+        ) != fallback)
         #expect(FreeTalkerPaths.resolveApplicationSupport(
             environment: [
                 "FREETALKER_ALLOW_ISOLATED_SMOKE": "1",
                 "FREETALKER_SMOKE_ROOT": "/Volumes/FreeTalkerSmoke/../escape",
             ], fallback: fallback, isMountedVolume: { _ in true },
             hasSafeComponents: { _ in true }, debugBuild: true
-        ) == fallback)
+        ) != fallback)
         #expect(FreeTalkerPaths.resolveApplicationSupport(
             environment: allowed, fallback: fallback,
             isMountedVolume: { _ in false }, hasSafeComponents: { _ in true },
             debugBuild: true
-        ) == fallback)
+        ) != fallback)
         #expect(FreeTalkerPaths.resolveApplicationSupport(
             environment: allowed, fallback: fallback,
             isMountedVolume: { _ in true }, hasSafeComponents: { _ in false },
             debugBuild: true
-        ) == fallback)
+        ) != fallback)
+    }
+
+    @Test("any invalid debug smoke configuration resolves only unusable paths")
+    func invalidSmokeConfigurationNeverFallsBackToLiveData() {
+        let live = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "live-support-\(UUID().uuidString)", isDirectory: true
+        )
+        let root = "/Volumes/FreeTalkerSmoke/session"
+        func assertInvalid(
+            _ environment: [String: String], mounted: Bool, safe: Bool
+        ) {
+            let resolution = FreeTalkerPaths.resolve(
+                environment: environment, fallback: live,
+                isMountedVolume: { _ in mounted }, hasSafeComponents: { _ in safe },
+                debugBuild: true
+            )
+            #expect(resolution.configurationError != nil)
+            #expect(resolution.paths.all.allSatisfy { !$0.path.hasPrefix(live.path) })
+            #expect(resolution.paths.all.allSatisfy {
+                $0.path.hasPrefix("/dev/null/FreeTalker-invalid-smoke-configuration")
+            })
+            #expect(!FileManager.default.fileExists(atPath: live.path))
+        }
+        assertInvalid(["FREETALKER_ALLOW_ISOLATED_SMOKE": "1"], mounted: true, safe: true)
+        assertInvalid(["FREETALKER_SMOKE_ROOT": root], mounted: true, safe: true)
+        assertInvalid(
+            ["FREETALKER_ALLOW_ISOLATED_SMOKE": "0", "FREETALKER_SMOKE_ROOT": root],
+            mounted: true, safe: true
+        )
+        assertInvalid(
+            ["FREETALKER_ALLOW_ISOLATED_SMOKE": "1", "FREETALKER_SMOKE_ROOT": "/Volumes/Fake/session"],
+            mounted: false, safe: true
+        )
+        assertInvalid(
+            ["FREETALKER_ALLOW_ISOLATED_SMOKE": "1", "FREETALKER_SMOKE_ROOT": root],
+            mounted: false, safe: true
+        )
+        assertInvalid(
+            ["FREETALKER_ALLOW_ISOLATED_SMOKE": "1", "FREETALKER_SMOKE_ROOT": root],
+            mounted: true, safe: false
+        )
+
+        let normal = FreeTalkerPaths.resolve(
+            environment: [:], fallback: live,
+            isMountedVolume: { _ in false }, hasSafeComponents: { _ in false },
+            debugBuild: true
+        )
+        #expect(normal.configurationError == nil)
+        #expect(normal.paths.applicationSupport == live)
     }
 
     @Test("isolation path component validation rejects symlinks")

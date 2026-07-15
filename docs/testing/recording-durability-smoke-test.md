@@ -29,32 +29,50 @@ confirmed journal segment.
    ```zsh
    DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build
    SMOKE_ROOT=/Volumes/FreeTalkerSmoke/session
+   wait_for_file() {
+     local path="$1"
+     for _ in {1..100}; do
+       test -e "$path" && return 0
+       sleep 0.1
+     done
+     print -u2 "timed out waiting for $path"
+     return 1
+   }
    launch_smoke() {
      env FREETALKER_ALLOW_ISOLATED_SMOKE=1 \
        FREETALKER_SMOKE_ROOT="$SMOKE_ROOT" \
        .build/debug/FreeTalker &
      APP_PID=$!
-     for _ in {1..100}; do
-       kill -0 "$APP_PID" 2>/dev/null || return 1
-       test -e "$SMOKE_ROOT/jobs.db" -a -e "$SMOKE_ROOT/library.db" && break
-       sleep 0.1
-     done
+     kill -0 "$APP_PID" 2>/dev/null || return 1
+     wait_for_file "$SMOKE_ROOT/jobs.db" || return 1
    }
-   verify_smoke_root() {
+   verify_jobs_root() {
      test "$(stat -f '%m' "$SMOKE_ROOT")" = /Volumes/FreeTalkerSmoke
      lsof -p "$APP_PID" | grep -F "$SMOKE_ROOT/jobs.db"
-     lsof -p "$APP_PID" | grep -F "$SMOKE_ROOT/library.db"
      sqlite3 "$SMOKE_ROOT/jobs.db" '.databases' | grep -F "$SMOKE_ROOT/jobs.db"
+   }
+   verify_library_root() {
+     wait_for_file "$SMOKE_ROOT/library.db" || return 1
      sqlite3 "$SMOKE_ROOT/library.db" '.databases' | grep -F "$SMOKE_ROOT/library.db"
    }
-   relaunch_and_verify() { launch_smoke && verify_smoke_root; }
-   relaunch_and_verify
+   relaunch_and_verify() { launch_smoke && verify_jobs_root; }
+   relaunch_and_verify || exit 1
    ```
 
-3. The launch is invalid unless `verify_smoke_root` succeeds. Stop immediately
-   if either database is outside the sparse image. Run `relaunch_and_verify`
+3. The launch is invalid unless `verify_jobs_root` succeeds. On a fresh profile,
+   `LibraryStore` creates `library.db` lazily: click the FreeTalker menu-bar icon,
+   choose **Library**, wait for the Library window, then run:
+
+   ```zsh
+   verify_library_root || exit 1
+   ```
+
+   Stop immediately if either database is outside the sparse image. Run
+   `relaunch_and_verify`
    after every clean quit or force-quit in this protocol; a bare `open`, direct
-   executable launch, or Finder relaunch does not preserve isolation.
+   executable launch, or Finder relaunch does not preserve isolation. After a
+   fresh isolated root, repeat the explicit Library UI step and
+   `verify_library_root || exit 1` before any Library assertion.
 
 4. Back up both isolated databases before lock/corruption tests, after quitting
    the app cleanly, then perform the exact isolated relaunch and verification:
