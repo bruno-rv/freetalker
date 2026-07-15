@@ -116,6 +116,8 @@ private final class RecordingJournalFileSystem: JournalFileSystem, @unchecked Se
         try record(.write(url.path), at: .write)
     }
 
+    func append(_ data: Data, to url: URL) throws {}
+
     func synchronizeFile(_ url: URL) throws {
         try record(.synchronizeFile(url.path), at: .synchronizeFile)
     }

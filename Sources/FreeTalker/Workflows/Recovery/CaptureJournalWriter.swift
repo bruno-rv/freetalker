@@ -5,6 +5,12 @@ struct CaptureDiagnostics: Sendable, Equatable, Codable {
     let rms: Float
     let inputDeviceUID: String?
     let routeFailure: String?
+
+    var indicatesSilence: Bool {
+        let deadSignalFloor: Float = 1e-7
+        return peak.isFinite && rms.isFinite && peak >= 0 && rms >= 0
+            && peak <= deadSignalFloor && rms <= deadSignalFloor
+    }
 }
 
 struct ActiveCaptureJournal: @unchecked Sendable {
@@ -55,6 +61,7 @@ final class CaptureJournalWriter: @unchecked Sendable {
         var processing = false
         var needsBootstrap = true
         var didNotifyFailure = false
+        var canonicalContentHash: String?
         var diagnostics: CaptureDiagnostics
     }
 
@@ -106,7 +113,6 @@ final class CaptureJournalWriter: @unchecked Sendable {
                 )
                 state.status = .failed(error)
                 state.queue.removeAll(keepingCapacity: false)
-                state.queuedFrames = 0
                 if !state.didNotifyFailure {
                     state.didNotifyFailure = true
                     notify = String(describing: error)
@@ -193,12 +199,8 @@ final class CaptureJournalWriter: @unchecked Sendable {
         lock.withLock { state.diagnostics = diagnostics }
     }
 
-    func recordedSampleCount() async -> Int {
-        _ = await committedSnapshot()
-        return lock.withLock {
-            state.committed.reduce(0) { $0 + $1.sampleCount }
-                + state.pending.count + state.queuedFrames
-        }
+    func finishedContentHash() -> String? {
+        lock.withLock { state.canonicalContentHash }
     }
 
     func stop() async {
@@ -207,7 +209,6 @@ final class CaptureJournalWriter: @unchecked Sendable {
             case .active, .finishing:
                 state.status = .failed(.failed("capture stopped"))
                 state.queue.removeAll(keepingCapacity: false)
-                state.queuedFrames = 0
             case .finished, .failed:
                 break
             }
@@ -236,7 +237,6 @@ final class CaptureJournalWriter: @unchecked Sendable {
                         let buffers = state.queue
                         let pending = state.pending
                         state.queue.removeAll(keepingCapacity: true)
-                        state.queuedFrames = 0
                         state.pending = []
                         state.processing = true
                         return .buffers(buffers, pending)
@@ -281,6 +281,11 @@ final class CaptureJournalWriter: @unchecked Sendable {
 
     private func bootstrap() async throws {
         guard lock.withLock({ state.needsBootstrap }) else { return }
+        if let persisted = try await ledger.session(id: session.id), persisted.state == .damaged {
+            throw CaptureJournalError.failed(
+                persisted.failureMessage ?? "capture journal is damaged"
+            )
+        }
         var committed = try await ledger.committedSegments(captureID: session.id)
         committed.sort { $0.ordinal < $1.ordinal }
         for (expected, segment) in committed.enumerated() {
@@ -335,15 +340,29 @@ final class CaptureJournalWriter: @unchecked Sendable {
         defer {
             if fileSystem.exists(temporary) { try? fileSystem.remove(temporary) }
         }
-        try DurableArtifactWriter(fileSystem: fileSystem).commit(
-            data, temporary: temporary, destination: destination
-        )
-        let segment = CaptureSegment(
-            captureID: session.id, ordinal: ordinal, url: destination,
-            sampleCount: samples.count, contentHash: codec.hash(data)
-        )
-        try await ledger.recordCommittedSegment(segment)
-        lock.withLock { state.committed.append(segment) }
+        do {
+            try DurableArtifactWriter(fileSystem: fileSystem).commit(
+                data, temporary: temporary, destination: destination
+            )
+            let segment = CaptureSegment(
+                captureID: session.id, ordinal: ordinal, url: destination,
+                sampleCount: samples.count, contentHash: codec.hash(data)
+            )
+            try await ledger.recordCommittedSegment(segment)
+            lock.withLock {
+                state.committed.append(segment)
+                state.queuedFrames -= samples.count
+            }
+        } catch {
+            if !fileSystem.exists(destination) {
+                try? await ledger.transition(
+                    id: session.id, from: .capturing, to: .damaged,
+                    recoveryJobID: nil, libraryDictationID: nil, assetKind: .damaged,
+                    failureMessage: String(describing: error), contentHash: nil
+                )
+            }
+            throw error
+        }
     }
 
     private func completeFinish() throws {
@@ -357,6 +376,7 @@ final class CaptureJournalWriter: @unchecked Sendable {
         lock.withLock {
             state.processing = false
             state.workerRunning = false
+            state.canonicalContentHash = assembled.contentHash
             state.status = .finished(staged)
         }
     }
@@ -372,7 +392,6 @@ final class CaptureJournalWriter: @unchecked Sendable {
             }
             state.status = .failed(journalError)
             state.queue.removeAll(keepingCapacity: false)
-            state.queuedFrames = 0
             state.processing = false
             state.workerRunning = false
             if !state.didNotifyFailure {

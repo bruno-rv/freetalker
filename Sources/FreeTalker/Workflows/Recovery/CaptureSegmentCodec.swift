@@ -9,6 +9,7 @@ enum CaptureJournalError: Error, Equatable, Sendable {
     case invalidSampleCount(String)
     case hashMismatch(String)
     case captureMismatch
+    case cleanupNotPermitted(String)
     case queueOverflow(maximumFrames: Int)
     case failed(String)
 }
@@ -22,21 +23,8 @@ struct CaptureSegmentCodec: Sendable {
     let fileSystem: any JournalFileSystem
 
     func encode(_ samples: [Float]) -> Data {
-        let payloadSize = samples.count * MemoryLayout<Float>.size
-        var data = Data(capacity: Self.headerSize + payloadSize)
-        data.appendASCII("RIFF")
-        data.appendLittleEndian(UInt32(36 + payloadSize))
-        data.appendASCII("WAVE")
-        data.appendASCII("fmt ")
-        data.appendLittleEndian(UInt32(16))
-        data.appendLittleEndian(UInt16(3)) // IEEE Float
-        data.appendLittleEndian(UInt16(Self.channelCount))
-        data.appendLittleEndian(UInt32(Self.sampleRate))
-        data.appendLittleEndian(UInt32(Self.sampleRate * MemoryLayout<Float>.size))
-        data.appendLittleEndian(UInt16(MemoryLayout<Float>.size))
-        data.appendLittleEndian(UInt16(Self.bitsPerSample))
-        data.appendASCII("data")
-        data.appendLittleEndian(UInt32(payloadSize))
+        var data = wavHeader(sampleCount: samples.count)
+        data.reserveCapacity(Self.headerSize + samples.count * MemoryLayout<Float>.size)
         for sample in samples {
             data.appendLittleEndian(sample.bitPattern)
         }
@@ -56,6 +44,11 @@ struct CaptureSegmentCodec: Sendable {
     }
 
     func validate(_ segment: CaptureSegment) throws -> [Float] {
+        let data = try validatedData(segment)
+        return try decode(data, path: segment.url.path)
+    }
+
+    private func validatedData(_ segment: CaptureSegment) throws -> Data {
         guard segment.url.deletingPathExtension().lastPathComponent
             == String(format: "segment-%08d", segment.ordinal) else {
             throw CaptureJournalError.invalidOrdinal(
@@ -71,13 +64,13 @@ struct CaptureSegmentCodec: Sendable {
         guard samples.count == segment.sampleCount else {
             throw CaptureJournalError.invalidSampleCount(segment.url.path)
         }
-        return samples
+        return data
     }
 
     func assemble(
         segments: [CaptureSegment], canonicalURL: URL
     ) throws -> (sampleCount: Int, contentHash: String) {
-        var samples: [Float] = []
+        var sampleCount = 0
         var captureID: UUID?
         for (expectedOrdinal, segment) in segments.enumerated() {
             guard segment.ordinal == expectedOrdinal else {
@@ -89,20 +82,60 @@ struct CaptureSegmentCodec: Sendable {
                 throw CaptureJournalError.captureMismatch
             }
             captureID = segment.captureID
-            samples.append(contentsOf: try validate(segment))
+            let (sum, overflow) = sampleCount.addingReportingOverflow(segment.sampleCount)
+            guard !overflow, segment.sampleCount >= 0 else {
+                throw CaptureJournalError.invalidSampleCount(segment.url.path)
+            }
+            sampleCount = sum
+        }
+        let maximumSamples = (Int(UInt32.max) - 36) / MemoryLayout<Float>.size
+        guard sampleCount <= maximumSamples else {
+            throw CaptureJournalError.invalidSampleCount(canonicalURL.path)
         }
 
-        let data = encode(samples)
         let temporary = canonicalURL.deletingLastPathComponent().appendingPathComponent(
             ".\(canonicalURL.lastPathComponent).\(UUID().uuidString).tmp"
         )
         defer {
             if fileSystem.exists(temporary) { try? fileSystem.remove(temporary) }
         }
-        try DurableArtifactWriter(fileSystem: fileSystem).commit(
-            data, temporary: temporary, destination: canonicalURL
-        )
-        return (samples.count, hash(data))
+        let header = wavHeader(sampleCount: sampleCount)
+        var hasher = SHA256()
+        hasher.update(data: header)
+        try fileSystem.write(header, to: temporary)
+        for segment in segments {
+            let data = try validatedData(segment)
+            let payload = Data(data.dropFirst(Self.headerSize))
+            try fileSystem.append(payload, to: temporary)
+            hasher.update(data: payload)
+        }
+        try fileSystem.synchronizeFile(temporary)
+        try fileSystem.rename(temporary, to: canonicalURL)
+        try fileSystem.synchronizeDirectory(canonicalURL.deletingLastPathComponent())
+        return (sampleCount, Self.hex(hasher.finalize()))
+    }
+
+    private func wavHeader(sampleCount: Int) -> Data {
+        let payloadSize = sampleCount * MemoryLayout<Float>.size
+        var data = Data(capacity: Self.headerSize)
+        data.appendASCII("RIFF")
+        data.appendLittleEndian(UInt32(36 + payloadSize))
+        data.appendASCII("WAVE")
+        data.appendASCII("fmt ")
+        data.appendLittleEndian(UInt32(16))
+        data.appendLittleEndian(UInt16(3)) // IEEE Float
+        data.appendLittleEndian(UInt16(Self.channelCount))
+        data.appendLittleEndian(UInt32(Self.sampleRate))
+        data.appendLittleEndian(UInt32(Self.sampleRate * MemoryLayout<Float>.size))
+        data.appendLittleEndian(UInt16(MemoryLayout<Float>.size))
+        data.appendLittleEndian(UInt16(Self.bitsPerSample))
+        data.appendASCII("data")
+        data.appendLittleEndian(UInt32(payloadSize))
+        return data
+    }
+
+    private static func hex<D: Sequence>(_ digest: D) -> String where D.Element == UInt8 {
+        digest.map { String(format: "%02x", $0) }.joined()
     }
 
     private func decode(_ data: Data, path: String) throws -> [Float] {

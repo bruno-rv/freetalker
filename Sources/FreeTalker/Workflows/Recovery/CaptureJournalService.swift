@@ -26,6 +26,7 @@ struct CaptureJournalService: Sendable {
             )
         }
         try fileSystem.createDirectory(request.directory)
+        try fileSystem.synchronizeDirectory(request.directory.deletingLastPathComponent())
         let session = try await ledger.createCapture(request)
         let codec = CaptureSegmentCodec(fileSystem: fileSystem)
         return ActiveCaptureJournal(
@@ -39,8 +40,9 @@ struct CaptureJournalService: Sendable {
 
     func finish(_ active: ActiveCaptureJournal) async throws -> StagedCapture {
         let staged = try await active.writer.finish()
-        let contentHash = try CaptureSegmentCodec(fileSystem: fileSystem)
-            .hashFile(staged.canonicalAudioURL)
+        guard let contentHash = active.writer.finishedContentHash() else {
+            throw CaptureJournalError.failed("canonical audio hash is unavailable")
+        }
         try await ledger.transition(
             id: active.session.id, from: .capturing, to: .staged,
             recoveryJobID: nil, libraryDictationID: nil, assetKind: .audio,
@@ -54,8 +56,8 @@ struct CaptureJournalService: Sendable {
         diagnostics: CaptureDiagnostics
     ) async throws {
         active.writer.updateDiagnostics(diagnostics)
-        guard await active.writer.recordedSampleCount() == 0 else {
-            throw CaptureJournalError.failed("silent capture contains audio samples")
+        guard diagnostics.indicatesSilence else {
+            throw CaptureJournalError.failed("capture diagnostics contain microphone signal")
         }
         await active.writer.stop()
         try await ledger.transition(
@@ -93,6 +95,9 @@ struct CaptureJournalService: Sendable {
 
     func resumeCleanup(captureID: UUID) async throws {
         guard let session = try await ledger.session(id: captureID) else { return }
+        guard session.state == .cancelling else {
+            throw CaptureJournalError.cleanupNotPermitted(session.state.rawValue)
+        }
         try await cancelAndClean(session: session)
     }
 
@@ -109,6 +114,7 @@ struct CaptureJournalService: Sendable {
         if fileSystem.exists(session.directory) {
             try fileSystem.remove(session.directory)
         }
+        try fileSystem.synchronizeDirectory(session.directory.deletingLastPathComponent())
         try await ledger.removeCleanedSession(id: session.id)
     }
 }

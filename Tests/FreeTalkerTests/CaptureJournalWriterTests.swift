@@ -3,6 +3,29 @@ import Testing
 @testable import FreeTalker
 
 @Suite struct CaptureJournalWriterTests {
+    @Test("canonical assembly writes one bounded payload chunk per segment")
+    func canonicalAssemblyStreamsSegments() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("capture-streaming-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileSystem = StreamingProbeFileSystem()
+        let ledger = MemoryCaptureLedger()
+        let request = captureRequest(directory: root)
+        try fileSystem.createDirectory(root)
+        let session = try await ledger.createCapture(request)
+        let writer = CaptureJournalWriter(
+            session: session, fileSystem: fileSystem, ledger: ledger,
+            configuration: .init(segmentFrames: 4, maximumQueuedFrames: 128)
+        )
+        #expect(writer.enqueue(Array(repeating: 0.25, count: 40)) == .accepted)
+
+        let staged = try await writer.finish()
+
+        #expect(staged.segments.count == 10)
+        #expect(fileSystem.appendCount == 10)
+        #expect(fileSystem.maximumChunkBytes <= CaptureSegmentCodec.headerSize + 4 * 4)
+    }
+
     @Test("journal service prepares, stages, and advances lifecycle metadata")
     func serviceLifecycle() async throws {
         let root = FileManager.default.temporaryDirectory
@@ -40,6 +63,7 @@ import Testing
         let service = CaptureJournalService(fileSystem: fileSystem, ledger: ledger)
         let request = captureRequest(directory: root)
         let active = try await service.prepare(request)
+        #expect(active.writer.enqueue([0, 0, 0, 0]) == .accepted)
 
         try await service.recordSilent(active, diagnostics: CaptureDiagnostics(
             peak: 0, rms: 0, inputDeviceUID: "test-mic", routeFailure: nil
@@ -257,3 +281,35 @@ actor MemoryCaptureLedger: CaptureLedgerStoring {
 }
 
 enum TestLedgerError: Error { case conflict, injected }
+
+private final class StreamingProbeFileSystem: JournalFileSystem, @unchecked Sendable {
+    private let base = LocalJournalFileSystem()
+    private let lock = NSLock()
+    private var chunkSizes: [Int] = []
+    private var appends = 0
+
+    var appendCount: Int { lock.withLock { appends } }
+    var maximumChunkBytes: Int { lock.withLock { chunkSizes.max() ?? 0 } }
+    func createDirectory(_ url: URL) throws { try base.createDirectory(url) }
+    func write(_ data: Data, to url: URL) throws {
+        lock.withLock { chunkSizes.append(data.count) }
+        try base.write(data, to: url)
+    }
+    func append(_ data: Data, to url: URL) throws {
+        lock.withLock {
+            appends += 1
+            chunkSizes.append(data.count)
+        }
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: data)
+    }
+    func synchronizeFile(_ url: URL) throws { try base.synchronizeFile(url) }
+    func rename(_ source: URL, to destination: URL) throws { try base.rename(source, to: destination) }
+    func synchronizeDirectory(_ url: URL) throws { try base.synchronizeDirectory(url) }
+    func contents(_ url: URL) throws -> [URL] { try base.contents(url) }
+    func read(_ url: URL) throws -> Data { try base.read(url) }
+    func remove(_ url: URL) throws { try base.remove(url) }
+    func exists(_ url: URL) -> Bool { base.exists(url) }
+}

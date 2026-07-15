@@ -4,6 +4,7 @@ import Foundation
 protocol JournalFileSystem: Sendable {
     func createDirectory(_ url: URL) throws
     func write(_ data: Data, to url: URL) throws
+    func append(_ data: Data, to url: URL) throws
     func synchronizeFile(_ url: URL) throws
     func rename(_ source: URL, to destination: URL) throws
     func synchronizeDirectory(_ url: URL) throws
@@ -54,6 +55,21 @@ struct LocalJournalFileSystem: JournalFileSystem {
             throw JournalPersistenceError.write(path: url.path, code: code)
         }
 
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer { try? handle.close() }
+        do {
+            try handle.write(contentsOf: data)
+            try handle.close()
+        } catch {
+            throw JournalPersistenceError.write(path: url.path, code: Self.code(for: error))
+        }
+    }
+
+    func append(_ data: Data, to url: URL) throws {
+        let descriptor = Darwin.open(url.path, O_WRONLY | O_APPEND | O_CLOEXEC)
+        guard descriptor >= 0 else {
+            throw JournalPersistenceError.write(path: url.path, code: errno)
+        }
         let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
         defer { try? handle.close() }
         do {
