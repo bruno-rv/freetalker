@@ -44,7 +44,14 @@ struct CaptureJournalService: Sendable {
                 sampleRate: request.sampleRate, channelCount: request.channelCount
             )
         }
-        try fileSystem.createDirectory(request.directory)
+        do {
+            try fileSystem.createDirectory(request.directory)
+        } catch {
+            // Directory creation can succeed durably and still lose its acknowledgement.
+            // Compensate or persist ownership exactly like the later parent-sync boundary.
+            try await compensateOrOwnFailedPrepare(request, original: error)
+            throw error
+        }
         do {
             try fileSystem.synchronizeDirectory(request.directory.deletingLastPathComponent())
         } catch {

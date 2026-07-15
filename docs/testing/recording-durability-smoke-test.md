@@ -9,11 +9,51 @@ confirmed journal segment.
 
 ## Prerequisites and evidence
 
-1. Back up the FreeTalker Library and `failed-dictations` recovery directory.
-   Never run destructive steps against the only copy of production data.
-2. Use a build with microphone permission and, for processing interruption,
-   the documented test-only pause hooks if that build provides them. Do not
-   infer a boundary result when no pause hook exists.
+1. Quit FreeTalker and create an isolated APFS sparse image. These commands
+   create at most a 1 GiB image in the named file; they never fill the system
+   disk intentionally:
+
+   ```zsh
+   IMAGE="$HOME/FreeTalkerSmoke.sparseimage"
+   hdiutil create -size 1g -type SPARSE -fs APFS \
+     -volname FreeTalkerSmoke "$IMAGE"
+   hdiutil attach "$IMAGE" -mountpoint /Volumes/FreeTalkerSmoke
+   mkdir -m 700 /Volumes/FreeTalkerSmoke/session
+   ```
+
+2. Build and launch the DEBUG executable with both isolation opt-ins. Release
+   builds ignore these variables, relative paths fail closed, and roots outside
+   a mounted `/Volumes/...` volume fail closed:
+
+   ```zsh
+   DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build
+   env FREETALKER_ALLOW_ISOLATED_SMOKE=1 \
+     FREETALKER_SMOKE_ROOT=/Volumes/FreeTalkerSmoke/session \
+     .build/debug/FreeTalker &
+   APP_PID=$!
+   ```
+
+3. Verify isolation before recording. Stop immediately if either database is
+   outside the sparse image:
+
+   ```zsh
+   lsof -p "$APP_PID" | grep '/Volumes/FreeTalkerSmoke/session'
+   test -e /Volumes/FreeTalkerSmoke/session/jobs.db
+   test -e /Volumes/FreeTalkerSmoke/session/library.db
+   sqlite3 /Volumes/FreeTalkerSmoke/session/jobs.db '.databases'
+   sqlite3 /Volumes/FreeTalkerSmoke/session/library.db '.databases'
+   ```
+
+4. Back up both isolated databases before lock/corruption tests, after quitting
+   the app cleanly:
+
+   ```zsh
+   kill "$APP_PID"; wait "$APP_PID" 2>/dev/null || true
+   sqlite3 /Volumes/FreeTalkerSmoke/session/jobs.db \
+     ".backup '/Volumes/FreeTalkerSmoke/jobs.backup.db'"
+   sqlite3 /Volumes/FreeTalkerSmoke/session/library.db \
+     ".backup '/Volumes/FreeTalkerSmoke/library.backup.db'"
+   ```
 3. Connect a known-good microphone. In System Settings, confirm FreeTalker has
    Microphone and Accessibility permission.
 4. Open **Library → Recoveries** and note its initial rows. Record the app
@@ -51,13 +91,32 @@ boundary. Do not press Cancel or Escape first.
    can be retried or exported, or is already present exactly once in Library.
 2. Repeat with Scratchpad. Confirm the same ownership invariant and that a
    successful retry restores the intended Scratchpad result.
-3. If a test build exposes processing pause hooks, repeat force-quit after job
-   creation, while a processing lease is held, immediately after Library insert,
-   immediately after `libraryCommitted`, and during source/job/ledger cleanup.
-   Relaunch after each pause. Confirm no duplicate Library row, no second
-   transcription once Library owns the capture, and eventual cleanup convergence.
-   If hooks are unavailable, mark these steps **not executed**; automated tests
-   provide the boundary evidence.
+3. For repeatable processing boundaries, launch the isolated DEBUG executable
+   under LLDB and set regex breakpoints on real functions (no hidden pause hook
+   is assumed):
+
+   ```zsh
+   lldb .build/debug/FreeTalker
+   (lldb) settings set target.env-vars FREETALKER_ALLOW_ISOLATED_SMOKE=1 FREETALKER_SMOKE_ROOT=/Volumes/FreeTalkerSmoke/session
+   (lldb) breakpoint set -r 'RecoveryRetryPipeline.*execute'
+   (lldb) breakpoint set -r 'RecoveryCaptureService.*completeJournalCapture'
+   (lldb) breakpoint set -r 'RecoveryCaptureService.*cleanupLibraryCommittedSession'
+   (lldb) run
+   ```
+
+   When the chosen breakpoint stops, obtain the exact process ID with
+   `process status`, then terminate from a second Terminal only after verifying
+   there is exactly one FreeTalker process:
+
+   ```zsh
+   PIDS=($(pgrep -x FreeTalker))
+   (( ${#PIDS[@]} == 1 )) || { print -u2 'refusing ambiguous kill'; exit 1; }
+   kill -9 "$PIDS[1]"
+   ```
+
+   Repeat after job creation/lease, Library insert, `libraryCommitted`, and
+   cleanup. If symbol breakpoints are unavailable, mark the stage **not
+   executed** rather than estimating timing.
 4. Launch FreeTalker twice during recovery setup. Confirm setup/reconciliation is
    single-flight, the stale runner stops, and one visible result remains.
 
@@ -88,17 +147,50 @@ confirm content-hash and lineage deduplication creates no duplicate row.
 
 ## Disk-full and health checks
 
-1. Never fill the system disk. Create a disposable APFS volume or size-limited
-   disk image, point a disposable test build's recovery root there, and retain a
-   second Terminal window capable of detaching/removing it.
+1. Never fill the system disk. Confirm `FREETALKER_SMOKE_ROOT` resolves to the
+   attached sparse image as above. Exhaust only its free space with a removable
+   filler, leaving the Terminal session available:
+
+   ```zsh
+   FILL=/Volumes/FreeTalkerSmoke/fill.bin
+   FREE_KB=$(df -k /Volumes/FreeTalkerSmoke | awk 'NR==2 {print $4}')
+   (( FREE_KB > 16384 )) || { print -u2 'disposable volume too small'; exit 1; }
+   mkfile "$((FREE_KB - 8192))k" "$FILL"
+   ```
+
+   Remove the filler immediately after the expected error with `rm -f "$FILL"`.
 2. Exhaust only that disposable volume during segment persistence and again
    during final assembly. Confirm recording stops visibly, committed evidence is
    retained, and relaunch reports an actionable unavailable/degraded state.
-3. Test read-only/unavailable recovery storage and a locked/busy jobs database.
+3. Test a real locked jobs database by keeping this interactive transaction open
+   in Terminal A while attempting recording in the app, then type `ROLLBACK;`:
+
+   ```zsh
+   sqlite3 /Volumes/FreeTalkerSmoke/session/jobs.db
+   sqlite> BEGIN EXCLUSIVE;
+   sqlite> SELECT count(*) FROM capture_sessions;
+   # attempt recording in FreeTalker now
+   sqlite> ROLLBACK;
+   ```
+
+   Confirm the first admission is blocked and Retry Recovery Setup succeeds
+   after rollback.
    Confirm External and Scratchpad admission is blocked while health is
    unavailable, the exact operation is shown, and Retry Recovery Setup recovers
    after access is restored.
-4. On disposable copies only, corrupt one store/artifact. Confirm store-wide
+4. On the isolated copy only, corrupt the jobs store after a force-quit, then
+   restore the SQLite backup. Never run these commands against `~/Library`:
+
+   ```zsh
+   printf 'corrupt-test-only\n' > /Volumes/FreeTalkerSmoke/session/jobs.db
+   rm -f /Volumes/FreeTalkerSmoke/session/jobs.db-{wal,shm}
+   # relaunch, capture the unavailable-health evidence, quit again
+   cp /Volumes/FreeTalkerSmoke/jobs.backup.db \
+     /Volumes/FreeTalkerSmoke/session/jobs.db
+   chmod 600 /Volumes/FreeTalkerSmoke/session/jobs.db
+   ```
+
+   On disposable copies only, corrupt one store/artifact. Confirm store-wide
    failure reports unavailable and blocks admission; item-local corruption is
    quarantined without deleting other evidence. Do not expect recovery from a
    wholly destroyed database when no filesystem evidence exists.
@@ -125,3 +217,12 @@ confirm content-hash and lineage deduplication creates no duplicate row.
   cancellation converge after relaunch without deleting an uncommitted last copy.
 - Record unexecuted hardware- or hook-dependent steps explicitly; do not report
   this protocol as passed unless every required executable step was observed.
+
+Finally quit FreeTalker, remove only the test image, and detach it:
+
+```zsh
+PIDS=($(pgrep -x FreeTalker))
+(( ${#PIDS[@]} == 0 )) || { print -u2 'quit FreeTalker before detach'; exit 1; }
+hdiutil detach /Volumes/FreeTalkerSmoke
+rm -f "$HOME/FreeTalkerSmoke.sparseimage"
+```

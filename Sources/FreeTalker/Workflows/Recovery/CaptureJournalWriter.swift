@@ -103,6 +103,7 @@ final class CaptureJournalWriter: @unchecked Sendable {
         let copied = samples.withUnsafeBufferPointer { Array($0) }
         var startWorker = false
         var notify: String?
+        var overflowError: CaptureJournalError?
         let result: EnqueueResult = lock.withLock {
             switch state.status {
             case .failed(let error): return .failed(String(describing: error))
@@ -115,6 +116,7 @@ final class CaptureJournalWriter: @unchecked Sendable {
                 )
                 state.status = .failed(error)
                 state.queue.removeAll(keepingCapacity: false)
+                overflowError = error
                 if !state.didNotifyFailure {
                     state.didNotifyFailure = true
                     notify = String(describing: error)
@@ -134,6 +136,13 @@ final class CaptureJournalWriter: @unchecked Sendable {
         }
         if let notify {
             Task { onFailure(notify) }
+        }
+        if let overflowError {
+            Task {
+                // The audio callback remains I/O-free. Persist durable failure ownership
+                // on the journal task so a crash after overflow cannot leave only RAM state.
+                try? await recordUnrecoverableFailure(overflowError)
+            }
         }
         if startWorker { launchWorker() }
         return result

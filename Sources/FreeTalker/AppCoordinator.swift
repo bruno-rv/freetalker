@@ -2957,13 +2957,10 @@ final class AppCoordinator: ObservableObject {
         )
     }
 
-    private static let applicationSupportDirectory: URL = {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("FreeTalker", isDirectory: true)
-    }()
+    private static let applicationSupportDirectory = FreeTalkerPaths.applicationSupport
 
     private static var recoveryDirectory: URL {
-        applicationSupportDirectory.appendingPathComponent("failed-dictations", isDirectory: true)
+        FreeTalkerPaths.recoveryDirectory
     }
 
     private static var mediaImportsDirectory: URL {
@@ -2973,14 +2970,14 @@ final class AppCoordinator: ObservableObject {
     private static func makeRecoveryStore() throws -> TranscriptionJobStore {
         try FileManager.default.createDirectory(at: applicationSupportDirectory, withIntermediateDirectories: true)
         return try TranscriptionJobStore(
-            databaseURL: applicationSupportDirectory.appendingPathComponent("jobs.db"),
+            databaseURL: FreeTalkerPaths.jobsDatabase,
             clock: SystemJobClock()
         )
     }
 
     private static func makeSnippetStore() throws -> SnippetStore {
         try FileManager.default.createDirectory(at: applicationSupportDirectory, withIntermediateDirectories: true)
-        return try SnippetStore(databaseURL: applicationSupportDirectory.appendingPathComponent("jobs.db"))
+        return try SnippetStore(databaseURL: FreeTalkerPaths.jobsDatabase)
     }
 
     private static func snippetStoreErrorMessage(_ error: Error) -> String {
@@ -3360,12 +3357,11 @@ final class AppCoordinator: ObservableObject {
     /// artifact for the live-mic silence investigation — lets the captured signal be inspected
     /// (played back, or peak/RMS-measured externally) without reproducing the bug interactively.
     private func writeLastCaptureDebugArtifact(_ samples: [Float]) {
-        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        let dir = support.appendingPathComponent("FreeTalker", isDirectory: true)
+        let dir = FreeTalkerPaths.applicationSupport
         do {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             let data = WAVEncoder.encode(samples: samples, sampleRate: 16_000)
-            try data.write(to: dir.appendingPathComponent("last-dictation.wav"))
+            try data.write(to: FreeTalkerPaths.debugAudio)
         } catch {
             Self.logger.error("failed to write last-dictation.wav: \(error.localizedDescription, privacy: .public)")
         }

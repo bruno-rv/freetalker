@@ -201,8 +201,7 @@ final class LibraryStore: ObservableObject, LibraryTranslationStoring {
     /// Removes the transient last-capture debug artifact. Recovery media has separate
     /// ownership and explicit deletion semantics and is never traversed here.
     private func purgeDebugAudio() throws {
-        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        try Self.purgeDebugAudio(in: support.appendingPathComponent("FreeTalker", isDirectory: true))
+        try Self.purgeDebugAudio(in: FreeTalkerPaths.applicationSupport)
     }
 
     nonisolated static func purgeDebugAudio(in dir: URL) throws {

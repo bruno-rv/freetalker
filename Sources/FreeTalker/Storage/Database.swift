@@ -12,14 +12,12 @@ enum DatabaseError: Error, Equatable {
 final class Database {
     private var handle: OpaquePointer?
 
-    static let defaultURL: URL = {
-        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        let dir = support.appendingPathComponent("FreeTalker", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("library.db")
-    }()
+    static let defaultURL: URL = FreeTalkerPaths.libraryDatabase
 
     init(path: URL = Database.defaultURL) throws {
+        try FileManager.default.createDirectory(
+            at: path.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
         if sqlite3_open(path.path, &handle) != SQLITE_OK {
             let message = String(cString: sqlite3_errmsg(handle))
             throw DatabaseError.openFailed(message)
