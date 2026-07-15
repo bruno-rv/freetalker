@@ -229,6 +229,63 @@ struct InputMonitoringPermissionPresentation: Equatable {
     }
 }
 
+enum VocabularyEditorPresentation {
+    static let placeholder = "One term or phrase per line"
+    static let examples = ["OpenAI", "ScreenCaptureKit"]
+    static let accessibilityLabel = "Vocabulary terms"
+    static let minimumHeight: CGFloat = 100
+    static let cornerRadius: CGFloat = 7
+}
+
+private struct VocabularyEditorField: View {
+    @Binding var text: String
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            if text.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(VocabularyEditorPresentation.placeholder)
+                    ForEach(VocabularyEditorPresentation.examples,
+                            id: \.self) { example in
+                        Text(example)
+                    }
+                }
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+            }
+
+            TextEditor(text: $text)
+                .scrollContentBackground(.hidden)
+                .padding(6)
+                .background(.clear)
+                .focused($isFocused)
+                .accessibilityLabel(
+                    VocabularyEditorPresentation.accessibilityLabel
+                )
+        }
+        .frame(minHeight: VocabularyEditorPresentation.minimumHeight)
+        .background(Color(nsColor: .textBackgroundColor))
+        .clipShape(RoundedRectangle(
+            cornerRadius: VocabularyEditorPresentation.cornerRadius
+        ))
+        .overlay {
+            RoundedRectangle(
+                cornerRadius: VocabularyEditorPresentation.cornerRadius
+            )
+            .stroke(
+                isFocused ? Color.accentColor :
+                    Color(nsColor: .separatorColor),
+                lineWidth: isFocused ? 2 : 1
+            )
+        }
+    }
+}
+
 private struct GeneralSettingsView: View {
     let destination: SettingsDestination
     @ObservedObject private var settings = AppSettings.shared
@@ -889,8 +946,7 @@ private struct GeneralSettingsView: View {
             Text("One term per line — proper nouns, names, or jargon that should be recognized and spelled correctly. Used to bias transcription and post-processing.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            TextEditor(text: $settings.vocabularyText)
-                .frame(minHeight: 100)
+            VocabularyEditorField(text: $settings.vocabularyText)
             if let truncation = settings.vocabularyTruncation {
                 Text("Using first \(truncation.kept) of \(truncation.total) terms (limit: \(AppSettings.maxVocabularyTerms) terms / \(AppSettings.maxVocabularyCharacterBudget) characters).")
                     .font(.caption)
