@@ -10,6 +10,7 @@ enum CaptureJournalError: Error, Equatable, Sendable {
     case hashMismatch(String)
     case captureMismatch
     case cleanupNotPermitted(String)
+    case missingCapture(UUID)
     case queueOverflow(maximumFrames: Int)
     case failed(String)
 }

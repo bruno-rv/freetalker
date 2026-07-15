@@ -74,7 +74,9 @@ struct CaptureJournalService: Sendable {
     }
 
     func markProcessing(captureID: UUID, recoveryJobID: UUID) async throws {
-        guard let session = try await ledger.session(id: captureID) else { return }
+        guard let session = try await ledger.session(id: captureID) else {
+            throw CaptureJournalError.missingCapture(captureID)
+        }
         try await ledger.transition(
             id: captureID, from: .staged, to: .processing,
             recoveryJobID: recoveryJobID, libraryDictationID: session.libraryDictationID,
@@ -84,7 +86,9 @@ struct CaptureJournalService: Sendable {
     }
 
     func markLibraryCommitted(captureID: UUID, dictationID: Int64) async throws {
-        guard let session = try await ledger.session(id: captureID) else { return }
+        guard let session = try await ledger.session(id: captureID) else {
+            throw CaptureJournalError.missingCapture(captureID)
+        }
         try await ledger.transition(
             id: captureID, from: .processing, to: .libraryCommitted,
             recoveryJobID: session.recoveryJobID, libraryDictationID: dictationID,
@@ -95,7 +99,7 @@ struct CaptureJournalService: Sendable {
 
     func resumeCleanup(captureID: UUID) async throws {
         guard let session = try await ledger.session(id: captureID) else { return }
-        guard session.state == .cancelling else {
+        guard session.state == .cancelling || session.state == .libraryCommitted else {
             throw CaptureJournalError.cleanupNotPermitted(session.state.rawValue)
         }
         try await cancelAndClean(session: session)

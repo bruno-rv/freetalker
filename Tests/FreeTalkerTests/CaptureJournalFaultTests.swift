@@ -4,6 +4,92 @@ import Testing
 @testable import FreeTalker
 
 @Suite struct CaptureJournalFaultTests {
+    @Test("durable failure marker prevents empty success when damage transition also fails")
+    func fileAndDamageLedgerFailureCannotReopenEmpty() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("capture-double-failure-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileSystem = OneShotWriteFailingFileSystem()
+        let ledger = MemoryCaptureLedger()
+        let request = CaptureStartRequest(
+            id: UUID(), directory: root, capturedAt: Date(timeIntervalSince1970: 10),
+            sampleRate: 16_000, channelCount: 1, inputDeviceUID: nil, destination: "test"
+        )
+        try fileSystem.createDirectory(root)
+        let session = try await ledger.createCapture(request)
+        await ledger.failDamageTransitions(with: TestLedgerError.injected)
+        var writer: CaptureJournalWriter? = CaptureJournalWriter(
+            session: session, fileSystem: fileSystem, ledger: ledger,
+            configuration: .init(segmentFrames: 4, maximumQueuedFrames: 8)
+        )
+        #expect(writer?.enqueue([0, 1, 2, 3]) == .accepted)
+        await #expect(throws: CaptureJournalError.self) { try await writer?.finish() }
+        #expect(await ledger.session(id: request.id)?.state == .capturing)
+        writer = nil
+        #expect(fileSystem.exists(root.appendingPathComponent("capture-failure.marker")))
+
+        let reopened = CaptureJournalWriter(
+            session: session, fileSystem: fileSystem, ledger: ledger,
+            configuration: .init(segmentFrames: 4, maximumQueuedFrames: 8)
+        )
+        await #expect(throws: CaptureJournalError.self) { try await reopened.finish() }
+        #expect(!fileSystem.exists(root.appendingPathComponent("\(request.id.uuidString).wav")))
+    }
+
+    @Test("mark processing rejects missing durable capture ownership")
+    func markProcessingRejectsMissingSession() async {
+        let service = CaptureJournalService(
+            fileSystem: LocalJournalFileSystem(), ledger: MemoryCaptureLedger()
+        )
+        let captureID = UUID()
+
+        await #expect(throws: CaptureJournalError.missingCapture(captureID)) {
+            try await service.markProcessing(captureID: captureID, recoveryJobID: UUID())
+        }
+    }
+
+    @Test("mark library committed rejects missing durable capture ownership")
+    func markLibraryCommittedRejectsMissingSession() async {
+        let service = CaptureJournalService(
+            fileSystem: LocalJournalFileSystem(), ledger: MemoryCaptureLedger()
+        )
+        let captureID = UUID()
+
+        await #expect(throws: CaptureJournalError.missingCapture(captureID)) {
+            try await service.markLibraryCommitted(captureID: captureID, dictationID: 42)
+        }
+    }
+
+    @Test("post-library cleanup failure persists intent and retries successfully")
+    func libraryCommittedCleanupIsResumable() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("capture-library-cleanup-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileSystem = RemoveFailingFileSystem()
+        let ledger = MemoryCaptureLedger()
+        let service = CaptureJournalService(fileSystem: fileSystem, ledger: ledger)
+        let request = CaptureStartRequest(
+            id: UUID(), directory: root, capturedAt: Date(timeIntervalSince1970: 10),
+            sampleRate: 16_000, channelCount: 1, inputDeviceUID: nil, destination: "test"
+        )
+        let active = try await service.prepare(request)
+        #expect(active.writer.enqueue([0.25]) == .accepted)
+        _ = try await service.finish(active)
+        try await service.markProcessing(captureID: request.id, recoveryJobID: UUID())
+        try await service.markLibraryCommitted(captureID: request.id, dictationID: 42)
+
+        await #expect(throws: JournalPersistenceError.remove(path: root.path, code: EIO)) {
+            try await service.resumeCleanup(captureID: request.id)
+        }
+        #expect(await ledger.session(id: request.id)?.state == .cancelling)
+        #expect(fileSystem.exists(root))
+
+        fileSystem.allowRemove()
+        try await service.resumeCleanup(captureID: request.id)
+        #expect(await ledger.session(id: request.id) == nil)
+        #expect(!fileSystem.exists(root))
+    }
+
     @Test("prepare syncs the capture parent before inserting the ledger row")
     func prepareParentSyncPrecedesLedger() async throws {
         let parent = FileManager.default.temporaryDirectory
@@ -363,6 +449,33 @@ private final class RemoveFailingFileSystem: JournalFileSystem, @unchecked Senda
         }
         try base.remove(url)
     }
+    func exists(_ url: URL) -> Bool { base.exists(url) }
+}
+
+private final class OneShotWriteFailingFileSystem: JournalFileSystem, @unchecked Sendable {
+    private let base = LocalJournalFileSystem()
+    private let lock = NSLock()
+    private var shouldFailSegmentWrite = true
+
+    func createDirectory(_ url: URL) throws { try base.createDirectory(url) }
+    func write(_ data: Data, to url: URL) throws {
+        let fail = lock.withLock { () -> Bool in
+            guard shouldFailSegmentWrite, url.lastPathComponent.hasPrefix(".segment-") else {
+                return false
+            }
+            shouldFailSegmentWrite = false
+            return true
+        }
+        if fail { throw JournalPersistenceError.write(path: url.path, code: EIO) }
+        try base.write(data, to: url)
+    }
+    func append(_ data: Data, to url: URL) throws { try base.append(data, to: url) }
+    func synchronizeFile(_ url: URL) throws { try base.synchronizeFile(url) }
+    func rename(_ source: URL, to destination: URL) throws { try base.rename(source, to: destination) }
+    func synchronizeDirectory(_ url: URL) throws { try base.synchronizeDirectory(url) }
+    func contents(_ url: URL) throws -> [URL] { try base.contents(url) }
+    func read(_ url: URL) throws -> Data { try base.read(url) }
+    func remove(_ url: URL) throws { try base.remove(url) }
     func exists(_ url: URL) -> Bool { base.exists(url) }
 }
 

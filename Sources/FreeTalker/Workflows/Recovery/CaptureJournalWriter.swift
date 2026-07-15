@@ -27,6 +27,8 @@ struct StagedCapture: Sendable, Equatable {
 }
 
 final class CaptureJournalWriter: @unchecked Sendable {
+    private static let failureMarkerName = "capture-failure.marker"
+
     struct Configuration: Sendable {
         let segmentFrames: Int
         let maximumQueuedFrames: Int
@@ -281,6 +283,10 @@ final class CaptureJournalWriter: @unchecked Sendable {
 
     private func bootstrap() async throws {
         guard lock.withLock({ state.needsBootstrap }) else { return }
+        let failureMarker = session.directory.appendingPathComponent(Self.failureMarkerName)
+        if fileSystem.exists(failureMarker) {
+            throw CaptureJournalError.failed("accepted capture audio could not be persisted")
+        }
         if let persisted = try await ledger.session(id: session.id), persisted.state == .damaged {
             throw CaptureJournalError.failed(
                 persisted.failureMessage ?? "capture journal is damaged"
@@ -355,13 +361,44 @@ final class CaptureJournalWriter: @unchecked Sendable {
             }
         } catch {
             if !fileSystem.exists(destination) {
-                try? await ledger.transition(
-                    id: session.id, from: .capturing, to: .damaged,
-                    recoveryJobID: nil, libraryDictationID: nil, assetKind: .damaged,
-                    failureMessage: String(describing: error), contentHash: nil
-                )
+                try await recordUnrecoverableFailure(error)
             }
             throw error
+        }
+    }
+
+    private func recordUnrecoverableFailure(_ originalError: Error) async throws {
+        let marker = session.directory.appendingPathComponent(Self.failureMarkerName)
+        let temporary = session.directory.appendingPathComponent(
+            ".capture-failure.\(UUID().uuidString).tmp"
+        )
+        var markerError: Error?
+        do {
+            defer {
+                if fileSystem.exists(temporary) { try? fileSystem.remove(temporary) }
+            }
+            try DurableArtifactWriter(fileSystem: fileSystem).commit(
+                Data("accepted capture audio could not be persisted".utf8),
+                temporary: temporary,
+                destination: marker
+            )
+        } catch {
+            markerError = error
+        }
+
+        do {
+            try await ledger.transition(
+                id: session.id, from: .capturing, to: .damaged,
+                recoveryJobID: nil, libraryDictationID: nil, assetKind: .damaged,
+                failureMessage: String(describing: originalError), contentHash: nil
+            )
+        } catch {
+            if let markerError {
+                throw CaptureJournalError.failed(
+                    "capture failure could not be persisted: file=\(markerError); ledger=\(error)"
+                )
+            }
+            // The durable marker is the recovery source when the ledger transition fails.
         }
     }
 

@@ -220,6 +220,7 @@ actor MemoryCaptureLedger: CaptureLedgerStoring {
     var sessions: [UUID: CaptureSession] = [:]
     var segments: [UUID: [CaptureSegment]] = [:]
     var recordError: Error?
+    var damageTransitionError: Error?
 
     func createCapture(_ request: CaptureStartRequest) throws -> CaptureSession {
         if let existing = sessions[request.id] { return existing }
@@ -250,6 +251,7 @@ actor MemoryCaptureLedger: CaptureLedgerStoring {
         recoveryJobID: UUID?, libraryDictationID: Int64?, assetKind: RecoveryAssetKind,
         failureMessage: String?, contentHash: String?
     ) throws {
+        if to == .damaged, let damageTransitionError { throw damageTransitionError }
         guard let old = sessions[id], old.state == from || old.state == to else {
             throw TestLedgerError.conflict
         }
@@ -278,6 +280,7 @@ actor MemoryCaptureLedger: CaptureLedgerStoring {
 
     func failRecords(with error: Error) { recordError = error }
     func allowRecords() { recordError = nil }
+    func failDamageTransitions(with error: Error) { damageTransitionError = error }
 }
 
 enum TestLedgerError: Error { case conflict, injected }
