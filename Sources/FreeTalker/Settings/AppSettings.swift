@@ -145,16 +145,20 @@ final class AppSettings: ObservableObject {
         }
     }
 
+    private var isNormalizingEdgeLauncherPosition = false
+
     @Published var edgeLauncherPosition: Double {
         didSet {
+            guard !isNormalizingEdgeLauncherPosition else { return }
+            let oldEffectiveValue = Self.clampNormalizedPosition(oldValue)
             let clamped = Self.clampNormalizedPosition(edgeLauncherPosition)
-            guard clamped == edgeLauncherPosition else {
+            if clamped != edgeLauncherPosition {
+                isNormalizingEdgeLauncherPosition = true
                 edgeLauncherPosition = clamped
-                defaults.set(clamped, forKey: Keys.edgeLauncherPosition)
-                return
+                isNormalizingEdgeLauncherPosition = false
             }
             defaults.set(clamped, forKey: Keys.edgeLauncherPosition)
-            guard clamped != oldValue else { return }
+            guard clamped != oldEffectiveValue else { return }
             resetLauncherPanelPosition()
         }
     }
