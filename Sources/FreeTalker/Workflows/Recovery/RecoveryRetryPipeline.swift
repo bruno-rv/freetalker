@@ -133,7 +133,10 @@ struct RecoveryRetryPipeline: Sendable {
             guard let source = ownedSource(job.source.reference) else {
                 throw RecoveryCleanupError.outsideOwnedDirectory
             }
-            if FileManager.default.fileExists(atPath: source.path) { try removeSource(source) }
+            if FileManager.default.fileExists(atPath: source.path) {
+                try RecoveryImportDispositionStore(directory: directory).record(source: source)
+                try removeSource(source)
+            }
             try await store.completeSourceCleanup(jobID: job.id)
         } catch {
             try? await store.recordSourceCleanupError(jobID: job.id, message: error.localizedDescription)

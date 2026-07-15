@@ -261,8 +261,23 @@ struct RecoveryCaptureService: Sendable {
             throw JobStoreError.invalidTransition
         }
         let captureID = session.id
-
         let canonical = session.directory.appendingPathComponent("\(captureID.uuidString).wav")
+        let recoveryJobID = session.recoveryJobID ?? captureID
+        let job = try await store.job(id: recoveryJobID)
+        if let job {
+            let source = URL(fileURLWithPath: job.source.reference).standardizedFileURL
+            let legacyCanonical = directory.appendingPathComponent("\(captureID.uuidString).wav")
+                .standardizedFileURL
+            guard source == canonical.standardizedFileURL || source == legacyCanonical else {
+                throw RecoveryFinalizationError.recoveryJobMismatch
+            }
+            if journalFileSystem.exists(source) {
+                try RecoveryImportDispositionStore(
+                    directory: directory, fileSystem: journalFileSystem
+                ).record(source: source)
+                try journalFileSystem.remove(source)
+            }
+        }
         if journalFileSystem.exists(canonical) { try journalFileSystem.remove(canonical) }
         for segment in try await ledger.committedSegments(captureID: captureID) {
             if journalFileSystem.exists(segment.url) { try journalFileSystem.remove(segment.url) }
@@ -270,11 +285,7 @@ struct RecoveryCaptureService: Sendable {
         if journalFileSystem.exists(session.directory) {
             try journalFileSystem.synchronizeDirectory(session.directory)
         }
-        if let recoveryJobID = session.recoveryJobID,
-           let job = try await store.job(id: recoveryJobID) {
-            guard job.source.reference == canonical.path else {
-                throw RecoveryFinalizationError.recoveryJobMismatch
-            }
+        if let job {
             let removed = try await store.deleteCommittedRecovery(
                 id: recoveryJobID,
                 expectedSourceReference: job.source.reference

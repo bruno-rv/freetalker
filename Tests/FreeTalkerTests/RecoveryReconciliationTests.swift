@@ -77,7 +77,7 @@ import Testing
         #expect(FileManager.default.fileExists(atPath: marker.path))
 
         let second = await fixture.reconciler().reconcile()
-        #expect(second.duplicates == 2) // marker plus normalized owned UUID artifact
+        #expect(second.duplicates == 1) // historical marker; owned audio stays within its ledger directory
         #expect(try await fixture.store.jobs(kind: .recovery).count == 1)
     }
 
@@ -325,6 +325,60 @@ import Testing
         #expect(report.failed == 1)
         #expect(report.imported == 1)
         #expect(try await fixture.store.jobs(kind: .recovery).count == 1)
+    }
+
+    @Test("Library cleanup discovers a capture job when ledger link was never persisted")
+    func libraryCleanupRepairsMissingLedgerJobLink() async throws {
+        let fixture = try ReconciliationFixture()
+        let id = UUID()
+        let sessionDirectory = fixture.root.appendingPathComponent(id.uuidString, isDirectory: true)
+        try fixture.fileSystem.createDirectory(sessionDirectory)
+        let canonical = sessionDirectory.appendingPathComponent("\(id.uuidString).wav")
+        let codec = CaptureSegmentCodec(fileSystem: fixture.fileSystem)
+        try codec.encode(Array(repeating: 0.2, count: 1_600)).write(to: canonical)
+        _ = try await fixture.store.createCapture(.init(
+            id: id, directory: sessionDirectory, capturedAt: Date(), sampleRate: 16_000,
+            channelCount: 1, inputDeviceUID: nil, destination: "external"
+        ))
+        try await fixture.store.transition(
+            id: id, from: .capturing, to: .staged, recoveryJobID: nil,
+            libraryDictationID: nil, assetKind: .audio, failureMessage: nil,
+            contentHash: try codec.hashFile(canonical)
+        )
+        _ = try await fixture.store.createProvisionalRecovery(
+            id: id, source: JobSource(reference: canonical.path), capturedAt: Date()
+        )
+
+        let reopened = try fixture.reopen()
+        let report = await reopened.reconciler(
+            libraryDictationID: { candidate in candidate == id ? 501 : nil }
+        ).reconcile()
+        #expect(report.failed == 0)
+        #expect(try await reopened.store.job(id: id) == nil)
+        #expect(try await reopened.store.session(id: id) == nil)
+        #expect(!FileManager.default.fileExists(atPath: canonical.path))
+    }
+
+    @Test("marker-backed normalized job converges when Library identity appears")
+    func markerBackedLibraryCleanupConverges() async throws {
+        let fixture = try ReconciliationFixture()
+        let id = UUID()
+        let marker = fixture.root.appendingPathComponent(
+            ".capture-preparation-\(id.uuidString).marker"
+        )
+        try Data("interrupted prepare".utf8).write(to: marker)
+        _ = await fixture.reconciler().reconcile()
+        let job = try #require(try await fixture.store.job(id: id))
+        #expect(try await fixture.store.session(id: id) != nil)
+
+        let reopened = try fixture.reopen()
+        let report = await reopened.reconciler(
+            libraryDictationID: { candidate in candidate == id ? 777 : nil }
+        ).reconcile()
+        #expect(report.failed == 0)
+        #expect(try await reopened.store.job(id: id) == nil)
+        #expect(try await reopened.store.session(id: id) == nil)
+        #expect(!FileManager.default.fileExists(atPath: job.source.reference))
     }
 }
 

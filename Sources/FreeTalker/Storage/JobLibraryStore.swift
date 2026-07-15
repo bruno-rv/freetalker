@@ -130,6 +130,38 @@ final class JobLibraryStore: ObservableObject {
         guard try await store.claimRecoveryForDeletion(id: id, claimedAt: Date()) else {
             throw JobStoreError.invalidTransition
         }
+        if let session = try await store.session(id: id),
+           let job = try await store.job(id: id) {
+            let source = URL(fileURLWithPath: job.source.reference).standardizedFileURL
+            let canonical = session.directory.appendingPathComponent("\(id.uuidString).wav")
+                .standardizedFileURL
+            let legacyCanonical = recoveryDirectory.appendingPathComponent("\(id.uuidString).wav")
+                .standardizedFileURL
+            guard source == canonical || source == legacyCanonical else {
+                throw RecoveryFinalizationError.recoveryJobMismatch
+            }
+            if FileManager.default.fileExists(atPath: source.path) {
+                try RecoveryImportDispositionStore(directory: recoveryDirectory)
+                    .record(source: source)
+                if source != canonical { try FileManager.default.removeItem(at: source) }
+            }
+            guard try await store.deleteClaimedRecovery(
+                id: id, expectedSourceReference: job.source.reference
+            ) else { throw JobStoreError.invalidTransition }
+            if session.state != .cancelling {
+                try await store.transition(
+                    id: id, from: session.state, to: .cancelling,
+                    recoveryJobID: session.recoveryJobID,
+                    libraryDictationID: session.libraryDictationID,
+                    assetKind: session.assetKind, failureMessage: session.failureMessage,
+                    contentHash: session.contentHash
+                )
+            }
+            try await CaptureJournalService(fileSystem: LocalJournalFileSystem(), ledger: store)
+                .resumeCleanup(captureID: id)
+            try await refresh()
+            return
+        }
         _ = try await RecoveryRetentionService(directory: recoveryDirectory, store: store)
             .purgeExpired(now: Date(), retention: .never)
         try await refresh()

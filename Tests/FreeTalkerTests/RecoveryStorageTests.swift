@@ -105,6 +105,7 @@ import Testing
         #expect(fixture.events.values == [
             "lookup:\(fixture.captureID.uuidString)",
             "ledger-commit:\(fixture.captureID.uuidString)",
+            "sync:\(fixture.temp.url.path)",
             "remove:\(fixture.canonical.path)",
             "remove:\(fixture.segment.path)",
             "sync:\(fixture.sessionDirectory.path)",

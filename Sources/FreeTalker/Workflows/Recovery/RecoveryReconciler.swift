@@ -156,7 +156,10 @@ actor RecoveryReconciler {
                     current, fallback: fallback,
                     message: current.failureMessage ?? "Capture journal is damaged"
                 )
-            case .processing, .libraryCommitted, .silent, .cancelling:
+            case .cancelling:
+                try await CaptureJournalService(fileSystem: fileSystem, ledger: ledger)
+                    .resumeCleanup(captureID: current.id)
+            case .processing, .libraryCommitted, .silent:
                 break
             }
         } catch {
@@ -213,9 +216,28 @@ actor RecoveryReconciler {
                 Data(message.utf8), temporary: temporary, destination: source
             )
         }
-        _ = try await importer.importAudio(
+        let result = try await importer.importAudio(
             source, preferredID: session.id, forceQuarantine: true
         )
+        if result == .disposed {
+            if let job = try await store.job(id: session.id) {
+                _ = try await store.deleteCommittedRecovery(
+                    id: job.id, expectedSourceReference: job.source.reference
+                )
+            }
+            guard let current = try await ledger.session(id: session.id) else { return }
+            if current.state != .cancelling {
+                try await ledger.transition(
+                    id: current.id, from: current.state, to: .cancelling,
+                    recoveryJobID: current.recoveryJobID,
+                    libraryDictationID: current.libraryDictationID,
+                    assetKind: current.assetKind, failureMessage: current.failureMessage,
+                    contentHash: current.contentHash
+                )
+            }
+            try await CaptureJournalService(fileSystem: fileSystem, ledger: ledger)
+                .resumeCleanup(captureID: current.id)
+        }
     }
 
     private func reconcilePreparationMarker(
@@ -450,6 +472,7 @@ private extension RecoveryReconciliationReport {
         case .imported: imported += 1
         case .duplicate: duplicates += 1
         case .quarantined: quarantined += 1
+        case .disposed: duplicates += 1
         }
     }
 }

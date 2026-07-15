@@ -85,6 +85,11 @@ import Testing
         #expect(try await fixture.store.job(id: job.id) == nil)
         #expect(!FileManager.default.fileExists(atPath: owned.path))
         #expect(FileManager.default.fileExists(atPath: historical.path))
+
+        let reopened = try fixture.reopen()
+        _ = await reopened.reconciler().reconcile()
+        #expect(try await reopened.store.jobs(kind: .recovery).isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: owned.path))
     }
 
     @Test("normalized ownership completes a real retry and cleans only the owned copy")
@@ -114,6 +119,32 @@ import Testing
         #expect(try await fixture.store.job(id: job.id)?.state == .ready)
         #expect(!FileManager.default.fileExists(atPath: owned.path))
         #expect(FileManager.default.fileExists(atPath: historical.path))
+
+        let reopened = try fixture.reopen()
+        _ = await reopened.reconciler().reconcile()
+        #expect(!FileManager.default.fileExists(atPath: owned.path))
+        #expect(try await reopened.store.jobs(kind: .recovery).count == 1)
+        #expect(try await reopened.store.job(id: job.id)?.state == .ready)
+    }
+
+    @MainActor @Test("explicit delete tombstones quarantine and ledger ownership")
+    func quarantineDeleteDoesNotResurrect() async throws {
+        let fixture = try ReconciliationFixture()
+        let historical = fixture.root.appendingPathComponent("failed-delete-corrupt.wav")
+        try Data("broken audio".utf8).write(to: historical)
+        _ = await fixture.reconciler().reconcile()
+        let job = try #require(try await fixture.store.jobs(kind: .recovery).first)
+        let library = JobLibraryStore(store: fixture.store, recoveryDirectory: fixture.root)
+        try await library.refresh()
+        try await library.delete(id: job.id)
+        #expect(try await fixture.store.job(id: job.id) == nil)
+        #expect(try await fixture.store.session(id: job.id) == nil)
+        #expect(FileManager.default.fileExists(atPath: historical.path))
+
+        let reopened = try fixture.reopen()
+        _ = await reopened.reconciler().reconcile()
+        #expect(try await reopened.store.jobs(kind: .recovery).isEmpty)
+        #expect(try await reopened.store.session(id: job.id) == nil)
     }
 
     @Test("registration retries at the exact same-session schedule")

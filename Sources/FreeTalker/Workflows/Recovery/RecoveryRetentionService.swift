@@ -46,6 +46,8 @@ struct RecoveryRetentionService: Sendable {
             }
             do {
                 if FileManager.default.fileExists(atPath: sourceURL.path) {
+                    try RecoveryImportDispositionStore(directory: lexicalDirectory)
+                        .record(source: sourceURL)
                     try fileRemover.removeItem(at: sourceURL)
                 }
                 if try await store.deleteClaimedRecovery(

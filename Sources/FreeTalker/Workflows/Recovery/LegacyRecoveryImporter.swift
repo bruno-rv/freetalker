@@ -27,7 +27,7 @@ struct RecoveryRegistrationRetrier: Sendable {
 }
 
 struct LegacyRecoveryImporter: Sendable {
-    enum Result: Sendable, Equatable { case imported, duplicate, quarantined }
+    enum Result: Sendable, Equatable { case imported, duplicate, quarantined, disposed }
 
     let store: TranscriptionJobStore
     let ledger: any CaptureLedgerStoring
@@ -43,6 +43,11 @@ struct LegacyRecoveryImporter: Sendable {
     ) async throws -> Result {
         let data = try codec.fileSystem.read(source)
         let hash = codec.hash(data)
+        if try RecoveryImportDispositionStore(
+            directory: ownedDirectory, fileSystem: codec.fileSystem
+        ).contains(hash: hash) {
+            return .disposed
+        }
         let id = preferredID ?? Self.stableID(hash: hash)
         let existed = try await store.job(id: id) != nil
 
@@ -60,7 +65,6 @@ struct LegacyRecoveryImporter: Sendable {
         let message = valid
             ? "Recovered audio is ready to process"
             : "Damaged or unsupported recovery audio was quarantined"
-        let owned = ownedDirectory.appendingPathComponent("\(id.uuidString).wav")
         try await retrier.run {
             try await beforeRegistrationAttempt()
             var job = if let existing = try await store.job(id: id) {
@@ -71,13 +75,23 @@ struct LegacyRecoveryImporter: Sendable {
                 )
             }
             if !valid { try await ensureQuarantine(id: id, source: source, message: message) }
+            let owned = if let session = try await ledger.session(id: id) {
+                session.directory.appendingPathComponent("\(id.uuidString).wav")
+            } else {
+                ownedDirectory.appendingPathComponent("\(id.uuidString).wav")
+            }
             if source.standardizedFileURL != owned.standardizedFileURL {
+                let ownedParent = owned.deletingLastPathComponent()
+                if !codec.fileSystem.exists(ownedParent) {
+                    try codec.fileSystem.createDirectory(ownedParent)
+                    try codec.fileSystem.synchronizeDirectory(ownedParent.deletingLastPathComponent())
+                }
                 if codec.fileSystem.exists(owned) {
                     guard try codec.hashFile(owned) == hash else {
                         throw CaptureJournalError.hashMismatch(owned.path)
                     }
                 } else {
-                    let temporary = ownedDirectory.appendingPathComponent(
+                    let temporary = owned.deletingLastPathComponent().appendingPathComponent(
                         ".\(id.uuidString).\(UUID().uuidString).import.tmp"
                     )
                     try DurableArtifactWriter(fileSystem: codec.fileSystem).commit(
@@ -107,8 +121,11 @@ struct LegacyRecoveryImporter: Sendable {
         if let existing = try await ledger.session(id: id) {
             session = existing
         } else {
+            let directory = ownedDirectory.appendingPathComponent(id.uuidString, isDirectory: true)
+            try codec.fileSystem.createDirectory(directory)
+            try codec.fileSystem.synchronizeDirectory(ownedDirectory)
             session = try await ledger.createCapture(.init(
-                id: id, directory: URL(fileURLWithPath: ownedDirectory.path),
+                id: id, directory: directory,
                 capturedAt: Self.creationDate(source), sampleRate: 16_000,
                 channelCount: 1, inputDeviceUID: nil, destination: "recovered"
             ))
