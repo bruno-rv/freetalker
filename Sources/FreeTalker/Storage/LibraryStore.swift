@@ -198,13 +198,8 @@ final class LibraryStore: ObservableObject, LibraryTranslationStoring {
         return try? db.dictationExists(id: id)
     }
 
-    nonisolated static func shouldPurgeFailedDictationFile(pathExtension: String) -> Bool {
-        pathExtension.lowercased() == "wav"
-    }
-
-    /// Removes debug audio written outside the Library DB (AppCoordinator's
-    /// `writeLastCaptureDebugArtifact` / `saveFailedAudio`) under the real Application Support
-    /// directory — see `purgeDebugAudio(in:)` for the testable core logic.
+    /// Removes the transient last-capture debug artifact. Recovery media has separate
+    /// ownership and explicit deletion semantics and is never traversed here.
     private func purgeDebugAudio() throws {
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         try Self.purgeDebugAudio(in: support.appendingPathComponent("FreeTalker", isDirectory: true))
@@ -219,26 +214,6 @@ final class LibraryStore: ObservableObject, LibraryTranslationStoring {
                 try FileManager.default.removeItem(at: lastDictationURL)
             } catch {
                 errors.append(error)
-            }
-        }
-
-        let failedDir = dir.appendingPathComponent("failed-dictations", isDirectory: true)
-        if FileManager.default.fileExists(atPath: failedDir.path) {
-            do {
-                let contents = try FileManager.default.contentsOfDirectory(
-                    at: failedDir, includingPropertiesForKeys: [.isRegularFileKey]
-                )
-                for file in contents where shouldPurgeFailedDictationFile(pathExtension: file.pathExtension) {
-                    let isRegularFile = (try? file.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile ?? false
-                    guard isRegularFile else { continue } // e.g. a directory named "foo.wav" — leave it alone
-                    do {
-                        try FileManager.default.removeItem(at: file)
-                    } catch {
-                        errors.append(error)
-                    }
-                }
-            } catch {
-                errors.append(error) // directory exists but couldn't be enumerated — audio may remain
             }
         }
 

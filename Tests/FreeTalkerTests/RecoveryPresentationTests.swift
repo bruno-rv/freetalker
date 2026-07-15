@@ -38,6 +38,93 @@ import Testing
         #expect(RecoveryPresentation.actions(for: .ready) == [])
     }
 
+    @Test func projectedActionsUseCaptureAssetAndPersistedJobState() throws {
+        let temp = try RecoveryPresentationTemporaryDirectory()
+        let id = UUID()
+        let captureDirectory = temp.url.appendingPathComponent(id.uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: captureDirectory, withIntermediateDirectories: false)
+        let audio = captureDirectory.appendingPathComponent("\(id.uuidString).wav")
+        try WAVEncoder.encode(samples: [0.25], sampleRate: 16_000).write(to: audio)
+        let failed = job(id: id, source: audio, state: .failed(.init(stage: .transcribing, message: "Offline")))
+
+        let item = try #require(RecoveryItem(
+            session: session(id: id, directory: captureDirectory, state: .processing, assetKind: .audio, recoveryJobID: id),
+            job: failed,
+            recoveryRoot: temp.url
+        ))
+
+        #expect(item.audioURL == audio)
+        #expect(item.availableActions == [.retryProcessing, .exportAudio, .delete])
+
+        let processing = RecoveryItem(
+            session: item.session,
+            job: job(id: id, source: audio, state: .processing(stage: .transcribing)),
+            recoveryRoot: temp.url
+        )
+        #expect(processing?.availableActions == [.exportAudio])
+    }
+
+    @Test func silentDamagedAndLegacyItemsNeverInventAudioActions() throws {
+        let temp = try RecoveryPresentationTemporaryDirectory()
+        let silent = RecoveryItem(
+            session: session(id: UUID(), directory: temp.url, state: .silent, assetKind: .silent),
+            job: nil,
+            recoveryRoot: temp.url
+        )
+        #expect(silent?.message == SilentCapturePresentation.message)
+        #expect(silent?.availableActions == [.startNewRecording, .delete])
+
+        let damagedID = UUID()
+        let damagedDirectory = temp.url.appendingPathComponent(damagedID.uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: damagedDirectory, withIntermediateDirectories: false)
+        let artifact = damagedDirectory.appendingPathComponent("capture-failure.marker")
+        try Data("disk full".utf8).write(to: artifact)
+        let damaged = RecoveryItem(
+            session: session(id: damagedID, directory: damagedDirectory, state: .damaged, assetKind: .quarantined),
+            job: nil,
+            recoveryRoot: temp.url
+        )
+        #expect(damaged?.artifactURL == artifact)
+        #expect(damaged?.availableActions == [.exportArtifact, .delete])
+
+        let legacyID = UUID()
+        let missing = temp.url.appendingPathComponent("\(legacyID.uuidString).wav")
+        let legacy = RecoveryItem(
+            session: nil,
+            job: job(id: legacyID, source: missing, state: .failed(.init(stage: .decoding, message: "Missing"))),
+            recoveryRoot: temp.url
+        )
+        #expect(legacy?.availableActions == [.delete])
+        #expect(legacy?.audioURL == nil)
+    }
+
+    @Test func projectionRejectsOutsideSymlinkAndCorruptAudio() throws {
+        let temp = try RecoveryPresentationTemporaryDirectory()
+        let outside = temp.url.deletingLastPathComponent().appendingPathComponent("outside-\(UUID()).wav")
+        defer { try? FileManager.default.removeItem(at: outside) }
+        try WAVEncoder.encode(samples: [0.1], sampleRate: 16_000).write(to: outside)
+        let id = UUID()
+        let symlink = temp.url.appendingPathComponent("\(id.uuidString).wav")
+        try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: outside)
+        let linked = RecoveryItem(
+            session: nil,
+            job: job(id: id, source: symlink, state: .failed(.init(stage: .transcribing, message: "x"))),
+            recoveryRoot: temp.url
+        )
+        #expect(linked?.audioURL == nil)
+        #expect(linked?.availableActions == [.delete])
+
+        try FileManager.default.removeItem(at: symlink)
+        try Data("not a wave".utf8).write(to: symlink)
+        let corrupt = RecoveryItem(
+            session: nil,
+            job: job(id: id, source: symlink, state: .failed(.init(stage: .transcribing, message: "x"))),
+            recoveryRoot: temp.url
+        )
+        #expect(corrupt?.audioURL == nil)
+        #expect(corrupt?.availableActions == [.delete])
+    }
+
     @Test func retryPresentationDistinguishesIdleQueuedAndProcessing() {
         #expect(RecoveryPresentation.retryState(for: .failed(.init(stage: .transcribing, message: "x"))) == .available)
         #expect(RecoveryPresentation.retryState(for: .queued) == .queued)
@@ -67,13 +154,43 @@ import Testing
     }
 
     private func job(state: JobState) -> TranscriptionJob {
+        job(id: UUID(), source: URL(fileURLWithPath: "/tmp/recovery.wav"), state: state)
+    }
+
+    private func job(id: UUID, source: URL, state: JobState) -> TranscriptionJob {
         TranscriptionJob(
-            id: UUID(), kind: .recovery, source: .init(reference: "/tmp/recovery.wav"),
+            id: id, kind: .recovery, source: .init(reference: source.path),
             state: state, progress: 0, createdAt: now, updatedAt: now,
             startedAt: nil, completedAt: nil, expiresAt: nil, result: nil,
             needsSourceCleanup: false, sourceCleanupError: nil
         )
     }
+
+    private func session(
+        id: UUID,
+        directory: URL,
+        state: CaptureSessionState,
+        assetKind: RecoveryAssetKind,
+        recoveryJobID: UUID? = nil
+    ) -> CaptureSession {
+        CaptureSession(
+            id: id, state: state, directory: directory, capturedAt: now,
+            sampleRate: 16_000, channelCount: 1, inputDeviceUID: nil,
+            destination: "external", recoveryJobID: recoveryJobID,
+            libraryDictationID: nil, assetKind: assetKind,
+            failureMessage: assetKind == .silent ? SilentCapturePresentation.message : "Damaged capture",
+            contentHash: nil
+        )
+    }
+}
+
+private final class RecoveryPresentationTemporaryDirectory {
+    let url: URL
+    init() throws {
+        url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
+    }
+    deinit { try? FileManager.default.removeItem(at: url) }
 }
 
 private actor RecoveryRetentionChangeProbe {

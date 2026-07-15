@@ -3165,6 +3165,9 @@ final class AppCoordinator: ObservableObject {
         }
         recoveryRunner = runner
         jobLibraryStore?.configureRetry { [weak runner] id in await runner?.enqueue(id) }
+        jobLibraryStore?.configureStartNewRecording { [weak self] in
+            self?.startHandsFreeRecording(destination: .external) ?? false
+        }
         await pipeline.retryPendingSourceCleanup()
         do {
             _ = try await recoveryStore.recoverInterruptedJobs(kind: .recovery)

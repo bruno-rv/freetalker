@@ -18,12 +18,14 @@ enum RecoveryPlaybackError: LocalizedError, Equatable {
 final class JobLibraryStore: ObservableObject {
     @Published private(set) var recoveryJobs: [TranscriptionJob] = []
     @Published private(set) var silentCaptures: [SilentCapturePresentation] = []
+    @Published private(set) var recoveryItems: [RecoveryItem] = []
     @Published private(set) var importJobs: [TranscriptionJob] = []
     @Published private(set) var importStatusMessage: String?
 
     private let store: TranscriptionJobStore
     private let recoveryDirectory: URL
     private var enqueueRecovery: (@Sendable (UUID) async -> Void)?
+    private var beginExternalRecording: (() -> Bool)?
     private var enqueueImport: (@Sendable (UUID) async -> Void)?
     private var cancelImport: (@Sendable (UUID) async -> LocalJobRunner.CancellationOutcome)?
     private var importService: MediaImportService?
@@ -43,6 +45,10 @@ final class JobLibraryStore: ObservableObject {
 
     func configureRetry(_ enqueue: @escaping @Sendable (UUID) async -> Void) {
         enqueueRecovery = enqueue
+    }
+
+    func configureStartNewRecording(_ begin: @escaping () -> Bool) {
+        beginExternalRecording = begin
     }
 
     func configureImports(
@@ -111,9 +117,27 @@ final class JobLibraryStore: ObservableObject {
         async let recoveries = store.jobs(kind: .recovery)
         async let imports = store.jobs(kind: .mediaImport)
         async let captures = store.unfinishedSessions()
-        recoveryJobs = try await recoveries
-        importJobs = try await imports
-        silentCaptures = try await captures.compactMap(SilentCapturePresentation.init)
+        let (recoveryRows, importRows, captureRows) = try await (recoveries, imports, captures)
+        recoveryJobs = recoveryRows
+        importJobs = importRows
+        silentCaptures = captureRows.compactMap(SilentCapturePresentation.init)
+        let jobsByID = Dictionary(uniqueKeysWithValues: recoveryJobs.map { ($0.id, $0) })
+        var projected = captureRows.compactMap { session in
+            RecoveryItem(
+                session: session,
+                job: session.recoveryJobID.flatMap { jobsByID[$0] } ?? jobsByID[session.id],
+                recoveryRoot: recoveryDirectory
+            )
+        }
+        let represented = Set(projected.map(\.id))
+        projected += recoveryJobs.compactMap { job in
+            guard !represented.contains(job.id) else { return nil }
+            return RecoveryItem(session: nil, job: job, recoveryRoot: recoveryDirectory)
+        }
+        recoveryItems = projected.sorted {
+            ($0.session?.capturedAt ?? $0.job?.createdAt ?? .distantPast)
+                > ($1.session?.capturedAt ?? $1.job?.createdAt ?? .distantPast)
+        }
     }
 
     func retry(id: UUID, configuration: AttemptConfiguration) async throws {
@@ -130,6 +154,11 @@ final class JobLibraryStore: ObservableObject {
     }
 
     func delete(id: UUID) async throws {
+        if let item = recoveryItems.first(where: { $0.id == id }), item.job == nil {
+            try await deleteLedgerOnly(item)
+            try await refresh()
+            return
+        }
         let newlyClaimed = try await store.claimRecoveryForDeletion(id: id, claimedAt: Date())
         let alreadyClaimed = try await store.claimedRecoveries().contains { $0.id == id }
         guard newlyClaimed || alreadyClaimed else {
@@ -142,12 +171,71 @@ final class JobLibraryStore: ObservableObject {
         try await refresh()
     }
 
-    func play(id: UUID) throws {
-        guard let job = recoveryJobs.first(where: { $0.id == id }) else {
+    func export(id: UUID, to destination: URL) throws {
+        guard let item = recoveryItems.first(where: { $0.id == id }),
+              let source = item.audioURL ?? item.artifactURL else {
             throw JobStoreError.jobNotFound
         }
-        let nextPlayer = try playbackFactory(URL(fileURLWithPath: job.source.reference))
+        let target = destination.standardizedFileURL
+        guard source.standardizedFileURL != target else {
+            throw CocoaError(.fileWriteFileExists)
+        }
+        try FileManager.default.copyItem(at: source, to: target)
+    }
+
+    func startNewRecording(id: UUID) -> Bool {
+        guard recoveryItems.first(where: { $0.id == id })?
+            .availableActions.contains(.startNewRecording) == true else { return false }
+        return beginExternalRecording?() ?? false
+    }
+
+    func play(id: UUID) throws {
+        guard let source = recoveryItems.first(where: { $0.id == id })?.audioURL else {
+            throw JobStoreError.jobNotFound
+        }
+        let nextPlayer = try playbackFactory(source)
         guard nextPlayer.play() else { throw RecoveryPlaybackError.couldNotStart }
         player = nextPlayer
+    }
+
+    private func deleteLedgerOnly(_ item: RecoveryItem) async throws {
+        guard let session = item.session else { throw JobStoreError.invalidTransition }
+        let expectedDirectory = recoveryDirectory.appendingPathComponent(
+            session.id.uuidString, isDirectory: true
+        ).standardizedFileURL
+        guard session.directory.standardizedFileURL == expectedDirectory,
+              session.directory.resolvingSymlinksInPath().standardizedFileURL
+                == recoveryDirectory.resolvingSymlinksInPath().appendingPathComponent(
+                    session.id.uuidString, isDirectory: true
+                ).standardizedFileURL else {
+            throw RecoveryFinalizationError.captureIdentityMismatch
+        }
+        let diagnostics = session.directory.appendingPathComponent("capture-diagnostics.json")
+        let diagnosticValues = try? diagnostics.resourceValues(
+            forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+        )
+        let validDiagnostics = diagnostics.resolvingSymlinksInPath().standardizedFileURL
+                == expectedDirectory.appendingPathComponent("capture-diagnostics.json")
+                    .standardizedFileURL
+            && diagnosticValues?.isRegularFile == true
+            && diagnosticValues?.isSymbolicLink != true
+        guard let retained = item.artifactURL
+                ?? (validDiagnostics ? diagnostics : nil) else {
+            throw CaptureJournalError.failed("Recovery has no owned artifact to dispose")
+        }
+        let dispositions = RecoveryImportDispositionStore(directory: recoveryDirectory)
+        let descriptor = try dispositions.descriptor(
+            id: item.id, source: retained, defaultScope: .capture(item.id)
+        )
+        try dispositions.record(descriptor)
+        try await store.transition(
+            id: item.id, from: session.state, to: .cancelling,
+            recoveryJobID: nil, libraryDictationID: session.libraryDictationID,
+            assetKind: session.assetKind, failureMessage: session.failureMessage,
+            contentHash: session.contentHash
+        )
+        try await CaptureJournalService(
+            fileSystem: LocalJournalFileSystem(), ledger: store
+        ).resumeCleanup(captureID: item.id)
     }
 }

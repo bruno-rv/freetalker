@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 enum RecoveryPresentation {
@@ -8,6 +9,10 @@ enum RecoveryPresentation {
 
     static func badgeCount(_ jobs: [TranscriptionJob], silentCount: Int = 0) -> Int {
         jobs.count { if case .failed = $0.state { true } else { false } } + silentCount
+    }
+
+    static func badgeCount(_ items: [RecoveryItem]) -> Int {
+        items.count { $0.availableActions.contains(.delete) }
     }
 
     static func badgeText(count: Int) -> String? { count == 0 ? nil : String(count) }
@@ -22,8 +27,7 @@ enum RecoveryPresentation {
     static func actions(for state: JobState) -> [Action] {
         switch state {
         case .failed: [.play, .retry, .delete]
-        case .queued: [.play]
-        case .processing: [.play]
+        case .queued, .processing: [.play]
         case .ready, .cancelled: []
         }
     }
@@ -78,103 +82,153 @@ enum RecoveryPresentation {
         case .cancelled: "xmark.circle"
         }
     }
+
+    static func stateLabel(_ item: RecoveryItem) -> String {
+        switch item.session?.assetKind {
+        case .silent: "No microphone signal"
+        case .damaged: "Damaged capture"
+        case .quarantined: "Quarantined artifact"
+        case .audio, nil: item.job.map { stateLabel($0.state) } ?? "Saved recording"
+        }
+    }
+
+    static func stateIcon(_ item: RecoveryItem) -> String {
+        switch item.session?.assetKind {
+        case .silent: "mic.slash"
+        case .damaged, .quarantined: "exclamationmark.triangle"
+        case .audio, nil: item.job.map { stateIcon($0.state) } ?? "waveform"
+        }
+    }
 }
 
 struct RecoveriesView: View {
     @ObservedObject var store: JobLibraryStore
     @State private var retryJob: TranscriptionJob?
-    @State private var pendingDelete: TranscriptionJob?
+    @State private var pendingDelete: RecoveryItem?
     @State private var errorMessage: String?
 
     var body: some View {
         Group {
-            if store.recoveryJobs.isEmpty && store.silentCaptures.isEmpty {
-                ContentUnavailableView("No Recoveries", systemImage: "checkmark.circle", description: Text("Failed dictation audio will appear here so you can listen or try again."))
+            if store.recoveryItems.isEmpty {
+                ContentUnavailableView(
+                    "No Recoveries", systemImage: "checkmark.circle",
+                    description: Text("Interrupted or failed recordings will appear here until you recover or delete them.")
+                )
             } else {
-                List {
-                    ForEach(store.silentCaptures, id: \.id) { capture in
-                        silentCaptureRow(capture)
-                    }
-                    ForEach(store.recoveryJobs, id: \.id) { job in
-                        recoveryRow(job)
-                    }
-                }
+                List(store.recoveryItems) { recoveryRow($0) }
             }
         }
         .task { await refresh() }
-        .sheet(item: $retryJob) { job in
-            RecoveryRetrySheet(job: job, store: store)
-        }
-        .confirmationDialog("Delete Recovery?", isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } })) {
+        .sheet(item: $retryJob) { job in RecoveryRetrySheet(job: job, store: store) }
+        .confirmationDialog(
+            "Delete Recovery?",
+            isPresented: Binding(
+                get: { pendingDelete != nil },
+                set: { if !$0 { pendingDelete = nil } }
+            )
+        ) {
             Button("Delete", role: .destructive) {
                 guard let id = pendingDelete?.id else { return }
                 pendingDelete = nil
-                Task { do { try await store.delete(id: id) } catch { errorMessage = error.localizedDescription } }
+                Task {
+                    do { try await store.delete(id: id) }
+                    catch { errorMessage = error.localizedDescription }
+                }
             }
             Button("Cancel", role: .cancel) { pendingDelete = nil }
         } message: { Text(RecoveryPresentation.deleteConfirmation) }
-        .alert("Recovery Error", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
+        .alert(
+            "Recovery Error",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } }
+            )
+        ) {
             Button("OK", role: .cancel) { errorMessage = nil }
         } message: { Text(errorMessage ?? "") }
     }
 
-    private func recoveryRow(_ job: TranscriptionJob) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+    private func recoveryRow(_ item: RecoveryItem) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Label(RecoveryPresentation.stateLabel(job.state), systemImage: RecoveryPresentation.stateIcon(job.state))
-                    .font(.headline)
+                Label(
+                    RecoveryPresentation.stateLabel(item),
+                    systemImage: RecoveryPresentation.stateIcon(item)
+                )
+                .font(.headline)
                 Spacer()
-                Text(job.createdAt, style: .relative).font(.caption).foregroundStyle(.secondary)
-            }
-            if case .failed(let failure) = job.state {
-                Text("\(RecoveryPresentation.stageLabel(failure.stage)): \(failure.message)")
-                    .lineLimit(2).foregroundStyle(.secondary)
-            }
-            Text(RecoveryPresentation.expiryText(createdAt: job.createdAt, retention: AppSettings.shared.recoveryRetention, now: Date()))
-                .font(.caption).foregroundStyle(.secondary)
-            HStack {
-                if RecoveryPresentation.actions(for: job.state).contains(.play) {
-                    Button("Play", systemImage: "play.fill") { do { try store.play(id: job.id) } catch { errorMessage = error.localizedDescription } }
-                        .keyboardShortcut(.space, modifiers: [])
-                }
-                if RecoveryPresentation.actions(for: job.state).contains(.retry) {
-                    Button("Retry…", systemImage: "arrow.clockwise") { retryJob = job }
-                }
-                Spacer()
-                if RecoveryPresentation.actions(for: job.state).contains(.delete) {
-                    Button("Delete…", systemImage: "trash", role: .destructive) { pendingDelete = job }
-                }
-            }
-            .labelStyle(.titleAndIcon)
-        }
-        .padding(.vertical, 4)
-        .accessibilityElement(children: .contain)
-    }
-
-    private func silentCaptureRow(_ capture: SilentCapturePresentation) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Label("No microphone signal", systemImage: "mic.slash")
-                    .font(.headline)
-                Spacer()
-                Text(capture.capturedAt, style: .relative)
+                Text(item.session?.capturedAt ?? item.job?.createdAt ?? Date(), style: .relative)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            Text(capture.message)
+            Text(item.message)
                 .foregroundStyle(.secondary)
-            Text("This attempt has no audio to process. It will remain here until you delete it.")
+                .textSelection(.enabled)
+            Text("Kept until recovered or explicitly deleted")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            actionButtons(item)
         }
-        .padding(.vertical, 4)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("Silent recovery")
-        .accessibilityValue(capture.message)
-        .accessibilityHint("No retryable audio is available")
+        .padding(.vertical, 5)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(RecoveryPresentation.stateLabel(item))
+        .accessibilityValue(item.message)
     }
 
-    private func refresh() async { do { try await store.refresh() } catch { errorMessage = error.localizedDescription } }
+    @ViewBuilder
+    private func actionButtons(_ item: RecoveryItem) -> some View {
+        HStack {
+            if item.availableActions.contains(.retryProcessing), let job = item.job {
+                Button("Retry Processing…", systemImage: "arrow.clockwise") { retryJob = job }
+                    .help("Process the saved audio again")
+                    .accessibilityHint("Opens processing options for this saved recording")
+            }
+            if item.availableActions.contains(.startNewRecording) {
+                Button("Start New Recording", systemImage: "mic") {
+                    if !store.startNewRecording(id: item.id) {
+                        errorMessage = "A new recording cannot start until Recovery setup and recording storage are available."
+                    }
+                }
+                .help("Start a new external recording")
+                .accessibilityHint("Keeps this silent attempt and starts a separate recording")
+            }
+            if item.availableActions.contains(.exportAudio) {
+                Button("Export Audio…", systemImage: "square.and.arrow.up") { export(item) }
+                    .help("Copy the saved audio to another location")
+                    .accessibilityHint("The recovery copy remains in FreeTalker")
+            }
+            if item.availableActions.contains(.exportArtifact) {
+                Button("Export Artifact…", systemImage: "square.and.arrow.up") { export(item) }
+                    .help("Copy the retained diagnostic or damaged artifact")
+                    .accessibilityHint("The recovery artifact remains in FreeTalker")
+            }
+            Spacer()
+            if item.availableActions.contains(.delete) {
+                Button("Delete…", systemImage: "trash", role: .destructive) {
+                    pendingDelete = item
+                }
+                .help("Permanently delete this recovery")
+                .accessibilityHint("Requires confirmation and cannot be undone")
+            }
+        }
+        .labelStyle(.titleAndIcon)
+    }
+
+    private func export(_ item: RecoveryItem) {
+        let source = item.audioURL ?? item.artifactURL
+        let panel = NSSavePanel()
+        panel.canCreateDirectories = true
+        panel.nameFieldStringValue = source?.lastPathComponent
+            ?? "recovery-\(item.id.uuidString)"
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        do { try store.export(id: item.id, to: destination) }
+        catch { errorMessage = "Could not export the recovery: \(error.localizedDescription)" }
+    }
+
+    private func refresh() async {
+        do { try await store.refresh() }
+        catch { errorMessage = error.localizedDescription }
+    }
 }
 
 extension TranscriptionJob: Identifiable {}

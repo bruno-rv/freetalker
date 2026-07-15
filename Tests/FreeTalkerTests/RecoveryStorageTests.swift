@@ -270,19 +270,73 @@ import Testing
         }
     }
 
-    @Test(arguments: [
-        (RecoveryRetention.oneDay, 1), (.sevenDays, 7), (.thirtyDays, 30), (.ninetyDays, 90)
-    ]) func purgesAtEveryConfiguredRetentionBoundary(retention: RecoveryRetention, days: Int) async throws {
+    @Test(arguments: RecoveryRetention.allCases.filter { $0 != .never })
+    func automaticRetentionNeverDeletesFailedRecovery(retention: RecoveryRetention) async throws {
         let fixture = try RecoveryFixture()
         let createdAt = Date(timeIntervalSince1970: 100_000)
         let id = try await fixture.failedRecovery(createdAt: createdAt)
         let service = RecoveryRetentionService(directory: fixture.directory, store: fixture.store)
 
-        #expect(try await service.purgeExpired(now: createdAt.addingTimeInterval(Double(days * 86_400) - 1), retention: retention) == PurgeResult(deletedJobIDs: []))
         let path = try #require(try await fixture.store.job(id: id)).source.reference
+        #expect(try await service.purgeExpired(now: .distantFuture, retention: retention) == PurgeResult(deletedJobIDs: []))
         #expect(FileManager.default.fileExists(atPath: path))
-        #expect(try await service.purgeExpired(now: createdAt.addingTimeInterval(Double(days * 86_400)), retention: retention) == PurgeResult(deletedJobIDs: [id]))
-        #expect(!FileManager.default.fileExists(atPath: path))
+        #expect(try await fixture.store.job(id: id) != nil)
+    }
+
+    @Test func libraryDebugPurgeNeverTraversesRecoveryRoot() throws {
+        let temp = try TemporaryDirectory()
+        let recovery = temp.url.appendingPathComponent("failed-dictations", isDirectory: true)
+        let nested = recovery.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        let retryable = recovery.appendingPathComponent("\(UUID().uuidString).wav")
+        let damaged = nested.appendingPathComponent("capture-failure.marker")
+        let silent = nested.appendingPathComponent("capture-diagnostics.json")
+        try Data("retryable".utf8).write(to: retryable)
+        try Data("damaged".utf8).write(to: damaged)
+        try Data("silent".utf8).write(to: silent)
+        let debug = temp.url.appendingPathComponent("last-dictation.wav")
+        try Data("debug".utf8).write(to: debug)
+
+        try LibraryStore.purgeDebugAudio(in: temp.url)
+
+        #expect(!FileManager.default.fileExists(atPath: debug.path))
+        #expect(try Data(contentsOf: retryable) == Data("retryable".utf8))
+        #expect(try Data(contentsOf: damaged) == Data("damaged".utf8))
+        #expect(try Data(contentsOf: silent) == Data("silent".utf8))
+    }
+
+    @Test func automaticRetentionFinishesOnlyLibraryCommittedCleanup() async throws {
+        let fixture = try RecoveryFixture()
+        let failedID = try await fixture.failedRecovery(createdAt: .distantPast)
+        let failedSource = try #require(try await fixture.store.job(id: failedID))
+            .source.reference
+        let committedID = UUID()
+        let committedDirectory = fixture.directory.appendingPathComponent(
+            committedID.uuidString, isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: committedDirectory, withIntermediateDirectories: false)
+        try Data("committed".utf8).write(
+            to: committedDirectory.appendingPathComponent("\(committedID.uuidString).wav")
+        )
+        _ = try await fixture.store.createCapture(.init(
+            id: committedID, directory: committedDirectory, capturedAt: .distantPast,
+            sampleRate: 16_000, channelCount: 1, inputDeviceUID: nil,
+            destination: "external"
+        ))
+        try await fixture.store.transition(
+            id: committedID, from: .capturing, to: .libraryCommitted,
+            recoveryJobID: nil, libraryDictationID: 42, assetKind: .audio,
+            failureMessage: nil, contentHash: nil
+        )
+
+        _ = try await RecoveryRetentionService(
+            directory: fixture.directory, store: fixture.store, ledger: fixture.store
+        ).purgeExpired(now: .distantFuture, retention: .oneDay)
+
+        #expect(try await fixture.store.session(id: committedID) == nil)
+        #expect(!FileManager.default.fileExists(atPath: committedDirectory.path))
+        #expect(try await fixture.store.job(id: failedID) != nil)
+        #expect(FileManager.default.fileExists(atPath: failedSource))
     }
 
     @Test func neverRetentionDoesNothing() async throws {
@@ -302,11 +356,13 @@ import Testing
         let source = try #require(try await fixture.store.job(id: id)).source.reference
         let sibling = URL(fileURLWithPath: source + ".backup")
         try Data("keep".utf8).write(to: sibling)
+        #expect(try await fixture.store.claimRecoveryForDeletion(id: id, claimedAt: Date()))
 
         _ = try await RecoveryRetentionService(directory: fixture.directory, store: fixture.store)
             .purgeExpired(now: .distantFuture, retention: .oneDay)
 
         #expect(FileManager.default.fileExists(atPath: sibling.path))
+        #expect(!FileManager.default.fileExists(atPath: source))
     }
 
     @Test func purgeExcludesQueuedProcessingReadyCancelledAndNonRecoveryJobs() async throws {
@@ -412,6 +468,7 @@ import Testing
     @Test func removalFailureKeepsClaimAndVisibleCleanupError() async throws {
         let fixture = try RecoveryFixture()
         let job = try await fixture.failedRecovery(createdAt: .distantPast)
+        #expect(try await fixture.store.claimRecoveryForDeletion(id: job, claimedAt: Date()))
 
         await #expect(throws: Error.self) {
             _ = try await RecoveryRetentionService(
@@ -443,7 +500,8 @@ import Testing
             symlink.path
         ]
         for reference in references {
-            _ = try await fixture.failedRecovery(createdAt: .distantPast, sourceReference: reference)
+            let id = try await fixture.failedRecovery(createdAt: .distantPast, sourceReference: reference)
+            #expect(try await fixture.store.claimRecoveryForDeletion(id: id, claimedAt: Date()))
         }
 
         _ = try? await RecoveryRetentionService(directory: fixture.directory, store: fixture.store)
@@ -465,6 +523,7 @@ import Testing
         let owned = linkedRoot.appendingPathComponent("\(UUID().uuidString).wav")
         try Data("owned".utf8).write(to: owned)
         let job = try await store.createRecovery(source: .init(reference: owned.path), metadata: .init(capturedAt: .distantPast, failure: .init(stage: .transcribing, message: "x")))
+        #expect(try await store.claimRecoveryForDeletion(id: job.id, claimedAt: Date()))
 
         _ = try await RecoveryRetentionService(directory: linkedRoot, store: store)
             .purgeExpired(now: .distantFuture, retention: .oneDay)

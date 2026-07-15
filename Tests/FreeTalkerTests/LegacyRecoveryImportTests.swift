@@ -31,7 +31,7 @@ import Testing
         #expect(try await reopened.store.jobs(kind: .recovery).count == 1)
     }
 
-    @Test("valid legacy lineage survives an ordinary restart before retention disposal")
+    @Test("valid legacy lineage survives an ordinary restart before explicit disposal")
     func validLegacyLineageSurvivesIntermediateRestart() async throws {
         let fixture = try ReconciliationFixture()
         let historical = fixture.root.appendingPathComponent("failed-valid-two-restarts.wav")
@@ -47,6 +47,7 @@ import Testing
         #expect(try RecoveryImportDispositionStore(directory: intermediate.root)
             .descriptor(id: job.id)?.scope == .legacy)
 
+        #expect(try await intermediate.store.claimRecoveryForDeletion(id: job.id, claimedAt: Date()))
         _ = try await RecoveryRetentionService(
             directory: intermediate.root, store: intermediate.store, ledger: intermediate.store
         ).purgeExpired(now: .distantFuture, retention: .oneDay)
@@ -104,7 +105,7 @@ import Testing
             .descriptor(id: id)?.scope == .capture(id))
     }
 
-    @Test("legacy disposal never suppresses identical bytes under an explicit UUID identity")
+    @MainActor @Test("legacy disposal never suppresses identical bytes under an explicit UUID identity")
     func legacyDispositionDoesNotSuppressIdenticalCaptureIdentity() async throws {
         let fixture = try ReconciliationFixture()
         let data = WAVEncoder.encode(
@@ -114,8 +115,9 @@ import Testing
         try data.write(to: historical)
         _ = await fixture.reconciler().reconcile()
         let legacy = try #require(try await fixture.store.jobs(kind: .recovery).first)
-        _ = try await RecoveryRetentionService(directory: fixture.root, store: fixture.store)
-            .purgeExpired(now: .distantFuture, retention: .oneDay)
+        let library = JobLibraryStore(store: fixture.store, recoveryDirectory: fixture.root)
+        try await library.refresh()
+        try await library.delete(id: legacy.id)
 
         let capture = fixture.root.appendingPathComponent("\(legacy.id.uuidString).wav")
         try data.write(to: capture)
@@ -129,7 +131,7 @@ import Testing
         #expect(FileManager.default.fileExists(atPath: historical.path))
     }
 
-    @Test("legacy descriptor never hash-mismatches different bytes under an explicit UUID identity")
+    @MainActor @Test("legacy descriptor never hash-mismatches different bytes under an explicit UUID identity")
     func legacyDescriptorDoesNotRejectDifferentCaptureBytes() async throws {
         let fixture = try ReconciliationFixture()
         let legacyData = WAVEncoder.encode(
@@ -139,8 +141,9 @@ import Testing
         try legacyData.write(to: historical)
         _ = await fixture.reconciler().reconcile()
         let legacy = try #require(try await fixture.store.jobs(kind: .recovery).first)
-        _ = try await RecoveryRetentionService(directory: fixture.root, store: fixture.store)
-            .purgeExpired(now: .distantFuture, retention: .oneDay)
+        let library = JobLibraryStore(store: fixture.store, recoveryDirectory: fixture.root)
+        try await library.refresh()
+        try await library.delete(id: legacy.id)
 
         let capture = fixture.root.appendingPathComponent("\(legacy.id.uuidString).wav")
         try WAVEncoder.encode(
@@ -221,7 +224,7 @@ import Testing
         #expect(FileManager.default.fileExists(atPath: job.source.reference))
     }
 
-    @Test("retention accepts normalized ownership and retains historical source")
+    @Test("explicit deletion accepts normalized ownership and retains historical source")
     func normalizedOwnershipWorksWithRetention() async throws {
         let fixture = try ReconciliationFixture()
         let historical = fixture.root.appendingPathComponent("failed-retention-history.wav")
@@ -231,6 +234,7 @@ import Testing
         _ = await fixture.reconciler().reconcile()
         let job = try #require(try await fixture.store.jobs(kind: .recovery).first)
         let owned = URL(fileURLWithPath: job.source.reference)
+        #expect(try await fixture.store.claimRecoveryForDeletion(id: job.id, claimedAt: Date()))
         _ = try await RecoveryRetentionService(directory: fixture.root, store: fixture.store)
             .purgeExpired(now: .distantFuture, retention: .oneDay)
         #expect(try await fixture.store.job(id: job.id) == nil)
@@ -330,7 +334,7 @@ import Testing
         #expect(FileManager.default.fileExists(atPath: second.path))
     }
 
-    @Test("automatic retention purges a session-canonical quarantine without resurrection")
+    @Test("explicit deletion purges a session-canonical quarantine without resurrection")
     func retentionPurgesSessionCanonicalQuarantine() async throws {
         let fixture = try ReconciliationFixture()
         let historical = fixture.root.appendingPathComponent("failed-session-retention.wav")
@@ -338,6 +342,7 @@ import Testing
         _ = await fixture.reconciler().reconcile()
         let job = try #require(try await fixture.store.jobs(kind: .recovery).first)
         let owned = URL(fileURLWithPath: job.source.reference)
+        #expect(try await fixture.store.claimRecoveryForDeletion(id: job.id, claimedAt: Date()))
 
         _ = try await RecoveryRetentionService(
             directory: fixture.root, store: fixture.store, ledger: fixture.store
@@ -382,6 +387,7 @@ import Testing
         try Data("claimed retention audio".utf8).write(to: historical)
         _ = await fixture.reconciler().reconcile()
         let job = try #require(try await fixture.store.jobs(kind: .recovery).first)
+        #expect(try await fixture.store.claimRecoveryForDeletion(id: job.id, claimedAt: Date()))
 
         await #expect(throws: Error.self) {
             _ = try await RecoveryRetentionService(

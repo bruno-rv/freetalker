@@ -35,12 +35,11 @@ struct RecoveryRetentionService: Sendable {
         self.fileSystem = fileSystem
     }
 
-    func purgeExpired(now: Date, retention: RecoveryRetention) async throws -> PurgeResult {
-        var claims = try await store.claimedRecoveries()
-        if retention != .never {
-            let cutoff = now.addingTimeInterval(-Double(retention.rawValue) * 86_400)
-            claims += try await store.claimExpiredRecoveries(cutoff: cutoff, claimedAt: now)
-        }
+    func purgeExpired(now _: Date, retention _: RecoveryRetention) async throws -> PurgeResult {
+        let claims = try await store.claimedRecoveries()
+        // Recovery audio is never age-expired. A claim is created only by an explicit
+        // user Delete action; this method resumes those durable claims after interruption.
+        try await cleanupLibraryCommittedSessions()
         var deleted: [UUID] = []
         for claim in claims {
             guard let sourceURL = ownedSourceURL(claim.sourceReference, id: claim.id) else {
@@ -76,6 +75,25 @@ struct RecoveryRetentionService: Sendable {
             }
         }
         return PurgeResult(deletedJobIDs: deleted)
+    }
+
+    private func cleanupLibraryCommittedSessions() async throws {
+        guard let ledger else { return }
+        for session in try await ledger.unfinishedSessions()
+        where session.state == .libraryCommitted {
+            let expected = lexicalDirectory.appendingPathComponent(
+                session.id.uuidString, isDirectory: true
+            ).standardizedFileURL
+            guard session.directory.standardizedFileURL == expected,
+                  session.directory.resolvingSymlinksInPath().standardizedFileURL
+                    == resolvedDirectory.appendingPathComponent(
+                        session.id.uuidString, isDirectory: true
+                    ).standardizedFileURL else {
+                throw RecoveryFinalizationError.captureIdentityMismatch
+            }
+            try await CaptureJournalService(fileSystem: fileSystem, ledger: ledger)
+                .resumeCleanup(captureID: session.id)
+        }
     }
 
     private func cleanupLedger(id: UUID) async throws {

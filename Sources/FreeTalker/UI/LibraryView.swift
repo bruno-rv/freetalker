@@ -177,9 +177,7 @@ private struct RecoveryPickerLabel: View {
     @ObservedObject var store: JobLibraryStore
 
     var body: some View {
-        let count = RecoveryPresentation.badgeCount(
-            store.recoveryJobs, silentCount: store.silentCaptures.count
-        )
+        let count = RecoveryPresentation.badgeCount(store.recoveryItems)
         let badge = RecoveryPresentation.badgeText(count: count)
         Text(badge.map { "Recoveries (\($0))" } ?? "Recoveries")
             .accessibilityLabel(count == 0 ? "Recoveries" : "Recoveries, \(count) needing attention")

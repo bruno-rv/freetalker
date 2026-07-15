@@ -374,7 +374,13 @@ import Testing
     @Test @MainActor func libraryFacadeSurfacesPlaybackStartFailure() async throws {
         let fixture = try RunnerFixture()
         let job = try await fixture.makeFailedRecovery()
-        let library = JobLibraryStore(store: fixture.store, playbackFactory: { _ in PlaybackStub(starts: false) })
+        try WAVEncoder.encode(samples: [0.2], sampleRate: 16_000)
+            .write(to: URL(fileURLWithPath: job.source.reference))
+        let library = JobLibraryStore(
+            store: fixture.store,
+            recoveryDirectory: fixture.database.directory,
+            playbackFactory: { _ in PlaybackStub(starts: false) }
+        )
         try await library.refresh()
 
         #expect(throws: RecoveryPlaybackError.couldNotStart) { try library.play(id: job.id) }
