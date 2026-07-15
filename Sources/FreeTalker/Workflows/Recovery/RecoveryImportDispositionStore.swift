@@ -129,19 +129,25 @@ struct RecoveryImportDispositionStore: Sendable {
     }
 
     func ownsSource(id: UUID, source: URL, requireCurrentHash: Bool = true) throws -> Bool {
+        guard let hash = try ownedSourceHash(id: id, source: source) else { return false }
+        if !requireCurrentHash { return true }
+        return try codec.hashFile(source) == hash
+    }
+
+    func ownedSourceHash(id: UUID, source: URL) throws -> String? {
         let marker = ownershipURL(id: id)
-        guard codec.fileSystem.exists(marker) else { return false }
+        guard codec.fileSystem.exists(marker) else { return nil }
         let fields = String(decoding: try codec.fileSystem.read(marker), as: UTF8.self)
             .split(separator: "\n", omittingEmptySubsequences: false)
         guard fields.count == 4, fields[0] == "v1", fields[1] == id.uuidString,
-              fields[2] == source.standardizedFileURL.path else { return false }
+              fields[2] == source.standardizedFileURL.path else { return nil }
         let hash = String(fields[3])
         guard hash.count == 64, hash.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else {
-            return false
+            return nil
         }
-        if requireCurrentHash, try codec.hashFile(source) != hash { return false }
-        guard let descriptor = try descriptor(id: id) else { return false }
-        return descriptor.id == id && descriptor.contentHash == hash
+        guard let descriptor = try descriptor(id: id), descriptor.id == id,
+              descriptor.contentHash == hash else { return nil }
+        return hash
     }
 
     func descriptor(

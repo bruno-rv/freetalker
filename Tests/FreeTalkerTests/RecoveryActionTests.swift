@@ -32,6 +32,13 @@ import Testing
         #expect(try Data(contentsOf: destination) == original)
         #expect(try Data(contentsOf: source) == original)
         #expect(try await fixture.store.job(id: job.id) != nil)
+        try FileManager.default.removeItem(at: source)
+        #expect(try Data(contentsOf: destination) == original)
+        let values = try destination.resourceValues(
+            forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+        )
+        #expect(values.isRegularFile == true)
+        #expect(values.isSymbolicLink != true)
     }
 
     @Test @MainActor func damagedArtifactExportIsCopyOnly() async throws {
@@ -181,6 +188,77 @@ import Testing
 
         #expect(!FileManager.default.fileExists(atPath: destination.path))
         #expect(FileManager.default.fileExists(atPath: source.path))
+    }
+
+    @Test @MainActor func descriptorExportRejectsIdenticalContentSymlinkSwapAtOpenBoundary() async throws {
+        let fixture = try RecoveryActionFixture()
+        let job = try await fixture.failedRecovery(samples: [0.2])
+        let other = try await fixture.failedRecovery(samples: [0.2])
+        let source = URL(fileURLWithPath: job.source.reference)
+        let exporter = RecoveryArtifactExporter(beforeSourceOpen: { opened in
+            try FileManager.default.removeItem(at: opened)
+            try FileManager.default.createSymbolicLink(
+                at: opened, withDestinationURL: URL(fileURLWithPath: other.source.reference)
+            )
+        })
+        let library = JobLibraryStore(
+            store: fixture.store, recoveryDirectory: fixture.root,
+            artifactExporter: exporter
+        )
+        try await library.refresh()
+        let destination = fixture.temp.url.appendingPathComponent("swapped.wav")
+
+        await #expect(throws: Error.self) {
+            try await library.export(id: job.id, to: destination)
+        }
+
+        #expect(!FileManager.default.fileExists(atPath: destination.path))
+        #expect(try source.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink == true)
+        #expect(FileManager.default.fileExists(atPath: other.source.reference))
+    }
+
+    @Test @MainActor func descriptorExportNeverFollowsOrDeletesPrecreatedTemporarySymlink() async throws {
+        let fixture = try RecoveryActionFixture()
+        let job = try await fixture.failedRecovery()
+        let outside = fixture.temp.url.appendingPathComponent("outside.txt")
+        try Data("keep".utf8).write(to: outside)
+        let attackedTemp = fixture.temp.url.appendingPathComponent("attacked.exporting")
+        try FileManager.default.createSymbolicLink(at: attackedTemp, withDestinationURL: outside)
+        let exporter = RecoveryArtifactExporter(
+            temporaryURL: { _ in attackedTemp }
+        )
+        let library = JobLibraryStore(
+            store: fixture.store, recoveryDirectory: fixture.root,
+            artifactExporter: exporter
+        )
+        try await library.refresh()
+        let destination = fixture.temp.url.appendingPathComponent("attacked.wav")
+
+        await #expect(throws: Error.self) {
+            try await library.export(id: job.id, to: destination)
+        }
+
+        #expect(!FileManager.default.fileExists(atPath: destination.path))
+        #expect(try attackedTemp.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink == true)
+        #expect(try Data(contentsOf: outside) == Data("keep".utf8))
+    }
+
+    @Test @MainActor func descriptorExportNeverReplacesOrFollowsDestinationSymlink() async throws {
+        let fixture = try RecoveryActionFixture()
+        let job = try await fixture.failedRecovery()
+        let outside = fixture.temp.url.appendingPathComponent("destination-outside.txt")
+        try Data("keep".utf8).write(to: outside)
+        let destination = fixture.temp.url.appendingPathComponent("destination-link.wav")
+        try FileManager.default.createSymbolicLink(at: destination, withDestinationURL: outside)
+        let library = JobLibraryStore(store: fixture.store, recoveryDirectory: fixture.root)
+        try await library.refresh()
+
+        await #expect(throws: Error.self) {
+            try await library.export(id: job.id, to: destination)
+        }
+
+        #expect(try destination.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink == true)
+        #expect(try Data(contentsOf: outside) == Data("keep".utf8))
     }
 
     @Test @MainActor func exportRevalidatesCurrentJobSourceAndLeavesNoDestination() async throws {

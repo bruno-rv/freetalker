@@ -31,16 +31,19 @@ final class JobLibraryStore: ObservableObject {
     private var importService: MediaImportService?
     private var importsDirectory: URL?
     private let playbackFactory: (URL) throws -> any RecoveryAudioPlaying
+    private let artifactExporter: any RecoveryArtifactExporting
     private var player: (any RecoveryAudioPlaying)?
 
     init(
         store: TranscriptionJobStore,
         recoveryDirectory: URL? = nil,
-        playbackFactory: @escaping (URL) throws -> any RecoveryAudioPlaying = { try AVAudioPlayer(contentsOf: $0) }
+        playbackFactory: @escaping (URL) throws -> any RecoveryAudioPlaying = { try AVAudioPlayer(contentsOf: $0) },
+        artifactExporter: any RecoveryArtifactExporting = RecoveryArtifactExporter()
     ) {
         self.store = store
         self.recoveryDirectory = recoveryDirectory ?? URL(fileURLWithPath: "/dev/null")
         self.playbackFactory = playbackFactory
+        self.artifactExporter = artifactExporter
     }
 
     func configureRetry(_ enqueue: @escaping @Sendable (UUID) async -> Void) {
@@ -205,26 +208,25 @@ final class JobLibraryStore: ObservableObject {
         guard source.standardizedFileURL != target else {
             throw CocoaError(.fileWriteFileExists)
         }
-        guard !FileManager.default.fileExists(atPath: target.path) else {
-            throw CocoaError(.fileWriteFileExists)
-        }
-        let temporary = target.deletingLastPathComponent().appendingPathComponent(
-            ".\(target.lastPathComponent).\(UUID().uuidString).exporting"
-        )
-        var copied = false
-        defer { if !copied { try? FileManager.default.removeItem(at: temporary) } }
         let codec = CaptureSegmentCodec(fileSystem: LocalJournalFileSystem())
-        let expectedHash = try codec.hashFile(source)
-        try FileManager.default.copyItem(at: source, to: temporary)
+        let dispositions = RecoveryImportDispositionStore(directory: recoveryDirectory)
+        let durableHash = try dispositions.ownedSourceHash(id: id, source: source)
+            ?? item.session?.contentHash
+            ?? dispositions.descriptor(id: id)?.contentHash
+        let expectedHash: String
+        if let durableHash {
+            expectedHash = durableHash
+        } else {
+            expectedHash = try codec.hashFile(source)
+        }
         let stillValid = item.audioURL != nil
             ? validator.validAudio(source) != nil : validator.validArtifact(source) != nil
-        guard stillValid,
-              try codec.hashFile(source) == expectedHash,
-              try codec.hashFile(temporary) == expectedHash else {
+        guard stillValid, try codec.hashFile(source) == expectedHash else {
             throw CaptureJournalError.hashMismatch(source.path)
         }
-        try FileManager.default.moveItem(at: temporary, to: target)
-        copied = true
+        try artifactExporter.export(
+            source: source, destination: target, expectedHash: expectedHash
+        )
     }
 
     func startNewRecording(id: UUID) -> Bool {
