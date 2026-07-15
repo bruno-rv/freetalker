@@ -4,6 +4,7 @@ import Foundation
 import OSLog
 
 final class AudioCapture {
+    enum ConsumerFailureAction: Equatable { case none, escalate }
     enum CaptureRoute: Equatable {
         case voiceProcessedSystemDefault
         case rawSelectedMicrophoneSuppressionUnavailable
@@ -48,6 +49,9 @@ final class AudioCapture {
     private let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false)!
     private var isCapturing = false
     private var conversionFailureCount = 0
+    private var sampleConsumer: (@Sendable ([Float]) -> CaptureJournalWriter.EnqueueResult)?
+    private var onConsumerFailure: (@Sendable (CaptureJournalWriter.EnqueueResult) -> Void)?
+    private var didReportConsumerFailure = false
 
     private(set) var captureWarnings: [String] = []
 
@@ -117,10 +121,18 @@ final class AudioCapture {
     /// Starts capturing. Throws if the mic can't be opened (e.g. permission denied).
     /// - Parameter deviceUID: CoreAudio UID of the input device to pin (AppSettings
     ///   `microphoneDeviceUID`), or nil to use the system default input.
-    func start(deviceUID: String?, noiseSuppression: Bool) throws {
+    func start(
+        deviceUID: String?,
+        noiseSuppression: Bool,
+        sampleConsumer: (@Sendable ([Float]) -> CaptureJournalWriter.EnqueueResult)? = nil,
+        onConsumerFailure: (@Sendable (CaptureJournalWriter.EnqueueResult) -> Void)? = nil
+    ) throws {
         samplesLock.lock()
         samples.removeAll()
         conversionFailureCount = 0
+        self.sampleConsumer = sampleConsumer
+        self.onConsumerFailure = onConsumerFailure
+        didReportConsumerFailure = false
         samplesLock.unlock()
         converter = nil
         captureWarnings.removeAll()
@@ -151,6 +163,12 @@ final class AudioCapture {
             try startCaptureAttempt(deviceUID: deviceUID, requestedVoiceProcessing: false)
         }
         isCapturing = true
+    }
+
+    nonisolated static func consumerFailureAction(
+        for result: CaptureJournalWriter.EnqueueResult
+    ) -> ConsumerFailureAction {
+        result == .accepted ? .none : .escalate
     }
 
     private func startCaptureAttempt(deviceUID: String?, requestedVoiceProcessing: Bool) throws {
@@ -450,9 +468,25 @@ final class AudioCapture {
             return
         }
         let frameCount = Int(outBuffer.frameLength)
+        let convertedSamples = Array(
+            UnsafeBufferPointer(start: channelData[0], count: frameCount)
+        )
         samplesLock.lock()
-        samples.append(contentsOf: UnsafeBufferPointer(start: channelData[0], count: frameCount))
+        samples.append(contentsOf: convertedSamples)
+        let consumer = sampleConsumer
+        let failureHandler = onConsumerFailure
         samplesLock.unlock()
+        guard let consumer else { return }
+        let result = consumer(convertedSamples)
+        guard Self.consumerFailureAction(for: result) == .escalate else { return }
+        let shouldReport = samplesLock.withLock {
+            guard !didReportConsumerFailure else { return false }
+            didReportConsumerFailure = true
+            return true
+        }
+        if shouldReport, let failureHandler {
+            Task { failureHandler(result) }
+        }
     }
 
     private func recordConversionFailure() {

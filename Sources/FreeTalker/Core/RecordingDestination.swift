@@ -7,6 +7,15 @@ struct ScratchpadInsertionToken: Hashable, Sendable {
 enum RecordingDestination: Equatable, Sendable {
     case external
     case scratchpad(ScratchpadInsertionToken)
+
+    var requiresDurableJournal: Bool { true }
+
+    var journalIdentifier: String {
+        switch self {
+        case .external: "external"
+        case .scratchpad(let token): "scratchpad:\(token.id.uuidString)"
+        }
+    }
 }
 
 struct RecordingProcessingContext: Equatable, Sendable {

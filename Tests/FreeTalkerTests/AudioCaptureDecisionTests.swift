@@ -2,6 +2,15 @@ import Testing
 @testable import FreeTalker
 
 struct AudioCaptureDecisionTests {
+    @Test func journalConsumerAcceptsSamplesWithoutFailureHandling() {
+        #expect(AudioCapture.consumerFailureAction(for: .accepted) == .none)
+    }
+
+    @Test func journalConsumerOverflowAndFailureAreEscalated() {
+        #expect(AudioCapture.consumerFailureAction(for: .overflow) == .escalate)
+        #expect(AudioCapture.consumerFailureAction(for: .failed("disk full")) == .escalate)
+    }
+
     @Test func selectedMicrophoneUsesRawCaptureWhenSuppressionIsRequested() {
         #expect(
             AudioCapture.captureRoute(
