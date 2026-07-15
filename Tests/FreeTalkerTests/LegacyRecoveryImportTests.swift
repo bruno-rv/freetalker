@@ -31,6 +31,84 @@ import Testing
         #expect(try await reopened.store.jobs(kind: .recovery).count == 1)
     }
 
+    @Test("legacy disposal never suppresses identical bytes under an explicit UUID identity")
+    func legacyDispositionDoesNotSuppressIdenticalCaptureIdentity() async throws {
+        let fixture = try ReconciliationFixture()
+        let data = WAVEncoder.encode(
+            samples: Array(repeating: 0.21, count: 1_600), sampleRate: 16_000
+        )
+        let historical = fixture.root.appendingPathComponent("failed-legacy-collision.wav")
+        try data.write(to: historical)
+        _ = await fixture.reconciler().reconcile()
+        let legacy = try #require(try await fixture.store.jobs(kind: .recovery).first)
+        _ = try await RecoveryRetentionService(directory: fixture.root, store: fixture.store)
+            .purgeExpired(now: .distantFuture, retention: .oneDay)
+
+        let capture = fixture.root.appendingPathComponent("\(legacy.id.uuidString).wav")
+        try data.write(to: capture)
+        let report = await fixture.reconciler().reconcile()
+
+        #expect(report.failed == 0, Comment(rawValue: String(describing: report.failures)))
+        let imported = try #require(try await fixture.store.job(id: legacy.id))
+        #expect(URL(fileURLWithPath: imported.source.reference).resolvingSymlinksInPath()
+            == capture.resolvingSymlinksInPath())
+        #expect(FileManager.default.fileExists(atPath: capture.path))
+        #expect(FileManager.default.fileExists(atPath: historical.path))
+    }
+
+    @Test("legacy descriptor never hash-mismatches different bytes under an explicit UUID identity")
+    func legacyDescriptorDoesNotRejectDifferentCaptureBytes() async throws {
+        let fixture = try ReconciliationFixture()
+        let legacyData = WAVEncoder.encode(
+            samples: Array(repeating: 0.22, count: 1_600), sampleRate: 16_000
+        )
+        let historical = fixture.root.appendingPathComponent("failed-legacy-different.wav")
+        try legacyData.write(to: historical)
+        _ = await fixture.reconciler().reconcile()
+        let legacy = try #require(try await fixture.store.jobs(kind: .recovery).first)
+        _ = try await RecoveryRetentionService(directory: fixture.root, store: fixture.store)
+            .purgeExpired(now: .distantFuture, retention: .oneDay)
+
+        let capture = fixture.root.appendingPathComponent("\(legacy.id.uuidString).wav")
+        try WAVEncoder.encode(
+            samples: Array(repeating: -0.23, count: 1_600), sampleRate: 16_000
+        ).write(to: capture)
+        let report = await fixture.reconciler().reconcile()
+
+        #expect(report.failed == 0, Comment(rawValue: String(describing: report.failures)))
+        let imported = try #require(try await fixture.store.job(id: legacy.id))
+        #expect(URL(fileURLWithPath: imported.source.reference).resolvingSymlinksInPath()
+            == capture.resolvingSymlinksInPath())
+        #expect(FileManager.default.fileExists(atPath: capture.path))
+        #expect(FileManager.default.fileExists(atPath: historical.path))
+    }
+
+    @Test("active legacy row collision is reported while UUID-owned bytes and evidence remain")
+    func activeLegacyRowCollisionKeepsUUIDPrimaryWithoutLoss() async throws {
+        let fixture = try ReconciliationFixture()
+        let legacyData = WAVEncoder.encode(
+            samples: Array(repeating: 0.24, count: 1_600), sampleRate: 16_000
+        )
+        let captureData = WAVEncoder.encode(
+            samples: Array(repeating: -0.25, count: 1_600), sampleRate: 16_000
+        )
+        let historical = fixture.root.appendingPathComponent("failed-active-collision.wav")
+        try legacyData.write(to: historical)
+        _ = await fixture.reconciler().reconcile()
+        let legacy = try #require(try await fixture.store.jobs(kind: .recovery).first)
+        let capture = URL(fileURLWithPath: legacy.source.reference)
+        try captureData.write(to: capture)
+
+        let report = await fixture.reconciler().reconcile()
+
+        #expect(report.failed == 1)
+        #expect(report.failures.first?.artifact.resolvingSymlinksInPath()
+            == historical.resolvingSymlinksInPath())
+        #expect(try await fixture.store.job(id: legacy.id) != nil)
+        #expect(try Data(contentsOf: capture) == captureData)
+        #expect(try Data(contentsOf: historical) == legacyData)
+    }
+
     @Test("quarantine discriminator and owned artifact survive reopen")
     func quarantineIsDurableAcrossReopen() async throws {
         let fixture = try ReconciliationFixture()

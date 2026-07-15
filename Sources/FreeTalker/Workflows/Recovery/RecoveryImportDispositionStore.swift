@@ -22,15 +22,57 @@ struct RecoveryImportDispositionStore: Sendable {
 
     func registerImport(_ descriptor: RecoveryImportDescriptor) throws {
         try validate(descriptor)
-        try commitExact(payload(descriptor), to: importURL(id: descriptor.id))
+        try commitExact(payload(descriptor), to: importURL(descriptor))
     }
 
     func descriptor(id: UUID) throws -> RecoveryImportDescriptor? {
-        let marker = importURL(id: id)
-        guard codec.fileSystem.exists(marker) else { return nil }
-        let descriptor = try decode(codec.fileSystem.read(marker))
-        guard descriptor.id == id else { throw CaptureJournalError.hashMismatch(marker.path) }
-        return descriptor
+        if let capture = try descriptor(scope: .capture(id), legacyHash: nil) {
+            return capture
+        }
+        let oldMarker = legacyImportURL(id: id)
+        var oldLegacy: RecoveryImportDescriptor?
+        if codec.fileSystem.exists(oldMarker) {
+            let decoded = try decode(codec.fileSystem.read(oldMarker))
+            guard decoded.id == id else {
+                throw CaptureJournalError.hashMismatch(oldMarker.path)
+            }
+            if decoded.scope == .legacy { oldLegacy = decoded }
+        }
+        for marker in try codec.fileSystem.contents(directory)
+        where marker.lastPathComponent.hasPrefix(".recovery-import-legacy-") {
+            let decoded = try decode(codec.fileSystem.read(marker))
+            if decoded.id == id, decoded.scope == .legacy { return decoded }
+        }
+        return oldLegacy
+    }
+
+    func descriptor(
+        scope: RecoveryImportScope, legacyHash: String?
+    ) throws -> RecoveryImportDescriptor? {
+        let marker: URL
+        let legacyID: UUID
+        switch scope {
+        case .capture(let id):
+            marker = captureImportURL(id: id)
+            legacyID = id
+        case .legacy:
+            guard let legacyHash else {
+                throw CaptureJournalError.failed("Legacy recovery hash is unavailable")
+            }
+            marker = legacyImportURL(hash: legacyHash)
+            legacyID = LegacyRecoveryImporter.stableID(hash: legacyHash)
+        }
+        if codec.fileSystem.exists(marker) {
+            let decoded = try decode(codec.fileSystem.read(marker))
+            guard decoded.scope == scope else {
+                throw CaptureJournalError.hashMismatch(marker.path)
+            }
+            return decoded
+        }
+        let oldMarker = legacyImportURL(id: legacyID)
+        guard codec.fileSystem.exists(oldMarker) else { return nil }
+        let decoded = try decode(codec.fileSystem.read(oldMarker))
+        return decoded.scope == scope ? decoded : nil
     }
 
     func contains(_ descriptor: RecoveryImportDescriptor) throws -> Bool {
@@ -48,22 +90,29 @@ struct RecoveryImportDispositionStore: Sendable {
     func descriptor(
         id: UUID, source: URL, defaultScope: RecoveryImportScope
     ) throws -> RecoveryImportDescriptor {
-        if let existing = try descriptor(id: id) {
-            if codec.fileSystem.exists(source) {
-                guard try codec.hashFile(source) == existing.contentHash else {
-                    throw CaptureJournalError.hashMismatch(source.path)
-                }
+        if let capture = try descriptor(scope: .capture(id), legacyHash: nil) {
+            if codec.fileSystem.exists(source),
+               try codec.hashFile(source) != capture.contentHash {
+                throw CaptureJournalError.hashMismatch(source.path)
             }
-            return existing
+            return capture
         }
-        guard codec.fileSystem.exists(source) else {
+        if codec.fileSystem.exists(source) {
+            let hash = try codec.hashFile(source)
+            if let legacy = try descriptor(scope: .legacy, legacyHash: hash),
+               legacy.id == id {
+                return legacy
+            }
+            let descriptor = RecoveryImportDescriptor(
+                id: id, scope: defaultScope, contentHash: hash
+            )
+            try registerImport(descriptor)
+            return descriptor
+        }
+        guard let existing = try descriptor(id: id) else {
             throw CaptureJournalError.hashMismatch(source.path)
         }
-        let descriptor = RecoveryImportDescriptor(
-            id: id, scope: defaultScope, contentHash: try codec.hashFile(source)
-        )
-        try registerImport(descriptor)
-        return descriptor
+        return existing
     }
 
     private func commitExact(_ data: Data, to destination: URL) throws {
@@ -84,7 +133,22 @@ struct RecoveryImportDispositionStore: Sendable {
         }
     }
 
-    private func importURL(id: UUID) -> URL {
+    private func importURL(_ descriptor: RecoveryImportDescriptor) -> URL {
+        switch descriptor.scope {
+        case .capture(let id): captureImportURL(id: id)
+        case .legacy: legacyImportURL(hash: descriptor.contentHash)
+        }
+    }
+
+    private func captureImportURL(id: UUID) -> URL {
+        directory.appendingPathComponent(".recovery-import-capture-\(id.uuidString).marker")
+    }
+
+    private func legacyImportURL(hash: String) -> URL {
+        directory.appendingPathComponent(".recovery-import-legacy-\(hash).marker")
+    }
+
+    private func legacyImportURL(id: UUID) -> URL {
         directory.appendingPathComponent(".recovery-import-\(id.uuidString).marker")
     }
 

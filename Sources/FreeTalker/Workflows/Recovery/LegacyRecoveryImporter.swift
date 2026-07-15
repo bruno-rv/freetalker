@@ -47,15 +47,16 @@ struct LegacyRecoveryImporter: Sendable {
         let dispositions = RecoveryImportDispositionStore(
             directory: ownedDirectory, fileSystem: codec.fileSystem
         )
+        let scope: RecoveryImportScope = preferredID == nil ? .legacy : .capture(id)
         let descriptor: RecoveryImportDescriptor
-        if preferredID != nil, let existing = try dispositions.descriptor(id: id) {
-            guard existing.contentHash == hash else {
+        if let existing = try dispositions.descriptor(scope: scope, legacyHash: hash) {
+            guard existing.id == id, existing.contentHash == hash else {
                 throw CaptureJournalError.hashMismatch(source.path)
             }
             descriptor = existing
         } else {
             descriptor = RecoveryImportDescriptor(
-                id: id, scope: preferredID == nil ? .legacy : .capture(id), contentHash: hash
+                id: id, scope: scope, contentHash: hash
             )
         }
         try dispositions.registerImport(descriptor)
