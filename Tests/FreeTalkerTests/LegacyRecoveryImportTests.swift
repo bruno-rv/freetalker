@@ -31,6 +31,79 @@ import Testing
         #expect(try await reopened.store.jobs(kind: .recovery).count == 1)
     }
 
+    @Test("valid legacy lineage survives an ordinary restart before retention disposal")
+    func validLegacyLineageSurvivesIntermediateRestart() async throws {
+        let fixture = try ReconciliationFixture()
+        let historical = fixture.root.appendingPathComponent("failed-valid-two-restarts.wav")
+        try WAVEncoder.encode(
+            samples: Array(repeating: 0.26, count: 1_600), sampleRate: 16_000
+        ).write(to: historical)
+        _ = await fixture.reconciler().reconcile()
+        let job = try #require(try await fixture.store.jobs(kind: .recovery).first)
+
+        let intermediate = try fixture.reopen()
+        let firstRestart = await intermediate.reconciler().reconcile()
+        #expect(firstRestart.failed == 0)
+        #expect(try RecoveryImportDispositionStore(directory: intermediate.root)
+            .descriptor(id: job.id)?.scope == .legacy)
+
+        _ = try await RecoveryRetentionService(
+            directory: intermediate.root, store: intermediate.store, ledger: intermediate.store
+        ).purgeExpired(now: .distantFuture, retention: .oneDay)
+        let final = try intermediate.reopen()
+        _ = await final.reconciler().reconcile()
+        #expect(try await final.store.job(id: job.id) == nil)
+        #expect(try await final.store.jobs(kind: .recovery).isEmpty)
+        #expect(FileManager.default.fileExists(atPath: historical.path))
+        #expect(try RecoveryImportDispositionStore(directory: final.root)
+            .descriptor(id: job.id)?.scope == .legacy)
+    }
+
+    @MainActor @Test("damaged legacy lineage survives an ordinary restart before Delete")
+    func damagedLegacyLineageSurvivesIntermediateRestart() async throws {
+        let fixture = try ReconciliationFixture()
+        let historical = fixture.root.appendingPathComponent("failed-damaged-two-restarts.wav")
+        try Data("damaged legacy restart".utf8).write(to: historical)
+        _ = await fixture.reconciler().reconcile()
+        let job = try #require(try await fixture.store.jobs(kind: .recovery).first)
+
+        let intermediate = try fixture.reopen()
+        let firstRestart = await intermediate.reconciler().reconcile()
+        #expect(firstRestart.failed == 0)
+        #expect(try RecoveryImportDispositionStore(directory: intermediate.root)
+            .descriptor(id: job.id)?.scope == .legacy)
+        let library = JobLibraryStore(
+            store: intermediate.store, recoveryDirectory: intermediate.root
+        )
+        try await library.refresh()
+        try await library.delete(id: job.id)
+
+        let final = try intermediate.reopen()
+        _ = await final.reconciler().reconcile()
+        #expect(try await final.store.job(id: job.id) == nil)
+        #expect(try await final.store.session(id: job.id) == nil)
+        #expect(FileManager.default.fileExists(atPath: historical.path))
+        #expect(try RecoveryImportDispositionStore(directory: final.root)
+            .descriptor(id: job.id)?.scope == .legacy)
+    }
+
+    @Test("loose UUID audio without an owning row remains capture lineage")
+    func missingRowLooseUUIDUsesCaptureLineage() async throws {
+        let fixture = try ReconciliationFixture()
+        let id = UUID()
+        let source = fixture.root.appendingPathComponent("\(id.uuidString).wav")
+        try WAVEncoder.encode(
+            samples: Array(repeating: 0.27, count: 1_600), sampleRate: 16_000
+        ).write(to: source)
+
+        let report = await fixture.reconciler().reconcile()
+
+        #expect(report.failed == 0)
+        #expect(try await fixture.store.job(id: id) != nil)
+        #expect(try RecoveryImportDispositionStore(directory: fixture.root)
+            .descriptor(id: id)?.scope == .capture(id))
+    }
+
     @Test("legacy disposal never suppresses identical bytes under an explicit UUID identity")
     func legacyDispositionDoesNotSuppressIdenticalCaptureIdentity() async throws {
         let fixture = try ReconciliationFixture()

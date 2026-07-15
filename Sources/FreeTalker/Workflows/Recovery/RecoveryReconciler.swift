@@ -269,9 +269,14 @@ actor RecoveryReconciler {
                 Data(message.utf8), temporary: temporary, destination: source
             )
         }
-        let result = try await importer.importAudio(
-            source, preferredID: session.id, forceQuarantine: true
-        )
+        let result: LegacyRecoveryImporter.Result
+        if let existing = try await importer.existingOwnedLegacyResult(source, id: session.id) {
+            result = existing
+        } else {
+            result = try await importer.importAudio(
+                source, preferredID: session.id, forceQuarantine: true
+            )
+        }
         if result == .disposed {
             if let job = try await store.job(id: session.id) {
                 _ = try await store.deleteCommittedRecovery(
@@ -392,7 +397,11 @@ actor RecoveryReconciler {
                 try await cleanupLibraryOwnedLoose(id, artifact: audio)
                 return
             }
-            report.add(try await importer.importAudio(audio, preferredID: id))
+            if let existing = try await importer.existingOwnedLegacyResult(audio, id: id) {
+                report.add(existing)
+            } else {
+                report.add(try await importer.importAudio(audio, preferredID: id))
+            }
         } else if stem.hasPrefix("failed-") {
             report.add(try await importer.importAudio(audio))
         }

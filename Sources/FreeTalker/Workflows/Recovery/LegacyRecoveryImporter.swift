@@ -128,6 +128,20 @@ struct LegacyRecoveryImporter: Sendable {
         return valid ? .imported : .quarantined
     }
 
+    func existingOwnedLegacyResult(_ source: URL, id: UUID) async throws -> Result? {
+        guard let job = try await store.job(id: id), job.kind == .recovery,
+              URL(fileURLWithPath: job.source.reference).resolvingSymlinksInPath()
+                == source.resolvingSymlinksInPath() else { return nil }
+        let hash = try codec.hashFile(source)
+        let dispositions = RecoveryImportDispositionStore(
+            directory: ownedDirectory, fileSystem: codec.fileSystem
+        )
+        guard try dispositions.descriptor(scope: .capture(id), legacyHash: nil) == nil,
+              let legacy = try dispositions.descriptor(scope: .legacy, legacyHash: hash),
+              legacy.id == id, legacy.contentHash == hash else { return nil }
+        return .duplicate
+    }
+
     private func ensureQuarantine(id: UUID, source: URL, message: String) async throws {
         let session: CaptureSession
         if let existing = try await ledger.session(id: id) {
