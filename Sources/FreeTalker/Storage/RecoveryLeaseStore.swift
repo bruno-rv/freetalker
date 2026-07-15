@@ -2,6 +2,18 @@ import CSQLite
 import Foundation
 
 extension TranscriptionJobStore: RecoveryLeaseStoring {
+    func deleteCommittedRecovery(id: UUID, expectedSourceReference: String) throws -> Bool {
+        let statement = try recoveryLeasePrepare("""
+        DELETE FROM transcription_jobs
+        WHERE id = ? AND kind = 'recovery' AND source_reference = ?;
+        """)
+        defer { sqlite3_finalize(statement) }
+        recoveryLeaseBind(id.uuidString, 1, statement)
+        recoveryLeaseBind(expectedSourceReference, 2, statement)
+        try recoveryLeaseStep(statement)
+        return sqlite3_changes(handle) == 1
+    }
+
     func beginOwnedAttempt(jobID: UUID, owner: UUID, configuration: AttemptConfiguration) throws -> JobAttempt {
         let statement = try recoveryLeasePrepare("""
         INSERT INTO job_attempts (job_id, attempt_number, started_at, language, speech_model, template)

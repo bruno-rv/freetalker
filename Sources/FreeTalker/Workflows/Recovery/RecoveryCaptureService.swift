@@ -40,9 +40,12 @@ struct SystemRecoveryFileRemover: RecoveryFileRemoving {
 }
 
 protocol RecoveryJobStoring: Sendable {
+    func job(id: UUID) async throws -> TranscriptionJob?
     func createProvisionalRecovery(source: JobSource, capturedAt: Date) async throws -> TranscriptionJob
+    func createProvisionalRecovery(id: UUID, source: JobSource, capturedAt: Date) async throws -> TranscriptionJob
     func failProvisionalRecovery(id: UUID, failure: JobFailure) async throws
     func deleteProvisionalRecovery(id: UUID, expectedSourceReference: String) async throws -> Bool
+    func deleteCommittedRecovery(id: UUID, expectedSourceReference: String) async throws -> Bool
     func createRecovery(source: JobSource, metadata: RecoveryMetadata) async throws -> TranscriptionJob
     func claimExpiredRecoveries(cutoff: Date, claimedAt: Date) async throws -> [RecoveryPurgeClaim]
     func claimedRecoveries() async throws -> [RecoveryPurgeClaim]
@@ -52,19 +55,34 @@ protocol RecoveryJobStoring: Sendable {
 
 extension TranscriptionJobStore: RecoveryJobStoring {}
 
+enum RecoveryFinalizationError: Error, Equatable {
+    case libraryOwnershipMissing(UUID)
+    case captureIdentityMismatch
+    case recoveryJobMismatch
+}
+
 struct RecoveryCaptureService: Sendable {
     private let directory: URL
     private let store: any RecoveryJobStoring
     private let fileRemover: any RecoveryFileRemoving
+    private let ledger: (any CaptureLedgerStoring)?
+    private let journalFileSystem: any JournalFileSystem
+    private let libraryDictationID: @Sendable (UUID) async throws -> Int64?
 
     init(
         directory: URL,
         store: any RecoveryJobStoring,
-        fileRemover: any RecoveryFileRemoving = SystemRecoveryFileRemover()
+        fileRemover: any RecoveryFileRemoving = SystemRecoveryFileRemover(),
+        ledger: (any CaptureLedgerStoring)? = nil,
+        journalFileSystem: any JournalFileSystem = LocalJournalFileSystem(),
+        libraryDictationID: @escaping @Sendable (UUID) async throws -> Int64? = { _ in nil }
     ) {
         self.directory = directory.standardizedFileURL
         self.store = store
         self.fileRemover = fileRemover
+        self.ledger = ledger
+        self.journalFileSystem = journalFileSystem
+        self.libraryDictationID = libraryDictationID
     }
 
     func stageProvisional(samples: [Float], capturedAt: Date) throws -> StagedRecoveryCapture {
@@ -146,12 +164,86 @@ struct RecoveryCaptureService: Sendable {
         try await store.failProvisionalRecovery(id: capture.id, failure: failure)
     }
 
-    func completeProvisional(_ capture: ProvisionalRecoveryCapture) async throws {
-        guard try await store.deleteProvisionalRecovery(
+    func registerJournalCapture(_ staged: StagedCapture, capturedAt: Date) async throws -> ProvisionalRecoveryCapture {
+        let session = try await ledger?.session(id: staged.captureID)
+        let job = try await store.createProvisionalRecovery(
+            id: staged.captureID,
+            source: JobSource(reference: staged.canonicalAudioURL.path),
+            capturedAt: session?.capturedAt ?? capturedAt
+        )
+        guard job.id == staged.captureID else {
+            throw RecoveryFinalizationError.captureIdentityMismatch
+        }
+        if let ledger {
+            guard let session else {
+                throw RecoveryFinalizationError.captureIdentityMismatch
+            }
+            if session.state == .staged {
+                try await ledger.transition(
+                    id: staged.captureID, from: .staged, to: .processing,
+                    recoveryJobID: job.id, libraryDictationID: nil,
+                    assetKind: session.assetKind,
+                    failureMessage: session.failureMessage,
+                    contentHash: session.contentHash
+                )
+            }
+        }
+        return ProvisionalRecoveryCapture(id: job.id, source: job.source)
+    }
+
+    func completeJournalCapture(
+        _ capture: ProvisionalRecoveryCapture,
+        captureID: UUID
+    ) async throws {
+        guard capture.id == captureID else {
+            throw RecoveryFinalizationError.captureIdentityMismatch
+        }
+        guard let ledger else {
+            throw RecoveryFinalizationError.captureIdentityMismatch
+        }
+        guard let dictationID = try await libraryDictationID(captureID) else {
+            throw RecoveryFinalizationError.libraryOwnershipMissing(captureID)
+        }
+        guard let session = try await ledger.session(id: captureID) else {
+            throw RecoveryFinalizationError.captureIdentityMismatch
+        }
+        guard session.recoveryJobID == nil || session.recoveryJobID == capture.id else {
+            throw RecoveryFinalizationError.recoveryJobMismatch
+        }
+        if session.state == .processing {
+            try await ledger.transition(
+                id: captureID, from: .processing, to: .libraryCommitted,
+                recoveryJobID: capture.id, libraryDictationID: dictationID,
+                assetKind: session.assetKind,
+                failureMessage: session.failureMessage,
+                contentHash: session.contentHash
+            )
+        } else {
+            guard session.state == .libraryCommitted,
+                  session.libraryDictationID == dictationID else {
+                throw JobStoreError.invalidTransition
+            }
+        }
+
+        let canonical = session.directory.appendingPathComponent("\(captureID.uuidString).wav")
+        if journalFileSystem.exists(canonical) { try journalFileSystem.remove(canonical) }
+        for segment in try await ledger.committedSegments(captureID: captureID) {
+            if journalFileSystem.exists(segment.url) { try journalFileSystem.remove(segment.url) }
+        }
+        if journalFileSystem.exists(session.directory) {
+            try journalFileSystem.synchronizeDirectory(session.directory)
+        }
+        let removed = try await store.deleteCommittedRecovery(
             id: capture.id,
             expectedSourceReference: capture.source.reference
-        ) else { throw JobStoreError.invalidTransition }
-        try fileRemover.removeItem(at: URL(fileURLWithPath: capture.source.reference))
+        )
+        if !removed {
+            // Only a completed prior retry may have removed the exact recovery identity.
+            guard try await store.job(id: capture.id) == nil else {
+                throw RecoveryFinalizationError.recoveryJobMismatch
+            }
+        }
+        try await ledger.removeCleanedSession(id: captureID)
     }
 
     func preserve(samples: [Float], metadata: RecoveryMetadata) async throws -> UUID {

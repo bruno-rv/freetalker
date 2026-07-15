@@ -87,8 +87,15 @@ actor TranscriptionJobStore {
     }
 
     func createProvisionalRecovery(source: JobSource, capturedAt: Date) throws -> TranscriptionJob {
+        try createProvisionalRecovery(id: UUID(), source: source, capturedAt: capturedAt)
+    }
+
+    func createProvisionalRecovery(
+        id: UUID,
+        source: JobSource,
+        capturedAt: Date
+    ) throws -> TranscriptionJob {
         if let existing = try recoveryJob(sourceReference: source.reference) { return existing }
-        let id = UUID()
         let statement = try prepare("""
         INSERT INTO transcription_jobs
             (id, kind, source_reference, source_bookmark, state, progress, created_at, updated_at,

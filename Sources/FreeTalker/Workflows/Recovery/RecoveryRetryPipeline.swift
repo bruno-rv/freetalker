@@ -33,7 +33,7 @@ protocol RecoveryLeaseStoring: RecoveryRetryStoring {
 extension TranscriptionJobStore: RecoveryRetryStoring {}
 
 struct RecoveryRetryPipeline: Sendable {
-    typealias ProcessDictation = @Sendable ([Float], AttemptConfiguration) async throws -> RecoveryDictation
+    typealias ProcessDictation = @Sendable ([Float], AttemptConfiguration, UUID) async throws -> RecoveryDictation
 
     private let directory: URL
     private let store: any RecoveryRetryStoring
@@ -41,6 +41,8 @@ struct RecoveryRetryPipeline: Sendable {
     private let processDictation: ProcessDictation
     private let removeSource: @Sendable (URL) throws -> Void
     private let errorStage: @Sendable (any Error) -> JobStage
+    private let libraryDictationID: @Sendable (UUID) async throws -> Int64?
+    private let finalizeJournalCapture: @Sendable (UUID, Int64) async throws -> Bool
 
     init(
         directory: URL,
@@ -48,7 +50,9 @@ struct RecoveryRetryPipeline: Sendable {
         loadSamples: @escaping @Sendable (URL) throws -> [Float] = Self.loadPCM,
         processDictation: @escaping ProcessDictation,
         removeSource: @escaping @Sendable (URL) throws -> Void = { try FileManager.default.removeItem(at: $0) },
-        errorStage: @escaping @Sendable (any Error) -> JobStage = { _ in .persisting }
+        errorStage: @escaping @Sendable (any Error) -> JobStage = { _ in .persisting },
+        libraryDictationID: @escaping @Sendable (UUID) async throws -> Int64? = { _ in nil },
+        finalizeJournalCapture: @escaping @Sendable (UUID, Int64) async throws -> Bool = { _, _ in false }
     ) {
         self.directory = directory.standardizedFileURL.resolvingSymlinksInPath()
         self.store = store
@@ -56,11 +60,18 @@ struct RecoveryRetryPipeline: Sendable {
         self.processDictation = processDictation
         self.removeSource = removeSource
         self.errorStage = errorStage
+        self.libraryDictationID = libraryDictationID
+        self.finalizeJournalCapture = finalizeJournalCapture
     }
 
     func execute(jobID: UUID, configuration: AttemptConfiguration?, cancellation: CancellationToken) async throws {
         guard let job = try await store.job(id: jobID), job.kind == .recovery else {
             throw JobStoreError.jobNotFound
+        }
+        if let libraryID = try await libraryDictationID(jobID) {
+            try cancellation.checkCancellation()
+            try await cancellation.beginFinalization()
+            if try await finalizeJournalCapture(jobID, libraryID) { return }
         }
         let attempt: JobAttempt
         if let unfinished = try await store.latestUnfinishedAttempt(jobID: jobID) {
@@ -79,9 +90,13 @@ struct RecoveryRetryPipeline: Sendable {
             } else { try await store.transition(jobID, from: .processing, to: .processing(stage: .transcribing)) }
             let samples = try loadSamples(URL(fileURLWithPath: job.source.reference))
             try cancellation.checkCancellation()
-            _ = try await processDictation(samples, attempt.configuration)
+            _ = try await processDictation(samples, attempt.configuration, jobID)
             try cancellation.checkCancellation()
             try await cancellation.beginFinalization()
+            if let libraryID = try await libraryDictationID(jobID),
+               try await finalizeJournalCapture(jobID, libraryID) {
+                return
+            }
         } catch {
             let result = AttemptResult.failed(JobFailure(stage: errorStage(error), message: error.localizedDescription))
             if let owner = cancellation.owner, let leased = store as? any RecoveryLeaseStoring {

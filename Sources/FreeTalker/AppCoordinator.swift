@@ -1689,7 +1689,7 @@ final class AppCoordinator: ObservableObject {
     private func stopAndTranscribe(
         preSnapshotted: (app: NSRunningApplication?, target: InsertionTarget?, contextTarget: ContextTargetSnapshot)? = nil,
         skipPostProcessing: Bool = false,
-        stoppedCapture: (samples: [Float], peak: Float, rms: Float)? = nil,
+        stoppedCapture: (samples: [Float], peak: Float, rms: Float, staged: StagedCapture?)? = nil,
         stopRequest suppliedStopRequest: PendingStopRequest? = nil
     ) {
         let stopRequest = suppliedStopRequest ?? makeStopRequest(
@@ -1724,9 +1724,11 @@ final class AppCoordinator: ObservableObject {
             journalFinalizationTask = Task {
                 do {
                     let downstreamSamples: [Float]
+                    let stagedCapture: StagedCapture?
                     if diagnostics.indicatesSilence {
                         try await service.recordSilent(active, diagnostics: diagnostics)
                         downstreamSamples = samples
+                        stagedCapture = nil
                     } else {
                         let staged = try await service.finish(active)
                         let url = staged.canonicalAudioURL
@@ -1735,6 +1737,7 @@ final class AppCoordinator: ObservableObject {
                                 fileSystem: LocalJournalFileSystem()
                             ).decode(url)
                         }
+                        stagedCapture = staged
                     }
                     guard captureAdmission.state == .finalizing(
                         captureID: active.session.id
@@ -1746,7 +1749,7 @@ final class AppCoordinator: ObservableObject {
                     activeCaptureJournal = nil
                     captureOwner = .none
                     stopAndTranscribe(
-                        stoppedCapture: (downstreamSamples, peak, rms),
+                        stoppedCapture: (downstreamSamples, peak, rms, stagedCapture),
                         stopRequest: stopRequest
                     )
                 } catch {
@@ -1876,60 +1879,64 @@ final class AppCoordinator: ObservableObject {
             recordingHUDDidReachTerminalState(generation: hudGeneration)
             return
         }
-        let recoveryService = RecoveryCaptureService(directory: Self.recoveryDirectory, store: recoveryStore)
-        do {
-            try Self.stageCaptureBeforeLaunching(
-                samples: samples,
-                stage: { try recoveryService.stageProvisional(samples: $0, capturedAt: Date()) },
-                launch: { staged in
-                    Task {
-                        guard let recovery = await registerProvisionalAudio(staged, service: recoveryService) else {
-                            isProcessing = false
-                            recordingHUDDidReachTerminalState(generation: hudGeneration)
-                            return
-                        }
-                        let resolvedCapture = await resolveWindowOCR(
-                            scope: contextScope,
-                            capture: contextCapture,
-                            target: contextTarget
-                        )
-                        if let hint = Self.contextPermissionHint(for: resolvedCapture.limitation) {
-                            hud.show(text: hint)
-                        }
-                        let resolved = Self.resolveContextAwareTemplate(
-                            automaticStyleEnabled: automaticStyleEnabled,
-                            capture: resolvedCapture,
-                            rules: appRules,
-                            templates: templates,
-                            activeTemplateID: activeTemplateID
-                        )
-                        await runPipeline(
-                            samples: samples,
-                            engine: engine,
-                            engineName: engineName,
-                            template: resolved.template,
-                            appName: appName,
-                            target: insertionTarget,
-                            forcedLanguage: forcedLanguage,
-                            outputLanguage: capturedOutputLanguage,
-                            cloudSnapshot: capturedCloudSnapshot,
-                            skipPostProcessing: stopRequest.skipPostProcessing,
-                            processor: processor,
-                            localContext: Self.localContextForProcessor(
-                                isCloudConfigured: !(processor is AppleFMProcessor),
-                                capture: resolvedCapture
-                            ),
-                            recovery: recovery,
-                            hudGeneration: hudGeneration
-                        )
-                    }
-                }
-            )
-        } catch {
-            lastError = "Failed to save recording: \(error.localizedDescription)"
-            hud.flash("Recording could not be saved — transcription not started")
+        guard let staged = stoppedCapture?.staged else {
+            lastError = "Durable recording ownership is unavailable"
+            hud.flash("Recording saved for recovery — processing not started")
             isProcessing = false
             recordingHUDDidReachTerminalState(generation: hudGeneration)
+            return
+        }
+        let recoveryService = makeJournalRecoveryService(store: recoveryStore)
+        Task {
+            do {
+                let capture = try await recoveryService.registerJournalCapture(
+                    staged, capturedAt: Date()
+                )
+                let recovery = ForegroundRecovery(
+                    service: recoveryService, capture: capture,
+                    captureID: staged.captureID
+                )
+                try? await jobLibraryStore?.refresh()
+                let resolvedCapture = await resolveWindowOCR(
+                    scope: contextScope,
+                    capture: contextCapture,
+                    target: contextTarget
+                )
+                if let hint = Self.contextPermissionHint(for: resolvedCapture.limitation) {
+                    hud.show(text: hint)
+                }
+                let resolved = Self.resolveContextAwareTemplate(
+                    automaticStyleEnabled: automaticStyleEnabled,
+                    capture: resolvedCapture,
+                    rules: appRules,
+                    templates: templates,
+                    activeTemplateID: activeTemplateID
+                )
+                await runPipeline(
+                    samples: samples,
+                    engine: engine,
+                    engineName: engineName,
+                    template: resolved.template,
+                    appName: appName,
+                    target: insertionTarget,
+                    forcedLanguage: forcedLanguage,
+                    outputLanguage: capturedOutputLanguage,
+                    cloudSnapshot: capturedCloudSnapshot,
+                    skipPostProcessing: stopRequest.skipPostProcessing,
+                    processor: processor,
+                    localContext: Self.localContextForProcessor(
+                        isCloudConfigured: !(processor is AppleFMProcessor),
+                        capture: resolvedCapture
+                    ),
+                    recovery: recovery,
+                    hudGeneration: hudGeneration
+                )
+            } catch {
+                lastError = "Failed to queue durable recording: \(error.localizedDescription)"
+                hud.flash("Recording saved for recovery — processing not started")
+                isProcessing = false
+                recordingHUDDidReachTerminalState(generation: hudGeneration)
+            }
         }
     }
 
@@ -2307,6 +2314,7 @@ final class AppCoordinator: ObservableObject {
     private struct ForegroundRecovery {
         let service: RecoveryCaptureService
         let capture: ProvisionalRecoveryCapture
+        let captureID: UUID
     }
 
     nonisolated static func stageCaptureBeforeLaunching<Capture>(
@@ -2317,19 +2325,20 @@ final class AppCoordinator: ObservableObject {
         launch(try stage(samples))
     }
 
-    private func registerProvisionalAudio(
-        _ staged: StagedRecoveryCapture,
-        service: RecoveryCaptureService
-    ) async -> ForegroundRecovery? {
-        do {
-            let capture = try await service.registerProvisional(staged)
-            try? await jobLibraryStore?.refresh()
-            return ForegroundRecovery(service: service, capture: capture)
-        } catch {
-            lastError = "Recording saved for recovery, but could not be queued: \(error.localizedDescription)"
-            hud.flash("Recording saved for recovery — transcription not started")
-            return nil
-        }
+    private func makeJournalRecoveryService(
+        store: TranscriptionJobStore
+    ) -> RecoveryCaptureService {
+        RecoveryCaptureService(
+            directory: Self.recoveryDirectory,
+            store: store,
+            ledger: store,
+            journalFileSystem: LocalJournalFileSystem(),
+            libraryDictationID: { captureID in
+                try await MainActor.run {
+                    try LibraryStore.shared.dictations(captureID: captureID).first?.id
+                }
+            }
+        )
     }
 
     private func failForegroundRecovery(_ recovery: ForegroundRecovery, failure: JobFailure) async {
@@ -2343,7 +2352,9 @@ final class AppCoordinator: ObservableObject {
 
     private func completeForegroundRecovery(_ recovery: ForegroundRecovery) async -> Bool {
         do {
-            try await recovery.service.completeProvisional(recovery.capture)
+            try await recovery.service.completeJournalCapture(
+                recovery.capture, captureID: recovery.captureID
+            )
             try? await jobLibraryStore?.refresh()
             return true
         } catch {
@@ -2366,7 +2377,18 @@ final class AppCoordinator: ObservableObject {
                     appName: appName, target: target, forcedLanguage: forcedLanguage,
                     skipPostProcessing: skipPostProcessing, outputLanguage: outputLanguage,
                     cloudSnapshot: cloudSnapshot.eligibility.isEligible ? cloudSnapshot : nil,
-                    processor: processor, localContext: localContext
+                    processor: processor, localContext: localContext,
+                    record: { result in
+                        try LibraryStore.shared.record(
+                            language: result.sourceLanguage.rawValue,
+                            requestedOutputLanguage: result.requestedOutputLanguage,
+                            template: result.templateName,
+                            transcript: result.rawTranscript,
+                            refined: result.finalOutput,
+                            engine: result.engineName,
+                            captureID: recovery.captureID
+                        )
+                    }
                 )
             },
             onSuccess: { result in
@@ -2426,7 +2448,7 @@ final class AppCoordinator: ObservableObject {
         outputLanguage: OutputLanguage,
         cloudSnapshot: CloudLLMSettingsSnapshot,
         skipPostProcessing: Bool,
-        stoppedCapture: (samples: [Float], peak: Float, rms: Float)?
+        stoppedCapture: (samples: [Float], peak: Float, rms: Float, staged: StagedCapture?)?
     ) {
         invalidateCapTimer()
         stopLivePreview()
@@ -2475,19 +2497,29 @@ final class AppCoordinator: ObservableObject {
             recordingHUDDidReachTerminalState(generation: hudGeneration)
             return
         }
-        let recoveryService = RecoveryCaptureService(directory: Self.recoveryDirectory, store: recoveryStore)
-        do {
-            try Self.stageCaptureBeforeLaunching(
-                samples: samples,
-                stage: { try recoveryService.stageProvisional(samples: $0, capturedAt: Date()) },
-                launch: { staged in
-                    Task {
-                        defer {
-                            isProcessing = false
-                            recordingHUDDidReachTerminalState(generation: hudGeneration)
-                        }
-                        guard let recovery = await registerProvisionalAudio(staged, service: recoveryService) else { return }
-                        await Self.runScratchpadPipelineTask(
+        guard let staged = stoppedCapture?.staged else {
+            lastError = "Durable recording ownership is unavailable"
+            hud.flash("Recording saved for recovery — processing not started")
+            isProcessing = false
+            recordingHUDDidReachTerminalState(generation: hudGeneration)
+            return
+        }
+        let recoveryService = makeJournalRecoveryService(store: recoveryStore)
+        Task {
+            do {
+                defer {
+                    isProcessing = false
+                    recordingHUDDidReachTerminalState(generation: hudGeneration)
+                }
+                let capture = try await recoveryService.registerJournalCapture(
+                    staged, capturedAt: Date()
+                )
+                let recovery = ForegroundRecovery(
+                    service: recoveryService, capture: capture,
+                    captureID: staged.captureID
+                )
+                try? await jobLibraryStore?.refresh()
+                await Self.runScratchpadPipelineTask(
                             operation: {
                                 try await destinationLifecycle.runAsync(
                                     destination: .scratchpad(token),
@@ -2504,6 +2536,27 @@ final class AppCoordinator: ObservableObject {
                                 )
                             },
                             onSuccess: { result, accepted in
+                                do {
+                                    try LibraryStore.shared.record(
+                                        language: result.language,
+                                        requestedOutputLanguage: outputLanguage,
+                                        template: result.recordedTemplateName,
+                                        transcript: result.transcript,
+                                        refined: result.refined,
+                                        engine: result.engineName,
+                                        captureID: staged.captureID
+                                    )
+                                } catch {
+                                    await failForegroundRecovery(
+                                        recovery,
+                                        failure: JobFailure(
+                                            stage: .persisting,
+                                            message: "Library save failed"
+                                        )
+                                    )
+                                    hud.flash("Library save failed — audio saved")
+                                    return
+                                }
                                 guard await completeForegroundRecovery(recovery) else {
                                     hud.flash("Dictation ready — recovery cleanup failed")
                                     return
@@ -2540,15 +2593,13 @@ final class AppCoordinator: ObservableObject {
                                 ))
                                 hud.flash(message)
                             }
-                        )
-                    }
-                }
-            )
-        } catch {
-            lastError = "Failed to save recording: \(error.localizedDescription)"
-            hud.flash("Recording could not be saved — transcription not started")
-            isProcessing = false
-            recordingHUDDidReachTerminalState(generation: hudGeneration)
+                )
+            } catch {
+                lastError = "Failed to queue durable recording: \(error.localizedDescription)"
+                hud.flash("Recording saved for recovery — processing not started")
+                isProcessing = false
+                recordingHUDDidReachTerminalState(generation: hudGeneration)
+            }
         }
     }
 
@@ -2840,13 +2891,34 @@ final class AppCoordinator: ObservableObject {
         let pipeline = RecoveryRetryPipeline(
             directory: Self.recoveryDirectory,
             store: recoveryStore,
-            processDictation: { [weak self] samples, configuration in
+            processDictation: { [weak self] samples, configuration, captureID in
                 guard let self else { throw CancellationError() }
-                return try await self.processRecoveredDictation(samples: samples, configuration: configuration)
+                return try await self.processRecoveredDictation(
+                    samples: samples, configuration: configuration,
+                    captureID: captureID
+                )
             },
             errorStage: { error in
                 if case PipelineError.recordFailed = error { return .persisting }
                 return .transcribing
+            },
+            libraryDictationID: { captureID in
+                try await MainActor.run {
+                    try LibraryStore.shared.dictations(captureID: captureID).first?.id
+                }
+            },
+            finalizeJournalCapture: { [weak self] captureID, _ in
+                guard let self,
+                      let job = try await recoveryStore.job(id: captureID),
+                      try await recoveryStore.session(id: captureID) != nil else {
+                    return false
+                }
+                let service = await self.makeJournalRecoveryService(store: recoveryStore)
+                try await service.completeJournalCapture(
+                    ProvisionalRecoveryCapture(id: job.id, source: job.source),
+                    captureID: captureID
+                )
+                return true
             }
         )
         let runner = LocalJobRunner(
@@ -2922,7 +2994,8 @@ final class AppCoordinator: ObservableObject {
 
     private func processRecoveredDictation(
         samples: [Float],
-        configuration: AttemptConfiguration
+        configuration: AttemptConfiguration,
+        captureID: UUID
     ) async throws -> RecoveryDictation {
         let template = TemplateStore.shared.templates.first {
             $0.id == configuration.template || $0.name == configuration.template
@@ -2939,24 +3012,28 @@ final class AppCoordinator: ObservableObject {
             refined: transcription.text,
             engine: "WhisperKit"
         )
-        try Self.persistRecoveredDictation(dictation)
+        try Self.persistRecoveredDictation(dictation, captureID: captureID)
         return dictation
     }
 
     static func persistRecoveredDictation(
         _ dictation: RecoveryDictation,
-        record: (RecoveryDictation) throws -> Void = { dictation in
-            try LibraryStore.shared.record(
-                language: dictation.language,
-                template: dictation.template,
-                transcript: dictation.transcript,
-                refined: dictation.refined,
-                engine: dictation.engine
-            )
-        }
+        captureID: UUID? = nil,
+        record: ((RecoveryDictation) throws -> Void)? = nil
     ) throws {
         do {
-            try record(dictation)
+            if let record {
+                try record(dictation)
+            } else {
+                try LibraryStore.shared.record(
+                    language: dictation.language,
+                    template: dictation.template,
+                    transcript: dictation.transcript,
+                    refined: dictation.refined,
+                    engine: dictation.engine,
+                    captureID: captureID
+                )
+            }
         } catch {
             throw PipelineError.recordFailed(error)
         }

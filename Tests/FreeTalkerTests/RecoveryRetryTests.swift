@@ -93,6 +93,71 @@ import Testing
         ])
     }
 
+    @Test func restartWithObservableLibraryCaptureSkipsTranscriptionAndResumesFinalization() async throws {
+        let fixture = try await RetryFixture()
+        let probe = RetryProbe()
+        let events = LockedRetryEvents()
+        let pipeline = RecoveryRetryPipeline(
+            directory: fixture.directory,
+            store: fixture.store,
+            loadSamples: { _ in
+                Issue.record("Library-owned capture must not reload audio")
+                return []
+            },
+            processDictation: probe.process,
+            libraryDictationID: { captureID in
+                #expect(captureID == fixture.job.id)
+                return 77
+            },
+            finalizeJournalCapture: { captureID, libraryID in
+                events.append("finalize:\(captureID.uuidString):\(libraryID)")
+                return true
+            }
+        )
+
+        try await pipeline.execute(
+            jobID: fixture.job.id,
+            configuration: .init(),
+            cancellation: CancellationToken()
+        )
+
+        #expect(probe.configurations.isEmpty)
+        #expect(events.values == ["finalize:\(fixture.job.id.uuidString):77"])
+    }
+
+    @Test func libraryInsertDurableThenThrowIsFoundOnRestartWithoutRetranscription() async throws {
+        let fixture = try await RetryFixture()
+        let library = DurableLibraryProbe()
+        let pipeline = RecoveryRetryPipeline(
+            directory: fixture.directory,
+            store: fixture.store,
+            loadSamples: { _ in [0.1] },
+            processDictation: { _, _, captureID in
+                try await library.persistThenThrow(captureID: captureID)
+            },
+            libraryDictationID: { captureID in
+                await library.dictationID(captureID: captureID)
+            },
+            finalizeJournalCapture: { captureID, libraryID in
+                await library.finalize(captureID: captureID, libraryID: libraryID)
+            }
+        )
+
+        await #expect(throws: RetryTestError.database) {
+            try await pipeline.execute(
+                jobID: fixture.job.id, configuration: .init(),
+                cancellation: CancellationToken()
+            )
+        }
+        try await pipeline.execute(
+            jobID: fixture.job.id, configuration: .init(),
+            cancellation: CancellationToken()
+        )
+
+        #expect(await library.processCount == 1)
+        #expect(await library.finalizationCount == 1)
+    }
+
     @Test func interruptedRetryResumesTheSameAttemptWithPersistedOverrides() async throws {
         let fixture = try await RetryFixture()
         try await fixture.store.transition(fixture.job.id, from: .processing, to: .processing(stage: .transcribing))
@@ -233,10 +298,39 @@ private actor CloudBoundaryProbe {
     func call() { calls += 1 }
 }
 
+private actor DurableLibraryProbe {
+    private var storedCaptureID: UUID?
+    private(set) var processCount = 0
+    private(set) var finalizationCount = 0
+
+    func persistThenThrow(captureID: UUID) throws -> RecoveryDictation {
+        processCount += 1
+        storedCaptureID = captureID
+        throw RetryTestError.database
+    }
+
+    func dictationID(captureID: UUID) -> Int64? {
+        storedCaptureID == captureID ? 123 : nil
+    }
+
+    func finalize(captureID: UUID, libraryID: Int64) -> Bool {
+        guard storedCaptureID == captureID, libraryID == 123 else { return false }
+        finalizationCount += 1
+        return true
+    }
+}
+
 private enum RetryTestError: Error, LocalizedError {
     case database
 
     var errorDescription: String? { "database" }
+}
+
+private final class LockedRetryEvents: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [String] = []
+    var values: [String] { lock.withLock { storage } }
+    func append(_ value: String) { lock.withLock { storage.append(value) } }
 }
 
 private final class RetryProbe: @unchecked Sendable {
@@ -255,7 +349,7 @@ private final class RetryProbe: @unchecked Sendable {
         self.recordFails = recordFails
     }
 
-    func process(samples: [Float], configuration: AttemptConfiguration) async throws -> RecoveryDictation {
+    func process(samples: [Float], configuration: AttemptConfiguration, captureID: UUID) async throws -> RecoveryDictation {
         lock.withLock {
             storedConfigurations.append(configuration)
             storedEvents.append("transcribe")
