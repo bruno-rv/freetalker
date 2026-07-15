@@ -138,7 +138,11 @@ final class AppSettings: ObservableObject {
     }
 
     @Published var edgeLauncherEdge: LauncherEdge {
-        didSet { defaults.set(edgeLauncherEdge.rawValue, forKey: Keys.edgeLauncherEdge) }
+        didSet {
+            defaults.set(edgeLauncherEdge.rawValue, forKey: Keys.edgeLauncherEdge)
+            guard edgeLauncherEdge != oldValue else { return }
+            resetLauncherPanelPosition()
+        }
     }
 
     @Published var edgeLauncherPosition: Double {
@@ -149,7 +153,9 @@ final class AppSettings: ObservableObject {
                 defaults.set(clamped, forKey: Keys.edgeLauncherPosition)
                 return
             }
-            defaults.set(edgeLauncherPosition, forKey: Keys.edgeLauncherPosition)
+            defaults.set(clamped, forKey: Keys.edgeLauncherPosition)
+            guard clamped != oldValue else { return }
+            resetLauncherPanelPosition()
         }
     }
 

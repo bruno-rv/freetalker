@@ -130,10 +130,14 @@ final class FloatingControlsController {
             .combineLatest(settings.$languagePin)
             .sink { [weak self] launcherSettings, languagePin in
                 guard let self else { return }
-                let (enabled, _) = launcherSettings
+                let (enabled, savedPosition) = launcherSettings
                 self.presentedLanguagePin = languagePin
                 self.refreshTranslationState()
-                if enabled { self.show() } else { self.hideForDisabledSetting() }
+                if enabled {
+                    self.show(savedPosition: savedPosition)
+                } else {
+                    self.hideForDisabledSetting()
+                }
             }
             .store(in: &cancellables)
         let configurationUpdates = Publishers.CombineLatest4(
@@ -175,7 +179,7 @@ final class FloatingControlsController {
 
     func screenConfigurationDidChange() {
         guard settings.edgeLauncherEnabled else { return }
-        renderAndPosition()
+        renderAndPosition(savedPosition: settings.launcherPanelPosition)
         hostingView?.reinstallTrackingArea()
     }
 
@@ -206,7 +210,9 @@ final class FloatingControlsController {
 
     private func refreshOutputPresentation() {
         refreshTranslationState()
-        if settings.edgeLauncherEnabled { renderAndPosition() }
+        if settings.edgeLauncherEnabled {
+            renderAndPosition(savedPosition: settings.launcherPanelPosition)
+        }
     }
 
     static func makePanel(size: NSSize) -> NSPanel {
@@ -226,11 +232,11 @@ final class FloatingControlsController {
         return panel
     }
 
-    private func show() {
+    private func show(savedPosition: NormalizedWindowPosition?) {
         if panel == nil {
             panel = Self.makePanel(size: CGSize(width: 18, height: 64))
         }
-        renderAndPosition()
+        renderAndPosition(savedPosition: savedPosition)
     }
 
     private func hideForDisabledSetting() {
@@ -246,7 +252,7 @@ final class FloatingControlsController {
         collapseWorkItem = nil
         state.reduce(.pointerEntered)
         state.reduce(.expansionCompleted)
-        renderAndPosition()
+        renderAndPosition(savedPosition: settings.launcherPanelPosition)
     }
 
     private func pointerExited() {
@@ -255,13 +261,13 @@ final class FloatingControlsController {
         let item = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.state.reduce(.collapseDelayElapsed)
-            self.renderAndPosition()
+            self.renderAndPosition(savedPosition: self.settings.launcherPanelPosition)
         }
         collapseWorkItem = item
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.0, execute: item)
     }
 
-    private func renderAndPosition() {
+    private func renderAndPosition(savedPosition: NormalizedWindowPosition?) {
         guard let panel else { return }
         guard !isRecording() else {
             panel.orderOut(nil)
@@ -311,16 +317,21 @@ final class FloatingControlsController {
         let placementContext = FloatingPanelPlacementPolicy.captureContext()
         let displays = placementContext.displays
         let fallback = Self.displayFrame(fallbackScreen, in: placementContext)
-        if settings.launcherPanelPosition == nil {
-            settings.launcherPanelPosition = FloatingPanelGeometry.legacyLauncherPosition(
+        let resolvedPosition: NormalizedWindowPosition
+        if let savedPosition {
+            resolvedPosition = savedPosition
+        } else {
+            let legacyPosition = FloatingPanelGeometry.legacyLauncherPosition(
                 edge: settings.edgeLauncherEdge,
                 position: settings.edgeLauncherPosition,
                 panelSize: size,
                 display: fallback
             )
+            settings.launcherPanelPosition = legacyPosition
+            resolvedPosition = legacyPosition
         }
         let restoredOrigin = FloatingPanelGeometry.restoredOrigin(
-            saved: settings.launcherPanelPosition,
+            saved: resolvedPosition,
             displays: displays,
             fallback: fallback,
             panelSize: size

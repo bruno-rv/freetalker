@@ -4,6 +4,67 @@ import Testing
 
 @MainActor
 struct FloatingControlsSettingsTests {
+    @Test("changing edge clears drag and rematerializes placement",
+          arguments: LauncherEdge.allCases)
+    func changingEdge(edge: LauncherEdge) throws {
+        let fixture = try FloatingSettingsFixture()
+        fixture.settings.edgeLauncherPosition = 0.25
+        fixture.settings.edgeLauncherEdge = edge == .right ? .left : .right
+        fixture.settings.launcherPanelPosition = NormalizedWindowPosition(
+            displayID: "main", x: 1, y: 0.5
+        )
+
+        fixture.settings.edgeLauncherEdge = edge
+
+        #expect(fixture.settings.launcherPanelPosition == nil)
+        #expect(fixture.defaults.data(forKey: "launcherPanelPosition") == nil)
+        let visible = CGRect(x: 100, y: 80, width: 1_000, height: 700)
+        let size = CGSize(width: 54, height: 54)
+        let display = DisplayFrame(id: "main", visibleFrame: visible)
+        let saved = FloatingPanelGeometry.legacyLauncherPosition(
+            edge: edge,
+            position: 0.25,
+            panelSize: size,
+            display: display
+        )
+        let origin = FloatingPanelGeometry.restoredOrigin(
+            saved: saved, displays: [display], fallback: display, panelSize: size
+        )
+        let frame = CGRect(origin: origin, size: size)
+        assert(frame: frame, touches: edge, visibleFrame: visible,
+               alongEdgePosition: 0.25)
+    }
+
+    @Test("changing along-edge position clears drag override")
+    func changingAlongEdgePosition() throws {
+        let fixture = try FloatingSettingsFixture()
+        fixture.settings.edgeLauncherEdge = .bottom
+        fixture.settings.launcherPanelPosition = NormalizedWindowPosition(
+            displayID: "main", x: 1, y: 0.5
+        )
+
+        fixture.settings.edgeLauncherPosition = 0.75
+
+        #expect(fixture.settings.launcherPanelPosition == nil)
+        #expect(fixture.defaults.data(forKey: "launcherPanelPosition") == nil)
+    }
+
+    @Test("drag after settings change becomes relaunch position")
+    func dragWinsAfterSettingsChange() throws {
+        let fixture = try FloatingSettingsFixture()
+        fixture.settings.edgeLauncherEdge = .bottom
+        fixture.settings.edgeLauncherPosition = 0.75
+        let dragged = NormalizedWindowPosition(
+            displayID: "secondary", x: 0.42, y: 0.38
+        )
+        fixture.settings.launcherPanelPosition = dragged
+
+        let reloaded = AppSettings(defaults: fixture.defaults)
+        #expect(reloaded.edgeLauncherEdge == .bottom)
+        #expect(reloaded.edgeLauncherPosition == 0.75)
+        #expect(reloaded.launcherPanelPosition == dragged)
+    }
+
     @Test func launcherDefaultsAreSafe() {
         let defaults = isolatedDefaults()
         defer { remove(defaults) }
@@ -141,4 +202,58 @@ struct FloatingControlsSettingsTests {
         let suite = defaults.string(forKey: "testSuiteName")!
         defaults.removePersistentDomain(forName: suite)
     }
+
+    private func assert(
+        frame: CGRect,
+        touches edge: LauncherEdge,
+        visibleFrame: CGRect,
+        alongEdgePosition: Double
+    ) {
+        let tolerance = 0.000_001
+        switch edge {
+        case .left:
+            #expect(abs(frame.minX - visibleFrame.minX) < tolerance)
+            let position = (frame.minY - visibleFrame.minY) / (visibleFrame.height - frame.height)
+            #expect(abs(position - alongEdgePosition) < tolerance)
+        case .right:
+            #expect(abs(frame.maxX - visibleFrame.maxX) < tolerance)
+            let position = (frame.minY - visibleFrame.minY) / (visibleFrame.height - frame.height)
+            #expect(abs(position - alongEdgePosition) < tolerance)
+        case .top:
+            #expect(abs(frame.maxY - visibleFrame.maxY) < tolerance)
+            let position = (frame.minX - visibleFrame.minX) / (visibleFrame.width - frame.width)
+            #expect(abs(position - alongEdgePosition) < tolerance)
+        case .bottom:
+            #expect(abs(frame.minY - visibleFrame.minY) < tolerance)
+            let position = (frame.minX - visibleFrame.minX) / (visibleFrame.width - frame.width)
+            #expect(abs(position - alongEdgePosition) < tolerance)
+        }
+    }
+}
+
+@MainActor
+private final class FloatingSettingsFixture {
+    private let suiteName: String
+    private nonisolated(unsafe) let cleanupDefaults: UserDefaults
+    let defaults: UserDefaults
+    let settings: AppSettings
+
+    init() throws {
+        let suite = "FloatingControlsSettingsTests.Fixture.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            throw FloatingSettingsFixtureError.unavailableDefaults
+        }
+        suiteName = suite
+        cleanupDefaults = defaults
+        self.defaults = defaults
+        settings = AppSettings(defaults: defaults)
+    }
+
+    deinit {
+        cleanupDefaults.removePersistentDomain(forName: suiteName)
+    }
+}
+
+private enum FloatingSettingsFixtureError: Error {
+    case unavailableDefaults
 }
