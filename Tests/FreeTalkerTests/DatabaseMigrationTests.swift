@@ -7,7 +7,7 @@ import Testing
     @Test func migratesEmptyDatabaseToLatestSchema() throws {
         let db = try TemporaryDatabase()
 
-        try DatabaseMigrator.migrate(db.handle)
+        try DatabaseMigrator.migrate(db.handle, role: .jobs)
 
         #expect(try db.tableNames() == [
             "transcription_jobs", "job_attempts", "speaker_segments",
@@ -31,21 +31,37 @@ import Testing
 
     @Test func versionTenJobsUpgradePreservesRowsAndIsIdempotent() throws {
         let db = try TemporaryDatabase()
-        try DatabaseMigrator.migrate(db.handle)
+        try DatabaseMigrator.migrate(db.handle, role: .jobs)
         try db.execute("""
+        DROP INDEX idx_capture_sessions_state_captured_at;
+        DROP TABLE capture_segments;
+        DROP TABLE capture_sessions;
         DELETE FROM schema_migrations WHERE version = 11;
+        CREATE TABLE dictations (
+          id INTEGER PRIMARY KEY, ts REAL NOT NULL, language TEXT NOT NULL,
+          template TEXT NOT NULL, transcript TEXT NOT NULL, refined TEXT NOT NULL,
+          engine TEXT NOT NULL, source_id INTEGER,
+          requested_output_language TEXT NOT NULL DEFAULT 'same'
+        );
         INSERT INTO transcription_jobs
             (id, kind, source_reference, state, created_at, updated_at)
         VALUES ('kept-job', 'recovery', '/kept.wav', 'failed', 100, 101);
         """)
+        #expect(try db.integer("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('capture_sessions', 'capture_segments');") == 0)
+        #expect(try db.integer("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_capture_sessions_state_captured_at';") == 0)
 
-        try DatabaseMigrator.migrate(db.handle)
+        try DatabaseMigrator.migrate(db.handle, role: .jobs)
         let schema = try db.schema()
-        try DatabaseMigrator.migrate(db.handle)
+        try DatabaseMigrator.migrate(db.handle, role: .jobs)
 
         #expect(try db.integer("SELECT COUNT(*) FROM transcription_jobs WHERE id = 'kept-job';") == 1)
         #expect(try db.schema() == schema)
+        #expect(try db.integer("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('capture_sessions', 'capture_segments');") == 2)
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('capture_segments') WHERE (name = 'capture_id' AND pk = 1) OR (name = 'ordinal' AND pk = 2);") == 2)
+        #expect(try db.integer("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_capture_sessions_state_captured_at';") == 1)
         #expect(try db.integer("SELECT COUNT(*) FROM pragma_foreign_key_list('capture_segments') WHERE \"table\" = 'capture_sessions' AND \"from\" = 'capture_id' AND on_delete = 'CASCADE';") == 1)
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('dictations') WHERE name = 'capture_id';") == 0)
+        #expect(try db.integer("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_dictations_capture_id';") == 0)
         #expect(try db.migrationVersions() == Array(1...DatabaseMigrator.latestVersion))
     }
 
@@ -53,6 +69,9 @@ import Testing
         let db = try TemporaryDatabase()
         try DatabaseMigrator.migrate(db.handle)
         try db.execute("""
+        DROP INDEX idx_capture_sessions_state_captured_at;
+        DROP TABLE capture_segments;
+        DROP TABLE capture_sessions;
         CREATE TABLE dictations (
           id INTEGER PRIMARY KEY, ts REAL NOT NULL, language TEXT NOT NULL,
           template TEXT NOT NULL, transcript TEXT NOT NULL, refined TEXT NOT NULL,
@@ -64,14 +83,18 @@ import Testing
           (id, ts, language, template, transcript, refined, engine, source_id, requested_output_language)
         VALUES (7, 123, 'pt', 'Clean', 'raw', 'kept', 'local', NULL, 'same');
         """)
+        #expect(try db.integer("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('capture_sessions', 'capture_segments');") == 0)
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('dictations') WHERE name = 'capture_id';") == 0)
 
-        try DatabaseMigrator.migrate(db.handle)
+        try DatabaseMigrator.migrate(db.handle, role: .library)
         let schema = try db.schema()
-        try DatabaseMigrator.migrate(db.handle)
+        try DatabaseMigrator.migrate(db.handle, role: .library)
 
         #expect(try db.string("SELECT language || '|' || requested_output_language || '|' || refined FROM dictations WHERE id = 7;") == "pt|same|kept")
         #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('dictations') WHERE name = 'capture_id' AND type = 'TEXT';") == 1)
         #expect(try db.integer("SELECT COUNT(*) FROM pragma_index_list('dictations') WHERE name = 'idx_dictations_capture_id' AND \"unique\" = 1;") == 1)
+        #expect(try db.integer("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('capture_sessions', 'capture_segments');") == 0)
+        #expect(try db.integer("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_capture_sessions_state_captured_at';") == 0)
         #expect(try db.schema() == schema)
         #expect(try db.migrationVersions() == Array(1...DatabaseMigrator.latestVersion))
     }
@@ -155,7 +178,7 @@ import Testing
 
     @Test func versionNineLibraryUpgradePreservesRowsAndAddsOutputMetadata() throws {
         let db = try TemporaryDatabase()
-        try DatabaseMigrator.migrate(db.handle)
+        try DatabaseMigrator.migrate(db.handle, role: .library)
         try db.execute("""
         DELETE FROM schema_migrations WHERE version >= 10;
         CREATE TABLE dictations (
@@ -166,7 +189,7 @@ import Testing
         INSERT INTO dictations VALUES (7, 123, 'pt', 'Clean', 'raw', 'kept', 'local', NULL);
         """)
 
-        try DatabaseMigrator.migrate(db.handle)
+        try DatabaseMigrator.migrate(db.handle, role: .library)
 
         #expect(try db.string("SELECT language || '|' || requested_output_language || '|' || refined FROM dictations WHERE id = 7;") == "pt|same|kept")
         #expect(try db.migrationVersions() == Array(1...DatabaseMigrator.latestVersion))
@@ -184,7 +207,7 @@ import Testing
         }
         do {
             let legacy = try TemporaryDatabase(path: url.path)
-            try DatabaseMigrator.migrate(legacy.handle)
+            try DatabaseMigrator.migrate(legacy.handle, role: .library)
             try legacy.execute("""
             DELETE FROM schema_migrations WHERE version >= 10;
             CREATE TABLE dictations (
@@ -208,7 +231,7 @@ import Testing
             INSERT INTO dictations VALUES (41, 1, 'en', 'Clean', 'source words', 'source result', 'local', NULL);
             INSERT INTO dictations VALUES (99, 2, 'pt', 'Clean', 'child words', 'searchable child', 'local', 41);
             """)
-            try DatabaseMigrator.migrate(legacy.handle)
+            try DatabaseMigrator.migrate(legacy.handle, role: .library)
             #expect(try legacy.integer("SELECT COUNT(*) FROM pragma_foreign_key_list('dictations') WHERE \"from\" = 'source_id';") == 0)
         }
 
@@ -248,7 +271,7 @@ import Testing
         }
         do {
             let shared = try TemporaryDatabase(path: url.path)
-            try DatabaseMigrator.migrate(shared.handle)
+            try DatabaseMigrator.migrate(shared.handle, role: .library)
             #expect(try shared.migrationVersions() == Array(1...DatabaseMigrator.latestVersion))
         }
 
@@ -271,7 +294,7 @@ import Testing
           engine TEXT NOT NULL, source_id INTEGER
         );
         """)
-        try DatabaseMigrator.migrate(db.handle)
+        try DatabaseMigrator.migrate(db.handle, role: .library)
         try db.execute("""
         DROP TABLE dictation_translation_variants;
         ALTER TABLE dictations DROP COLUMN requested_output_language;
@@ -282,7 +305,9 @@ import Testing
         VALUES (7, 1, 'en', 'Clean', 'raw', 'kept', 'local', NULL);
         """)
 
-        #expect(throws: DatabaseError.self) { try DatabaseMigrator.migrate(db.handle) }
+        #expect(throws: DatabaseError.self) {
+            try DatabaseMigrator.migrate(db.handle, role: .library)
+        }
 
         #expect(try db.migrationVersions() == Array(1...9))
         #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('dictations') WHERE name = 'requested_output_language';") == 0)

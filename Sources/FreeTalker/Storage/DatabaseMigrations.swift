@@ -1,9 +1,14 @@
 import CSQLite
 
+enum DatabaseRole: Sendable {
+    case jobs
+    case library
+}
+
 enum DatabaseMigrator {
     static let latestVersion = 11
 
-    static func migrate(_ db: OpaquePointer) throws {
+    static func migrate(_ db: OpaquePointer, role: DatabaseRole = .jobs) throws {
         try execute(db, "BEGIN IMMEDIATE;")
         do {
             try execute(db, """
@@ -22,7 +27,7 @@ enum DatabaseMigrator {
                 if version == 10 {
                     try migrateLibraryV10(db)
                 } else if version == 11 {
-                    try migrateCaptureV11(db)
+                    try migrateCaptureV11(db, role: role)
                 } else {
                     try execute(db, migration)
                 }
@@ -232,8 +237,9 @@ enum DatabaseMigrator {
 
     private static let migrations = [migration1, migration2, migration3, migration4, migration5, migration6, migration7, migration8, migration9, migration10, migration11]
 
-    private static func migrateCaptureV11(_ db: OpaquePointer) throws {
-        if try tableExists("transcription_jobs", db: db) {
+    private static func migrateCaptureV11(_ db: OpaquePointer, role: DatabaseRole) throws {
+        switch role {
+        case .jobs:
             try execute(db, """
             CREATE TABLE IF NOT EXISTS capture_sessions (
                 id TEXT PRIMARY KEY,
@@ -262,8 +268,8 @@ enum DatabaseMigrator {
             CREATE INDEX IF NOT EXISTS idx_capture_sessions_state_captured_at
                 ON capture_sessions(state, captured_at);
             """)
-        }
-        if try tableExists("dictations", db: db) {
+        case .library:
+            guard try tableExists("dictations", db: db) else { return }
             if try !columnExists("capture_id", in: "dictations", db: db) {
                 try execute(db, "ALTER TABLE dictations ADD COLUMN capture_id TEXT;")
             }

@@ -26,7 +26,7 @@ actor TranscriptionJobStore {
             guard sqlite3_exec(database, "PRAGMA foreign_keys = ON;", nil, nil, nil) == SQLITE_OK else {
                 throw DatabaseError.sqlFailed(String(cString: sqlite3_errmsg(database)))
             }
-            try DatabaseMigrator.migrate(database)
+            try DatabaseMigrator.migrate(database, role: .jobs)
         } catch {
             sqlite3_close(database)
             throw error

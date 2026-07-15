@@ -29,7 +29,7 @@ final class Database {
         try exec("PRAGMA secure_delete=ON;")
         try exec("PRAGMA foreign_keys=ON;")
         try createSchema()
-        try DatabaseMigrator.migrate(try requireHandle())
+        try DatabaseMigrator.migrate(try requireHandle(), role: .library)
         try createCaptureIdentitySchema()
         try createTranslationSchema()
     }

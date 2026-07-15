@@ -18,7 +18,7 @@ actor SnippetStore {
         do {
             try DatabasePrivacy.secureOpenedDatabase(database, url: databaseURL)
             try Self.execute(database, "PRAGMA foreign_keys=ON;")
-            try DatabaseMigrator.migrate(database)
+            try DatabaseMigrator.migrate(database, role: .jobs)
             guard try Self.foreignKeysEnabled(database) else {
                 throw DatabaseError.sqlFailed("SQLite foreign key enforcement could not be enabled")
             }

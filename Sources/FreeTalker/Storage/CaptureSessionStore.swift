@@ -89,7 +89,11 @@ extension TranscriptionJobStore: CaptureLedgerStoring {
             throw JobStoreError.invalidTransition
         }
         if from == to {
-            guard try session(id: id)?.state == from else { throw JobStoreError.invalidTransition }
+            guard try transitionMatchesPersistedSession(
+                id: id, state: to, recoveryJobID: recoveryJobID,
+                libraryDictationID: libraryDictationID, assetKind: assetKind,
+                failureMessage: failureMessage, contentHash: contentHash
+            ) else { throw JobStoreError.invalidTransition }
             return
         }
         let statement = try capturePrepare("""
@@ -113,8 +117,30 @@ extension TranscriptionJobStore: CaptureLedgerStoring {
         captureBind(from.rawValue, at: 8, in: statement)
         try captureStepDone(statement)
         if sqlite3_changes(handle) == 0 {
-            guard try session(id: id)?.state == to else { throw JobStoreError.invalidTransition }
+            guard try transitionMatchesPersistedSession(
+                id: id, state: to, recoveryJobID: recoveryJobID,
+                libraryDictationID: libraryDictationID, assetKind: assetKind,
+                failureMessage: failureMessage, contentHash: contentHash
+            ) else { throw JobStoreError.invalidTransition }
         }
+    }
+
+    private func transitionMatchesPersistedSession(
+        id: UUID,
+        state: CaptureSessionState,
+        recoveryJobID: UUID?,
+        libraryDictationID: Int64?,
+        assetKind: RecoveryAssetKind,
+        failureMessage: String?,
+        contentHash: String?
+    ) throws -> Bool {
+        guard let persisted = try session(id: id) else { return false }
+        return persisted.state == state
+            && persisted.recoveryJobID == recoveryJobID
+            && persisted.libraryDictationID == libraryDictationID
+            && persisted.assetKind == assetKind
+            && persisted.failureMessage == failureMessage
+            && persisted.contentHash == contentHash
     }
 
     func session(id: UUID) throws -> CaptureSession? {
@@ -197,8 +223,7 @@ extension TranscriptionJobStore: CaptureLedgerStoring {
              (.capturing, .damaged), (.capturing, .cancelling),
              (.staged, .processing), (.staged, .damaged), (.staged, .cancelling),
              (.processing, .libraryCommitted), (.processing, .damaged),
-             (.processing, .cancelling),
-             (.damaged, .processing), (.damaged, .cancelling),
+             (.processing, .cancelling), (.damaged, .cancelling),
              (.silent, .cancelling), (.libraryCommitted, .cancelling): true
         default: false
         }
