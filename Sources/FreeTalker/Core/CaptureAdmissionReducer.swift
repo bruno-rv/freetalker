@@ -110,9 +110,20 @@ struct CaptureAdmissionReducer {
             state = .idle
             return .none
 
+        case (.cleanupFailed(let expected, _), .failureHandled(let captureID))
+            where expected == captureID:
+            state = .idle
+            return .none
+
+        case (.cleanupFailed(let captureID, _), .cancelRequested):
+            state = .cancelling(captureID: captureID)
+            return .cancel(captureID)
+
         case (.cancelling(let expected), .cleanupFailed(let captureID, let message))
             where expected == captureID,
              (.finalizing(let expected), .cleanupFailed(let captureID, let message))
+            where expected == captureID,
+             (.cleanupFailed(let expected, _), .cleanupFailed(let captureID, let message))
             where expected == captureID:
             state = .cleanupFailed(captureID: captureID, message: message)
             return .fail(message)
@@ -128,6 +139,27 @@ struct CaptureAdmissionReducer {
             return .none
         }
     }
+}
+
+struct CaptureCleanupRetryGate {
+    private var active: (captureID: UUID, generation: UUID)?
+
+    mutating func begin(captureID: UUID) -> UUID? {
+        guard active == nil else { return nil }
+        let generation = UUID()
+        active = (captureID, generation)
+        return generation
+    }
+
+    mutating func finish(captureID: UUID, generation: UUID) -> Bool {
+        guard active?.captureID == captureID, active?.generation == generation else {
+            return false
+        }
+        active = nil
+        return true
+    }
+
+    func isInFlight(captureID: UUID) -> Bool { active?.captureID == captureID }
 }
 
 enum CaptureCanonicalAudioLoader {

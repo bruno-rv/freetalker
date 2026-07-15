@@ -1,5 +1,10 @@
 import Foundation
 
+struct OwnedCapturePreparationFailure: Error, @unchecked Sendable {
+    let active: ActiveCaptureJournal
+    let message: String
+}
+
 struct CaptureJournalService: Sendable {
     let fileSystem: any JournalFileSystem
     let ledger: any CaptureLedgerStoring
@@ -26,8 +31,26 @@ struct CaptureJournalService: Sendable {
             )
         }
         try fileSystem.createDirectory(request.directory)
-        try fileSystem.synchronizeDirectory(request.directory.deletingLastPathComponent())
-        let session = try await ledger.createCapture(request)
+        do {
+            try fileSystem.synchronizeDirectory(request.directory.deletingLastPathComponent())
+        } catch {
+            try await compensateOrOwnFailedPrepare(request, original: error)
+            throw error
+        }
+        let session: CaptureSession
+        do {
+            session = try await ledger.createCapture(request)
+        } catch {
+            if let persisted = try await ledger.session(id: request.id) {
+                return makeActive(persisted)
+            }
+            try await compensateOrOwnFailedPrepare(request, original: error)
+            throw error
+        }
+        return makeActive(session)
+    }
+
+    private func makeActive(_ session: CaptureSession) -> ActiveCaptureJournal {
         let codec = CaptureSegmentCodec(fileSystem: fileSystem)
         return ActiveCaptureJournal(
             session: session,
@@ -36,6 +59,52 @@ struct CaptureJournalService: Sendable {
                 configuration: configuration, onFailure: onFailure
             )
         )
+    }
+
+    private func compensateFailedPrepare(_ request: CaptureStartRequest) throws {
+        if fileSystem.exists(request.directory) {
+            try fileSystem.remove(request.directory)
+        }
+        try fileSystem.synchronizeDirectory(request.directory.deletingLastPathComponent())
+    }
+
+    private func compensateOrOwnFailedPrepare(
+        _ request: CaptureStartRequest,
+        original: Error
+    ) async throws {
+        do {
+            try compensateFailedPrepare(request)
+            return
+        } catch let cleanupError {
+            let session: CaptureSession
+            do {
+                session = try await ledger.createCapture(request)
+            } catch {
+                if let persisted = try await ledger.session(id: request.id) {
+                    session = persisted
+                } else {
+                    let marker = request.directory.appendingPathComponent(
+                        "capture-preparation-failure.marker"
+                    )
+                    let temporary = request.directory.appendingPathComponent(
+                        ".capture-preparation-failure.\(UUID().uuidString).tmp"
+                    )
+                    try DurableArtifactWriter(fileSystem: fileSystem).commit(
+                        Data("capture \(request.id.uuidString) requires reconciliation".utf8),
+                        temporary: temporary, destination: marker
+                    )
+                    throw CaptureJournalError.failed(
+                        "capture \(request.id.uuidString) preparation and cleanup failed: "
+                            + "\(original.localizedDescription); \(cleanupError.localizedDescription)"
+                    )
+                }
+            }
+            throw OwnedCapturePreparationFailure(
+                active: makeActive(session),
+                message: "Preparation failed and cleanup needs retry: "
+                    + "\(original.localizedDescription); \(cleanupError.localizedDescription)"
+            )
+        }
     }
 
     func finish(_ active: ActiveCaptureJournal) async throws -> StagedCapture {

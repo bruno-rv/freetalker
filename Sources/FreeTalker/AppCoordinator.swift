@@ -55,6 +55,14 @@ final class AppCoordinator: ObservableObject {
         return captureStartDecision(current: current, requested: requested)
     }
 
+    nonisolated static func shouldHandleJournalFailure(
+        callbackCaptureID: UUID,
+        currentCaptureID: UUID?,
+        alreadyHandled: Bool
+    ) -> Bool {
+        !alreadyHandled && callbackCaptureID == currentCaptureID
+    }
+
     nonisolated static func capturePressDecision(current: CaptureOwner, pressed: CaptureOwner) -> CaptureDecision {
         if current == pressed { return .stop }
         return captureStartDecision(current: current, requested: pressed)
@@ -184,6 +192,14 @@ final class AppCoordinator: ObservableObject {
         let completion: Completion
     }
     private var pendingCaptureCleanup: PendingCaptureCleanup?
+    private var cleanupRetryGate = CaptureCleanupRetryGate()
+    private var cleanupRetryTask: Task<Void, Never>?
+    private struct PendingFailurePreservation {
+        let active: ActiveCaptureJournal
+        let service: CaptureJournalService
+        let message: String
+    }
+    private var pendingFailurePreservation: PendingFailurePreservation?
     private let hud = HUDController()
     private let recoveryStore: TranscriptionJobStore?
     let jobLibraryStore: JobLibraryStore?
@@ -1090,6 +1106,10 @@ final class AppCoordinator: ObservableObject {
     /// capture-start failure, so the caller never commits the state transition for a recording
     /// that never actually started.
     private func beginCapture(destination: RecordingDestination) -> Bool {
+        if pendingFailurePreservation != nil {
+            retryPendingFailurePreservation()
+            return false
+        }
         if pendingCaptureCleanup != nil {
             retryPendingCaptureCleanup()
             return false
@@ -1147,7 +1167,9 @@ final class AppCoordinator: ObservableObject {
             fileSystem: LocalJournalFileSystem(), ledger: recoveryStore,
             onFailure: { [weak self] message in
                 Task { @MainActor in
-                    self?.handleJournalConsumerFailure(.failed(message))
+                    self?.handleJournalConsumerFailure(
+                        captureID: captureID, result: .failed(message)
+                    )
                 }
             }
         )
@@ -1157,6 +1179,10 @@ final class AppCoordinator: ObservableObject {
                     try await service.prepare(request)
                 }.value
                 self?.completeCaptureAdmission(active, service: service)
+            } catch let owned as OwnedCapturePreparationFailure {
+                self?.handleOwnedPreparationFailure(
+                    owned, service: service, destination: destination
+                )
             } catch {
                 self?.failCaptureAdmission(
                     captureID: captureID,
@@ -1166,6 +1192,23 @@ final class AppCoordinator: ObservableObject {
             }
         }
         return true
+    }
+
+    private func handleOwnedPreparationFailure(
+        _ failure: OwnedCapturePreparationFailure,
+        service: CaptureJournalService,
+        destination: RecordingDestination
+    ) {
+        guard reduceCaptureAdmission(.prepared(
+            captureID: failure.active.session.id
+        )) != .none else { return }
+        _ = reduceCaptureAdmission(.cancelRequested)
+        activeCaptureJournal = failure.active
+        lastError = failure.message
+        hud.flash("Recording preparation failed — cleanup retained")
+        Task {
+            await cleanCancelledAdmission(failure.active, service: service)
+        }
     }
 
     private func completeCaptureAdmission(
@@ -1183,7 +1226,11 @@ final class AppCoordinator: ObservableObject {
                     noiseSuppression: AppSettings.shared.noiseSuppressionEnabled,
                     sampleConsumer: { active.writer.enqueue($0) },
                     onConsumerFailure: { [weak self] result in
-                        Task { @MainActor in self?.handleJournalConsumerFailure(result) }
+                        Task { @MainActor in
+                            self?.handleJournalConsumerFailure(
+                                captureID: active.session.id, result: result
+                            )
+                        }
                     }
                 )
                 activeCaptureJournal = active
@@ -1268,6 +1315,7 @@ final class AppCoordinator: ObservableObject {
             activeCaptureJournal = nil
             captureOwner = .none
             pendingCaptureCleanup = nil
+            pendingFailurePreservation = nil
             finishCancellationPresentation()
         } catch {
             retainFailedCleanup(
@@ -1291,28 +1339,35 @@ final class AppCoordinator: ObservableObject {
         case .startFailure(let message): message
         }
         let detail = "\(operation) cleanup failed: \(cleanupError.localizedDescription)"
-        _ = reduceCaptureAdmission(.cleanupFailed(
+        guard reduceCaptureAdmission(.cleanupFailed(
             captureID: active.session.id, message: detail
-        ))
+        )) == .fail(detail) else { return }
         activeCaptureJournal = active
         pendingCaptureCleanup = PendingCaptureCleanup(
             active: active, service: service, destination: destination,
             completion: completion
         )
+        pendingFailurePreservation = nil
         lastError = detail
         hud.flash("Recording cleanup needs retry — recovery retained")
     }
 
     private func retryPendingCaptureCleanup() {
         guard let pending = pendingCaptureCleanup else { return }
-        Task {
+        let captureID = pending.active.session.id
+        guard let generation = cleanupRetryGate.begin(captureID: captureID) else { return }
+        cleanupRetryTask = Task {
             do {
                 try await pending.service.resumeCleanup(
-                    captureID: pending.active.session.id
+                    captureID: captureID
                 )
+                guard cleanupRetryGate.finish(
+                    captureID: captureID, generation: generation
+                ), pendingCaptureCleanup?.active.session.id == captureID else { return }
                 _ = reduceCaptureAdmission(.cleanupFinished(
-                    captureID: pending.active.session.id
+                    captureID: captureID
                 ))
+                cleanupRetryTask = nil
                 pendingCaptureCleanup = nil
                 activeCaptureJournal = nil
                 captureOwner = .none
@@ -1328,12 +1383,58 @@ final class AppCoordinator: ObservableObject {
                     recordingHUDDidReachTerminalState()
                 }
             } catch {
+                guard cleanupRetryGate.finish(
+                    captureID: captureID, generation: generation
+                ), pendingCaptureCleanup?.active.session.id == captureID else { return }
+                cleanupRetryTask = nil
                 retainFailedCleanup(
                     active: pending.active, service: pending.service,
                     destination: pending.destination,
                     completion: pending.completion,
                     cleanupError: error
                 )
+            }
+        }
+    }
+
+    private func retryPendingFailurePreservation() {
+        guard let pending = pendingFailurePreservation else { return }
+        let captureID = pending.active.session.id
+        guard let generation = cleanupRetryGate.begin(captureID: captureID) else { return }
+        cleanupRetryTask = Task {
+            do {
+                try await pending.service.preserveFailure(
+                    pending.active, message: pending.message
+                )
+                guard cleanupRetryGate.finish(
+                    captureID: captureID, generation: generation
+                ), pendingFailurePreservation?.active.session.id == captureID else { return }
+                _ = reduceCaptureAdmission(.failureHandled(captureID: captureID))
+                cleanupRetryTask = nil
+                pendingFailurePreservation = nil
+                activeCaptureJournal = nil
+                captureOwner = .none
+                let destination = destinationLifecycle.take()
+                if case .scratchpad = destination {
+                    _ = try? Self.routeDestinationEvent(
+                        .failure(pending.message), destination: destination,
+                        router: scratchpadRecordingRouter
+                    ) {}
+                }
+                recordingOutputSelection.resolveTerminal()
+                hud.flash("Recording retained for recovery — try again")
+                recordingHUDDidReachTerminalState()
+            } catch {
+                guard cleanupRetryGate.finish(
+                    captureID: captureID, generation: generation
+                ), pendingFailurePreservation?.active.session.id == captureID else { return }
+                cleanupRetryTask = nil
+                let detail = "\(pending.message): \(error.localizedDescription)"
+                _ = reduceCaptureAdmission(.cleanupFailed(
+                    captureID: captureID, message: detail
+                ))
+                lastError = detail
+                hud.flash("Recovery ownership still needs retry")
             }
         }
     }
@@ -1349,11 +1450,17 @@ final class AppCoordinator: ObservableObject {
     }
 
     private func handleJournalConsumerFailure(
-        _ result: CaptureJournalWriter.EnqueueResult
+        captureID: UUID,
+        result: CaptureJournalWriter.EnqueueResult
     ) {
         guard AudioCapture.consumerFailureAction(for: result) == .escalate else { return }
-        guard !journalFailureHandled else { return }
+        guard Self.shouldHandleJournalFailure(
+            callbackCaptureID: captureID,
+            currentCaptureID: captureAdmission.state.captureID,
+            alreadyHandled: journalFailureHandled
+        ) else { return }
         guard let active = activeCaptureJournal, let recoveryStore else { return }
+        guard active.session.id == captureID else { return }
         journalFailureHandled = true
         guard reduceCaptureAdmission(.failureHandlingStarted(
             captureID: active.session.id
@@ -1372,6 +1479,7 @@ final class AppCoordinator: ObservableObject {
                 try await service.preserveFailure(active, message: message)
                 guard captureAdmission.state.captureID == active.session.id else { return }
                 _ = reduceCaptureAdmission(.failureHandled(captureID: active.session.id))
+                pendingFailurePreservation = nil
                 activeCaptureJournal = nil
                 captureOwner = .none
                 let destination = destinationLifecycle.take()
@@ -1389,6 +1497,9 @@ final class AppCoordinator: ObservableObject {
                 _ = reduceCaptureAdmission(.cleanupFailed(
                     captureID: active.session.id, message: detail
                 ))
+                pendingFailurePreservation = PendingFailurePreservation(
+                    active: active, service: service, message: message
+                )
                 lastError = detail
                 hud.flash("Recording failure retained — recovery needs attention")
             }
