@@ -18,6 +18,7 @@ import Testing
         ]
 
         #expect(RecoveryPresentation.badgeCount(jobs) == 1)
+        #expect(RecoveryPresentation.badgeCount(jobs, silentCount: 2) == 3)
         #expect(RecoveryPresentation.badgeText(count: 0) == nil)
         #expect(RecoveryPresentation.badgeText(count: 3) == "3")
     }

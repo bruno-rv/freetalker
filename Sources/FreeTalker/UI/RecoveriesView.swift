@@ -6,8 +6,8 @@ enum RecoveryPresentation {
 
     static let deleteConfirmation = "Permanently delete this recovery and its saved audio? This cannot be undone."
 
-    static func badgeCount(_ jobs: [TranscriptionJob]) -> Int {
-        jobs.count { if case .failed = $0.state { true } else { false } }
+    static func badgeCount(_ jobs: [TranscriptionJob], silentCount: Int = 0) -> Int {
+        jobs.count { if case .failed = $0.state { true } else { false } } + silentCount
     }
 
     static func badgeText(count: Int) -> String? { count == 0 ? nil : String(count) }
@@ -88,11 +88,16 @@ struct RecoveriesView: View {
 
     var body: some View {
         Group {
-            if store.recoveryJobs.isEmpty {
+            if store.recoveryJobs.isEmpty && store.silentCaptures.isEmpty {
                 ContentUnavailableView("No Recoveries", systemImage: "checkmark.circle", description: Text("Failed dictation audio will appear here so you can listen or try again."))
             } else {
-                List(store.recoveryJobs, id: \.id) { job in
-                    recoveryRow(job)
+                List {
+                    ForEach(store.silentCaptures, id: \.id) { capture in
+                        silentCaptureRow(capture)
+                    }
+                    ForEach(store.recoveryJobs, id: \.id) { job in
+                        recoveryRow(job)
+                    }
                 }
             }
         }
@@ -144,6 +149,29 @@ struct RecoveriesView: View {
         }
         .padding(.vertical, 4)
         .accessibilityElement(children: .contain)
+    }
+
+    private func silentCaptureRow(_ capture: SilentCapturePresentation) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Label("No microphone signal", systemImage: "mic.slash")
+                    .font(.headline)
+                Spacer()
+                Text(capture.capturedAt, style: .relative)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Text(capture.message)
+                .foregroundStyle(.secondary)
+            Text("This attempt has no audio to process. It will remain here until you delete it.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Silent recovery")
+        .accessibilityValue(capture.message)
+        .accessibilityHint("No retryable audio is available")
     }
 
     private func refresh() async { do { try await store.refresh() } catch { errorMessage = error.localizedDescription } }

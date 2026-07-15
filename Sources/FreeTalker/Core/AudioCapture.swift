@@ -3,7 +3,96 @@ import AudioToolbox
 import Foundation
 import OSLog
 
-final class AudioCapture {
+enum AudioCaptureFault: Equatable, Sendable {
+    case inputRoute(captureID: UUID, message: String)
+    case engine(captureID: UUID, message: String)
+
+    var captureID: UUID {
+        switch self {
+        case .inputRoute(let captureID, _), .engine(let captureID, _): captureID
+        }
+    }
+
+    var message: String {
+        switch self {
+        case .inputRoute(_, let message), .engine(_, let message): message
+        }
+    }
+}
+
+struct MicrophoneSignalWatchdog: Sendable {
+    enum Decision: Equatable, Sendable {
+        case continueRecording
+        case warnNoSignal
+        case restartForRouteFailure(String)
+    }
+
+    static let signalFloor: Float = 1e-7
+
+    let captureID: UUID?
+    private(set) var hasObservedSignal = false
+    private(set) var didRequestRestart = false
+    private(set) var observationCount = 0
+    private(set) var peak: Float = 0
+    private(set) var rms: Float = 0
+    private var warned = false
+    private var silentObservationCount = 0
+    private var sumSquares: Double = 0
+    private var sampleCount = 0
+
+    init(captureID: UUID? = nil) {
+        self.captureID = captureID
+    }
+
+    var isSilentAttempt: Bool { !hasObservedSignal }
+    var retainedSampleCount: Int { 0 }
+
+    mutating func observe(samples: [Float], fault: AudioCaptureFault? = nil) -> Decision {
+        observationCount += 1
+        var localPeak: Float = 0
+        var localSquares: Double = 0
+        for sample in samples where sample.isFinite {
+            localPeak = max(localPeak, abs(sample))
+            localSquares += Double(sample) * Double(sample)
+        }
+        peak = max(peak, localPeak)
+        sumSquares += localSquares
+        sampleCount += samples.count
+        rms = sampleCount == 0 ? 0 : Float((sumSquares / Double(sampleCount)).squareRoot())
+        return decide(peak: localPeak, rms: samples.isEmpty ? 0 : Float((localSquares / Double(samples.count)).squareRoot()), fault: fault)
+    }
+
+    mutating func observe(peak: Float, rms: Float, fault: AudioCaptureFault?) -> Decision {
+        observationCount += 1
+        self.peak = max(self.peak, peak.isFinite ? max(0, peak) : 0)
+        self.rms = max(self.rms, rms.isFinite ? max(0, rms) : 0)
+        return decide(peak: peak, rms: rms, fault: fault)
+    }
+
+    private mutating func decide(peak: Float, rms: Float, fault: AudioCaptureFault?) -> Decision {
+        if peak.isFinite, rms.isFinite,
+           peak > Self.signalFloor || rms > Self.signalFloor {
+            hasObservedSignal = true
+            return .continueRecording
+        }
+        guard !hasObservedSignal else { return .continueRecording }
+        silentObservationCount += 1
+        if let fault,
+           !didRequestRestart,
+           captureID == nil || fault.captureID == captureID {
+            didRequestRestart = true
+            warned = true
+            return .restartForRouteFailure(fault.message)
+        }
+        if !warned, silentObservationCount >= 3 {
+            warned = true
+            return .warnNoSignal
+        }
+        return .continueRecording
+    }
+}
+
+final class AudioCapture: @unchecked Sendable {
     enum ConsumerFailureAction: Equatable { case none, escalate }
     enum CaptureRoute: Equatable {
         case voiceProcessedSystemDefault
@@ -52,6 +141,11 @@ final class AudioCapture {
     private var sampleConsumer: (@Sendable ([Float]) -> CaptureJournalWriter.EnqueueResult)?
     private var onConsumerFailure: (@Sendable (CaptureJournalWriter.EnqueueResult) -> Void)?
     private var didReportConsumerFailure = false
+    private var signalWatchdog = MicrophoneSignalWatchdog()
+    private var onSignalDecision: (@Sendable (MicrophoneSignalWatchdog.Decision) -> Void)?
+    private var configurationObserver: NSObjectProtocol?
+    private var activeDeviceUID: String?
+    private var activeNoiseSuppression = false
 
     private(set) var captureWarnings: [String] = []
 
@@ -124,14 +218,20 @@ final class AudioCapture {
     func start(
         deviceUID: String?,
         noiseSuppression: Bool,
+        captureID: UUID? = nil,
         sampleConsumer: (@Sendable ([Float]) -> CaptureJournalWriter.EnqueueResult)? = nil,
-        onConsumerFailure: (@Sendable (CaptureJournalWriter.EnqueueResult) -> Void)? = nil
+        onConsumerFailure: (@Sendable (CaptureJournalWriter.EnqueueResult) -> Void)? = nil,
+        onSignalDecision: (@Sendable (MicrophoneSignalWatchdog.Decision) -> Void)? = nil
     ) throws {
         samplesLock.lock()
         samples.removeAll()
         conversionFailureCount = 0
         self.sampleConsumer = sampleConsumer
         self.onConsumerFailure = onConsumerFailure
+        self.onSignalDecision = onSignalDecision
+        signalWatchdog = MicrophoneSignalWatchdog(captureID: captureID)
+        activeDeviceUID = deviceUID
+        activeNoiseSuppression = noiseSuppression
         didReportConsumerFailure = false
         samplesLock.unlock()
         converter = nil
@@ -162,7 +262,33 @@ final class AudioCapture {
             recordWarning("Voice processing failed — using raw microphone audio")
             try startCaptureAttempt(deviceUID: deviceUID, requestedVoiceProcessing: false)
         }
-        isCapturing = true
+        samplesLock.withLock { isCapturing = true }
+        installConfigurationObserver(captureID: captureID)
+    }
+
+    func restartAfterCorroboratedFault() throws {
+        samplesLock.lock()
+        let capturing = isCapturing
+        let deviceUID = activeDeviceUID
+        let noiseSuppression = activeNoiseSuppression
+        samplesLock.unlock()
+        guard capturing else { throw CaptureError.engineStartFailed("capture is no longer active") }
+
+        removeConfigurationObserver()
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+        converter = nil
+        let route = Self.captureRoute(deviceUID: deviceUID, noiseSuppression: noiseSuppression)
+        do {
+            try startCaptureAttempt(
+                deviceUID: deviceUID,
+                requestedVoiceProcessing: route == .voiceProcessedSystemDefault
+            )
+            installConfigurationObserver(captureID: signalWatchdog.captureID)
+        } catch {
+            samplesLock.withLock { isCapturing = false }
+            throw error
+        }
     }
 
     nonisolated static func consumerFailureAction(
@@ -240,8 +366,13 @@ final class AudioCapture {
 
     /// Stops capturing and returns the accumulated 16 kHz mono Float32 samples.
     func stop() -> [Float] {
-        if isCapturing {
+        let wasCapturing = samplesLock.withLock {
+            let value = isCapturing
             isCapturing = false
+            return value
+        }
+        if wasCapturing {
+            removeConfigurationObserver()
             engine.inputNode.removeTap(onBus: 0)
             engine.stop()
         }
@@ -251,6 +382,44 @@ final class AudioCapture {
         samplesLock.unlock()
         Self.logger.info("Capture stopped with \(failures) conversion failures")
         return capturedSamples
+    }
+
+    func signalDiagnostics() -> (peak: Float, rms: Float, hasObservedSignal: Bool) {
+        samplesLock.withLock {
+            (signalWatchdog.peak, signalWatchdog.rms, signalWatchdog.hasObservedSignal)
+        }
+    }
+
+    private func installConfigurationObserver(captureID: UUID?) {
+        removeConfigurationObserver()
+        guard let captureID else { return }
+        configurationObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: nil
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.reportFault(.engine(
+                captureID: captureID,
+                message: "The audio input configuration changed unexpectedly."
+            ))
+        }
+    }
+
+    private func removeConfigurationObserver() {
+        if let configurationObserver {
+            NotificationCenter.default.removeObserver(configurationObserver)
+            self.configurationObserver = nil
+        }
+    }
+
+    func reportFault(_ fault: AudioCaptureFault) {
+        let payload = samplesLock.withLock { () -> ((@Sendable (MicrophoneSignalWatchdog.Decision) -> Void)?, MicrophoneSignalWatchdog.Decision)? in
+            guard isCapturing else { return nil }
+            let decision = signalWatchdog.observe(peak: 0, rms: 0, fault: fault)
+            return (onSignalDecision, decision)
+        }
+        if let payload { payload.0?(payload.1) }
     }
 
     private func reconcileVoiceProcessing(requested: Bool) throws -> AVAudioInputNode {
@@ -475,7 +644,12 @@ final class AudioCapture {
         samples.append(contentsOf: convertedSamples)
         let consumer = sampleConsumer
         let failureHandler = onConsumerFailure
+        let signalDecision = signalWatchdog.observe(samples: convertedSamples)
+        let signalHandler = onSignalDecision
         samplesLock.unlock()
+        if signalDecision != .continueRecording {
+            signalHandler?(signalDecision)
+        }
         guard let consumer else { return }
         let result = consumer(convertedSamples)
         guard Self.consumerFailureAction(for: result) == .escalate else { return }
@@ -500,6 +674,7 @@ private enum CaptureError: LocalizedError {
     case converterUnavailable(String)
     case rawFallbackUnavailable(String)
     case configuredDeviceUnavailable(String)
+    case engineStartFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -509,6 +684,8 @@ private enum CaptureError: LocalizedError {
             "Could not establish raw microphone capture after voice-processing failure: \(reason)"
         case let .configuredDeviceUnavailable(reason):
             "Could not use the configured microphone because \(reason). Recording was not started."
+        case let .engineStartFailed(reason):
+            "Could not restart microphone capture: \(reason)"
         }
     }
 }

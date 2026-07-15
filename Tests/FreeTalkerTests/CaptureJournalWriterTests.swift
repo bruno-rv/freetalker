@@ -70,6 +70,8 @@ import Testing
         ))
 
         #expect(await ledger.session(id: request.id)?.state == .silent)
+        #expect(await ledger.session(id: request.id)?.assetKind == .silent)
+        #expect(await ledger.session(id: request.id)?.failureMessage == "No microphone signal was captured.")
         #expect(try fileSystem.contents(root).allSatisfy { $0.pathExtension != "wav" })
     }
 

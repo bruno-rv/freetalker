@@ -135,6 +135,16 @@ private struct MenuBarContentView: View {
 
             Text(coordinator.engineStatusText)
 
+            if let warning = RecoveryHealthWarning(health: coordinator.recoveryHealth) {
+                Text("⚠️ \(warning.message)")
+                    .accessibilityLabel("Recovery warning: \(warning.message)")
+                Button(warning.actionTitle) {
+                    coordinator.retryRecoverySetup()
+                }
+                .help("Reopen recovery storage and retry reconciliation")
+                .accessibilityHint("Reopens recovery storage and retries reconciliation")
+            }
+
             if let hotKeyStatusText = coordinator.hotKeyStatusText {
                 Text("⚠️ \(hotKeyStatusText)")
             }

@@ -183,7 +183,7 @@ struct CaptureJournalService: Sendable {
         try await ledger.transition(
             id: active.session.id, from: .capturing, to: .silent,
             recoveryJobID: nil, libraryDictationID: nil, assetKind: .silent,
-            failureMessage: diagnostics.routeFailure, contentHash: nil
+            failureMessage: SilentCapturePresentation.message, contentHash: nil
         )
     }
 

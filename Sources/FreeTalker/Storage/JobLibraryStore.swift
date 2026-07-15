@@ -17,6 +17,7 @@ enum RecoveryPlaybackError: LocalizedError, Equatable {
 @MainActor
 final class JobLibraryStore: ObservableObject {
     @Published private(set) var recoveryJobs: [TranscriptionJob] = []
+    @Published private(set) var silentCaptures: [SilentCapturePresentation] = []
     @Published private(set) var importJobs: [TranscriptionJob] = []
     @Published private(set) var importStatusMessage: String?
 
@@ -109,8 +110,10 @@ final class JobLibraryStore: ObservableObject {
     func refresh() async throws {
         async let recoveries = store.jobs(kind: .recovery)
         async let imports = store.jobs(kind: .mediaImport)
+        async let captures = store.unfinishedSessions()
         recoveryJobs = try await recoveries
         importJobs = try await imports
+        silentCaptures = try await captures.compactMap(SilentCapturePresentation.init)
     }
 
     func retry(id: UUID, configuration: AttemptConfiguration) async throws {

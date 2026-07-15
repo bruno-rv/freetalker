@@ -17,6 +17,9 @@ struct LibraryView: View {
         // Delete All dialog while the whole archive is about to be wiped. See Round 1 Codex
         // finding 1.
         VStack(spacing: 0) {
+            if let warning = RecoveryHealthWarning(health: coordinator.recoveryHealth) {
+                recoveryHealthWarning(warning)
+            }
             Picker("Library section", selection: $section) {
                 Text("Dictations").tag(Section.dictations)
                 if let recoveryStore = coordinator.jobLibraryStore {
@@ -40,6 +43,21 @@ struct LibraryView: View {
             }
         }
         .frame(minWidth: 720, maxWidth: .infinity, minHeight: 480, maxHeight: .infinity)
+    }
+
+    private func recoveryHealthWarning(_ warning: RecoveryHealthWarning) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.yellow)
+            Text(warning.message)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button(warning.actionTitle) { coordinator.retryRecoverySetup() }
+                .accessibilityHint("Reopens recovery storage and retries reconciliation")
+        }
+        .padding(10)
+        .background(.yellow.opacity(0.12))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Recovery warning: \(warning.message)")
     }
 
     private var dictationsView: some View {
@@ -149,7 +167,9 @@ private struct RecoveryPickerLabel: View {
     @ObservedObject var store: JobLibraryStore
 
     var body: some View {
-        let count = RecoveryPresentation.badgeCount(store.recoveryJobs)
+        let count = RecoveryPresentation.badgeCount(
+            store.recoveryJobs, silentCount: store.silentCaptures.count
+        )
         let badge = RecoveryPresentation.badgeText(count: count)
         Text(badge.map { "Recoveries (\($0))" } ?? "Recoveries")
             .accessibilityLabel(count == 0 ? "Recoveries" : "Recoveries, \(count) needing attention")

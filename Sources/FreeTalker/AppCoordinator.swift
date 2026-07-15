@@ -93,6 +93,7 @@ final class AppCoordinator: ObservableObject {
     @Published private(set) var isProcessing = false
     @Published private(set) var lastError: String?
     @Published private(set) var recoveryReconciliationReport: RecoveryReconciliationReport?
+    @Published private(set) var recoveryHealth: RecoveryHealth = .initializing
     private var pendingOutputTranslationFailuresStorage: [OutputTranslationFailure] = []
     private lazy var translationRecoveryController = makeTranslationRecoveryController()
     weak var translationRecoveryPresentationRouter: (any TranslationRecoveryPresentationRouting)?
@@ -202,9 +203,10 @@ final class AppCoordinator: ObservableObject {
     }
     private var pendingFailurePreservation: PendingFailurePreservation?
     private let hud = HUDController()
-    private let recoveryStore: TranscriptionJobStore?
+    private var recoveryStore: TranscriptionJobStore?
     private var recoveryStoreInitializationError: String?
-    let jobLibraryStore: JobLibraryStore?
+    @Published private(set) var jobLibraryStore: JobLibraryStore?
+    private var recoveryAdmissionStorageHealthy = false
     private var recoveryRunner: LocalJobRunner?
     private let recoveryLaunchGate = RecoveryLaunchGate()
     private var mediaImportRunner: LocalJobRunner?
@@ -255,6 +257,9 @@ final class AppCoordinator: ObservableObject {
             snippetStoreInitializationError = Self.snippetStoreErrorMessage(error)
         }
         jobLibraryStore = recoveryStore.map { JobLibraryStore(store: $0, recoveryDirectory: Self.recoveryDirectory) }
+        if let recoveryStoreInitializationError {
+            recoveryHealth = .unavailable(recoveryStoreInitializationError)
+        }
         whisperEngine.setEventReceiver(modelStore)
         modelStore.onAutomaticSelection = { [weak whisperEngine] target in
             guard let whisperEngine else { return }
@@ -1130,6 +1135,18 @@ final class AppCoordinator: ObservableObject {
         ) == .start else {
             return false
         }
+        guard recoveryHealth.allowsCapture(
+            requiresDurableJournal: destination.requiresDurableJournal,
+            admissionStorageHealthy: recoveryAdmissionStorageHealthy
+        ) else {
+            let detail = recoveryHealth.message ?? "Recovery storage is not ready."
+            let message = "Recording unavailable: \(detail)"
+            destinationLifecycle.failStart(destination, message: message)
+            recordingOutputSelection.resolveTerminal()
+            lastError = message
+            hud.flash(message)
+            return false
+        }
         recordingDestination = nil
         oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .clear)
         let micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
@@ -1220,6 +1237,8 @@ final class AppCoordinator: ObservableObject {
         recordingOutputSelection.resolveTerminal()
         destinationLifecycle.failStart(destination, message: failure.message)
         lastError = failure.message
+        recoveryAdmissionStorageHealthy = false
+        recoveryHealth = .unavailable(failure.message)
         hud.flash("Recording preparation needs recovery")
         recordingHUDDidReachTerminalState()
     }
@@ -1276,11 +1295,19 @@ final class AppCoordinator: ObservableObject {
                 try audioCapture.start(
                     deviceUID: AppSettings.shared.microphoneDeviceUID,
                     noiseSuppression: AppSettings.shared.noiseSuppressionEnabled,
+                    captureID: active.session.id,
                     sampleConsumer: { active.writer.enqueue($0) },
                     onConsumerFailure: { [weak self] result in
                         Task { @MainActor in
                             self?.handleJournalConsumerFailure(
                                 captureID: active.session.id, result: result
+                            )
+                        }
+                    },
+                    onSignalDecision: { [weak self] decision in
+                        Task { @MainActor in
+                            self?.handleMicrophoneSignalDecision(
+                                decision, captureID: active.session.id
                             )
                         }
                     }
@@ -1353,6 +1380,8 @@ final class AppCoordinator: ObservableObject {
         }
         destinationLifecycle.failStart(destination, message: message)
         lastError = message
+        recoveryAdmissionStorageHealthy = false
+        recoveryHealth = .unavailable(message)
         hud.flash(message)
         recordingHUDDidReachTerminalState()
     }
@@ -1401,6 +1430,7 @@ final class AppCoordinator: ObservableObject {
         )
         pendingFailurePreservation = nil
         lastError = detail
+        recoveryHealth = .degraded(detail)
         hud.flash("Recording cleanup needs retry — recovery retained")
     }
 
@@ -1531,6 +1561,8 @@ final class AppCoordinator: ObservableObject {
         _ = audioCapture.stop()
         let message = "Recording stopped because audio could not be saved"
         lastError = message
+        recoveryAdmissionStorageHealthy = false
+        recoveryHealth = .unavailable(message)
         let service = CaptureJournalService(
             fileSystem: LocalJournalFileSystem(), ledger: recoveryStore
         )
@@ -1567,6 +1599,30 @@ final class AppCoordinator: ObservableObject {
                 )
                 lastError = detail
                 hud.flash("Recording failure retained — recovery needs attention")
+            }
+        }
+    }
+
+    private func handleMicrophoneSignalDecision(
+        _ decision: MicrophoneSignalWatchdog.Decision,
+        captureID: UUID
+    ) {
+        guard captureAdmission.state.captureID == captureID,
+              activeCaptureJournal?.session.id == captureID else { return }
+        switch decision {
+        case .continueRecording:
+            break
+        case .warnNoSignal:
+            hud.flash("No microphone signal detected yet — recording continues")
+        case .restartForRouteFailure(let message):
+            do {
+                try audioCapture.restartAfterCorroboratedFault()
+                hud.flash("Microphone input restarted after a route failure")
+            } catch {
+                handleJournalConsumerFailure(
+                    captureID: captureID,
+                    result: .failed("\(message): \(error.localizedDescription)")
+                )
             }
         }
     }
@@ -1720,8 +1776,10 @@ final class AppCoordinator: ObservableObject {
             journalFailureHandled = true
             invalidateCapTimer()
             stopLivePreview()
-            let samples = audioCapture.stop()
-            let (peak, rms) = AudioLevel.peakAndRMS(samples)
+            _ = audioCapture.stop()
+            let signal = audioCapture.signalDiagnostics()
+            let peak = signal.peak
+            let rms = signal.rms
             let diagnostics = CaptureDiagnostics(
                 peak: peak, rms: rms,
                 inputDeviceUID: AppSettings.shared.microphoneDeviceUID,
@@ -1733,21 +1791,45 @@ final class AppCoordinator: ObservableObject {
             )
             journalFinalizationTask = Task {
                 do {
-                    let downstreamSamples: [Float]
-                    let stagedCapture: StagedCapture?
                     if diagnostics.indicatesSilence {
                         try await service.recordSilent(active, diagnostics: diagnostics)
-                        downstreamSamples = samples
-                        stagedCapture = nil
-                    } else {
-                        let staged = try await service.finish(active)
-                        let url = staged.canonicalAudioURL
-                        downstreamSamples = try await CaptureCanonicalAudioLoader.load {
-                            try CaptureSegmentCodec(
-                                fileSystem: LocalJournalFileSystem()
-                            ).decode(url)
+                        guard captureAdmission.state == .finalizing(
+                            captureID: active.session.id
+                        ) else { return }
+                        _ = reduceCaptureAdmission(.finalizationFinished(
+                            captureID: active.session.id
+                        ))
+                        journalFinalizationTask = nil
+                        activeCaptureJournal = nil
+                        captureOwner = .none
+                        pendingStopRequest = nil
+                        _ = destinationLifecycle.take()
+                        recordingOutputSelection.resolveTerminal()
+                        lastError = SilentCapturePresentation.message
+                        do {
+                            try await jobLibraryStore?.refresh()
+                        } catch {
+                            recoveryHealth = .degraded(
+                                "Silent recovery was saved, but the Library could not refresh: \(error.localizedDescription)"
+                            )
                         }
-                        stagedCapture = staged
+                        if case .scratchpad = stopRequest.destination {
+                            _ = try? Self.routeDestinationEvent(
+                                .failure(SilentCapturePresentation.message),
+                                destination: stopRequest.destination,
+                                router: scratchpadRecordingRouter
+                            ) {}
+                        }
+                        hud.flash(SilentCapturePresentation.message)
+                        recordingHUDDidReachTerminalState()
+                        return
+                    }
+                    let staged = try await service.finish(active)
+                    let url = staged.canonicalAudioURL
+                    let downstreamSamples = try await CaptureCanonicalAudioLoader.load {
+                        try CaptureSegmentCodec(
+                            fileSystem: LocalJournalFileSystem()
+                        ).decode(url)
                     }
                     guard captureAdmission.state == .finalizing(
                         captureID: active.session.id
@@ -1759,7 +1841,7 @@ final class AppCoordinator: ObservableObject {
                     activeCaptureJournal = nil
                     captureOwner = .none
                     stopAndTranscribe(
-                        stoppedCapture: (downstreamSamples, peak, rms, stagedCapture),
+                        stoppedCapture: (downstreamSamples, peak, rms, staged),
                         stopRequest: stopRequest
                     )
                 } catch {
@@ -2902,11 +2984,45 @@ final class AppCoordinator: ObservableObject {
         }
     }
 
-    private func performLaunchRecoveryWorkflows() async {
-        guard recoveryRunner == nil else { return }
+    func retryRecoverySetup() {
+        Task { [weak self] in
+            guard let self else { return }
+            await recoveryLaunchGate.run { [weak self] in
+                await self?.performRetryRecoverySetup()
+            }
+        }
+    }
+
+    private func performRetryRecoverySetup() async {
+        recoveryHealth = recoveryHealth.beginRetry()
+        recoveryAdmissionStorageHealthy = false
+        do {
+            let reopened = try Self.makeRecoveryStore()
+            if recoveryStore == nil {
+                recoveryStore = reopened
+                jobLibraryStore = JobLibraryStore(
+                    store: reopened, recoveryDirectory: Self.recoveryDirectory
+                )
+            }
+            recoveryStoreInitializationError = nil
+        } catch {
+            let message = error.localizedDescription
+            recoveryStoreInitializationError = message
+            recoveryHealth = .unavailable(message)
+            lastError = "Recovery storage needs attention: \(message)"
+            return
+        }
+        await performLaunchRecoveryWorkflows(isRetry: true)
+        await resolveReconciledCaptureAdmissionIfPossible()
+    }
+
+    private func performLaunchRecoveryWorkflows(isRetry: Bool = false) async {
+        recoveryHealth = .initializing
+        recoveryAdmissionStorageHealthy = false
         guard let recoveryStore else {
             let message = recoveryStoreInitializationError ?? "Recovery store is unavailable"
             recoveryReconciliationReport = RecoveryReconciliationReport(storeFailure: message)
+            recoveryHealth = .unavailable(message)
             lastError = "Recovery storage needs attention: \(message)"
             return
         }
@@ -2922,10 +3038,22 @@ final class AppCoordinator: ObservableObject {
         )
         var reconciliation = await reconciler.reconcile()
         recoveryReconciliationReport = reconciliation
+        recoveryAdmissionStorageHealthy = reconciliation.storeFailure == nil
+        updateRecoveryHealth(from: reconciliation)
         if let failure = reconciliation.storeFailure {
             lastError = "Recovery reconciliation needs attention: \(failure)"
         } else if reconciliation.failed > 0 {
             lastError = "Recovery reconciliation could not restore \(reconciliation.failed) item(s)"
+        }
+        if recoveryRunner != nil {
+            do {
+                try await jobLibraryStore?.refresh()
+            } catch {
+                reconciliation.recordFailure(Self.recoveryDirectory, error)
+                recoveryReconciliationReport = reconciliation
+                updateRecoveryHealth(from: reconciliation)
+            }
+            return
         }
         let pipeline = RecoveryRetryPipeline(
             directory: Self.recoveryDirectory,
@@ -2990,12 +3118,54 @@ final class AppCoordinator: ObservableObject {
             reconciliation.recordFailure(Self.recoveryDirectory, error)
         }
         recoveryReconciliationReport = reconciliation
+        updateRecoveryHealth(from: reconciliation)
         await runner.resumeQueuedJobs()
         do {
             try await jobLibraryStore?.refresh()
         } catch {
             reconciliation.recordFailure(Self.recoveryDirectory, error)
             recoveryReconciliationReport = reconciliation
+            updateRecoveryHealth(from: reconciliation)
+        }
+    }
+
+    private func updateRecoveryHealth(from report: RecoveryReconciliationReport) {
+        let failures = report.failures.map(\.message)
+        let ownedFailure: String? = if case .cleanupFailed(_, let message) = captureAdmission.state {
+            message
+        } else if pendingCaptureCleanup != nil || pendingFailurePreservation != nil {
+            lastError ?? "A captured recording still needs recovery cleanup."
+        } else {
+            nil
+        }
+        recoveryHealth = RecoveryHealth.resolve(
+            storeFailure: report.storeFailure,
+            itemFailures: failures,
+            ownedFailure: ownedFailure
+        )
+        if case .unavailable = recoveryHealth {
+            recoveryAdmissionStorageHealthy = false
+        }
+    }
+
+    private func resolveReconciledCaptureAdmissionIfPossible() async {
+        guard case .cleanupFailed(let captureID, _) = captureAdmission.state,
+              pendingCaptureCleanup == nil,
+              pendingFailurePreservation == nil,
+              let recoveryStore else { return }
+        do {
+            guard try await recoveryStore.session(id: captureID) != nil else { return }
+            _ = reduceCaptureAdmission(.failureHandled(captureID: captureID))
+            activeCaptureJournal = nil
+            captureOwner = .none
+            if let report = recoveryReconciliationReport {
+                updateRecoveryHealth(from: report)
+            }
+        } catch {
+            let message = "Recovery ownership could not be verified: \(error.localizedDescription)"
+            recoveryAdmissionStorageHealthy = false
+            recoveryHealth = .unavailable(message)
+            lastError = message
         }
     }
 
