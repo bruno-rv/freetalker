@@ -12,7 +12,8 @@ import Testing
         #expect(try db.tableNames() == [
             "transcription_jobs", "job_attempts", "speaker_segments",
             "speaker_names", "snippets", "snippet_triggers", "schema_migrations",
-            "media_job_stages", "transcript_segments", "speaker_turns", "media_derived_files"
+            "media_job_stages", "transcript_segments", "speaker_turns", "media_derived_files",
+            "capture_sessions", "capture_segments"
         ])
         #expect(try db.indexNames() == [
             "idx_transcription_jobs_state_expires_at",
@@ -20,10 +21,58 @@ import Testing
             "idx_transcription_jobs_needs_source_cleanup",
             "idx_job_attempts_job_id", "idx_snippet_triggers_normalized_unique",
             "idx_transcript_segments_job_id", "idx_speaker_turns_job_id",
-            "idx_transcription_jobs_lease_expires_at", "idx_transcription_jobs_deletion_claimed_at"
+            "idx_transcription_jobs_lease_expires_at", "idx_transcription_jobs_deletion_claimed_at",
+            "idx_capture_sessions_state_captured_at"
         ])
         #expect(try db.integer("SELECT COUNT(*) FROM pragma_foreign_key_list('snippet_triggers') WHERE \"table\" = 'snippets' AND \"from\" = 'snippet_id' AND on_delete = 'CASCADE';") == 1)
         #expect(try db.integer("SELECT COUNT(*) FROM pragma_foreign_key_list('job_attempts') WHERE \"table\" = 'transcription_jobs' AND \"from\" = 'job_id' AND on_delete = 'CASCADE';") == 1)
+        #expect(try db.migrationVersions() == Array(1...DatabaseMigrator.latestVersion))
+    }
+
+    @Test func versionTenJobsUpgradePreservesRowsAndIsIdempotent() throws {
+        let db = try TemporaryDatabase()
+        try DatabaseMigrator.migrate(db.handle)
+        try db.execute("""
+        DELETE FROM schema_migrations WHERE version = 11;
+        INSERT INTO transcription_jobs
+            (id, kind, source_reference, state, created_at, updated_at)
+        VALUES ('kept-job', 'recovery', '/kept.wav', 'failed', 100, 101);
+        """)
+
+        try DatabaseMigrator.migrate(db.handle)
+        let schema = try db.schema()
+        try DatabaseMigrator.migrate(db.handle)
+
+        #expect(try db.integer("SELECT COUNT(*) FROM transcription_jobs WHERE id = 'kept-job';") == 1)
+        #expect(try db.schema() == schema)
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_foreign_key_list('capture_segments') WHERE \"table\" = 'capture_sessions' AND \"from\" = 'capture_id' AND on_delete = 'CASCADE';") == 1)
+        #expect(try db.migrationVersions() == Array(1...DatabaseMigrator.latestVersion))
+    }
+
+    @Test func versionTenLibraryUpgradePreservesRowsAndIsIdempotent() throws {
+        let db = try TemporaryDatabase()
+        try DatabaseMigrator.migrate(db.handle)
+        try db.execute("""
+        CREATE TABLE dictations (
+          id INTEGER PRIMARY KEY, ts REAL NOT NULL, language TEXT NOT NULL,
+          template TEXT NOT NULL, transcript TEXT NOT NULL, refined TEXT NOT NULL,
+          engine TEXT NOT NULL, source_id INTEGER,
+          requested_output_language TEXT NOT NULL DEFAULT 'same'
+        );
+        DELETE FROM schema_migrations WHERE version = 11;
+        INSERT INTO dictations
+          (id, ts, language, template, transcript, refined, engine, source_id, requested_output_language)
+        VALUES (7, 123, 'pt', 'Clean', 'raw', 'kept', 'local', NULL, 'same');
+        """)
+
+        try DatabaseMigrator.migrate(db.handle)
+        let schema = try db.schema()
+        try DatabaseMigrator.migrate(db.handle)
+
+        #expect(try db.string("SELECT language || '|' || requested_output_language || '|' || refined FROM dictations WHERE id = 7;") == "pt|same|kept")
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('dictations') WHERE name = 'capture_id' AND type = 'TEXT';") == 1)
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_index_list('dictations') WHERE name = 'idx_dictations_capture_id' AND \"unique\" = 1;") == 1)
+        #expect(try db.schema() == schema)
         #expect(try db.migrationVersions() == Array(1...DatabaseMigrator.latestVersion))
     }
 
@@ -108,7 +157,7 @@ import Testing
         let db = try TemporaryDatabase()
         try DatabaseMigrator.migrate(db.handle)
         try db.execute("""
-        DELETE FROM schema_migrations WHERE version = 10;
+        DELETE FROM schema_migrations WHERE version >= 10;
         CREATE TABLE dictations (
           id INTEGER PRIMARY KEY, ts REAL NOT NULL, language TEXT NOT NULL,
           template TEXT NOT NULL, transcript TEXT NOT NULL, refined TEXT NOT NULL,
@@ -137,7 +186,7 @@ import Testing
             let legacy = try TemporaryDatabase(path: url.path)
             try DatabaseMigrator.migrate(legacy.handle)
             try legacy.execute("""
-            DELETE FROM schema_migrations WHERE version = 10;
+            DELETE FROM schema_migrations WHERE version >= 10;
             CREATE TABLE dictations (
               id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, language TEXT NOT NULL,
               template TEXT NOT NULL, transcript TEXT NOT NULL, refined TEXT NOT NULL,
@@ -226,9 +275,11 @@ import Testing
         try db.execute("""
         DROP TABLE dictation_translation_variants;
         ALTER TABLE dictations DROP COLUMN requested_output_language;
-        DELETE FROM schema_migrations WHERE version = 10;
+        DELETE FROM schema_migrations WHERE version >= 10;
         CREATE TABLE dictation_translation_variants (collision INTEGER);
-        INSERT INTO dictations VALUES (7, 1, 'en', 'Clean', 'raw', 'kept', 'local', NULL);
+        INSERT INTO dictations
+          (id, ts, language, template, transcript, refined, engine, source_id)
+        VALUES (7, 1, 'en', 'Clean', 'raw', 'kept', 'local', NULL);
         """)
 
         #expect(throws: DatabaseError.self) { try DatabaseMigrator.migrate(db.handle) }

@@ -22,6 +22,7 @@ struct Dictation: Identifiable, Equatable {
     var refined: String
     var engine: String
     var sourceID: Int64?
+    var captureID: UUID? = nil
 
     var language: String {
         get { sourceLanguage.rawValue }

@@ -1,7 +1,7 @@
 import CSQLite
 
 enum DatabaseMigrator {
-    static let latestVersion = 10
+    static let latestVersion = 11
 
     static func migrate(_ db: OpaquePointer) throws {
         try execute(db, "BEGIN IMMEDIATE;")
@@ -21,6 +21,8 @@ enum DatabaseMigrator {
                 guard version > appliedVersions.count else { continue }
                 if version == 10 {
                     try migrateLibraryV10(db)
+                } else if version == 11 {
+                    try migrateCaptureV11(db)
                 } else {
                     try execute(db, migration)
                 }
@@ -226,8 +228,52 @@ enum DatabaseMigrator {
     """
 
     private static let migration10 = ""
+    private static let migration11 = ""
 
-    private static let migrations = [migration1, migration2, migration3, migration4, migration5, migration6, migration7, migration8, migration9, migration10]
+    private static let migrations = [migration1, migration2, migration3, migration4, migration5, migration6, migration7, migration8, migration9, migration10, migration11]
+
+    private static func migrateCaptureV11(_ db: OpaquePointer) throws {
+        if try tableExists("transcription_jobs", db: db) {
+            try execute(db, """
+            CREATE TABLE IF NOT EXISTS capture_sessions (
+                id TEXT PRIMARY KEY,
+                state TEXT NOT NULL,
+                directory TEXT NOT NULL,
+                captured_at REAL NOT NULL,
+                sample_rate REAL NOT NULL,
+                channel_count INTEGER NOT NULL,
+                input_device_uid TEXT,
+                destination TEXT NOT NULL,
+                recovery_job_id TEXT,
+                library_dictation_id INTEGER,
+                asset_kind TEXT NOT NULL,
+                failure_message TEXT,
+                content_hash TEXT
+            );
+            CREATE TABLE IF NOT EXISTS capture_segments (
+                capture_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                sample_count INTEGER NOT NULL,
+                content_hash TEXT NOT NULL,
+                PRIMARY KEY (capture_id, ordinal),
+                FOREIGN KEY (capture_id) REFERENCES capture_sessions(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_capture_sessions_state_captured_at
+                ON capture_sessions(state, captured_at);
+            """)
+        }
+        if try tableExists("dictations", db: db) {
+            if try !columnExists("capture_id", in: "dictations", db: db) {
+                try execute(db, "ALTER TABLE dictations ADD COLUMN capture_id TEXT;")
+            }
+            try execute(db, """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_dictations_capture_id
+            ON dictations(capture_id)
+            WHERE capture_id IS NOT NULL;
+            """)
+        }
+    }
 
     private static func migrateLibraryV10(_ db: OpaquePointer) throws {
         guard try tableExists("dictations", db: db) else { return }

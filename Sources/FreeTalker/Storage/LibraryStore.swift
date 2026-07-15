@@ -34,8 +34,10 @@ final class LibraryStore: ObservableObject, LibraryTranslationStoring {
     }
 
     private let db: Database?
+    private let temporaryDirectory: URL?
 
     private init() {
+        temporaryDirectory = nil
         do {
             db = try Database()
         } catch {
@@ -43,6 +45,31 @@ final class LibraryStore: ObservableObject, LibraryTranslationStoring {
             print("FreeTalker: LibraryStore failed to open database: \(error)")
         }
         refresh()
+    }
+
+    private init(db: Database, temporaryDirectory: URL) {
+        self.db = db
+        self.temporaryDirectory = temporaryDirectory
+        refresh()
+    }
+
+    static func temporary() throws -> LibraryStore {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("library-store-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        do {
+            return try LibraryStore(
+                db: Database(path: directory.appendingPathComponent("library.db")),
+                temporaryDirectory: directory
+            )
+        } catch {
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
+    }
+
+    deinit {
+        if let temporaryDirectory { try? FileManager.default.removeItem(at: temporaryDirectory) }
     }
 
     func refresh() {
@@ -87,6 +114,28 @@ final class LibraryStore: ObservableObject, LibraryTranslationStoring {
         ))
         refresh()
         return id
+    }
+
+    @discardableResult
+    func record(_ dictation: Dictation, captureID: UUID? = nil) throws -> Dictation {
+        guard let db else { throw LibraryStoreError.databaseUnavailable }
+        let stored = try db.insertDictation(.init(
+            timestamp: dictation.timestamp,
+            sourceLanguage: dictation.sourceLanguage,
+            requestedOutputLanguage: dictation.requestedOutputLanguage,
+            template: dictation.templateName,
+            transcript: dictation.transcript,
+            refined: dictation.refined,
+            engine: dictation.engine,
+            sourceID: dictation.sourceID
+        ), captureID: captureID)
+        refresh()
+        return stored
+    }
+
+    func dictations(captureID: UUID) throws -> [Dictation] {
+        guard let db else { throw LibraryStoreError.databaseUnavailable }
+        return try db.dictations(captureID: captureID)
     }
 
     func translationVariants(parentID: Int64) throws -> [DictationTranslationVariant] {
