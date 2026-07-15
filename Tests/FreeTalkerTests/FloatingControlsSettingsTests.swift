@@ -49,6 +49,20 @@ struct FloatingControlsSettingsTests {
         #expect(fixture.defaults.data(forKey: "launcherPanelPosition") == nil)
     }
 
+    @Test("clamped along-edge change clears drag override")
+    func clampedAlongEdgeChange() throws {
+        let fixture = try FloatingSettingsFixture()
+        fixture.settings.launcherPanelPosition = NormalizedWindowPosition(
+            displayID: "main", x: 1, y: 0.5
+        )
+
+        fixture.settings.edgeLauncherPosition = 2
+
+        #expect(fixture.settings.edgeLauncherPosition == 1)
+        #expect(fixture.settings.launcherPanelPosition == nil)
+        #expect(fixture.defaults.data(forKey: "launcherPanelPosition") == nil)
+    }
+
     @Test("drag after settings change becomes relaunch position")
     func dragWinsAfterSettingsChange() throws {
         let fixture = try FloatingSettingsFixture()
