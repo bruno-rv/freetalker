@@ -59,6 +59,9 @@ actor RecoveryReconciler {
         let sessions: [CaptureSession]
         do {
             try fileSystem.createDirectory(directory)
+            _ = try await RecoveryRetentionService(
+                directory: directory, store: store, ledger: ledger, fileSystem: fileSystem
+            ).purgeExpired(now: Date(), retention: .never)
             rootItems = try fileSystem.contents(directory).sorted { $0.path < $1.path }
             sessions = try await ledger.unfinishedSessions()
             _ = try await store.jobs(kind: .recovery)
@@ -98,6 +101,7 @@ actor RecoveryReconciler {
         _ session: CaptureSession, report: inout RecoveryReconciliationReport
     ) async {
         do {
+            if try await cleanupDisposedSession(session) { return }
             if let libraryID = try await libraryDictationID(session.id) {
                 try await reconcileLibraryOwnedSession(session, libraryID: libraryID)
                 return
@@ -165,6 +169,55 @@ actor RecoveryReconciler {
         } catch {
             report.recordFailure(session.directory, error)
         }
+    }
+
+    private func cleanupDisposedSession(_ snapshot: CaptureSession) async throws -> Bool {
+        let dispositions = RecoveryImportDispositionStore(
+            directory: directory, fileSystem: fileSystem
+        )
+        guard let descriptor = try dispositions.descriptor(id: snapshot.id),
+              try dispositions.contains(descriptor) else { return false }
+        if let job = try await store.job(id: snapshot.id) {
+            let source = URL(fileURLWithPath: job.source.reference).standardizedFileURL
+            let direct = directory.appendingPathComponent("\(snapshot.id.uuidString).wav")
+                .standardizedFileURL
+            let nestedDirectory = directory.appendingPathComponent(
+                snapshot.id.uuidString, isDirectory: true
+            ).standardizedFileURL
+            let nested = nestedDirectory.appendingPathComponent("\(snapshot.id.uuidString).wav")
+            guard source == direct || source == nested else {
+                throw RecoveryFinalizationError.recoveryJobMismatch
+            }
+            _ = try await store.deleteCommittedRecovery(
+                id: job.id, expectedSourceReference: job.source.reference
+            )
+        }
+        guard let current = try await ledger.session(id: snapshot.id) else { return true }
+        if current.state != .cancelling {
+            try await ledger.transition(
+                id: current.id, from: current.state, to: .cancelling,
+                recoveryJobID: current.recoveryJobID,
+                libraryDictationID: current.libraryDictationID,
+                assetKind: current.assetKind, failureMessage: current.failureMessage,
+                contentHash: current.contentHash
+            )
+        }
+        if current.directory.standardizedFileURL == directory {
+            let canonical = directory.appendingPathComponent("\(current.id.uuidString).wav")
+            if fileSystem.exists(canonical) { try fileSystem.remove(canonical) }
+            try fileSystem.synchronizeDirectory(directory)
+            try await ledger.removeCleanedSession(id: current.id)
+        } else {
+            let expected = directory.appendingPathComponent(
+                current.id.uuidString, isDirectory: true
+            ).standardizedFileURL
+            guard current.directory.standardizedFileURL == expected else {
+                throw RecoveryFinalizationError.captureIdentityMismatch
+            }
+            try await CaptureJournalService(fileSystem: fileSystem, ledger: ledger)
+                .resumeCleanup(captureID: current.id)
+        }
+        return true
     }
 
     private func reconcileLibraryOwnedSession(
@@ -430,9 +483,23 @@ actor RecoveryReconciler {
             } catch { throw RecoveryReconciliationOperationError(operation: "mark ownership damaged", underlying: error) }
         }
         do {
-            _ = try await importer.importAudio(
+            let result = try await importer.importAudio(
                 source, preferredID: id, forceQuarantine: true
             )
+            if result == .disposed,
+               let current = try await ledger.session(id: session.id) {
+                if current.state != .cancelling {
+                    try await ledger.transition(
+                        id: current.id, from: current.state, to: .cancelling,
+                        recoveryJobID: current.recoveryJobID,
+                        libraryDictationID: current.libraryDictationID,
+                        assetKind: current.assetKind, failureMessage: current.failureMessage,
+                        contentHash: current.contentHash
+                    )
+                }
+                try await CaptureJournalService(fileSystem: fileSystem, ledger: ledger)
+                    .resumeCleanup(captureID: current.id)
+            }
         } catch { throw RecoveryReconciliationOperationError(operation: "register damaged recovery", underlying: error) }
     }
 

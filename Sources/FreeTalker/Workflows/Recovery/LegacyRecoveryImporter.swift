@@ -43,12 +43,23 @@ struct LegacyRecoveryImporter: Sendable {
     ) async throws -> Result {
         let data = try codec.fileSystem.read(source)
         let hash = codec.hash(data)
-        if try RecoveryImportDispositionStore(
-            directory: ownedDirectory, fileSystem: codec.fileSystem
-        ).contains(hash: hash) {
-            return .disposed
-        }
         let id = preferredID ?? Self.stableID(hash: hash)
+        let dispositions = RecoveryImportDispositionStore(
+            directory: ownedDirectory, fileSystem: codec.fileSystem
+        )
+        let descriptor: RecoveryImportDescriptor
+        if preferredID != nil, let existing = try dispositions.descriptor(id: id) {
+            guard existing.contentHash == hash else {
+                throw CaptureJournalError.hashMismatch(source.path)
+            }
+            descriptor = existing
+        } else {
+            descriptor = RecoveryImportDescriptor(
+                id: id, scope: preferredID == nil ? .legacy : .capture(id), contentHash: hash
+            )
+        }
+        try dispositions.registerImport(descriptor)
+        if try dispositions.contains(descriptor) { return .disposed }
         let existed = try await store.job(id: id) != nil
 
         let valid: Bool

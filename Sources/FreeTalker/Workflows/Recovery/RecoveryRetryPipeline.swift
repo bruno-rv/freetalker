@@ -130,11 +130,15 @@ struct RecoveryRetryPipeline: Sendable {
 
     private func cleanSource(for job: TranscriptionJob) async {
         do {
-            guard let source = ownedSource(job.source.reference) else {
+            guard let source = ownedSource(job.source.reference, id: job.id) else {
                 throw RecoveryCleanupError.outsideOwnedDirectory
             }
             if FileManager.default.fileExists(atPath: source.path) {
-                try RecoveryImportDispositionStore(directory: directory).record(source: source)
+                let dispositions = RecoveryImportDispositionStore(directory: directory)
+                let descriptor = try dispositions.descriptor(
+                    id: job.id, source: source, defaultScope: .capture(job.id)
+                )
+                try dispositions.record(descriptor)
                 try removeSource(source)
             }
             try await store.completeSourceCleanup(jobID: job.id)
@@ -159,11 +163,24 @@ struct RecoveryRetryPipeline: Sendable {
         }
     }
 
-    private func ownedSource(_ reference: String) -> URL? {
+    private func ownedSource(_ reference: String, id: UUID) -> URL? {
         let source = URL(fileURLWithPath: reference).standardizedFileURL
         guard source.pathExtension == "wav",
-              UUID(uuidString: source.deletingPathExtension().lastPathComponent) != nil,
-              source.resolvingSymlinksInPath().deletingLastPathComponent() == directory else { return nil }
+              UUID(uuidString: source.deletingPathExtension().lastPathComponent) != nil else {
+            return nil
+        }
+        let parent = source.deletingLastPathComponent()
+        let direct = parent == directory
+        let nested = parent.lastPathComponent == id.uuidString
+            && source.deletingPathExtension().lastPathComponent == id.uuidString
+            && parent.deletingLastPathComponent() == directory
+        guard direct || nested else { return nil }
+        let resolvedParent = source.resolvingSymlinksInPath().deletingLastPathComponent()
+        let resolvedDirect = resolvedParent == directory
+        let resolvedNested = resolvedParent.lastPathComponent == id.uuidString
+            && source.resolvingSymlinksInPath().deletingPathExtension().lastPathComponent == id.uuidString
+            && resolvedParent.deletingLastPathComponent() == directory
+        guard resolvedDirect || resolvedNested else { return nil }
         return source
     }
 

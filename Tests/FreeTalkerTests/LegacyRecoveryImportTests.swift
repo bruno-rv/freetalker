@@ -147,6 +147,106 @@ import Testing
         #expect(try await reopened.store.session(id: job.id) == nil)
     }
 
+    @MainActor @Test("deleting one UUID capture never disposes identical audio owned by another UUID")
+    func captureDispositionKeepsUUIDIdentity() async throws {
+        let fixture = try ReconciliationFixture()
+        let firstID = UUID()
+        let secondID = UUID()
+        let audio = WAVEncoder.encode(
+            samples: Array(repeating: 0.3, count: 1_600), sampleRate: 16_000
+        )
+        let first = fixture.root.appendingPathComponent("\(firstID.uuidString).wav")
+        let second = fixture.root.appendingPathComponent("\(secondID.uuidString).wav")
+        try audio.write(to: first)
+        try audio.write(to: second)
+        let report = await fixture.reconciler().reconcile()
+        #expect(report.failed == 0, Comment(rawValue: String(describing: report.failures)))
+        #expect(try await fixture.store.job(id: firstID) != nil)
+        #expect(try await fixture.store.job(id: secondID) != nil)
+
+        let library = JobLibraryStore(store: fixture.store, recoveryDirectory: fixture.root)
+        try await library.refresh()
+        try await library.delete(id: firstID)
+        #expect(try await fixture.store.session(id: firstID) == nil)
+        #expect(try await fixture.store.job(id: secondID) != nil)
+        #expect(FileManager.default.fileExists(atPath: second.path))
+
+        let reopened = try fixture.reopen()
+        _ = await reopened.reconciler().reconcile()
+        #expect(try await reopened.store.job(id: firstID) == nil)
+        #expect(try await reopened.store.session(id: firstID) == nil)
+        #expect(try await reopened.store.job(id: secondID) != nil)
+        #expect(FileManager.default.fileExists(atPath: second.path))
+    }
+
+    @Test("automatic retention purges a session-canonical quarantine without resurrection")
+    func retentionPurgesSessionCanonicalQuarantine() async throws {
+        let fixture = try ReconciliationFixture()
+        let historical = fixture.root.appendingPathComponent("failed-session-retention.wav")
+        try Data("damaged session audio".utf8).write(to: historical)
+        _ = await fixture.reconciler().reconcile()
+        let job = try #require(try await fixture.store.jobs(kind: .recovery).first)
+        let owned = URL(fileURLWithPath: job.source.reference)
+
+        _ = try await RecoveryRetentionService(
+            directory: fixture.root, store: fixture.store, ledger: fixture.store
+        ).purgeExpired(now: .distantFuture, retention: .oneDay)
+
+        #expect(try await fixture.store.job(id: job.id) == nil)
+        #expect(try await fixture.store.session(id: job.id) == nil)
+        #expect(!FileManager.default.fileExists(atPath: owned.path))
+        #expect(FileManager.default.fileExists(atPath: historical.path))
+        let reopened = try fixture.reopen()
+        _ = await reopened.reconciler().reconcile()
+        #expect(try await reopened.store.jobs(kind: .recovery).isEmpty)
+        #expect(try await reopened.store.session(id: job.id) == nil)
+    }
+
+    @MainActor @Test("startup resumes an explicit Delete interrupted immediately after its durable claim")
+    func claimedDeleteResumesAfterReopen() async throws {
+        let fixture = try ReconciliationFixture()
+        let historical = fixture.root.appendingPathComponent("failed-claimed-delete.wav")
+        try Data("claimed delete audio".utf8).write(to: historical)
+        _ = await fixture.reconciler().reconcile()
+        let job = try #require(try await fixture.store.jobs(kind: .recovery).first)
+        #expect(try await fixture.store.claimRecoveryForDeletion(id: job.id, claimedAt: Date()))
+
+        let reopened = try fixture.reopen()
+        let library = JobLibraryStore(store: reopened.store, recoveryDirectory: reopened.root)
+        try await library.refresh()
+        try await library.delete(id: job.id)
+        _ = await reopened.reconciler().reconcile()
+        #expect(try await reopened.store.job(id: job.id) == nil)
+        #expect(try await reopened.store.session(id: job.id) == nil)
+        #expect(FileManager.default.fileExists(atPath: historical.path))
+        let rerun = try fixture.reopen()
+        _ = await rerun.reconciler().reconcile()
+        #expect(try await rerun.store.jobs(kind: .recovery).isEmpty)
+    }
+
+    @Test("startup resumes a claimed quarantine after removal throws")
+    func claimedRetentionFailureResumesAfterReopen() async throws {
+        let fixture = try ReconciliationFixture()
+        let historical = fixture.root.appendingPathComponent("failed-claimed-retention.wav")
+        try Data("claimed retention audio".utf8).write(to: historical)
+        _ = await fixture.reconciler().reconcile()
+        let job = try #require(try await fixture.store.jobs(kind: .recovery).first)
+
+        await #expect(throws: Error.self) {
+            _ = try await RecoveryRetentionService(
+                directory: fixture.root, store: fixture.store,
+                fileRemover: FailingLegacyRecoveryRemover(), ledger: fixture.store
+            ).purgeExpired(now: .distantFuture, retention: .oneDay)
+        }
+        #expect(try await fixture.store.claimedRecoveries().map(\.id) == [job.id])
+
+        let reopened = try fixture.reopen()
+        _ = await reopened.reconciler().reconcile()
+        #expect(try await reopened.store.job(id: job.id) == nil)
+        #expect(try await reopened.store.session(id: job.id) == nil)
+        #expect(FileManager.default.fileExists(atPath: historical.path))
+    }
+
     @Test("registration retries at the exact same-session schedule")
     func registrationRetrySchedule() async throws {
         let recorder = RetryRecorder(failuresBeforeSuccess: 2)
@@ -170,4 +270,8 @@ private actor RetryRecorder {
         attemptCount += 1
         if attemptCount <= failuresBeforeSuccess { throw CocoaError(.fileWriteUnknown) }
     }
+}
+
+private struct FailingLegacyRecoveryRemover: RecoveryFileRemoving {
+    func removeItem(at _: URL) throws { throw CocoaError(.fileWriteUnknown) }
 }

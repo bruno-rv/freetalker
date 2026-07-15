@@ -2982,7 +2982,9 @@ final class AppCoordinator: ObservableObject {
             reconciliation.recordFailure(Self.recoveryDirectory, error)
         }
         do {
-            _ = try await RecoveryRetentionService(directory: Self.recoveryDirectory, store: recoveryStore)
+            _ = try await RecoveryRetentionService(
+                directory: Self.recoveryDirectory, store: recoveryStore, ledger: recoveryStore
+            )
                 .purgeExpired(now: Date(), retention: AppSettings.shared.recoveryRetention)
         } catch {
             reconciliation.recordFailure(Self.recoveryDirectory, error)
@@ -3095,7 +3097,9 @@ final class AppCoordinator: ObservableObject {
 
     private func purgeRecoveries(retention: RecoveryRetention) async {
         guard let recoveryStore else { return }
-        _ = try? await RecoveryRetentionService(directory: Self.recoveryDirectory, store: recoveryStore)
+        _ = try? await RecoveryRetentionService(
+            directory: Self.recoveryDirectory, store: recoveryStore, ledger: recoveryStore
+        )
             .purgeExpired(now: Date(), retention: retention)
         try? await jobLibraryStore?.refresh()
     }

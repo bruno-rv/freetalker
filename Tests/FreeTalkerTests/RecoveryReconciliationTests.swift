@@ -380,6 +380,30 @@ import Testing
         #expect(try await reopened.store.session(id: id) == nil)
         #expect(!FileManager.default.fileExists(atPath: job.source.reference))
     }
+
+    @MainActor @Test("disposing one fixed-content marker never disposes another capture identity")
+    func markerDispositionKeepsCaptureIdentity() async throws {
+        let fixture = try ReconciliationFixture()
+        let firstID = UUID()
+        let secondID = UUID()
+        for id in [firstID, secondID] {
+            try Data("same interrupted preparation".utf8).write(to:
+                fixture.root.appendingPathComponent(".capture-preparation-\(id.uuidString).marker")
+            )
+        }
+        _ = await fixture.reconciler().reconcile()
+        let library = JobLibraryStore(store: fixture.store, recoveryDirectory: fixture.root)
+        try await library.refresh()
+        try await library.delete(id: firstID)
+
+        let reopened = try fixture.reopen()
+        let report = await reopened.reconciler().reconcile()
+        #expect(report.failed == 0, Comment(rawValue: String(describing: report.failures)))
+        #expect(try await reopened.store.job(id: firstID) == nil)
+        #expect(try await reopened.store.session(id: firstID) == nil)
+        #expect(try await reopened.store.job(id: secondID) != nil)
+        #expect(try await reopened.store.session(id: secondID) != nil)
+    }
 }
 
 private actor LaunchGateProbe {

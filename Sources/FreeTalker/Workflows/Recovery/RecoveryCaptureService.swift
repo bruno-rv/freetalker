@@ -272,9 +272,13 @@ struct RecoveryCaptureService: Sendable {
                 throw RecoveryFinalizationError.recoveryJobMismatch
             }
             if journalFileSystem.exists(source) {
-                try RecoveryImportDispositionStore(
+                let dispositions = RecoveryImportDispositionStore(
                     directory: directory, fileSystem: journalFileSystem
-                ).record(source: source)
+                )
+                let descriptor = try dispositions.descriptor(
+                    id: captureID, source: source, defaultScope: .capture(captureID)
+                )
+                try dispositions.record(descriptor)
                 try journalFileSystem.remove(source)
             }
         }
