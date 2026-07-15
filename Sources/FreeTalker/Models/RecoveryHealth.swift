@@ -75,3 +75,48 @@ struct SilentCapturePresentation: Equatable, Sendable {
         message = session.failureMessage ?? Self.message
     }
 }
+
+struct RecoverySetupRetryScheduler: Sendable {
+    enum Action: Equatable { case none, deferred, run }
+    private(set) var hasDeferredRetry = false
+
+    mutating func request(isBusy: Bool) -> Action {
+        guard isBusy else { return .run }
+        hasDeferredRetry = true
+        return .deferred
+    }
+
+    mutating func becameIdle(isBusy: Bool) -> Action {
+        guard hasDeferredRetry, !isBusy else { return .none }
+        hasDeferredRetry = false
+        return .run
+    }
+}
+
+enum RecoveryFinalizationFailurePolicy {
+    struct Classification: Equatable {
+        let health: RecoveryHealth
+        let admissionStorageHealthy: Bool
+    }
+
+    static func classify(
+        ownershipTransitionCompleted: Bool,
+        message: String
+    ) -> Classification {
+        ownershipTransitionCompleted
+            ? Classification(health: .degraded(message), admissionStorageHealthy: true)
+            : Classification(health: .unavailable(message), admissionStorageHealthy: false)
+    }
+}
+
+enum RecoveryStoreRetry {
+    static func openFresh<Store>(
+        replacing _: Store?,
+        open: () throws -> Store,
+        validate: (Store) throws -> Void
+    ) throws -> Store {
+        let fresh = try open()
+        try validate(fresh)
+        return fresh
+    }
+}

@@ -41,6 +41,7 @@ import Testing
         var watchdog = MicrophoneSignalWatchdog(captureID: id)
         #expect(watchdog.observe(peak: 0, rms: 0, fault: .inputRoute(captureID: id, message: "input vanished")) == .restartForRouteFailure("input vanished"))
         #expect(watchdog.observe(peak: 0, rms: 0, fault: .engine(captureID: id, message: "engine stopped")) == .continueRecording)
+        #expect(watchdog.routeFailure == "input vanished")
     }
 
     @Test("stale capture fault is ignored")
@@ -60,6 +61,29 @@ import Testing
         #expect(watchdog.peak == 0)
         #expect(watchdog.rms == 0)
         #expect(watchdog.retainedSampleCount == 0)
+    }
+
+    @Test("stop waits for an admitted callback and rejects stale generations")
+    func generationGateQuiescesCallbacks() async {
+        let gate = AudioCaptureGenerationGate()
+        let first = gate.activate()
+        #expect(gate.begin(first))
+        let stopReturned = LockedFlag()
+        let stop = Task.detached {
+            gate.deactivateAndWait()
+            stopReturned.set()
+        }
+        await Task.yield()
+        #expect(!stopReturned.value)
+        gate.finish(first)
+        await stop.value
+        #expect(stopReturned.value)
+
+        let second = gate.activate()
+        #expect(!gate.begin(first))
+        #expect(gate.begin(second))
+        gate.finish(second)
+        gate.deactivateAndWait()
     }
 
     @Test("all-silent stop uses exact visible non-retryable failure")
@@ -106,4 +130,11 @@ import Testing
         #expect(library.silentCaptures.map(\.id) == [captureID])
         #expect(try await reopened.jobs(kind: .recovery).isEmpty)
     }
+}
+
+private final class LockedFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = false
+    var value: Bool { lock.withLock { storage } }
+    func set() { lock.withLock { storage = true } }
 }

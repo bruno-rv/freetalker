@@ -112,6 +112,27 @@ actor RecoveryReconciler {
             case .capturing:
                 if fileSystem.exists(canonical) {
                     try await importCanonical(canonical, id: current.id)
+                } else if fileSystem.exists(
+                    current.directory.appendingPathComponent("capture-diagnostics.json")
+                ) {
+                    let diagnostics = try CaptureJournalService(
+                        fileSystem: fileSystem, ledger: ledger
+                    ).loadSilentDiagnostics(current)
+                    guard diagnostics.indicatesSilence else {
+                        throw RecoveryReconciliationOperationError(
+                            operation: "restore silent capture",
+                            underlying: CaptureJournalError.failed(
+                                "persisted diagnostics contain microphone signal"
+                            )
+                        )
+                    }
+                    try await ledger.transition(
+                        id: current.id, from: .capturing, to: .silent,
+                        recoveryJobID: nil, libraryDictationID: nil,
+                        assetKind: .silent,
+                        failureMessage: SilentCapturePresentation.message,
+                        contentHash: nil
+                    )
                 } else {
                     let segments = try await ledger.committedSegments(captureID: current.id)
                     if !segments.isEmpty {
@@ -137,6 +158,11 @@ actor RecoveryReconciler {
                             try await quarantineJournal(
                                 current, fallback: failureMarker,
                                 message: "Capture journal failed before recoverable audio was committed"
+                            )
+                        } else {
+                            try await quarantineJournal(
+                                current, fallback: nil,
+                                message: "Interrupted capture has no committed audio"
                             )
                         }
                     }

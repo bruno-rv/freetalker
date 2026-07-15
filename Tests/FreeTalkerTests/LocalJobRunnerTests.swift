@@ -3,6 +3,33 @@ import Testing
 @testable import FreeTalker
 
 @Suite struct LocalJobRunnerTests {
+    @Test func shutdownDrainsCurrentWorkAndLeavesQueuedJobsForFreshRunner() async throws {
+        let fixture = try RunnerFixture()
+        let current = try await fixture.makeJob(.recovery, "current-rebind.wav")
+        let queued = try await fixture.makeJob(.recovery, "queued-rebind.wav")
+        let oldProbe = SuspendedExecutorProbe()
+        let oldRunner = LocalJobRunner(store: fixture.store, executor: oldProbe.execute)
+        await oldRunner.enqueue(current.id)
+        await oldRunner.enqueue(queued.id)
+        await oldProbe.waitUntilStarted(current.id)
+
+        let shutdown = Task { await oldRunner.shutdown() }
+        await Task.yield()
+        await oldProbe.resume(current.id)
+        await shutdown.value
+
+        #expect(await oldProbe.started == [current.id])
+        #expect(try await fixture.store.job(id: queued.id)?.state == .queued)
+
+        let freshProbe = SuspendedExecutorProbe()
+        let freshRunner = LocalJobRunner(store: fixture.store, executor: freshProbe.execute)
+        await freshRunner.resumeQueuedJobs()
+        await freshProbe.waitUntilStarted(queued.id)
+        await freshProbe.resume(queued.id)
+        await freshRunner.waitUntilIdle()
+        #expect(await freshProbe.started == [queued.id])
+    }
+
     @Test func executesQueuedJobsSeriallyInFIFOOrder() async throws {
         let fixture = try RunnerFixture()
         let first = try await fixture.makeJob(.recovery, "first.wav")

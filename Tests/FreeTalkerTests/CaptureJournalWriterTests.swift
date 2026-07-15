@@ -65,13 +65,15 @@ import Testing
         let active = try await service.prepare(request)
         #expect(active.writer.enqueue([0, 0, 0, 0]) == .accepted)
 
-        try await service.recordSilent(active, diagnostics: CaptureDiagnostics(
-            peak: 0, rms: 0, inputDeviceUID: "test-mic", routeFailure: nil
-        ))
+        let diagnostics = CaptureDiagnostics(
+            peak: 0, rms: 0, inputDeviceUID: "test-mic", routeFailure: "input route vanished"
+        )
+        try await service.recordSilent(active, diagnostics: diagnostics)
 
         #expect(await ledger.session(id: request.id)?.state == .silent)
         #expect(await ledger.session(id: request.id)?.assetKind == .silent)
         #expect(await ledger.session(id: request.id)?.failureMessage == "No microphone signal was captured.")
+        #expect(try service.loadSilentDiagnostics(active.session) == diagnostics)
         #expect(try fileSystem.contents(root).allSatisfy { $0.pathExtension != "wav" })
     }
 

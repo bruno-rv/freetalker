@@ -3,6 +3,36 @@ import Testing
 @testable import FreeTalker
 
 @Suite struct RecoveryReconciliationTests {
+    @Test("silent diagnostics resume an interrupted silent ledger transition")
+    func silentDiagnosticsResumeTransition() async throws {
+        let fixture = try ReconciliationFixture()
+        let id = UUID()
+        let directory = fixture.root.appendingPathComponent(id.uuidString, isDirectory: true)
+        try fixture.fileSystem.createDirectory(directory)
+        _ = try await fixture.store.createCapture(.init(
+            id: id, directory: directory, capturedAt: Date(), sampleRate: 16_000,
+            channelCount: 1, inputDeviceUID: "mic", destination: "external"
+        ))
+        let diagnostics = CaptureDiagnostics(
+            peak: 0, rms: 0, inputDeviceUID: "mic", routeFailure: "route unavailable"
+        )
+        let target = directory.appendingPathComponent("capture-diagnostics.json")
+        try DurableArtifactWriter(fileSystem: fixture.fileSystem).commit(
+            try JSONEncoder().encode(diagnostics),
+            temporary: directory.appendingPathComponent("diagnostics.tmp"),
+            destination: target
+        )
+
+        let report = await fixture.reconciler().reconcile()
+
+        #expect(report.failed == 0)
+        #expect(try await fixture.store.session(id: id)?.state == .silent)
+        #expect(try await fixture.store.session(id: id)?.failureMessage == SilentCapturePresentation.message)
+        #expect(try CaptureJournalService(
+            fileSystem: fixture.fileSystem, ledger: fixture.store
+        ).loadSilentDiagnostics(try #require(try await fixture.store.session(id: id))) == diagnostics)
+    }
+
     @Test("corrupt artifacts are quarantined without blocking later valid audio")
     func corruptThenValidIsIsolatedAndDurable() async throws {
         let fixture = try ReconciliationFixture()

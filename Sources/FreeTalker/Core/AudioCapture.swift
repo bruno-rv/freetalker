@@ -35,6 +35,7 @@ struct MicrophoneSignalWatchdog: Sendable {
     private(set) var observationCount = 0
     private(set) var peak: Float = 0
     private(set) var rms: Float = 0
+    private(set) var routeFailure: String?
     private var warned = false
     private var silentObservationCount = 0
     private var sumSquares: Double = 0
@@ -78,8 +79,9 @@ struct MicrophoneSignalWatchdog: Sendable {
         guard !hasObservedSignal else { return .continueRecording }
         silentObservationCount += 1
         if let fault,
-           !didRequestRestart,
            captureID == nil || fault.captureID == captureID {
+            if routeFailure == nil { routeFailure = fault.message }
+            guard !didRequestRestart else { return .continueRecording }
             didRequestRestart = true
             warned = true
             return .restartForRouteFailure(fault.message)
@@ -89,6 +91,56 @@ struct MicrophoneSignalWatchdog: Sendable {
             return .warnNoSignal
         }
         return .continueRecording
+    }
+}
+
+final class AudioCaptureGenerationGate: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var activeGeneration: UUID?
+    private var accepting = false
+    private var inFlight = 0
+
+    func activate() -> UUID {
+        condition.withLock {
+            precondition(activeGeneration == nil && inFlight == 0)
+            let generation = UUID()
+            activeGeneration = generation
+            accepting = true
+            return generation
+        }
+    }
+
+    func begin(_ generation: UUID) -> Bool {
+        condition.withLock {
+            guard accepting, activeGeneration == generation else { return false }
+            inFlight += 1
+            return true
+        }
+    }
+
+    func finish(_ generation: UUID) {
+        condition.lock()
+        if activeGeneration == generation, inFlight > 0 {
+            inFlight -= 1
+            if inFlight == 0 { condition.broadcast() }
+        }
+        condition.unlock()
+    }
+
+    func deactivateAndWait() {
+        condition.lock()
+        accepting = false
+        while inFlight > 0 { condition.wait() }
+        activeGeneration = nil
+        condition.unlock()
+    }
+
+    func isCurrent(_ generation: UUID) -> Bool {
+        condition.withLock { activeGeneration == generation }
+    }
+
+    var currentGeneration: UUID? {
+        condition.withLock { activeGeneration }
     }
 }
 
@@ -131,7 +183,7 @@ final class AudioCapture: @unchecked Sendable {
 
     private static let logger = Logger(subsystem: "org.freetalker.app", category: "audio-capture")
     private var engine = AVAudioEngine()
-    private var converter: AVAudioConverter?
+    private let generationGate = AudioCaptureGenerationGate()
     private var samples: [Float] = []
     // Guards `samples` and `conversionFailureCount`, which cross the tap and main threads.
     private let samplesLock = NSLock()
@@ -234,7 +286,6 @@ final class AudioCapture: @unchecked Sendable {
         activeNoiseSuppression = noiseSuppression
         didReportConsumerFailure = false
         samplesLock.unlock()
-        converter = nil
         captureWarnings.removeAll()
 
         let route = Self.captureRoute(deviceUID: deviceUID, noiseSuppression: noiseSuppression)
@@ -245,10 +296,11 @@ final class AudioCapture: @unchecked Sendable {
 
         let attemptWarningStart = captureWarnings.count
         do {
-            try startCaptureAttempt(
+            let generation = try startCaptureAttempt(
                 deviceUID: deviceUID,
                 requestedVoiceProcessing: requestedVoiceProcessing
             )
+            installConfigurationObserver(captureID: captureID, generation: generation)
         } catch {
             guard Self.captureFailureAction(
                 effectiveVoiceProcessing: engine.inputNode.isVoiceProcessingEnabled
@@ -260,31 +312,39 @@ final class AudioCapture: @unchecked Sendable {
             captureWarnings = Self.captureWarnings(captureWarnings, rollingBackTo: attemptWarningStart)
             try replaceWithRawEngine()
             recordWarning("Voice processing failed — using raw microphone audio")
-            try startCaptureAttempt(deviceUID: deviceUID, requestedVoiceProcessing: false)
+            let generation = try startCaptureAttempt(
+                deviceUID: deviceUID, requestedVoiceProcessing: false
+            )
+            installConfigurationObserver(captureID: captureID, generation: generation)
         }
-        samplesLock.withLock { isCapturing = true }
-        installConfigurationObserver(captureID: captureID)
     }
 
     func restartAfterCorroboratedFault() throws {
-        samplesLock.lock()
-        let capturing = isCapturing
-        let deviceUID = activeDeviceUID
-        let noiseSuppression = activeNoiseSuppression
-        samplesLock.unlock()
-        guard capturing else { throw CaptureError.engineStartFailed("capture is no longer active") }
+        let state = samplesLock.withLock {
+            (
+                capturing: isCapturing,
+                deviceUID: activeDeviceUID,
+                noiseSuppression: activeNoiseSuppression,
+                captureID: signalWatchdog.captureID
+            )
+        }
+        guard state.capturing else { throw CaptureError.engineStartFailed("capture is no longer active") }
 
         removeConfigurationObserver()
+        generationGate.deactivateAndWait()
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
-        converter = nil
-        let route = Self.captureRoute(deviceUID: deviceUID, noiseSuppression: noiseSuppression)
+        let route = Self.captureRoute(
+            deviceUID: state.deviceUID, noiseSuppression: state.noiseSuppression
+        )
         do {
-            try startCaptureAttempt(
-                deviceUID: deviceUID,
+            let generation = try startCaptureAttempt(
+                deviceUID: state.deviceUID,
                 requestedVoiceProcessing: route == .voiceProcessedSystemDefault
             )
-            installConfigurationObserver(captureID: signalWatchdog.captureID)
+            installConfigurationObserver(
+                captureID: state.captureID, generation: generation
+            )
         } catch {
             samplesLock.withLock { isCapturing = false }
             throw error
@@ -297,9 +357,13 @@ final class AudioCapture: @unchecked Sendable {
         result == .accepted ? .none : .escalate
     }
 
-    private func startCaptureAttempt(deviceUID: String?, requestedVoiceProcessing: Bool) throws {
+    private func startCaptureAttempt(
+        deviceUID: String?, requestedVoiceProcessing: Bool
+    ) throws -> UUID {
         var input: AVAudioInputNode?
         var tapInstalled = false
+        let generation = generationGate.activate()
+        samplesLock.withLock { isCapturing = true }
         do {
             let attemptInput = try reconcileVoiceProcessing(requested: requestedVoiceProcessing)
             input = attemptInput
@@ -317,20 +381,23 @@ final class AudioCapture: @unchecked Sendable {
             guard let negotiatedConverter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
                 throw CaptureError.converterUnavailable(inputFormat.description)
             }
-            converter = negotiatedConverter
-
             attemptInput.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
-                self?.consume(buffer: buffer, inputFormat: inputFormat)
+                self?.consume(
+                    buffer: buffer, inputFormat: inputFormat,
+                    converter: negotiatedConverter, generation: generation
+                )
             }
             tapInstalled = true
             engine.prepare()
             try engine.start()
+            return generation
         } catch {
             if tapInstalled {
                 input?.removeTap(onBus: 0)
             }
             engine.stop()
-            converter = nil
+            generationGate.deactivateAndWait()
+            samplesLock.withLock { isCapturing = false }
             throw error
         }
     }
@@ -373,6 +440,7 @@ final class AudioCapture: @unchecked Sendable {
         }
         if wasCapturing {
             removeConfigurationObserver()
+            generationGate.deactivateAndWait()
             engine.inputNode.removeTap(onBus: 0)
             engine.stop()
         }
@@ -384,13 +452,18 @@ final class AudioCapture: @unchecked Sendable {
         return capturedSamples
     }
 
-    func signalDiagnostics() -> (peak: Float, rms: Float, hasObservedSignal: Bool) {
+    func signalDiagnostics() -> (
+        peak: Float, rms: Float, hasObservedSignal: Bool, routeFailure: String?
+    ) {
         samplesLock.withLock {
-            (signalWatchdog.peak, signalWatchdog.rms, signalWatchdog.hasObservedSignal)
+            (
+                signalWatchdog.peak, signalWatchdog.rms,
+                signalWatchdog.hasObservedSignal, signalWatchdog.routeFailure
+            )
         }
     }
 
-    private func installConfigurationObserver(captureID: UUID?) {
+    private func installConfigurationObserver(captureID: UUID?, generation: UUID) {
         removeConfigurationObserver()
         guard let captureID else { return }
         configurationObserver = NotificationCenter.default.addObserver(
@@ -399,10 +472,13 @@ final class AudioCapture: @unchecked Sendable {
             queue: nil
         ) { [weak self] _ in
             guard let self else { return }
-            self.reportFault(.engine(
-                captureID: captureID,
-                message: "The audio input configuration changed unexpectedly."
-            ))
+            self.reportFault(
+                .engine(
+                    captureID: captureID,
+                    message: "The audio input configuration changed unexpectedly."
+                ),
+                generation: generation
+            )
         }
     }
 
@@ -414,8 +490,14 @@ final class AudioCapture: @unchecked Sendable {
     }
 
     func reportFault(_ fault: AudioCaptureFault) {
+        guard let generation = generationGate.currentGeneration else { return }
+        reportFault(fault, generation: generation)
+    }
+
+    private func reportFault(_ fault: AudioCaptureFault, generation: UUID) {
+        guard generationGate.isCurrent(generation) else { return }
         let payload = samplesLock.withLock { () -> ((@Sendable (MicrophoneSignalWatchdog.Decision) -> Void)?, MicrophoneSignalWatchdog.Decision)? in
-            guard isCapturing else { return nil }
+            guard isCapturing, generationGate.isCurrent(generation) else { return nil }
             let decision = signalWatchdog.observe(peak: 0, rms: 0, fault: fault)
             return (onSignalDecision, decision)
         }
@@ -472,7 +554,6 @@ final class AudioCapture: @unchecked Sendable {
 
     private func replaceWithRawEngine() throws {
         engine.stop()
-        converter = nil
         engine = AVAudioEngine()
         let input = engine.inputNode
         if input.isVoiceProcessingEnabled {
@@ -602,15 +683,18 @@ final class AudioCapture: @unchecked Sendable {
         return deviceID
     }
 
-    private func consume(buffer: AVAudioPCMBuffer, inputFormat: AVAudioFormat) {
-        guard let converter else {
-            recordConversionFailure()
-            return
-        }
+    private func consume(
+        buffer: AVAudioPCMBuffer,
+        inputFormat: AVAudioFormat,
+        converter: AVAudioConverter,
+        generation: UUID
+    ) {
+        guard generationGate.begin(generation) else { return }
+        defer { generationGate.finish(generation) }
         let ratio = targetFormat.sampleRate / inputFormat.sampleRate
         let outCapacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 16
         guard let outBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outCapacity) else {
-            recordConversionFailure()
+            recordConversionFailure(generation: generation)
             return
         }
 
@@ -629,17 +713,18 @@ final class AudioCapture: @unchecked Sendable {
         }
 
         guard status != .error, error == nil else {
-            recordConversionFailure()
+            recordConversionFailure(generation: generation)
             return
         }
         guard let channelData = outBuffer.floatChannelData else {
-            recordConversionFailure()
+            recordConversionFailure(generation: generation)
             return
         }
         let frameCount = Int(outBuffer.frameLength)
         let convertedSamples = Array(
             UnsafeBufferPointer(start: channelData[0], count: frameCount)
         )
+        guard generationGate.isCurrent(generation) else { return }
         samplesLock.lock()
         samples.append(contentsOf: convertedSamples)
         let consumer = sampleConsumer
@@ -663,7 +748,8 @@ final class AudioCapture: @unchecked Sendable {
         }
     }
 
-    private func recordConversionFailure() {
+    private func recordConversionFailure(generation: UUID) {
+        guard generationGate.isCurrent(generation) else { return }
         samplesLock.lock()
         conversionFailureCount += 1
         samplesLock.unlock()

@@ -113,6 +113,7 @@ actor LocalJobRunner {
     private var worker: Task<Void, Never>?
     private var current: CurrentExecution?
     private var staleRecoveryTask: Task<Void, Never>?
+    private var shuttingDown = false
 
     init(
         store: any TranscriptionJobStoring,
@@ -139,6 +140,7 @@ actor LocalJobRunner {
     }
 
     func enqueue(_ id: UUID) {
+        guard !shuttingDown else { return }
         staleRecoveryTask?.cancel()
         staleRecoveryTask = nil
         guard current?.id != id, !queue.contains(id) else { return }
@@ -164,6 +166,7 @@ actor LocalJobRunner {
     }
 
     func resumeQueuedJobs() async {
+        guard !shuttingDown else { return }
         if worker == nil, current == nil {
             if let leased = store as? any LeasedTranscriptionJobStoring {
                 _ = try? await leased.recoverStaleJobs(kind: kind)
@@ -183,6 +186,14 @@ actor LocalJobRunner {
 
     func waitUntilIdle() async {
         while worker != nil { await Task.yield() }
+    }
+
+    func shutdown() async {
+        shuttingDown = true
+        staleRecoveryTask?.cancel()
+        staleRecoveryTask = nil
+        queue.removeAll()
+        await waitUntilIdle()
     }
 
     private func startWorkerIfNeeded() {

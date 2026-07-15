@@ -141,8 +141,13 @@ private struct MenuBarContentView: View {
                 Button(warning.actionTitle) {
                     coordinator.retryRecoverySetup()
                 }
+                .disabled(coordinator.recoverySetupRetryIsBusy)
                 .help("Reopen recovery storage and retry reconciliation")
-                .accessibilityHint("Reopens recovery storage and retries reconciliation")
+                .accessibilityHint(
+                    coordinator.recoverySetupRetryIsBusy
+                        ? "Available after the current recording or processing finishes"
+                        : "Reopens recovery storage and retries reconciliation"
+                )
             }
 
             if let hotKeyStatusText = coordinator.hotKeyStatusText {

@@ -180,11 +180,30 @@ struct CaptureJournalService: Sendable {
             throw CaptureJournalError.failed("capture diagnostics contain microphone signal")
         }
         await active.writer.stop()
+        let diagnosticURL = silentDiagnosticsURL(active.session)
+        try DurableArtifactWriter(fileSystem: fileSystem).commit(
+            try JSONEncoder().encode(diagnostics),
+            temporary: diagnosticURL.deletingLastPathComponent().appendingPathComponent(
+                ".capture-diagnostics.\(UUID().uuidString).tmp"
+            ),
+            destination: diagnosticURL
+        )
         try await ledger.transition(
             id: active.session.id, from: .capturing, to: .silent,
             recoveryJobID: nil, libraryDictationID: nil, assetKind: .silent,
             failureMessage: SilentCapturePresentation.message, contentHash: nil
         )
+    }
+
+    func loadSilentDiagnostics(_ session: CaptureSession) throws -> CaptureDiagnostics {
+        try JSONDecoder().decode(
+            CaptureDiagnostics.self,
+            from: fileSystem.read(silentDiagnosticsURL(session))
+        )
+    }
+
+    private func silentDiagnosticsURL(_ session: CaptureSession) -> URL {
+        session.directory.appendingPathComponent("capture-diagnostics.json")
     }
 
     func cancelAndClean(_ active: ActiveCaptureJournal) async throws {

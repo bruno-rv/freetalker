@@ -67,4 +67,39 @@ import Testing
             admissionStorageHealthy: false
         ))
     }
+
+    @Test("retry defers while capture or processing owns mutable recovery state")
+    func retryDeferral() {
+        var scheduler = RecoverySetupRetryScheduler()
+        #expect(scheduler.request(isBusy: true) == .deferred)
+        #expect(scheduler.becameIdle(isBusy: true) == .none)
+        #expect(scheduler.becameIdle(isBusy: false) == .run)
+        #expect(scheduler.becameIdle(isBusy: false) == .none)
+    }
+
+    @Test("durability finalization failure blocks admission until reconciliation")
+    func finalizationFailurePolicy() {
+        #expect(RecoveryFinalizationFailurePolicy.classify(
+            ownershipTransitionCompleted: false,
+            message: "jobs.db is busy"
+        ) == .init(health: .unavailable("jobs.db is busy"), admissionStorageHealthy: false))
+        #expect(RecoveryFinalizationFailurePolicy.classify(
+            ownershipTransitionCompleted: true,
+            message: "canonical audio is damaged"
+        ) == .init(health: .degraded("canonical audio is damaged"), admissionStorageHealthy: true))
+    }
+
+    @Test("retry always installs the freshly opened and validated store")
+    func freshStoreReplacement() throws {
+        final class Store { let name: String; init(_ name: String) { self.name = name } }
+        let old = Store("old")
+        var validated: [String] = []
+        let replacement = try RecoveryStoreRetry.openFresh(
+            replacing: old,
+            open: { Store("fresh") },
+            validate: { validated.append($0.name) }
+        )
+        #expect(replacement.name == "fresh")
+        #expect(validated == ["fresh"])
+    }
 }

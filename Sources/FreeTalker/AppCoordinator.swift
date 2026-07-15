@@ -209,6 +209,8 @@ final class AppCoordinator: ObservableObject {
     private var recoveryAdmissionStorageHealthy = false
     private var recoveryRunner: LocalJobRunner?
     private let recoveryLaunchGate = RecoveryLaunchGate()
+    private var recoverySetupRetryScheduler = RecoverySetupRetryScheduler()
+    @Published private(set) var recoverySetupRetryInFlight = false
     private var mediaImportRunner: LocalJobRunner?
     private var recoveryRetentionTask: Task<Void, Never>?
     private let localJobExecutionAuthority = LocalJobExecutionAuthority()
@@ -490,6 +492,11 @@ final class AppCoordinator: ObservableObject {
     }
 
     private func beginVoiceEditInstructionRecording() {
+        guard !recoverySetupRetryInFlight else {
+            hud.flash("Recovery setup is in progress — try Voice Edit again shortly")
+            pendingVoiceEditSelection = nil
+            return
+        }
         guard Self.captureStartDecision(
             current: captureOwner, requested: .voiceEdit,
             admissionState: captureAdmission.state
@@ -867,6 +874,7 @@ final class AppCoordinator: ObservableObject {
         recordingHUDOwnershipGeneration = nil
         translationRecoveryHUDOwner = .none
         presentTranslationRecoveryState()
+        runDeferredRecoverySetupRetryIfPossible()
     }
 
     func recordingHUDDidEndEarly(
@@ -1607,7 +1615,7 @@ final class AppCoordinator: ObservableObject {
         _ decision: MicrophoneSignalWatchdog.Decision,
         captureID: UUID
     ) {
-        guard captureAdmission.state.captureID == captureID,
+        guard captureAdmission.state == .recording(captureID: captureID),
               activeCaptureJournal?.session.id == captureID else { return }
         switch decision {
         case .continueRecording:
@@ -1783,13 +1791,14 @@ final class AppCoordinator: ObservableObject {
             let diagnostics = CaptureDiagnostics(
                 peak: peak, rms: rms,
                 inputDeviceUID: AppSettings.shared.microphoneDeviceUID,
-                routeFailure: nil
+                routeFailure: signal.routeFailure
             )
             active.writer.updateDiagnostics(diagnostics)
             let service = CaptureJournalService(
                 fileSystem: LocalJournalFileSystem(), ledger: recoveryStore
             )
             journalFinalizationTask = Task {
+                var ownershipTransitionCompleted = false
                 do {
                     if diagnostics.indicatesSilence {
                         try await service.recordSilent(active, diagnostics: diagnostics)
@@ -1825,6 +1834,7 @@ final class AppCoordinator: ObservableObject {
                         return
                     }
                     let staged = try await service.finish(active)
+                    ownershipTransitionCompleted = true
                     let url = staged.canonicalAudioURL
                     let downstreamSamples = try await CaptureCanonicalAudioLoader.load {
                         try CaptureSegmentCodec(
@@ -1855,7 +1865,14 @@ final class AppCoordinator: ObservableObject {
                     activeCaptureJournal = nil
                     captureOwner = .none
                     let message = "Recording was preserved, but could not be prepared for processing"
-                    lastError = "\(message): \(error.localizedDescription)"
+                    let detail = "\(message): \(error.localizedDescription)"
+                    let classification = RecoveryFinalizationFailurePolicy.classify(
+                        ownershipTransitionCompleted: ownershipTransitionCompleted,
+                        message: detail
+                    )
+                    recoveryHealth = classification.health
+                    recoveryAdmissionStorageHealthy = classification.admissionStorageHealthy
+                    lastError = detail
                     let destination = destinationLifecycle.take()
                     if case .scratchpad = destination {
                         _ = try? Self.routeDestinationEvent(
@@ -2985,6 +3002,34 @@ final class AppCoordinator: ObservableObject {
     }
 
     func retryRecoverySetup() {
+        switch recoverySetupRetryScheduler.request(
+            isBusy: recoverySetupRetryIsBusy
+        ) {
+        case .deferred, .none:
+            return
+        case .run:
+            break
+        }
+        startRecoverySetupRetry()
+    }
+
+    var recoverySetupRetryIsBusy: Bool {
+        recoverySetupRetryInFlight
+            || captureAdmission.state.isActive
+            || captureOwner != .none
+            || journalFinalizationTask != nil
+            || isRecording
+            || isProcessing
+    }
+
+    private func runDeferredRecoverySetupRetryIfPossible() {
+        guard recoverySetupRetryScheduler.becameIdle(
+            isBusy: recoverySetupRetryIsBusy
+        ) == .run else { return }
+        startRecoverySetupRetry()
+    }
+
+    private func startRecoverySetupRetry() {
         Task { [weak self] in
             guard let self else { return }
             await recoveryLaunchGate.run { [weak self] in
@@ -2994,16 +3039,30 @@ final class AppCoordinator: ObservableObject {
     }
 
     private func performRetryRecoverySetup() async {
+        guard !recoverySetupRetryIsBusy else {
+            _ = recoverySetupRetryScheduler.request(isBusy: true)
+            return
+        }
+        recoverySetupRetryInFlight = true
+        defer { recoverySetupRetryInFlight = false }
         recoveryHealth = recoveryHealth.beginRetry()
         recoveryAdmissionStorageHealthy = false
         do {
-            let reopened = try Self.makeRecoveryStore()
-            if recoveryStore == nil {
-                recoveryStore = reopened
-                jobLibraryStore = JobLibraryStore(
-                    store: reopened, recoveryDirectory: Self.recoveryDirectory
-                )
-            }
+            await recoveryRunner?.shutdown()
+            await mediaImportRunner?.shutdown()
+            let reopened = try RecoveryStoreRetry.openFresh(
+                replacing: recoveryStore,
+                open: Self.makeRecoveryStore,
+                validate: { _ in }
+            )
+            _ = try await reopened.jobs(kind: .recovery)
+            _ = try await reopened.unfinishedSessions()
+            recoveryRunner = nil
+            mediaImportRunner = nil
+            recoveryStore = reopened
+            jobLibraryStore = JobLibraryStore(
+                store: reopened, recoveryDirectory: Self.recoveryDirectory
+            )
             recoveryStoreInitializationError = nil
         } catch {
             let message = error.localizedDescription
@@ -3013,6 +3072,7 @@ final class AppCoordinator: ObservableObject {
             return
         }
         await performLaunchRecoveryWorkflows(isRetry: true)
+        await launchMediaImportWorkflows()
         await resolveReconciledCaptureAdmissionIfPossible()
     }
 

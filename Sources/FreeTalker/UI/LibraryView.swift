@@ -52,7 +52,17 @@ struct LibraryView: View {
             Text(warning.message)
                 .frame(maxWidth: .infinity, alignment: .leading)
             Button(warning.actionTitle) { coordinator.retryRecoverySetup() }
-                .accessibilityHint("Reopens recovery storage and retries reconciliation")
+                .disabled(coordinator.recoverySetupRetryIsBusy)
+                .help(
+                    coordinator.recoverySetupRetryIsBusy
+                        ? "Available after the current recording or processing finishes"
+                        : "Reopen recovery storage and retry reconciliation"
+                )
+                .accessibilityHint(
+                    coordinator.recoverySetupRetryIsBusy
+                        ? "Available after the current recording or processing finishes"
+                        : "Reopens recovery storage and retries reconciliation"
+                )
         }
         .padding(10)
         .background(.yellow.opacity(0.12))
