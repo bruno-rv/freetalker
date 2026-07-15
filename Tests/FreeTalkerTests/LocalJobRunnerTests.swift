@@ -3,6 +3,41 @@ import Testing
 @testable import FreeTalker
 
 @Suite struct LocalJobRunnerTests {
+    @Test(
+        "shutdown invalidates suspended resume discovery before stale runner can execute",
+        arguments: RunnerResumeBoundary.allCases
+    )
+    func shutdownInvalidatesSuspendedResume(boundary: RunnerResumeBoundary) async throws {
+        let fixture = try RunnerFixture()
+        let job = try await fixture.makeJob(.recovery, "resume-rebind.wav")
+        let suspendedStore = SuspendedResumeStore(base: fixture.store, boundary: boundary)
+        let oldProbe = RecordingExecutorProbe()
+        let oldRunner = LocalJobRunner(store: suspendedStore, executor: oldProbe.execute)
+
+        let oldResume = Task { await oldRunner.resumeQueuedJobs() }
+        await suspendedStore.waitUntilBlocked()
+        await oldRunner.shutdown()
+
+        let freshProbe = SuspendedExecutorProbe()
+        let freshRunner = LocalJobRunner(store: fixture.store, executor: freshProbe.execute)
+        await suspendedStore.release()
+        await oldResume.value
+        await oldRunner.waitUntilIdle()
+        for _ in 0..<10 { await Task.yield() }
+
+        #expect(await oldProbe.started.isEmpty)
+        #expect(try await fixture.store.job(id: job.id)?.state == .queued)
+        #expect(await suspendedStore.staleScheduleRequests == 0)
+
+        let freshJob = try await fixture.makeJob(.recovery, "fresh-rebind.wav")
+        await freshRunner.enqueue(freshJob.id)
+        await freshProbe.waitUntilStarted(freshJob.id)
+        await freshProbe.resume(freshJob.id)
+        await freshRunner.waitUntilIdle()
+        #expect(await freshProbe.started == [freshJob.id])
+        #expect(try await fixture.store.job(id: freshJob.id)?.state == .ready)
+    }
+
     @Test func shutdownDrainsCurrentWorkAndLeavesQueuedJobsForFreshRunner() async throws {
         let fixture = try RunnerFixture()
         let current = try await fixture.makeJob(.recovery, "current-rebind.wav")
@@ -415,6 +450,82 @@ private struct RunnerFixture {
     }
 }
 
+enum RunnerResumeBoundary: CaseIterable, Sendable {
+    case recoverStaleJobs
+    case jobs
+}
+
+private actor SuspendedResumeStore:
+    LeasedTranscriptionJobStoring, LeaseExpirySchedulingStore
+{
+    private let base: TranscriptionJobStore
+    private let boundary: RunnerResumeBoundary
+    private var blocked = false
+    private var continuation: CheckedContinuation<Void, Never>?
+    private(set) var staleScheduleRequests = 0
+
+    init(base: TranscriptionJobStore, boundary: RunnerResumeBoundary) {
+        self.base = base
+        self.boundary = boundary
+    }
+
+    func job(id: UUID) async throws -> TranscriptionJob? { try await base.job(id: id) }
+
+    func jobs(kind: JobKind?) async throws -> [TranscriptionJob] {
+        if boundary == .jobs { await suspendOnce() }
+        return try await base.jobs(kind: kind)
+    }
+
+    func recoverInterruptedJobs(kind: JobKind?) async throws -> Int {
+        try await base.recoverInterruptedJobs(kind: kind)
+    }
+
+    func recoverStaleJobs(kind: JobKind?) async throws -> Int {
+        if boundary == .recoverStaleJobs { await suspendOnce() }
+        return try await base.recoverStaleJobs(kind: kind)
+    }
+
+    func transition(_ id: UUID, from: JobState.Kind, to state: JobState) async throws {
+        try await base.transition(id, from: from, to: state)
+    }
+
+    func claimQueuedJob(
+        _ id: UUID, kind: JobKind?, owner: UUID, leaseDuration: TimeInterval
+    ) async throws -> TranscriptionJob {
+        try await base.claimQueuedJob(
+            id, kind: kind, owner: owner, leaseDuration: leaseDuration
+        )
+    }
+
+    func renewLease(_ id: UUID, owner: UUID, leaseDuration: TimeInterval) async throws {
+        try await base.renewLease(id, owner: owner, leaseDuration: leaseDuration)
+    }
+
+    func transitionOwned(_ id: UUID, owner: UUID, to state: JobState) async throws {
+        try await base.transitionOwned(id, owner: owner, to: state)
+    }
+
+    func delayUntilNextLeaseExpiry(kind: JobKind?) async throws -> TimeInterval? {
+        staleScheduleRequests += 1
+        return try await base.delayUntilNextLeaseExpiry(kind: kind)
+    }
+
+    func waitUntilBlocked() async {
+        while !blocked { await Task.yield() }
+    }
+
+    func release() {
+        continuation?.resume()
+        continuation = nil
+    }
+
+    private func suspendOnce() async {
+        guard !blocked else { return }
+        blocked = true
+        await withCheckedContinuation { continuation = $0 }
+    }
+}
+
 private func facadeResult(_ operation: () async throws -> Void) async -> Result<Void, Error> {
     do { try await operation(); return .success(()) }
     catch { return .failure(error) }
@@ -489,6 +600,14 @@ private actor SuspendedExecutorProbe {
 
     func resume(_ id: UUID) {
         continuations.removeValue(forKey: id)?.resume()
+    }
+}
+
+private actor RecordingExecutorProbe {
+    private(set) var started: [UUID] = []
+    func execute(job: TranscriptionJob, token: CancellationToken) async throws {
+        started.append(job.id)
+        try token.checkCancellation()
     }
 }
 

@@ -17,6 +17,7 @@ protocol CaptureLedgerStoring: Sendable {
     func session(id: UUID) async throws -> CaptureSession?
     func unfinishedSessions() async throws -> [CaptureSession]
     func committedSegments(captureID: UUID) async throws -> [CaptureSegment]
+    func removeCommittedSegments(captureID: UUID) async throws
     func removeCleanedSession(id: UUID) async throws
 }
 
@@ -212,6 +213,21 @@ extension TranscriptionJobStore: CaptureLedgerStoring {
         }
         guard result == SQLITE_DONE else { throw captureSQLError() }
         return segments
+    }
+
+    func removeCommittedSegments(captureID: UUID) throws {
+        guard try session(id: captureID)?.state == .silent else {
+            throw JobStoreError.invalidTransition
+        }
+        let statement = try capturePrepare("""
+        DELETE FROM capture_segments WHERE capture_id = ?;
+        """)
+        defer { sqlite3_finalize(statement) }
+        captureBind(captureID.uuidString, at: 1, in: statement)
+        try captureStepDone(statement)
+        guard try committedSegments(captureID: captureID).isEmpty else {
+            throw JobStoreError.invalidTransition
+        }
     }
 
     func removeCleanedSession(id: UUID) throws {

@@ -523,6 +523,7 @@ private actor AdmissionLedger: CaptureLedgerStoring {
     }
     func unfinishedSessions() async throws -> [CaptureSession] { [] }
     func committedSegments(captureID: UUID) async throws -> [CaptureSegment] { [] }
+    func removeCommittedSegments(captureID: UUID) async throws {}
     func removeCleanedSession(id: UUID) async throws {
         events.append(.removeLedger)
         stored = nil

@@ -686,6 +686,7 @@ private struct EventingCaptureLedger: CaptureLedgerStoring {
     func session(id: UUID) async throws -> CaptureSession? { try await base.session(id: id) }
     func unfinishedSessions() async throws -> [CaptureSession] { try await base.unfinishedSessions() }
     func committedSegments(captureID: UUID) async throws -> [CaptureSegment] { try await base.committedSegments(captureID: captureID) }
+    func removeCommittedSegments(captureID: UUID) async throws { try await base.removeCommittedSegments(captureID: captureID) }
     func removeCleanedSession(id: UUID) async throws {
         try await base.removeCleanedSession(id: id)
         try events.record("delete-ledger:\(id.uuidString)", boundary: "delete-ledger")

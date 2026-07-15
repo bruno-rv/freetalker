@@ -114,6 +114,7 @@ actor LocalJobRunner {
     private var current: CurrentExecution?
     private var staleRecoveryTask: Task<Void, Never>?
     private var shuttingDown = false
+    private var lifecycleGeneration = 0
 
     init(
         store: any TranscriptionJobStoring,
@@ -167,14 +168,17 @@ actor LocalJobRunner {
 
     func resumeQueuedJobs() async {
         guard !shuttingDown else { return }
+        let generation = lifecycleGeneration
         if worker == nil, current == nil {
             if let leased = store as? any LeasedTranscriptionJobStoring {
                 _ = try? await leased.recoverStaleJobs(kind: kind)
             } else {
                 _ = try? await store.recoverInterruptedJobs(kind: kind)
             }
+            guard isActive(generation) else { return }
         }
         guard let jobs = try? await store.jobs(kind: kind) else { return }
+        guard isActive(generation) else { return }
         for job in jobs where job.state == .queued {
             if current?.id != job.id, !queue.contains(job.id) {
                 queue.append(job.id)
@@ -190,6 +194,7 @@ actor LocalJobRunner {
 
     func shutdown() async {
         shuttingDown = true
+        lifecycleGeneration &+= 1
         staleRecoveryTask?.cancel()
         staleRecoveryTask = nil
         queue.removeAll()
@@ -197,12 +202,12 @@ actor LocalJobRunner {
     }
 
     private func startWorkerIfNeeded() {
-        guard worker == nil else { return }
+        guard !shuttingDown, worker == nil else { return }
         worker = Task { await self.drainQueue() }
     }
 
     private func drainQueue() async {
-        while !queue.isEmpty {
+        while !shuttingDown, !queue.isEmpty {
             let id = queue.removeFirst()
             let token = CancellationToken()
             token.installLeaseOwner(UUID())
@@ -219,20 +224,30 @@ actor LocalJobRunner {
     }
 
     private func scheduleStaleRecoveryIfNeeded() {
-        guard staleRecoveryTask == nil, worker == nil, current == nil,
+        guard !shuttingDown, staleRecoveryTask == nil, worker == nil, current == nil,
               let schedulingStore = store as? any LeaseExpirySchedulingStore else { return }
+        let generation = lifecycleGeneration
         staleRecoveryTask = Task { [weak self] in
             guard let self, let delay = try? await schedulingStore.delayUntilNextLeaseExpiry(kind: kind) else {
                 await self?.clearStaleRecoveryTask(); return
             }
+            guard await self.isActive(generation), !Task.isCancelled else {
+                await self.clearStaleRecoveryTask(); return
+            }
             await leaseSleeper(delay)
-            guard !Task.isCancelled else { await self.clearStaleRecoveryTask(); return }
+            guard await self.isActive(generation), !Task.isCancelled else {
+                await self.clearStaleRecoveryTask(); return
+            }
             await self.clearStaleRecoveryTask()
             await self.resumeQueuedJobs()
         }
     }
 
     private func clearStaleRecoveryTask() { staleRecoveryTask = nil }
+
+    private func isActive(_ generation: Int) -> Bool {
+        !shuttingDown && lifecycleGeneration == generation
+    }
 
     private func execute(_ id: UUID, token: CancellationToken) async {
         guard let job = try? await store.job(id: id), job.state == .queued,

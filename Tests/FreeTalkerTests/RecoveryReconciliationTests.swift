@@ -3,6 +3,50 @@ import Testing
 @testable import FreeTalker
 
 @Suite struct RecoveryReconciliationTests {
+    @Test(
+        "silent segment cleanup converges after every durable boundary failure",
+        arguments: SilentCleanupBoundary.allCases
+    )
+    func silentSegmentCleanupConverges(boundary: SilentCleanupBoundary) async throws {
+        let fixture = try ReconciliationFixture()
+        let id = UUID()
+        let directory = fixture.root.appendingPathComponent(id.uuidString, isDirectory: true)
+        let fileSystem = SilentCleanupFaultFileSystem(boundary: boundary)
+        let ledger = SilentCleanupFaultLedger(base: fixture.store, boundary: boundary)
+        let service = CaptureJournalService(
+            fileSystem: fileSystem, ledger: ledger,
+            configuration: .init(segmentFrames: 4, maximumQueuedFrames: 16)
+        )
+        let active = try await service.prepare(.init(
+            id: id, directory: directory, capturedAt: Date(), sampleRate: 16_000,
+            channelCount: 1, inputDeviceUID: "mic", destination: "external"
+        ))
+        #expect(active.writer.enqueue(Array(repeating: 0, count: 8)) == .accepted)
+        #expect(await active.writer.committedSnapshot().count == 2)
+
+        await #expect(throws: (any Error).self) {
+            try await service.recordSilent(
+                active,
+                diagnostics: .init(peak: 0, rms: 0, inputDeviceUID: "mic", routeFailure: nil)
+            )
+        }
+        #expect(try await fixture.store.session(id: id)?.state == .silent)
+        #expect(try await fixture.store.session(id: id)?.failureMessage == SilentCapturePresentation.message)
+        #expect(try await fixture.store.committedSegments(captureID: id).count == 2)
+
+        let reopened = try fixture.reopen()
+        let report = await reopened.reconciler().reconcile()
+
+        #expect(report.failed == 0)
+        #expect(try await reopened.store.session(id: id)?.state == .silent)
+        #expect(try await reopened.store.session(id: id)?.failureMessage == SilentCapturePresentation.message)
+        #expect(try await reopened.store.committedSegments(captureID: id).isEmpty)
+        #expect(try reopened.fileSystem.contents(directory).allSatisfy {
+            CaptureSegmentCodec.ordinal(from: $0) == nil
+        })
+        #expect(try await reopened.store.jobs(kind: .recovery).isEmpty)
+    }
+
     @Test("silent diagnostics resume an interrupted silent ledger transition")
     func silentDiagnosticsResumeTransition() async throws {
         let fixture = try ReconciliationFixture()
@@ -434,6 +478,80 @@ import Testing
         #expect(try await reopened.store.job(id: secondID) != nil)
         #expect(try await reopened.store.session(id: secondID) != nil)
     }
+}
+
+enum SilentCleanupBoundary: CaseIterable, Sendable {
+    case removeSegment
+    case synchronizeDirectory
+    case removeMetadata
+}
+
+private final class SilentCleanupFaultFileSystem: JournalFileSystem, @unchecked Sendable {
+    private let base = LocalJournalFileSystem()
+    private let boundary: SilentCleanupBoundary
+    private let lock = NSLock()
+    private var didFail = false
+    private var removedSegment = false
+
+    init(boundary: SilentCleanupBoundary) { self.boundary = boundary }
+    func createDirectory(_ url: URL) throws { try base.createDirectory(url) }
+    func write(_ data: Data, to url: URL) throws { try base.write(data, to: url) }
+    func append(_ data: Data, to url: URL) throws { try base.append(data, to: url) }
+    func synchronizeFile(_ url: URL) throws { try base.synchronizeFile(url) }
+    func rename(_ source: URL, to destination: URL) throws { try base.rename(source, to: destination) }
+    func synchronizeDirectory(_ url: URL) throws {
+        let fail = lock.withLock { () -> Bool in
+            guard boundary == .synchronizeDirectory, removedSegment, !didFail else { return false }
+            didFail = true
+            return true
+        }
+        if fail { throw JournalPersistenceError.synchronizeDirectory(path: url.path, code: EIO) }
+        try base.synchronizeDirectory(url)
+    }
+    func contents(_ url: URL) throws -> [URL] { try base.contents(url) }
+    func read(_ url: URL) throws -> Data { try base.read(url) }
+    func remove(_ url: URL) throws {
+        let isSegment = CaptureSegmentCodec.ordinal(from: url) != nil
+        let fail = lock.withLock { () -> Bool in
+            if isSegment { removedSegment = true }
+            guard boundary == .removeSegment, isSegment, !didFail else { return false }
+            didFail = true
+            return true
+        }
+        if fail { throw JournalPersistenceError.remove(path: url.path, code: EIO) }
+        try base.remove(url)
+    }
+    func exists(_ url: URL) -> Bool { base.exists(url) }
+}
+
+private final class SilentCleanupFaultLedger: CaptureLedgerStoring, @unchecked Sendable {
+    private let base: TranscriptionJobStore
+    private let boundary: SilentCleanupBoundary
+    private let lock = NSLock()
+    private var didFail = false
+
+    init(base: TranscriptionJobStore, boundary: SilentCleanupBoundary) {
+        self.base = base
+        self.boundary = boundary
+    }
+    func createCapture(_ request: CaptureStartRequest) async throws -> CaptureSession { try await base.createCapture(request) }
+    func recordCommittedSegment(_ segment: CaptureSegment) async throws { try await base.recordCommittedSegment(segment) }
+    func transition(id: UUID, from: CaptureSessionState, to: CaptureSessionState, recoveryJobID: UUID?, libraryDictationID: Int64?, assetKind: RecoveryAssetKind, failureMessage: String?, contentHash: String?) async throws {
+        try await base.transition(id: id, from: from, to: to, recoveryJobID: recoveryJobID, libraryDictationID: libraryDictationID, assetKind: assetKind, failureMessage: failureMessage, contentHash: contentHash)
+    }
+    func session(id: UUID) async throws -> CaptureSession? { try await base.session(id: id) }
+    func unfinishedSessions() async throws -> [CaptureSession] { try await base.unfinishedSessions() }
+    func committedSegments(captureID: UUID) async throws -> [CaptureSegment] { try await base.committedSegments(captureID: captureID) }
+    func removeCommittedSegments(captureID: UUID) async throws {
+        let fail = lock.withLock { () -> Bool in
+            guard boundary == .removeMetadata, !didFail else { return false }
+            didFail = true
+            return true
+        }
+        if fail { throw TestLedgerError.injected }
+        try await base.removeCommittedSegments(captureID: captureID)
+    }
+    func removeCleanedSession(id: UUID) async throws { try await base.removeCleanedSession(id: id) }
 }
 
 private actor LaunchGateProbe {

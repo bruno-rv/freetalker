@@ -193,6 +193,7 @@ struct CaptureJournalService: Sendable {
             recoveryJobID: nil, libraryDictationID: nil, assetKind: .silent,
             failureMessage: SilentCapturePresentation.message, contentHash: nil
         )
+        try await removeSilentSegments(active.session)
     }
 
     func loadSilentDiagnostics(_ session: CaptureSession) throws -> CaptureDiagnostics {
@@ -204,6 +205,22 @@ struct CaptureJournalService: Sendable {
 
     private func silentDiagnosticsURL(_ session: CaptureSession) -> URL {
         session.directory.appendingPathComponent("capture-diagnostics.json")
+    }
+
+    func resumeSilentCleanup(captureID: UUID) async throws {
+        guard let session = try await ledger.session(id: captureID) else { return }
+        guard session.state == .silent else {
+            throw CaptureJournalError.cleanupNotPermitted(session.state.rawValue)
+        }
+        try await removeSilentSegments(session)
+    }
+
+    private func removeSilentSegments(_ session: CaptureSession) async throws {
+        for segment in try await ledger.committedSegments(captureID: session.id) {
+            if fileSystem.exists(segment.url) { try fileSystem.remove(segment.url) }
+        }
+        try fileSystem.synchronizeDirectory(session.directory)
+        try await ledger.removeCommittedSegments(captureID: session.id)
     }
 
     func cancelAndClean(_ active: ActiveCaptureJournal) async throws {

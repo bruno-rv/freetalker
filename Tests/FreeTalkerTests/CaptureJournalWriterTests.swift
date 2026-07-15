@@ -60,10 +60,15 @@ import Testing
         defer { try? FileManager.default.removeItem(at: root) }
         let ledger = MemoryCaptureLedger()
         let fileSystem = LocalJournalFileSystem()
-        let service = CaptureJournalService(fileSystem: fileSystem, ledger: ledger)
+        let service = CaptureJournalService(
+            fileSystem: fileSystem, ledger: ledger,
+            configuration: .init(segmentFrames: 4, maximumQueuedFrames: 16)
+        )
         let request = captureRequest(directory: root)
         let active = try await service.prepare(request)
-        #expect(active.writer.enqueue([0, 0, 0, 0]) == .accepted)
+        #expect(active.writer.enqueue(Array(repeating: 0, count: 8)) == .accepted)
+        #expect(await active.writer.committedSnapshot().count == 2)
+        #expect(await ledger.committedSegments(captureID: request.id).count == 2)
 
         let diagnostics = CaptureDiagnostics(
             peak: 0, rms: 0, inputDeviceUID: "test-mic", routeFailure: "input route vanished"
@@ -75,6 +80,7 @@ import Testing
         #expect(await ledger.session(id: request.id)?.failureMessage == "No microphone signal was captured.")
         #expect(try service.loadSilentDiagnostics(active.session) == diagnostics)
         #expect(try fileSystem.contents(root).allSatisfy { $0.pathExtension != "wav" })
+        #expect(await ledger.committedSegments(captureID: request.id).isEmpty)
     }
 
     @Test("cancel removes artifacts before deleting the ledger row")
@@ -272,6 +278,10 @@ actor MemoryCaptureLedger: CaptureLedgerStoring {
     func unfinishedSessions() -> [CaptureSession] { Array(sessions.values) }
     func committedSegments(captureID: UUID) -> [CaptureSegment] {
         segments[captureID, default: []].sorted { $0.ordinal < $1.ordinal }
+    }
+    func removeCommittedSegments(captureID: UUID) throws {
+        guard sessions[captureID]?.state == .silent else { throw TestLedgerError.conflict }
+        segments[captureID] = nil
     }
     func removeCleanedSession(id: UUID) {
         sessions[id] = nil
