@@ -91,13 +91,41 @@ struct RecoveryImportDispositionStore: Sendable {
         let descriptor = try descriptor(
             id: id, source: source, defaultScope: .capture(id)
         )
+        try registerOwnedSource(id: id, source: source, expectedHash: descriptor.contentHash)
+    }
+
+    func registerOwnedSource(id: UUID, source: URL, expectedHash: String) throws {
+        let descriptor = RecoveryImportDescriptor(
+            id: id, scope: .capture(id), contentHash: expectedHash
+        )
+        try validate(descriptor)
+        guard codec.fileSystem.exists(source), try codec.hashFile(source) == expectedHash else {
+            throw CaptureJournalError.hashMismatch(source.path)
+        }
+        if let existing = try self.descriptor(id: id) {
+            guard existing == descriptor else {
+                throw CaptureJournalError.hashMismatch(source.path)
+            }
+        } else {
+            try registerImport(descriptor)
+        }
+        guard try codec.hashFile(source) == expectedHash else {
+            throw CaptureJournalError.hashMismatch(source.path)
+        }
         try commitExact(
             ownershipPayload(
                 id: id, path: source.standardizedFileURL.path,
-                hash: descriptor.contentHash
+                hash: expectedHash
             ),
             to: ownershipURL(id: id)
         )
+        guard try codec.hashFile(source) == expectedHash else {
+            throw CaptureJournalError.hashMismatch(source.path)
+        }
+    }
+
+    func ownershipRecordExists(id: UUID) -> Bool {
+        codec.fileSystem.exists(ownershipURL(id: id))
     }
 
     func ownsSource(id: UUID, source: URL, requireCurrentHash: Bool = true) throws -> Bool {

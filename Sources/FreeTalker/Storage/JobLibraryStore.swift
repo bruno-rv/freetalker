@@ -118,6 +118,9 @@ final class JobLibraryStore: ObservableObject {
         async let imports = store.jobs(kind: .mediaImport)
         async let captures = store.unfinishedSessions()
         let (recoveryRows, importRows, captureRows) = try await (recoveries, imports, captures)
+        _ = RecoveryOwnershipMigrator(root: recoveryDirectory).migrate(
+            jobs: recoveryRows + importRows, sessions: captureRows
+        )
         recoveryJobs = recoveryRows
         importJobs = importRows
         silentCaptures = captureRows.compactMap(SilentCapturePresentation.init)
@@ -174,16 +177,54 @@ final class JobLibraryStore: ObservableObject {
         try await refresh()
     }
 
-    func export(id: UUID, to destination: URL) throws {
+    func export(id: UUID, to destination: URL) async throws {
         guard let item = recoveryItems.first(where: { $0.id == id }),
-              let source = item.audioURL ?? item.artifactURL else {
+              let projectedSource = item.audioURL ?? item.artifactURL else {
             throw JobStoreError.jobNotFound
         }
+        if let projectedJob = item.job {
+            guard let currentJob = try await store.job(id: id),
+                  currentJob.source.reference == projectedJob.source.reference else {
+                throw RecoveryFinalizationError.captureIdentityMismatch
+            }
+        } else if item.session != nil {
+            guard try await store.session(id: id) != nil else {
+                throw JobStoreError.jobNotFound
+            }
+        }
+        let validator = RecoveryOwnedArtifactValidator(
+            root: recoveryDirectory, id: id, fileManager: .default
+        )
+        let source = if item.audioURL != nil {
+            validator.validAudio(projectedSource)
+        } else {
+            validator.validArtifact(projectedSource)
+        }
+        guard let source else { throw RecoveryFinalizationError.captureIdentityMismatch }
         let target = destination.standardizedFileURL
         guard source.standardizedFileURL != target else {
             throw CocoaError(.fileWriteFileExists)
         }
-        try FileManager.default.copyItem(at: source, to: target)
+        guard !FileManager.default.fileExists(atPath: target.path) else {
+            throw CocoaError(.fileWriteFileExists)
+        }
+        let temporary = target.deletingLastPathComponent().appendingPathComponent(
+            ".\(target.lastPathComponent).\(UUID().uuidString).exporting"
+        )
+        var copied = false
+        defer { if !copied { try? FileManager.default.removeItem(at: temporary) } }
+        let codec = CaptureSegmentCodec(fileSystem: LocalJournalFileSystem())
+        let expectedHash = try codec.hashFile(source)
+        try FileManager.default.copyItem(at: source, to: temporary)
+        let stillValid = item.audioURL != nil
+            ? validator.validAudio(source) != nil : validator.validArtifact(source) != nil
+        guard stillValid,
+              try codec.hashFile(source) == expectedHash,
+              try codec.hashFile(temporary) == expectedHash else {
+            throw CaptureJournalError.hashMismatch(source.path)
+        }
+        try FileManager.default.moveItem(at: temporary, to: target)
+        copied = true
     }
 
     func startNewRecording(id: UUID) -> Bool {

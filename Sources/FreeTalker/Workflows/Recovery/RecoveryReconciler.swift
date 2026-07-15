@@ -57,6 +57,7 @@ actor RecoveryReconciler {
         var report = RecoveryReconciliationReport()
         let rootItems: [URL]
         let sessions: [CaptureSession]
+        let jobs: [TranscriptionJob]
         do {
             try fileSystem.createDirectory(directory)
             _ = try await RecoveryRetentionService(
@@ -64,13 +65,22 @@ actor RecoveryReconciler {
             ).purgeExpired(now: Date(), retention: .never)
             rootItems = try fileSystem.contents(directory).sorted { $0.path < $1.path }
             sessions = try await ledger.unfinishedSessions()
-            _ = try await store.jobs(kind: .recovery)
+            jobs = try await store.jobs()
         } catch {
             report.storeFailure = error.localizedDescription
             return report
         }
 
+        let migration = RecoveryOwnershipMigrator(root: directory, fileSystem: fileSystem)
+            .migrate(jobs: jobs, sessions: sessions)
+        for issue in migration.issues {
+            report.recordFailure(
+                issue.source,
+                CaptureJournalError.failed(issue.message)
+            )
+        }
         var ownedPaths = Set(sessions.map { $0.directory.standardizedFileURL.path })
+            .union(migration.protectedPaths)
         for session in sessions {
             await reconcileKnownSession(session, report: &report)
             ownedPaths.insert(session.directory.standardizedFileURL.path)
@@ -88,7 +98,9 @@ actor RecoveryReconciler {
                         try await reconcileSessionDirectory(item, report: &report)
                     }
                 } else if item.pathExtension.lowercased() == "wav" {
-                    try await reconcileLooseAudio(item, report: &report)
+                    if !ownedPaths.contains(item.standardizedFileURL.path) {
+                        try await reconcileLooseAudio(item, report: &report)
+                    }
                 }
             } catch {
                 report.recordFailure(item, error)

@@ -221,8 +221,10 @@ struct RecoveriesView: View {
         panel.nameFieldStringValue = source?.lastPathComponent
             ?? "recovery-\(item.id.uuidString)"
         guard panel.runModal() == .OK, let destination = panel.url else { return }
-        do { try store.export(id: item.id, to: destination) }
-        catch { errorMessage = "Could not export the recovery: \(error.localizedDescription)" }
+        Task {
+            do { try await store.export(id: item.id, to: destination) }
+            catch { errorMessage = "Could not export the recovery: \(error.localizedDescription)" }
+        }
     }
 
     private func refresh() async {

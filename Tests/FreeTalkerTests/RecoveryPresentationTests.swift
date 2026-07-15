@@ -112,7 +112,7 @@ import Testing
             recoveryRoot: temp.url
         )
         #expect(linked?.audioURL == nil)
-        #expect(linked?.availableActions == [.delete])
+        #expect(linked?.availableActions.isEmpty == true)
 
         try FileManager.default.removeItem(at: symlink)
         try Data("not a wave".utf8).write(to: symlink)
@@ -122,7 +122,7 @@ import Testing
             recoveryRoot: temp.url
         )
         #expect(corrupt?.audioURL == nil)
-        #expect(corrupt?.availableActions == [.delete])
+        #expect(corrupt?.availableActions.isEmpty == true)
     }
 
     @Test func retryPresentationDistinguishesIdleQueuedAndProcessing() {

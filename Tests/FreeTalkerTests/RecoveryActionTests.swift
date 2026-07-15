@@ -27,7 +27,7 @@ import Testing
         let source = URL(fileURLWithPath: job.source.reference)
         let original = try Data(contentsOf: source)
 
-        try library.export(id: job.id, to: destination)
+        try await library.export(id: job.id, to: destination)
 
         #expect(try Data(contentsOf: destination) == original)
         #expect(try Data(contentsOf: source) == original)
@@ -43,7 +43,7 @@ import Testing
         try await library.refresh()
         let destination = fixture.temp.url.appendingPathComponent("exported.marker")
 
-        try library.export(id: id, to: destination)
+        try await library.export(id: id, to: destination)
 
         #expect(try Data(contentsOf: destination) == Data("fault".utf8))
         #expect(try Data(contentsOf: source) == Data("fault".utf8))
@@ -90,12 +90,131 @@ import Testing
 
         let corrupted = try #require(library.recoveryItems.first { $0.id == first.id })
         #expect(corrupted.audioURL == nil)
-        #expect(corrupted.availableActions == [.delete])
+        #expect(corrupted.availableActions.isEmpty)
         await #expect(throws: Error.self) {
             try await library.delete(id: first.id)
         }
         #expect(FileManager.default.fileExists(atPath: second.source.reference))
         #expect(try await fixture.store.job(id: second.id) != nil)
+    }
+
+    @Test @MainActor func markerlessCurrentRecoveryBackfillsOwnershipIdempotentlyAndDeletesAcrossReopen() async throws {
+        let fixture = try RecoveryActionFixture()
+        let job = try await fixture.markerlessFailedRecovery()
+        let source = URL(fileURLWithPath: job.source.reference)
+        let library = JobLibraryStore(store: fixture.store, recoveryDirectory: fixture.root)
+
+        try await library.refresh()
+
+        #expect(library.recoveryItems.first { $0.id == job.id }?.availableActions
+            == [.retryProcessing, .exportAudio, .delete])
+        let dispositions = RecoveryImportDispositionStore(directory: fixture.root)
+        #expect(try dispositions.ownsSource(id: job.id, source: source))
+        let marker = fixture.root.appendingPathComponent(
+            ".recovery-ownership-\(job.id.uuidString).marker"
+        )
+        let firstMarker = try Data(contentsOf: marker)
+
+        try await library.refresh()
+
+        #expect(try Data(contentsOf: marker) == firstMarker)
+        try await library.delete(id: job.id)
+        let reopened = try TranscriptionJobStore(databaseURL: fixture.database, clock: SystemJobClock())
+        let reopenedLibrary = JobLibraryStore(store: reopened, recoveryDirectory: fixture.root)
+        try await reopenedLibrary.refresh()
+        #expect(try await reopened.job(id: job.id) == nil)
+        #expect(!FileManager.default.fileExists(atPath: source.path))
+        #expect(!reopenedLibrary.recoveryItems.contains { $0.id == job.id })
+    }
+
+    @Test @MainActor func markerlessCrossLinkToAnotherOwnedRecoveryIsNeverBackfilled() async throws {
+        let fixture = try RecoveryActionFixture()
+        let markerless = try await fixture.markerlessFailedRecovery()
+        let owned = try await fixture.failedRecovery()
+        try await fixture.store.updateRecoverySource(
+            id: markerless.id, expectedSourceReference: markerless.source.reference,
+            source: owned.source
+        )
+        let library = JobLibraryStore(store: fixture.store, recoveryDirectory: fixture.root)
+
+        try await library.refresh()
+
+        #expect(try !RecoveryImportDispositionStore(directory: fixture.root)
+            .ownsSource(id: markerless.id, source: URL(fileURLWithPath: owned.source.reference)))
+        #expect(library.recoveryItems.first { $0.id == markerless.id }?.availableActions.isEmpty == true)
+        #expect(FileManager.default.fileExists(atPath: owned.source.reference))
+    }
+
+    @Test @MainActor func exportRevalidatesChangedBytesAndLeavesNoDestination() async throws {
+        let fixture = try RecoveryActionFixture()
+        let job = try await fixture.failedRecovery()
+        let library = JobLibraryStore(store: fixture.store, recoveryDirectory: fixture.root)
+        try await library.refresh()
+        let source = URL(fileURLWithPath: job.source.reference)
+        try WAVEncoder.encode(samples: [0.9], sampleRate: 16_000).write(to: source)
+        let destination = fixture.temp.url.appendingPathComponent("changed.wav")
+
+        await #expect(throws: Error.self) {
+            try await library.export(id: job.id, to: destination)
+        }
+
+        #expect(!FileManager.default.fileExists(atPath: destination.path))
+        #expect(FileManager.default.fileExists(atPath: source.path))
+    }
+
+    @Test @MainActor func exportRevalidatesSymlinkAndLeavesNoDestination() async throws {
+        let fixture = try RecoveryActionFixture()
+        let job = try await fixture.failedRecovery()
+        let other = try await fixture.failedRecovery()
+        let library = JobLibraryStore(store: fixture.store, recoveryDirectory: fixture.root)
+        try await library.refresh()
+        let source = URL(fileURLWithPath: job.source.reference)
+        try FileManager.default.removeItem(at: source)
+        try FileManager.default.createSymbolicLink(
+            at: source, withDestinationURL: URL(fileURLWithPath: other.source.reference)
+        )
+        let destination = fixture.temp.url.appendingPathComponent("symlink.wav")
+
+        await #expect(throws: Error.self) {
+            try await library.export(id: job.id, to: destination)
+        }
+
+        #expect(!FileManager.default.fileExists(atPath: destination.path))
+        #expect(FileManager.default.fileExists(atPath: source.path))
+    }
+
+    @Test @MainActor func exportRevalidatesCurrentJobSourceAndLeavesNoDestination() async throws {
+        let fixture = try RecoveryActionFixture()
+        let job = try await fixture.failedRecovery()
+        let other = try await fixture.failedRecovery()
+        let library = JobLibraryStore(store: fixture.store, recoveryDirectory: fixture.root)
+        try await library.refresh()
+        try await fixture.store.updateRecoverySource(
+            id: job.id, expectedSourceReference: job.source.reference, source: other.source
+        )
+        let destination = fixture.temp.url.appendingPathComponent("cross-id.wav")
+
+        await #expect(throws: Error.self) {
+            try await library.export(id: job.id, to: destination)
+        }
+
+        #expect(!FileManager.default.fileExists(atPath: destination.path))
+        #expect(FileManager.default.fileExists(atPath: job.source.reference))
+    }
+
+    @Test @MainActor func nestedNoncanonicalAudioNeverOffersRetryOrAudioExport() async throws {
+        let fixture = try RecoveryActionFixture()
+        let segment = try await fixture.failedNestedRecovery(filename: "segment-00000000.wav")
+        let arbitrary = try await fixture.failedNestedRecovery(filename: "other.wav")
+        let canonical = try await fixture.failedNestedRecovery(filename: nil)
+        let library = JobLibraryStore(store: fixture.store, recoveryDirectory: fixture.root)
+
+        try await library.refresh()
+
+        #expect(library.recoveryItems.first { $0.id == segment.id }?.availableActions.isEmpty == true)
+        #expect(library.recoveryItems.first { $0.id == arbitrary.id }?.availableActions.isEmpty == true)
+        #expect(library.recoveryItems.first { $0.id == canonical.id }?.availableActions
+            == [.retryProcessing, .exportAudio, .delete])
     }
 
     @Test @MainActor func libraryCommittedSessionIdentitySuppressesFallbackJobProjection() async throws {
@@ -236,6 +355,30 @@ private final class RecoveryActionFixture: @unchecked Sendable {
         )
         try RecoveryImportDispositionStore(directory: root)
             .registerOwnedSource(id: job.id, source: source)
+        return job
+    }
+
+    func markerlessFailedRecovery() async throws -> TranscriptionJob {
+        let source = root.appendingPathComponent("\(UUID().uuidString).wav")
+        try WAVEncoder.encode(samples: [0.2], sampleRate: 16_000).write(to: source)
+        return try await store.createRecovery(
+            source: .init(reference: source.path),
+            metadata: .init(capturedAt: Date(), failure: .init(stage: .transcribing, message: "Offline"))
+        )
+    }
+
+    func failedNestedRecovery(filename: String?) async throws -> TranscriptionJob {
+        let id = UUID()
+        let directory = root.appendingPathComponent(id.uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        let source = directory.appendingPathComponent(filename ?? "\(id.uuidString).wav")
+        try WAVEncoder.encode(samples: [0.2], sampleRate: 16_000).write(to: source)
+        let job = try await store.createProvisionalRecovery(
+            id: id, source: .init(reference: source.path), capturedAt: Date()
+        )
+        try await store.failProvisionalRecovery(
+            id: id, failure: .init(stage: .transcribing, message: "Offline")
+        )
         return job
     }
 }

@@ -3,6 +3,35 @@ import Testing
 @testable import FreeTalker
 
 @Suite struct RecoveryReconciliationTests {
+    @Test("launch reconciliation upgrades a markerless current-format job before orphan import")
+    func launchUpgradesMarkerlessCurrentRecovery() async throws {
+        let fixture = try ReconciliationFixture()
+        let filenameID = UUID()
+        let source = fixture.root.appendingPathComponent("\(filenameID.uuidString).wav")
+        try WAVEncoder.encode(samples: [0.2], sampleRate: 16_000).write(to: source)
+        let job = try await fixture.store.createRecovery(
+            source: .init(reference: source.path),
+            metadata: .init(
+                capturedAt: Date(),
+                failure: .init(stage: .transcribing, message: "Offline")
+            )
+        )
+
+        let report = await fixture.reconciler().reconcile()
+
+        #expect(report.failed == 0)
+        #expect(try await fixture.store.jobs(kind: .recovery).map(\.id) == [job.id])
+        #expect(try await fixture.store.job(id: filenameID) == nil)
+        #expect(try await fixture.store.session(id: filenameID) == nil)
+        #expect(try RecoveryImportDispositionStore(directory: fixture.root)
+            .ownsSource(id: job.id, source: source))
+
+        let reopened = try fixture.reopen()
+        let second = await reopened.reconciler().reconcile()
+        #expect(second.failed == 0)
+        #expect(try await reopened.store.jobs(kind: .recovery).map(\.id) == [job.id])
+    }
+
     @Test(
         "silent cleanup rejects every unowned segment path without partial deletion",
         arguments: UnsafeSilentSegmentCase.allCases

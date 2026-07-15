@@ -38,6 +38,7 @@ struct RecoveryItem: Identifiable, Equatable, Sendable {
             ? source.flatMap { validator.validAudio($0) }
                 ?? validator.validAudio(validator.canonical(in: session?.directory))
             : nil
+        let missingOwnedAudio = source.flatMap { validator.ownedMissingAudio($0) }
         let retainedArtifact: URL? = switch assetKind {
         case .damaged, .quarantined:
             source.flatMap { validator.validArtifact($0) }
@@ -58,7 +59,7 @@ struct RecoveryItem: Identifiable, Equatable, Sendable {
                 if case .failed = job?.state { actions.insert(.retryProcessing) }
                 if case .failed = job?.state { actions.insert(.delete) }
                 if job == nil, session?.state == .staged { actions.insert(.delete) }
-            } else if case .failed = job?.state {
+            } else if missingOwnedAudio != nil, case .failed = job?.state {
                 actions.insert(.delete)
             }
         }
@@ -69,9 +70,12 @@ struct RecoveryItem: Identifiable, Equatable, Sendable {
         audioURL = validAudio
         artifactURL = retainedArtifact
         availableActions = actions
-        message = session?.failureMessage
+        message = if assetKind == .audio, source != nil, validAudio == nil,
+                     missingOwnedAudio == nil {
+            "Saved audio ownership could not be verified. FreeTalker will not retry, export, or delete it."
+        } else { session?.failureMessage
             ?? job?.failureMessage
-            ?? (assetKind == .silent ? SilentCapturePresentation.message : Self.defaultMessage(assetKind))
+            ?? (assetKind == .silent ? SilentCapturePresentation.message : Self.defaultMessage(assetKind)) }
     }
 
     private static func defaultMessage(_ kind: RecoveryAssetKind) -> String {
@@ -103,10 +107,18 @@ struct RecoveryOwnedArtifactValidator {
 
     func validAudio(_ url: URL) -> URL? {
         guard url.pathExtension.lowercased() == "wav",
+              hasOwnedAudioIdentity(url.standardizedFileURL),
               let artifact = validArtifact(url),
               let audio = try? AVAudioFile(forReading: artifact),
               audio.length > 0 else { return nil }
         return artifact
+    }
+
+    func ownedMissingAudio(_ url: URL) -> URL? {
+        let lexical = url.standardizedFileURL
+        guard !fileManager.fileExists(atPath: lexical.path),
+              hasOwnedAudioIdentity(lexical) else { return nil }
+        return ownedMissingArtifact(lexical)
     }
 
     func validArtifact(_ url: URL) -> URL? {
@@ -158,6 +170,17 @@ struct RecoveryOwnedArtifactValidator {
         guard parent == root else { return false }
         let stem = url.deletingPathExtension().lastPathComponent
         if let directID = UUID(uuidString: stem), directID == id { return true }
+        return (try? RecoveryImportDispositionStore(directory: root)
+            .ownsSource(id: id, source: url)) == true
+    }
+
+    private func hasOwnedAudioIdentity(_ url: URL) -> Bool {
+        let parent = url.deletingLastPathComponent()
+        if parent == root.appendingPathComponent(id.uuidString, isDirectory: true) {
+            return url.lastPathComponent == "\(id.uuidString).wav"
+        }
+        guard parent == root else { return false }
+        if UUID(uuidString: url.deletingPathExtension().lastPathComponent) == id { return true }
         return (try? RecoveryImportDispositionStore(directory: root)
             .ownsSource(id: id, source: url)) == true
     }
