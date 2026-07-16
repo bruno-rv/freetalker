@@ -10,7 +10,7 @@ enum TriggerNormalizer {
     }
 }
 
-struct Snippet: Identifiable, Equatable, Sendable {
+struct Snippet: Identifiable, Equatable, Codable, Sendable {
     let id: String
     var name: String
     var triggers: [String]

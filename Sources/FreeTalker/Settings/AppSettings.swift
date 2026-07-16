@@ -106,8 +106,19 @@ final class AppSettings: ObservableObject {
     @Published var sttEngine: STTEngineKind {
         didSet { defaults.set(sttEngine.rawValue, forKey: Keys.sttEngine) }
     }
+    /// Stripped to scheme + host + port + path at the setter level (see `strippedBaseURL`) so a
+    /// credential typed into userinfo/query/fragment is never persisted, let alone exported. See
+    /// PLAN.md F1.3.
     @Published var cloudSTTBaseURL: String {
-        didSet { defaults.set(cloudSTTBaseURL, forKey: Keys.cloudSTTBaseURL) }
+        didSet {
+            let stripped = Self.strippedBaseURL(cloudSTTBaseURL)
+            guard stripped == cloudSTTBaseURL else {
+                cloudSTTBaseURL = stripped
+                defaults.set(stripped, forKey: Keys.cloudSTTBaseURL)
+                return
+            }
+            defaults.set(cloudSTTBaseURL, forKey: Keys.cloudSTTBaseURL)
+        }
     }
     @Published private(set) var whisperModel: String {
         didSet { defaults.set(whisperModel, forKey: Keys.whisperModel) }
@@ -227,8 +238,18 @@ final class AppSettings: ObservableObject {
             if resolved.model != cloudLLMModel { cloudLLMModel = resolved.model }
         }
     }
+    /// Stripped to scheme + host + port + path at the setter level — see `cloudSTTBaseURL` above
+    /// and `strippedBaseURL`.
     @Published var cloudLLMBaseURL: String {
-        didSet { defaults.set(cloudLLMBaseURL, forKey: Keys.cloudLLMBaseURL) }
+        didSet {
+            let stripped = Self.strippedBaseURL(cloudLLMBaseURL)
+            guard stripped == cloudLLMBaseURL else {
+                cloudLLMBaseURL = stripped
+                defaults.set(stripped, forKey: Keys.cloudLLMBaseURL)
+                return
+            }
+            defaults.set(cloudLLMBaseURL, forKey: Keys.cloudLLMBaseURL)
+        }
     }
     @Published var cloudLLMModel: String {
         didSet { defaults.set(cloudLLMModel, forKey: Keys.cloudLLMModel) }
@@ -500,6 +521,26 @@ final class AppSettings: ObservableObject {
         boundedVocabulary(raw).kept
     }
 
+    /// Strips a base-URL string to scheme + host [:port] + path — drops userinfo, query, and
+    /// fragment, the only places a credential can ride along in a URL string. Applied at the
+    /// `cloudSTTBaseURL`/`cloudLLMBaseURL` setter level (not just at export time) so stored state
+    /// is always already clean — see PLAN.md F1.3. Idempotent: re-stripping an already-stripped
+    /// URL returns it unchanged. Unparseable input (no scheme+host, e.g. a partial edit) is
+    /// trimmed but passed through rather than discarded, so an in-progress edit isn't wiped.
+    nonisolated static func strippedBaseURL(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let components = URLComponents(string: trimmed),
+              let scheme = components.scheme, let host = components.host else {
+            return trimmed
+        }
+        var stripped = URLComponents()
+        stripped.scheme = scheme
+        stripped.host = host
+        stripped.port = components.port
+        stripped.path = components.path
+        return stripped.string ?? trimmed
+    }
+
     nonisolated static let knownProviderDefaults: [LLMProviderKind: LLMProviderDefault] = [
         .anthropic: LLMProviderDefault(baseURL: "https://api.anthropic.com/v1", model: "claude-sonnet-4-5"),
         .ollama: LLMProviderDefault(baseURL: "https://ollama.com/v1", model: "gpt-oss:120b"),
@@ -525,7 +566,9 @@ final class AppSettings: ObservableObject {
         )
     }
 
-    private enum Keys {
+    // Internal (not private) so `BackupBundle.swift` can key its JSON export/decode against the
+    // exact same UserDefaults key strings the setters/exporters use. See `exportableKeys` above.
+    enum Keys {
         static let hotKeySpec = "hotKeySpec"
         /// Raw value intentionally kept as the old "redoHotKeySpec" string (pre-rename) — this
         /// is UserDefaults' persisted key, so changing it would silently drop every user's saved
@@ -587,7 +630,16 @@ final class AppSettings: ObservableObject {
             voiceEditHotKeySpec = nil
         }
         sttEngine = STTEngineKind(rawValue: defaults.string(forKey: Keys.sttEngine) ?? "") ?? .whisperKit
-        cloudSTTBaseURL = defaults.string(forKey: Keys.cloudSTTBaseURL) ?? "https://api.openai.com/v1"
+        // One-time load normalization: a value stored before setter-level stripping existed (or
+        // hand-edited) may still carry userinfo/query/fragment credentials — strip and persist
+        // back so on-disk state converges to the same invariant the setter now enforces. See
+        // PLAN.md F1.3.
+        let storedCloudSTTBaseURL = defaults.string(forKey: Keys.cloudSTTBaseURL) ?? "https://api.openai.com/v1"
+        let strippedCloudSTTBaseURL = Self.strippedBaseURL(storedCloudSTTBaseURL)
+        cloudSTTBaseURL = strippedCloudSTTBaseURL
+        if strippedCloudSTTBaseURL != storedCloudSTTBaseURL {
+            defaults.set(strippedCloudSTTBaseURL, forKey: Keys.cloudSTTBaseURL)
+        }
         let storedWhisperModel = defaults.string(forKey: Keys.whisperModel) ?? SpeechModelCatalog.defaultID
         let normalizedWhisperModel = SpeechModelCatalog.normalize(storedWhisperModel)
         whisperModel = normalizedWhisperModel
@@ -622,13 +674,18 @@ final class AppSettings: ObservableObject {
         // See Round 1 Codex findings 2/4, Round 2 Codex finding 2 (direct init assignment
         // doesn't trigger `llmProvider`'s didSet, so this resolution must also run here, once).
         let loadedProvider = LLMProviderKind(rawValue: defaults.string(forKey: Keys.llmProvider) ?? "") ?? .anthropic
-        let rawCloudLLMBaseURL = defaults.string(forKey: Keys.cloudLLMBaseURL) ?? ""
+        // `storedCloudLLMBaseURL` (not the stripped value) is the write-back comparison target
+        // below, so a credential stripped here by the one-time load normalization (same
+        // reasoning as cloudSTTBaseURL above) is detected and persisted even when
+        // `resolveProviderDefaults` itself leaves the (already-stripped) value unchanged.
+        let storedCloudLLMBaseURL = defaults.string(forKey: Keys.cloudLLMBaseURL) ?? ""
+        let strippedCloudLLMBaseURL = Self.strippedBaseURL(storedCloudLLMBaseURL)
         let rawCloudLLMModel = defaults.string(forKey: Keys.cloudLLMModel) ?? ""
-        let resolvedProviderDefaults = Self.resolveProviderDefaults(provider: loadedProvider, baseURL: rawCloudLLMBaseURL, model: rawCloudLLMModel)
+        let resolvedProviderDefaults = Self.resolveProviderDefaults(provider: loadedProvider, baseURL: strippedCloudLLMBaseURL, model: rawCloudLLMModel)
         llmProvider = loadedProvider
         cloudLLMBaseURL = resolvedProviderDefaults.baseURL
         cloudLLMModel = resolvedProviderDefaults.model
-        if resolvedProviderDefaults.baseURL != rawCloudLLMBaseURL {
+        if resolvedProviderDefaults.baseURL != storedCloudLLMBaseURL {
             defaults.set(resolvedProviderDefaults.baseURL, forKey: Keys.cloudLLMBaseURL)
         }
         if resolvedProviderDefaults.model != rawCloudLLMModel {
@@ -774,7 +831,12 @@ extension AppSettings {
     /// and `hudPosition` — both read-only migration keys that current code only ever reads, never
     /// writes. Never includes an API key: those live only in the Keychain (see Keychain.swift) and
     /// have no `UserDefaults` key at all.
-    private static let exportableKeys: [String] = [
+    ///
+    /// Internal (not private) so `BackupBundle.swift` can decode/apply against the same key set
+    /// the exporters emit. `historyPanelHotKeySpec` and `dictationLanguages` (F3/F5) are not yet
+    /// implemented — adding either is a one-line append here plus a matching `Keys.*` entry,
+    /// `exportableSettingsSnapshot()` case, and `SettingsPatch` field/decode/apply case.
+    static let exportableKeys: [String] = [
         Keys.hotKeySpec,
         Keys.insertLastDictationHotKeySpec,
         Keys.voiceEditHotKeySpec,
@@ -830,5 +892,56 @@ extension AppSettings {
             "settings": settings
         ]
         return try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+    }
+
+    /// Complete v2 snapshot: every `exportableKeys` entry, always present, at its current
+    /// normalized (live-property) value — nil-valued optionals encode as `NSNull` so the key
+    /// stays present rather than being omitted. Unlike `exportSettingsJSON()`'s v1 "only keys
+    /// UserDefaults happens to have an entry for" semantics, this makes "restore = overwrite"
+    /// well-defined: every key's *documented default* is already what the live property holds
+    /// when UserDefaults has no stored entry (see `init`), so reading the properties directly —
+    /// not `defaults.object(forKey:)` — is what gives completeness for free. See PLAN.md F1.2.
+    /// The JSON shape per key matches `exportSettingsJSON()`'s (hotkey/position structs embedded
+    /// as nested JSON, not base64), so `BackupBundle.swift` decodes both formats with one reader.
+    func exportableSettingsSnapshot() -> [String: Any] {
+        func jsonValue<T: Encodable>(_ value: T) -> Any {
+            guard let data = try? JSONEncoder().encode(value),
+                  let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else {
+                return NSNull()
+            }
+            return object
+        }
+        var out: [String: Any] = [:]
+        out[Keys.hotKeySpec] = jsonValue(hotKeySpec)
+        out[Keys.insertLastDictationHotKeySpec] = insertLastDictationHotKeySpec.map(jsonValue) ?? NSNull()
+        out[Keys.voiceEditHotKeySpec] = voiceEditHotKeySpec.map(jsonValue) ?? NSNull()
+        out[Keys.sttEngine] = sttEngine.rawValue
+        out[Keys.cloudSTTBaseURL] = cloudSTTBaseURL
+        out[Keys.whisperModel] = whisperModel
+        out[Keys.whisperModelChosen] = whisperModelChosen
+        out[Keys.livePreviewEnabled] = livePreviewEnabled
+        out[Keys.noiseSuppressionEnabled] = noiseSuppressionEnabled
+        out[Keys.edgeLauncherEnabled] = edgeLauncherEnabled
+        out[Keys.edgeLauncherEdge] = edgeLauncherEdge.rawValue
+        out[Keys.edgeLauncherPosition] = edgeLauncherPosition
+        out[Keys.launcherPanelPosition] = launcherPanelPosition.map(jsonValue) ?? NSNull()
+        out[Keys.recordingHUDPosition] = recordingHUDPosition.map(jsonValue) ?? NSNull()
+        out[Keys.transientHUDPosition] = transientHUDPosition.map(jsonValue) ?? NSNull()
+        out[Keys.llmProvider] = llmProvider.rawValue
+        out[Keys.cloudLLMBaseURL] = cloudLLMBaseURL
+        out[Keys.cloudLLMModel] = cloudLLMModel
+        out[Keys.activeTemplateID] = activeTemplateID
+        out[Keys.recoveryRetention] = recoveryRetention.rawValue
+        out[Keys.mediaImportRetention] = mediaImportRetention.rawValue
+        out[Keys.localContextScope] = localContextScope.rawValue
+        out[Keys.automaticStyleEnabled] = automaticStyleEnabled
+        out[Keys.handsFreeMaxMinutes] = handsFreeMaxMinutes
+        out[Keys.appRules] = appRules
+        out[Keys.languagePin] = languagePin
+        out[Keys.defaultOutputLanguage] = defaultOutputLanguage.rawValue
+        out[Keys.appLanguageRules] = appLanguageRules
+        out[Keys.microphoneDeviceUID] = microphoneDeviceUID ?? NSNull()
+        out[Keys.vocabularyText] = vocabularyText
+        return out
     }
 }

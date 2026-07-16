@@ -332,7 +332,9 @@ private struct GeneralSettingsView: View {
     @State private var cloudLLMTestResult: String?
     @State private var modelPendingDeletion: SpeechModelCatalogEntry?
     @State private var modelDeleteError: String?
-    @State private var exportSettingsError: String?
+    @State private var backupError: String?
+    @State private var backupRestoreSummary: String?
+    @State private var restoringBackup = false
 
     private let refreshTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
@@ -431,16 +433,39 @@ private struct GeneralSettingsView: View {
         } message: {
             Text(modelDeleteError ?? "The model couldn't be deleted.")
         }
+        .fileImporter(
+            isPresented: $restoringBackup,
+            allowedContentTypes: [.json],
+            allowsMultipleSelection: false
+        ) { result in
+            switch result {
+            case .success(let urls):
+                if let url = urls.first { restoreBackup(from: url) }
+            case .failure(let error):
+                backupError = error.localizedDescription
+            }
+        }
         .alert(
-            "Export failed",
+            "Backup failed",
             isPresented: Binding(
-                get: { exportSettingsError != nil },
-                set: { if !$0 { exportSettingsError = nil } }
+                get: { backupError != nil },
+                set: { if !$0 { backupError = nil } }
             )
         ) {
-            Button("OK") { exportSettingsError = nil }
+            Button("OK") { backupError = nil }
         } message: {
-            Text(exportSettingsError ?? "The settings couldn't be exported.")
+            Text(backupError ?? "The backup couldn't be completed.")
+        }
+        .alert(
+            "Restore complete",
+            isPresented: Binding(
+                get: { backupRestoreSummary != nil },
+                set: { if !$0 { backupRestoreSummary = nil } }
+            )
+        ) {
+            Button("OK") { backupRestoreSummary = nil }
+        } message: {
+            Text(backupRestoreSummary ?? "")
         }
         .onAppear {
             inputDevices = AudioInputDevices.enumerate()
@@ -852,25 +877,58 @@ private struct GeneralSettingsView: View {
             .padding(.vertical, 12)
             Divider()
             VStack(alignment: .leading, spacing: 8) {
-                Button("Export Settings…") { exportSettings() }
-                Text("Saves your preferences to a JSON file. Your API key is never included — it stays in the macOS Keychain.")
+                HStack(spacing: 12) {
+                    Button("Back Up…") { backUp() }
+                    Button("Restore…") { restoringBackup = true }
+                }
+                Text("Back Up saves your settings, templates, and snippets to a JSON file. Your API key is never included — it stays in the macOS Keychain. Restore overwrites your current settings and merges in templates/snippets; existing templates and snippets are never changed.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             .padding(.vertical, 12)
         }
     }
 
-    private func exportSettings() {
+    private func backUp() {
+        guard let snippetStore = coordinator.snippetStore else {
+            backupError = coordinator.snippetStoreInitializationError ?? "Snippet storage isn't available."
+            return
+        }
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.json]
-        panel.nameFieldStringValue = "FreeTalker Settings.json"
+        panel.nameFieldStringValue = BackupBundle.fileName
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        do {
-            let data = try settings.exportSettingsJSON()
-            try data.write(to: url, options: .atomic)
-        } catch {
-            exportSettingsError = "Could not save settings: \(error.localizedDescription)"
+        Task {
+            do {
+                let data = try await BackupBundle.export(settings: settings, templateStore: templateStore, snippetStore: snippetStore)
+                try data.write(to: url, options: .atomic)
+            } catch {
+                backupError = "Could not save backup: \(error.localizedDescription)"
+            }
         }
+    }
+
+    private func restoreBackup(from url: URL) {
+        guard let snippetStore = coordinator.snippetStore else {
+            backupError = coordinator.snippetStoreInitializationError ?? "Snippet storage isn't available."
+            return
+        }
+        Task {
+            let didAccess = url.startAccessingSecurityScopedResource()
+            defer { if didAccess { url.stopAccessingSecurityScopedResource() } }
+            do {
+                let data = try Data(contentsOf: url)
+                let result = try await BackupBundle.restore(data: data, settings: settings, templateStore: templateStore, snippetStore: snippetStore)
+                backupRestoreSummary = Self.summary(for: result)
+            } catch {
+                backupError = error.localizedDescription
+            }
+        }
+    }
+
+    private static func summary(for result: BackupBundleImportResult) -> String {
+        "Templates: \(result.templatesImported) imported, \(result.templatesSkipped) skipped.\n"
+            + "Snippets: \(result.snippetsImported) imported, \(result.snippetsSkipped) skipped.\n"
+            + "Settings: \(result.settingsApplied ? "restored" : "not restored")."
     }
 
     @ViewBuilder
@@ -1333,7 +1391,7 @@ private struct TemplatesSettingsView: View {
                             selectedID = new.id
                         } label: { Image(systemName: "plus") }
                         Button {
-                            if let selectedID { store.delete(id: selectedID); self.selectedID = nil }
+                            if let selectedID { try? store.delete(id: selectedID); self.selectedID = nil }
                         } label: { Image(systemName: "minus") }
                         .disabled(selectedID == nil)
                         Button {
@@ -1382,8 +1440,8 @@ private struct TemplatesSettingsView: View {
         do {
             let data = try Data(contentsOf: url)
             let existingIDs = Set(store.templates.map(\.id))
-            let count = try store.importTemplates(from: data)
-            if count > 0, let imported = store.templates.first(where: { !existingIDs.contains($0.id) }) {
+            let result = try store.importTemplates(from: data)
+            if result.importedCount > 0, let imported = store.templates.first(where: { !existingIDs.contains($0.id) }) {
                 selectedID = imported.id
             }
         } catch {

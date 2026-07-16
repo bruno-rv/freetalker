@@ -4,6 +4,10 @@ import Testing
 
 @MainActor
 struct TemplateImportTests {
+    // `importTemplates` now returns `TemplateStore.ImportResult` (idMap + counts) instead of a
+    // bare `Int` — Backup Bundle restore needs the old→new ID map to rewrite `activeTemplateID`/
+    // `appRules` references (PLAN.md F1.5). Every existing case below is preserved unchanged;
+    // each is extended with an `idMap` assertion for the case it already covers.
     @Test func importsArrayOfNewTemplatesWithoutTouchingExisting() throws {
         let store = try makeStore()
         let existing = store.templates
@@ -12,9 +16,12 @@ struct TemplateImportTests {
             Template(id: "a", name: "Meeting Notes", prompt: "Summarize this meeting."),
             Template(id: "b", name: "Bug Report", prompt: "Format this as a bug report.")
         ]
-        let count = try store.importTemplates(from: encode(incoming))
+        let result = try store.importTemplates(from: encode(incoming))
 
-        #expect(count == 2)
+        #expect(result.importedCount == 2)
+        #expect(result.skippedCount == 0)
+        // Appended-keeping-ID: ids "a"/"b" didn't collide, so the map is identity.
+        #expect(result.idMap == ["a": "a", "b": "b"])
         #expect(store.templates.contains { $0.name == "Meeting Notes" && $0.prompt == "Summarize this meeting." })
         #expect(store.templates.contains { $0.name == "Bug Report" && $0.prompt == "Format this as a bug report." })
         for template in existing {
@@ -28,9 +35,12 @@ struct TemplateImportTests {
         try store.upsert(seeded)
 
         let duplicate = Template(id: "different-id", name: "Seeded Template", prompt: "Seeded prompt.")
-        let count = try store.importTemplates(from: encode([duplicate]))
+        let result = try store.importTemplates(from: encode([duplicate]))
 
-        #expect(count == 0)
+        #expect(result.importedCount == 0)
+        #expect(result.skippedCount == 1)
+        // Skipped-as-duplicate: maps the incoming id to the matching EXISTING template's id.
+        #expect(result.idMap == ["different-id": "seed"])
         #expect(store.templates.filter { $0.name == "Seeded Template" }.count == 1)
     }
 
@@ -40,25 +50,28 @@ struct TemplateImportTests {
         try store.upsert(seeded)
 
         let colliding = Template(id: "shared-id", name: "Imported", prompt: "Imported prompt.")
-        let count = try store.importTemplates(from: encode([colliding]))
+        let result = try store.importTemplates(from: encode([colliding]))
 
-        #expect(count == 1)
+        #expect(result.importedCount == 1)
         #expect(store.template(id: "shared-id") == seeded)
         let imported = try #require(store.templates.first { $0.name == "Imported" })
         #expect(imported.id != "shared-id")
         #expect(imported.prompt == "Imported prompt.")
+        // Appended-with-fresh-ID: maps the incoming (colliding) id to the freshly-minted id.
+        #expect(result.idMap["shared-id"] == imported.id)
     }
 
     @Test func renamesReservedNameInsteadOfThrowing() throws {
         let store = try makeStore()
         let reserved = Template(id: "raw", name: "raw transcript", prompt: "Reserved collision.")
 
-        let count = try store.importTemplates(from: encode([reserved]))
+        let result = try store.importTemplates(from: encode([reserved]))
 
-        #expect(count == 1)
+        #expect(result.importedCount == 1)
         let imported = try #require(store.templates.first { $0.prompt == "Reserved collision." })
         #expect(imported.name != "raw transcript")
         #expect(!TemplateStore.isReservedTemplateName(imported.name))
+        #expect(result.idMap == ["raw": "raw"])
     }
 
     @Test func malformedJSONThrows() throws {
@@ -74,9 +87,9 @@ struct TemplateImportTests {
         let store = try makeStore()
         let single = Template(id: "single", name: "Single Import", prompt: "A single template object.")
 
-        let count = try store.importTemplates(from: encode(single))
+        let result = try store.importTemplates(from: encode(single))
 
-        #expect(count == 1)
+        #expect(result.importedCount == 1)
         #expect(store.templates.contains { $0.name == "Single Import" })
     }
 

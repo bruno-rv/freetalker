@@ -93,6 +93,64 @@ actor SnippetStore {
         try snippets(whereClause: "", bindings: [])
     }
 
+    struct ImportResult: Equatable, Sendable {
+        let importedCount: Int
+        let skippedCount: Int
+    }
+
+    /// Merges already-decoded `incoming` snippets into the store, mirroring the table's ACTUAL
+    /// UNIQUE constraints — `snippets.name`, and the partial unique index on
+    /// `snippet_triggers.normalized_trigger WHERE is_legacy = 0` (see DatabaseMigrations.swift)
+    /// — in a single preflight-and-insert pass inside ONE transaction, so no import can violate
+    /// an index mid-transaction. An incoming snippet whose name or any normalized trigger already
+    /// exists — in the store OR earlier in this same batch — is skipped (existing/earlier wins),
+    /// as is one with an empty or internally-duplicate trigger. Fresh IDs for every appended row;
+    /// existing rows are never modified. Used directly by Backup Bundle restore, which bounds-
+    /// checks `incoming` before this ever runs — see PLAN.md F1.4/F1.7.
+    func importSnippets(_ incoming: [Snippet]) throws -> ImportResult {
+        var imported = 0
+        var skipped = 0
+        try transaction {
+            var reservedNames = Set<String>()
+            var reservedTriggers = Set<String>()
+            for snippet in incoming {
+                let normalizedTriggers = snippet.triggers.map(Self.normalizeTrigger)
+                guard !normalizedTriggers.isEmpty, !normalizedTriggers.contains(where: \.isEmpty),
+                      Set(normalizedTriggers).count == normalizedTriggers.count else {
+                    skipped += 1
+                    continue
+                }
+                let nameTaken = try reservedNames.contains(snippet.name)
+                    || scalarInt("SELECT COUNT(*) FROM snippets WHERE name = ?;", bindings: [.text(snippet.name)]) > 0
+                let triggerTaken = try normalizedTriggers.contains { normalized in
+                    try reservedTriggers.contains(normalized)
+                        || scalarInt("SELECT COUNT(*) FROM snippet_triggers WHERE normalized_trigger = ?;", bindings: [.text(normalized)]) > 0
+                }
+                guard !nameTaken, !triggerTaken else {
+                    skipped += 1
+                    continue
+                }
+
+                let freshID = UUID().uuidString
+                try execute(
+                    "INSERT INTO snippets (id, name, replacement, created_at, updated_at) VALUES (?, ?, ?, ?, ?);",
+                    bindings: [.text(freshID), .text(snippet.name), .text(snippet.expansion),
+                               .double(snippet.createdAt.timeIntervalSince1970), .double(snippet.updatedAt.timeIntervalSince1970)]
+                )
+                for (trigger, normalized) in zip(snippet.triggers, normalizedTriggers) {
+                    try execute(
+                        "INSERT INTO snippet_triggers (snippet_id, trigger, normalized_trigger, is_legacy) VALUES (?, ?, ?, 0);",
+                        bindings: [.text(freshID), .text(trigger), .text(normalized)]
+                    )
+                }
+                reservedNames.insert(snippet.name)
+                reservedTriggers.formUnion(normalizedTriggers)
+                imported += 1
+            }
+        }
+        return ImportResult(importedCount: imported, skippedCount: skipped)
+    }
+
     func match(_ trigger: String) throws -> SnippetMatch {
         let normalized = Self.normalizeTrigger(trigger)
         guard !normalized.isEmpty else { return .none }
