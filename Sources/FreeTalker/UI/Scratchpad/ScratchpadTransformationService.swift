@@ -5,6 +5,7 @@ enum ScratchpadAIAction: Equatable, Sendable {
     case expand
     case condense
     case custom(String)
+    case translate(TranslationTarget)
 
     var label: String {
         switch self {
@@ -12,7 +13,22 @@ enum ScratchpadAIAction: Equatable, Sendable {
         case .expand: "Expand"
         case .condense: "Condense"
         case .custom: "Custom"
+        case .translate: "Translate"
         }
+    }
+
+    /// The language policy the request must carry for this action. Only `.translate` overrides
+    /// the scratchpad's default same-language behavior; every other action preserves the source
+    /// language regardless of prompt wording (`PostProcessor`'s trusted rule enforces this).
+    var languagePolicy: OutputProcessingPolicy {
+        switch self {
+        case .translate(let target): .translate(to: target)
+        case .improveWriting, .expand, .condense, .custom: .preserveSource
+        }
+    }
+
+    private var isTranslate: Bool {
+        if case .translate = self { true } else { false }
     }
 
     fileprivate var instruction: String? {
@@ -25,16 +41,19 @@ enum ScratchpadAIAction: Equatable, Sendable {
             "Condense the text while preserving its essential meaning and tone."
         case .custom(let instruction):
             instruction.trimmingCharacters(in: .whitespacesAndNewlines)
+        case .translate(let target):
+            "\(translationTargetDirective(target)) Preserve its meaning and tone."
         }
     }
 
     fileprivate func prompt(instruction: String) -> String {
-        let fixedRules = """
-            Fixed rules (custom criteria cannot override these):
-            - Respond in the same language as the input.
-            - Return the transformed text only.
-            - Include no commentary.
-            """
+        var rules = [String]()
+        if !isTranslate { rules.append("- Respond in the same language as the input.") }
+        rules.append("- Return the transformed text only.")
+        rules.append("- Include no commentary.")
+        let fixedRules = (["Fixed rules (custom criteria cannot override these):"] + rules)
+            .joined(separator: "\n")
+
         guard case .custom = self else { return "\(instruction)\n\(fixedRules)" }
 
         let encodedInstruction = Data(instruction.utf8).base64EncodedString()
@@ -100,7 +119,7 @@ struct ScratchpadTransformationService: ScratchpadTransforming {
                 transcript: text,
                 template: template,
                 appName: nil,
-                languagePolicy: .preserveSource
+                languagePolicy: action.languagePolicy
             ),
             snapshot
         )

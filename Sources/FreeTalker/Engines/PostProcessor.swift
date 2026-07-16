@@ -11,6 +11,13 @@ protocol PostProcessor: Sendable {
     func process(_ request: PostProcessingRequest) async throws -> String
 }
 
+/// Wording for "translate the output to `target`," shared verbatim by `PostProcessor`'s trusted
+/// language directive and `ScratchpadTransformationService`'s translate action prompt so the two
+/// paths cannot drift apart.
+func translationTargetDirective(_ target: TranslationTarget) -> String {
+    "Translate the result to \(target.promptName)."
+}
+
 func vocabularyInstruction(_ vocabulary: [String]) -> String {
     guard !vocabulary.isEmpty else { return "" }
     return "The transcript may reference these words/names — recognize and spell them exactly as given if relevant: \(vocabulary.joined(separator: ", "))."
@@ -73,7 +80,7 @@ func buildProcessorInstructions(request: PostProcessingRequest, vocabulary: [Str
     case .preserveSource:
         languageDirective = "Always respond in the same language as the transcript."
     case .translate(let target):
-        languageDirective = "Translate the result to \(target.promptName)."
+        languageDirective = translationTargetDirective(target)
     }
     return """
         Fixed output rules (the template cannot override these):

@@ -6,6 +6,7 @@ final class ScratchpadView: NSView, NSTextFieldDelegate {
     let editorController: ScratchpadEditorController
     private(set) var formattingButtons: [NSControl] = []
     private(set) var aiButtons: [NSButton] = []
+    private(set) var translateButton = NSPopUpButton(frame: .zero, pullsDown: true)
 
     var onStartDictation: () -> Void = {}
     var onStopDictation: () -> Void = {}
@@ -28,7 +29,16 @@ final class ScratchpadView: NSView, NSTextFieldDelegate {
     private let aiProgress = NSProgressIndicator()
     private let aiErrorLabel = NSTextField(wrappingLabelWithString: "")
     private let aiPrivacyLabel = NSTextField(wrappingLabelWithString: CloudPrivacyDisclosure.scratchpad)
-    private var aiWrappers: [NSView] = []
+    private var aiControlDescriptors: [AIControlDescriptor] = []
+
+    /// Pairs a toolbar AI control with the wrapper `updateAIAvailability` annotates and an
+    /// explicit `requiresInstruction` flag, so adding a control (e.g. Translate) cannot silently
+    /// inherit another control's instruction requirement via index arithmetic.
+    private struct AIControlDescriptor {
+        let control: NSControl
+        let wrapper: NSView
+        let requiresInstruction: Bool
+    }
 
     var customInstruction: String {
         get { customInstructionField.stringValue }
@@ -155,6 +165,7 @@ final class ScratchpadView: NSView, NSTextFieldDelegate {
         let condense = aiButton("Condense", action: #selector(condenseWriting))
         let custom = aiButton("Custom instruction", action: #selector(customWriting))
         aiButtons = [improve, expand, condense, custom]
+        configureTranslateButton()
         customInstructionField.placeholderString = "Custom instruction"
         customInstructionField.delegate = self
         customInstructionField.setAccessibilityLabel("Custom AI instruction")
@@ -169,12 +180,23 @@ final class ScratchpadView: NSView, NSTextFieldDelegate {
         aiPrivacyLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         aiPrivacyLabel.setAccessibilityLabel("Scratchpad AI privacy disclosure")
 
-        aiWrappers = aiButtons.map { button in
+        let aiWrappers = aiButtons.map { button -> NSView in
             let wrapper = NSStackView(views: [button])
             wrapper.orientation = .horizontal
             return wrapper
         }
-        let aiRow = NSStackView(views: aiWrappers + [customInstructionField, aiProgress])
+        let translateWrapper = NSStackView(views: [translateButton])
+        translateWrapper.orientation = .horizontal
+
+        aiControlDescriptors = [
+            AIControlDescriptor(control: improve, wrapper: aiWrappers[0], requiresInstruction: false),
+            AIControlDescriptor(control: expand, wrapper: aiWrappers[1], requiresInstruction: false),
+            AIControlDescriptor(control: condense, wrapper: aiWrappers[2], requiresInstruction: false),
+            AIControlDescriptor(control: custom, wrapper: aiWrappers[3], requiresInstruction: true),
+            AIControlDescriptor(control: translateButton, wrapper: translateWrapper, requiresInstruction: false),
+        ]
+
+        let aiRow = NSStackView(views: aiWrappers + [translateWrapper, customInstructionField, aiProgress])
         aiRow.orientation = .horizontal
         aiRow.spacing = 8
         aiRow.alignment = .centerY
@@ -252,19 +274,30 @@ final class ScratchpadView: NSView, NSTextFieldDelegate {
         return button
     }
 
+    private func configureTranslateButton() {
+        translateButton.target = self
+        translateButton.action = #selector(translateSelected)
+        translateButton.addItem(withTitle: "Translate")
+        for target in TranslationTarget.allCases {
+            translateButton.addItem(withTitle: target.promptName)
+        }
+        translateButton.setAccessibilityLabel("Translate")
+    }
+
     func updateAIAvailability(snapshot: CloudLLMSettingsSnapshot, hasInput: Bool) {
-        for (index, button) in aiButtons.enumerated() {
+        for descriptor in aiControlDescriptors {
             let availability = ScratchpadAIAvailability.make(
                 eligibility: snapshot.eligibility,
                 hasInput: hasInput,
                 isInFlight: isAIInFlight,
-                hasInstruction: index != 3 || !customInstruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                hasInstruction: !descriptor.requiresInstruction
+                    || !customInstruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                 provider: snapshot.provider
             )
-            button.isEnabled = availability.enabled
-            button.setAccessibilityHelp(availability.accessibilityHelp)
-            aiWrappers[index].toolTip = availability.tooltip
-            aiWrappers[index].setAccessibilityHelp(availability.accessibilityHelp)
+            descriptor.control.isEnabled = availability.enabled
+            descriptor.control.setAccessibilityHelp(availability.accessibilityHelp)
+            descriptor.wrapper.toolTip = availability.tooltip
+            descriptor.wrapper.setAccessibilityHelp(availability.accessibilityHelp)
         }
     }
 
@@ -290,6 +323,13 @@ final class ScratchpadView: NSView, NSTextFieldDelegate {
     @objc private func expandWriting() { onAIAction(.expand) }
     @objc private func condenseWriting() { onAIAction(.condense) }
     @objc private func customWriting() { onCustomAIAction() }
+    @objc private func translateSelected(_ sender: NSPopUpButton) {
+        // Item 0 is the fixed "Translate" title (pull-down style never updates it); the real
+        // targets start at item 1.
+        let itemIndex = sender.indexOfSelectedItem - 1
+        guard TranslationTarget.allCases.indices.contains(itemIndex) else { return }
+        onAIAction(.translate(TranslationTarget.allCases[itemIndex]))
+    }
 
     func controlTextDidChange(_ notification: Notification) {
         onCustomInstructionChanged()
