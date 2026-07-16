@@ -768,3 +768,67 @@ extension AppSettings {
         )
     }
 }
+
+extension AppSettings {
+    /// Every `Keys` entry that's safe and meaningful to export, excluding `legacyHotKeyDeviceMask`
+    /// and `hudPosition` — both read-only migration keys that current code only ever reads, never
+    /// writes. Never includes an API key: those live only in the Keychain (see Keychain.swift) and
+    /// have no `UserDefaults` key at all.
+    private static let exportableKeys: [String] = [
+        Keys.hotKeySpec,
+        Keys.insertLastDictationHotKeySpec,
+        Keys.voiceEditHotKeySpec,
+        Keys.sttEngine,
+        Keys.cloudSTTBaseURL,
+        Keys.whisperModel,
+        Keys.whisperModelChosen,
+        Keys.livePreviewEnabled,
+        Keys.noiseSuppressionEnabled,
+        Keys.edgeLauncherEnabled,
+        Keys.edgeLauncherEdge,
+        Keys.edgeLauncherPosition,
+        Keys.launcherPanelPosition,
+        Keys.recordingHUDPosition,
+        Keys.transientHUDPosition,
+        Keys.llmProvider,
+        Keys.cloudLLMBaseURL,
+        Keys.cloudLLMModel,
+        Keys.activeTemplateID,
+        Keys.recoveryRetention,
+        Keys.mediaImportRetention,
+        Keys.localContextScope,
+        Keys.automaticStyleEnabled,
+        Keys.handsFreeMaxMinutes,
+        Keys.appRules,
+        Keys.languagePin,
+        Keys.defaultOutputLanguage,
+        Keys.appLanguageRules,
+        Keys.microphoneDeviceUID,
+        Keys.vocabularyText
+    ]
+
+    /// Exports every non-secret setting to a human-readable JSON file. Reads only the
+    /// `UserDefaults` keys above — never the Keychain — so the API key can never end up in the
+    /// output. Values persisted as JSON-encoded `Data` (hotkeys, HUD/panel positions) are decoded
+    /// and embedded as nested JSON rather than base64 blobs; everything else embeds directly.
+    func exportSettingsJSON() throws -> Data {
+        var settings: [String: Any] = [:]
+        for key in Self.exportableKeys {
+            guard let value = defaults.object(forKey: key) else { continue }
+            if let data = value as? Data {
+                if let decoded = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) {
+                    settings[key] = decoded
+                }
+                // Defensive: an undecodable blob is skipped rather than crashing the export.
+            } else if JSONSerialization.isValidJSONObject([value]) {
+                settings[key] = value
+            }
+        }
+        let payload: [String: Any] = [
+            "formatVersion": 1,
+            "app": "FreeTalker",
+            "settings": settings
+        ]
+        return try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+    }
+}

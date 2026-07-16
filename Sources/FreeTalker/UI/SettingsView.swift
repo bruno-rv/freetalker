@@ -332,6 +332,7 @@ private struct GeneralSettingsView: View {
     @State private var cloudLLMTestResult: String?
     @State private var modelPendingDeletion: SpeechModelCatalogEntry?
     @State private var modelDeleteError: String?
+    @State private var exportSettingsError: String?
 
     private let refreshTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
@@ -429,6 +430,17 @@ private struct GeneralSettingsView: View {
             Button("OK") { modelDeleteError = nil }
         } message: {
             Text(modelDeleteError ?? "The model couldn't be deleted.")
+        }
+        .alert(
+            "Export failed",
+            isPresented: Binding(
+                get: { exportSettingsError != nil },
+                set: { if !$0 { exportSettingsError = nil } }
+            )
+        ) {
+            Button("OK") { exportSettingsError = nil }
+        } message: {
+            Text(exportSettingsError ?? "The settings couldn't be exported.")
         }
         .onAppear {
             inputDevices = AudioInputDevices.enumerate()
@@ -838,6 +850,26 @@ private struct GeneralSettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             .padding(.vertical, 12)
+            Divider()
+            VStack(alignment: .leading, spacing: 8) {
+                Button("Export Settings…") { exportSettings() }
+                Text("Saves your preferences to a JSON file. Your API key is never included — it stays in the macOS Keychain.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            .padding(.vertical, 12)
+        }
+    }
+
+    private func exportSettings() {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.json]
+        panel.nameFieldStringValue = "FreeTalker Settings.json"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let data = try settings.exportSettingsJSON()
+            try data.write(to: url, options: .atomic)
+        } catch {
+            exportSettingsError = "Could not save settings: \(error.localizedDescription)"
         }
     }
 
@@ -1267,6 +1299,8 @@ private struct TemplatesSettingsView: View {
     @ObservedObject private var store = TemplateStore.shared
     @ObservedObject private var settings = AppSettings.shared
     @State private var selectedID: String?
+    @State private var importingFile = false
+    @State private var importError: String?
 
     var body: some View {
         SettingsEditorPage(title: "Templates", subtitle: "Create and refine reusable dictation formats") {
@@ -1302,6 +1336,10 @@ private struct TemplatesSettingsView: View {
                             if let selectedID { store.delete(id: selectedID); self.selectedID = nil }
                         } label: { Image(systemName: "minus") }
                         .disabled(selectedID == nil)
+                        Button {
+                            importingFile = true
+                        } label: { Image(systemName: "square.and.arrow.down") }
+                        .help("Import Templates")
                     }
                 }
 
@@ -1312,6 +1350,44 @@ private struct TemplatesSettingsView: View {
                     Text("Select a template").foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
+        }
+        .fileImporter(
+            isPresented: $importingFile,
+            allowedContentTypes: [.json],
+            allowsMultipleSelection: false
+        ) { result in
+            switch result {
+            case .success(let urls):
+                if let url = urls.first { importTemplates(from: url) }
+            case .failure(let error):
+                importError = error.localizedDescription
+            }
+        }
+        .alert(
+            "Import failed",
+            isPresented: Binding(
+                get: { importError != nil },
+                set: { if !$0 { importError = nil } }
+            )
+        ) {
+            Button("OK") { importError = nil }
+        } message: {
+            Text(importError ?? "The templates couldn't be imported.")
+        }
+    }
+
+    private func importTemplates(from url: URL) {
+        let didAccess = url.startAccessingSecurityScopedResource()
+        defer { if didAccess { url.stopAccessingSecurityScopedResource() } }
+        do {
+            let data = try Data(contentsOf: url)
+            let existingIDs = Set(store.templates.map(\.id))
+            let count = try store.importTemplates(from: data)
+            if count > 0, let imported = store.templates.first(where: { !existingIDs.contains($0.id) }) {
+                selectedID = imported.id
+            }
+        } catch {
+            importError = error.localizedDescription
         }
     }
 }
