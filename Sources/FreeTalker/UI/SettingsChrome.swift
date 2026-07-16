@@ -11,6 +11,7 @@ enum SettingsDestination: String, CaseIterable, Identifiable {
     case templates
     case snippets
     case library
+    case stats
 
     var id: Self { self }
 
@@ -25,6 +26,7 @@ enum SettingsDestination: String, CaseIterable, Identifiable {
         case .templates: "Templates"
         case .snippets: "Snippets"
         case .library: "Library"
+        case .stats: "Usage Statistics"
         }
     }
 

@@ -48,7 +48,9 @@ final class Database {
             engine TEXT NOT NULL,
             source_id INTEGER,
             requested_output_language TEXT NOT NULL DEFAULT 'same',
-            capture_id TEXT
+            capture_id TEXT,
+            bundle_id TEXT,
+            duration_secs REAL
         );
         """)
         try exec("""
@@ -106,8 +108,8 @@ final class Database {
     func insertDictation(_ request: DictationInsertRequest, captureID: UUID?) throws -> Dictation {
         let sql = """
         INSERT INTO dictations
-            (ts, language, requested_output_language, template, transcript, refined, engine, source_id, capture_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (ts, language, requested_output_language, template, transcript, refined, engine, source_id, capture_id, bundle_id, duration_secs)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(capture_id) WHERE capture_id IS NOT NULL DO NOTHING;
         """
         let stmt = try prepare(sql)
@@ -128,6 +130,16 @@ final class Database {
             bindText(stmt, 9, captureID.uuidString)
         } else {
             sqlite3_bind_null(stmt, 9)
+        }
+        if let bundleID = request.bundleID {
+            bindText(stmt, 10, bundleID)
+        } else {
+            sqlite3_bind_null(stmt, 10)
+        }
+        if let durationSecs = request.durationSecs {
+            sqlite3_bind_double(stmt, 11, durationSecs)
+        } else {
+            sqlite3_bind_null(stmt, 11)
         }
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.sqlFailed(lastError())
@@ -239,17 +251,24 @@ final class Database {
 
     // MARK: - Reads
 
+    /// The single source-of-truth column list, in the exact order `readAll` reads positionally.
+    /// Every dictation SELECT interpolates this so the projection and the reader can never drift.
+    private static let dictationColumns =
+        "id, ts, language, requested_output_language, template, transcript, refined, engine, source_id, capture_id, bundle_id, duration_secs"
+    private static let dictationColumnsPrefixedD =
+        "d.id, d.ts, d.language, d.requested_output_language, d.template, d.transcript, d.refined, d.engine, d.source_id, d.capture_id, d.bundle_id, d.duration_secs"
+
     /// All dictations, reverse-chronological. `id DESC` breaks ties when two rows share a `ts`
     /// (e.g. inserted within the same clock tick) — id is the monotonic tiebreaker.
     func allDictations() throws -> [Dictation] {
-        let sql = "SELECT id, ts, language, requested_output_language, template, transcript, refined, engine, source_id, capture_id FROM dictations ORDER BY ts DESC, id DESC;"
+        let sql = "SELECT \(Self.dictationColumns) FROM dictations ORDER BY ts DESC, id DESC;"
         let stmt = try prepare(sql)
         defer { sqlite3_finalize(stmt) }
         return try readAll(stmt)
     }
 
     func latestDictation() throws -> Dictation? {
-        let sql = "SELECT id, ts, language, requested_output_language, template, transcript, refined, engine, source_id, capture_id FROM dictations ORDER BY id DESC LIMIT 1;"
+        let sql = "SELECT \(Self.dictationColumns) FROM dictations ORDER BY id DESC LIMIT 1;"
         let stmt = try prepare(sql)
         defer { sqlite3_finalize(stmt) }
         return try readAll(stmt).first
@@ -262,7 +281,7 @@ final class Database {
         guard !trimmed.isEmpty else { return try allDictations() }
 
         let ftsSQL = """
-        SELECT d.id, d.ts, d.language, d.requested_output_language, d.template, d.transcript, d.refined, d.engine, d.source_id, d.capture_id
+        SELECT \(Self.dictationColumnsPrefixedD)
         FROM dictations d
         JOIN dictations_fts f ON f.rowid = d.id
         WHERE dictations_fts MATCH ?
@@ -279,7 +298,7 @@ final class Database {
 
         // Fallback: plain LIKE scan.
         let likeSQL = """
-        SELECT id, ts, language, requested_output_language, template, transcript, refined, engine, source_id, capture_id FROM dictations
+        SELECT \(Self.dictationColumns) FROM dictations
         WHERE transcript LIKE ? OR refined LIKE ?
         ORDER BY ts DESC, id DESC;
         """
@@ -317,6 +336,8 @@ final class Database {
             let engine = columnText(stmt, 7)
             let sourceID: Int64? = sqlite3_column_type(stmt, 8) == SQLITE_NULL ? nil : sqlite3_column_int64(stmt, 8)
             let captureID = optionalColumnText(stmt, 9).flatMap(UUID.init(uuidString:))
+            let bundleID = optionalColumnText(stmt, 10)
+            let durationSecs: Double? = sqlite3_column_type(stmt, 11) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 11)
             results.append(Dictation(
                 id: id,
                 timestamp: Date(timeIntervalSince1970: ts),
@@ -327,7 +348,9 @@ final class Database {
                 refined: refined,
                 engine: engine,
                 sourceID: sourceID,
-                captureID: captureID
+                captureID: captureID,
+                bundleID: bundleID,
+                durationSecs: durationSecs
             ))
             stepResult = sqlite3_step(stmt)
         }
@@ -338,17 +361,41 @@ final class Database {
     }
 
     func dictation(id: Int64) throws -> Dictation? {
-        let stmt = try prepare("SELECT id, ts, language, requested_output_language, template, transcript, refined, engine, source_id, capture_id FROM dictations WHERE id = ?;")
+        let stmt = try prepare("SELECT \(Self.dictationColumns) FROM dictations WHERE id = ?;")
         defer { sqlite3_finalize(stmt) }
         sqlite3_bind_int64(stmt, 1, id)
         return try readAll(stmt).first
     }
 
     func dictations(captureID: UUID) throws -> [Dictation] {
-        let stmt = try prepare("SELECT id, ts, language, requested_output_language, template, transcript, refined, engine, source_id, capture_id FROM dictations WHERE capture_id = ? ORDER BY id;")
+        let stmt = try prepare("SELECT \(Self.dictationColumns) FROM dictations WHERE capture_id = ? ORDER BY id;")
         defer { sqlite3_finalize(stmt) }
         bindText(stmt, 1, captureID.uuidString)
         return try readAll(stmt)
+    }
+
+    /// Minimal projection for Usage Statistics — just the columns the aggregation needs, so a large
+    /// history streams through with no `Dictation` allocation overhead. Word counts are computed in
+    /// Swift from `refined`, never in SQL. See PLAN.md F4.4.
+    func statRows() throws -> [DictationStatRow] {
+        let stmt = try prepare("SELECT ts, language, template, engine, bundle_id, duration_secs, refined FROM dictations;")
+        defer { sqlite3_finalize(stmt) }
+        var rows: [DictationStatRow] = []
+        var result = sqlite3_step(stmt)
+        while Self.classifyStep(result) == .row {
+            rows.append(DictationStatRow(
+                timestamp: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 0)),
+                language: columnText(stmt, 1),
+                template: columnText(stmt, 2),
+                engine: columnText(stmt, 3),
+                bundleID: optionalColumnText(stmt, 4),
+                durationSecs: sqlite3_column_type(stmt, 5) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 5),
+                refined: columnText(stmt, 6)
+            ))
+            result = sqlite3_step(stmt)
+        }
+        guard Self.classifyStep(result) == .done else { throw DatabaseError.sqlFailed(lastError()) }
+        return rows
     }
 
     func translationVariants(parentID: Int64) throws -> [DictationTranslationVariant] {

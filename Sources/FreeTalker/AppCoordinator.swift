@@ -813,7 +813,8 @@ final class AppCoordinator: ObservableObject {
                     template: record.templateName,
                     transcript: record.rawTranscript,
                     refined: record.finalOutput,
-                    engine: record.engineName
+                    engine: record.engineName,
+                    bundleID: record.bundleID
                 )
             },
             onHistoryFailure: { [weak self] message in self?.hud.flash(message) },
@@ -2082,6 +2083,8 @@ final class AppCoordinator: ObservableObject {
                         capture: resolvedCapture
                     ),
                     recovery: recovery,
+                    bundleID: bundleID,
+                    durationSecs: Double(staged.sampleCount) / Double(CaptureSegmentCodec.sampleRate),
                     hudGeneration: hudGeneration
                 )
             } catch {
@@ -2525,7 +2528,7 @@ final class AppCoordinator: ObservableObject {
         }
     }
 
-    private func runPipeline(samples: [Float], engine: any TranscriptionEngine, engineName: String, template: Template, appName: String?, target: InsertionTarget?, forcedLanguage: String?, candidateLanguages: [String], outputLanguage: OutputLanguage, cloudSnapshot: CloudLLMSettingsSnapshot, skipPostProcessing: Bool, processor: (any PostProcessor)? = nil, localContext: LocalProcessingContext? = nil, recovery: ForegroundRecovery, hudGeneration: UUID) async {
+    private func runPipeline(samples: [Float], engine: any TranscriptionEngine, engineName: String, template: Template, appName: String?, target: InsertionTarget?, forcedLanguage: String?, candidateLanguages: [String], outputLanguage: OutputLanguage, cloudSnapshot: CloudLLMSettingsSnapshot, skipPostProcessing: Bool, processor: (any PostProcessor)? = nil, localContext: LocalProcessingContext? = nil, recovery: ForegroundRecovery, bundleID: String?, durationSecs: Double?, hudGeneration: UUID) async {
         defer {
             isProcessing = false
             recordingHUDDidReachTerminalState(generation: hudGeneration)
@@ -2548,7 +2551,9 @@ final class AppCoordinator: ObservableObject {
                             transcript: result.rawTranscript,
                             refined: result.finalOutput,
                             engine: result.engineName,
-                            captureID: recovery.captureID
+                            captureID: recovery.captureID,
+                            bundleID: bundleID,
+                            durationSecs: durationSecs
                         )
                     }
                 )
@@ -2708,7 +2713,8 @@ final class AppCoordinator: ObservableObject {
                                         transcript: result.transcript,
                                         refined: result.refined,
                                         engine: result.engineName,
-                                        captureID: staged.captureID
+                                        captureID: staged.captureID,
+                                        durationSecs: Double(staged.sampleCount) / Double(CaptureSegmentCodec.sampleRate)
                                     )
                                 } catch {
                                     await failForegroundRecovery(
@@ -3464,7 +3470,9 @@ final class AppCoordinator: ObservableObject {
                 transcript: dictation.transcript,
                 refined: refined,
                 engine: dictation.engine,
-                sourceID: dictation.sourceID ?? dictation.id
+                sourceID: dictation.sourceID ?? dictation.id,
+                bundleID: dictation.bundleID,
+                durationSecs: dictation.durationSecs
             )
         } catch {
             hud.flash("Library save failed")

@@ -23,6 +23,13 @@ struct Dictation: Identifiable, Equatable {
     var engine: String
     var sourceID: Int64?
     var captureID: UUID? = nil
+    /// Destination app bundle id known at dictation STOP time (the stop-time context snapshot),
+    /// not paste time. NULL for rows created before this column existed or where no external
+    /// destination applies (scratchpad, recovery). See PLAN.md F4.2.
+    var bundleID: String? = nil
+    /// Captured audio length in seconds — Σ committed capture-segment sample counts ÷ sample rate,
+    /// carried as a value from the processing context. NULL where capture metadata never existed.
+    var durationSecs: Double? = nil
 
     var language: String {
         get { sourceLanguage.rawValue }
@@ -39,6 +46,8 @@ struct DictationInsertRequest: Equatable, Sendable {
     var refined: String
     var engine: String
     var sourceID: Int64?
+    var bundleID: String?
+    var durationSecs: Double?
 
     init(
         timestamp: Date,
@@ -48,7 +57,9 @@ struct DictationInsertRequest: Equatable, Sendable {
         transcript: String,
         refined: String,
         engine: String,
-        sourceID: Int64? = nil
+        sourceID: Int64? = nil,
+        bundleID: String? = nil,
+        durationSecs: Double? = nil
     ) {
         self.timestamp = timestamp
         self.sourceLanguage = sourceLanguage
@@ -58,5 +69,8 @@ struct DictationInsertRequest: Equatable, Sendable {
         self.refined = refined
         self.engine = engine
         self.sourceID = sourceID
+        self.bundleID = bundleID
+        self.durationSecs = durationSecs
     }
 }
+

@@ -36,7 +36,7 @@ import Testing
         DROP INDEX idx_capture_sessions_state_captured_at;
         DROP TABLE capture_segments;
         DROP TABLE capture_sessions;
-        DELETE FROM schema_migrations WHERE version = 11;
+        DELETE FROM schema_migrations WHERE version >= 11;
         CREATE TABLE dictations (
           id INTEGER PRIMARY KEY, ts REAL NOT NULL, language TEXT NOT NULL,
           template TEXT NOT NULL, transcript TEXT NOT NULL, refined TEXT NOT NULL,
@@ -78,7 +78,7 @@ import Testing
           engine TEXT NOT NULL, source_id INTEGER,
           requested_output_language TEXT NOT NULL DEFAULT 'same'
         );
-        DELETE FROM schema_migrations WHERE version = 11;
+        DELETE FROM schema_migrations WHERE version >= 11;
         INSERT INTO dictations
           (id, ts, language, template, transcript, refined, engine, source_id, requested_output_language)
         VALUES (7, 123, 'pt', 'Clean', 'raw', 'kept', 'local', NULL, 'same');
@@ -95,6 +95,40 @@ import Testing
         #expect(try db.integer("SELECT COUNT(*) FROM pragma_index_list('dictations') WHERE name = 'idx_dictations_capture_id' AND \"unique\" = 1;") == 1)
         #expect(try db.integer("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('capture_sessions', 'capture_segments');") == 0)
         #expect(try db.integer("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_capture_sessions_state_captured_at';") == 0)
+        #expect(try db.schema() == schema)
+        #expect(try db.migrationVersions() == Array(1...DatabaseMigrator.latestVersion))
+    }
+
+    @Test func versionElevenLibraryUpgradeAddsStatsColumnsAndIsIdempotent() throws {
+        let db = try TemporaryDatabase()
+        try DatabaseMigrator.migrate(db.handle)
+        try db.execute("""
+        DROP INDEX idx_capture_sessions_state_captured_at;
+        DROP TABLE capture_segments;
+        DROP TABLE capture_sessions;
+        DELETE FROM schema_migrations WHERE version >= 12;
+        CREATE TABLE dictations (
+          id INTEGER PRIMARY KEY, ts REAL NOT NULL, language TEXT NOT NULL,
+          template TEXT NOT NULL, transcript TEXT NOT NULL, refined TEXT NOT NULL,
+          engine TEXT NOT NULL, source_id INTEGER,
+          requested_output_language TEXT NOT NULL DEFAULT 'same',
+          capture_id TEXT
+        );
+        INSERT INTO dictations
+          (id, ts, language, template, transcript, refined, engine, source_id,
+           requested_output_language, capture_id)
+        VALUES (7, 123, 'pt', 'Clean', 'raw', 'kept', 'local', NULL, 'same', NULL);
+        """)
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('dictations') WHERE name IN ('bundle_id', 'duration_secs');") == 0)
+
+        try DatabaseMigrator.migrate(db.handle, role: .library)
+        let schema = try db.schema()
+        try DatabaseMigrator.migrate(db.handle, role: .library)
+
+        #expect(try db.string("SELECT language || '|' || requested_output_language || '|' || refined FROM dictations WHERE id = 7;") == "pt|same|kept")
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('dictations') WHERE name = 'bundle_id' AND type = 'TEXT';") == 1)
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('dictations') WHERE name = 'duration_secs' AND type = 'REAL';") == 1)
+        #expect(try db.integer("SELECT bundle_id IS NULL AND duration_secs IS NULL FROM dictations WHERE id = 7;") == 1)
         #expect(try db.schema() == schema)
         #expect(try db.migrationVersions() == Array(1...DatabaseMigrator.latestVersion))
     }

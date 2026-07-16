@@ -63,6 +63,9 @@ struct TranslationRecoveryHistoryRecord: Equatable {
     let requestedOutputLanguage: OutputLanguage
     let templateName: String
     let engineName: String
+    /// Destination app known from the captured external target, if any. NULL for scratchpad
+    /// destinations or when no target was captured. See PLAN.md F4.2.
+    var bundleID: String? = nil
 }
 
 struct TranslationRecoveryPresentation: Equatable {
@@ -249,7 +252,8 @@ final class PendingTranslationRecoveryController {
                 sourceLanguage: SourceLanguage(recovery.sourceLanguage ?? ""),
                 requestedOutputLanguage: OutputLanguage(rawValue: recovery.outputLanguage.rawValue) ?? .sameAsSpoken,
                 templateName: recovery.template.name,
-                engineName: recovery.engineName
+                engineName: recovery.engineName,
+                bundleID: recovery.capturedExternalTarget?.bundleID
             ))
         } catch {
             onHistoryFailure("Library save failed")

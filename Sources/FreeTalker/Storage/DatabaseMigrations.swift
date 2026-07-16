@@ -6,7 +6,7 @@ enum DatabaseRole: Sendable {
 }
 
 enum DatabaseMigrator {
-    static let latestVersion = 11
+    static let latestVersion = 12
 
     static func migrate(_ db: OpaquePointer, role: DatabaseRole = .jobs) throws {
         try execute(db, "BEGIN IMMEDIATE;")
@@ -28,6 +28,8 @@ enum DatabaseMigrator {
                     try migrateLibraryV10(db)
                 } else if version == 11 {
                     try migrateCaptureV11(db, role: role)
+                } else if version == 12 {
+                    try migrateLibraryStatsV12(db, role: role)
                 } else {
                     try execute(db, migration)
                 }
@@ -234,8 +236,24 @@ enum DatabaseMigrator {
 
     private static let migration10 = ""
     private static let migration11 = ""
+    private static let migration12 = ""
 
-    private static let migrations = [migration1, migration2, migration3, migration4, migration5, migration6, migration7, migration8, migration9, migration10, migration11]
+    private static let migrations = [migration1, migration2, migration3, migration4, migration5, migration6, migration7, migration8, migration9, migration10, migration11, migration12]
+
+    /// Adds the Usage Statistics columns to an existing Library `dictations` table. Runs only for
+    /// the Library database (the jobs database has no `dictations`). Guarded by `columnExists` so a
+    /// fresh install — whose `createSchema()` baseline already declares both columns — converges to
+    /// the identical schema without re-adding them. FTS triggers are untouched. See PLAN.md F4.1.
+    private static func migrateLibraryStatsV12(_ db: OpaquePointer, role: DatabaseRole) throws {
+        guard role == .library else { return }
+        guard try tableExists("dictations", db: db) else { return }
+        if try !columnExists("bundle_id", in: "dictations", db: db) {
+            try execute(db, "ALTER TABLE dictations ADD COLUMN bundle_id TEXT;")
+        }
+        if try !columnExists("duration_secs", in: "dictations", db: db) {
+            try execute(db, "ALTER TABLE dictations ADD COLUMN duration_secs REAL;")
+        }
+    }
 
     private static func migrateCaptureV11(_ db: OpaquePointer, role: DatabaseRole) throws {
         switch role {

@@ -130,6 +130,12 @@ struct SettingsView: View {
                 .allowsHitTesting(selection == .library)
                 .disabled(selection != .library)
                 .accessibilityHidden(selection != .library)
+
+                UsageStatisticsView(isActive: selection == .stats)
+                    .opacity(selection == .stats ? 1 : 0)
+                    .allowsHitTesting(selection == .stats)
+                    .disabled(selection != .stats)
+                    .accessibilityHidden(selection != .stats)
             }
         }
         .frame(minWidth: 780, maxWidth: .infinity, minHeight: 560, maxHeight: .infinity)
@@ -147,7 +153,7 @@ private extension SettingsDestination {
         switch self {
         case .privacy, .recording, .transcription, .processing, .launcher, .storage:
             true
-        case .templates, .snippets, .library:
+        case .templates, .snippets, .library, .stats:
             false
         }
     }

@@ -100,7 +100,7 @@ final class LibraryStore: ObservableObject, LibraryTranslationStoring {
     /// the failure — the transcript is already inserted/pasteboarded by this point, so a failure
     /// here only loses the Library row, not the user's words. See Round 1 Codex finding 10.
     @discardableResult
-    func record(language: String, requestedOutputLanguage: OutputLanguage = .sameAsSpoken, template: String, transcript: String, refined: String, engine: String, sourceID: Int64? = nil, captureID: UUID? = nil) throws -> Int64 {
+    func record(language: String, requestedOutputLanguage: OutputLanguage = .sameAsSpoken, template: String, transcript: String, refined: String, engine: String, sourceID: Int64? = nil, captureID: UUID? = nil, bundleID: String? = nil, durationSecs: Double? = nil) throws -> Int64 {
         guard let db else { throw LibraryStoreError.databaseUnavailable }
         let stored = try db.insertDictation(.init(
             timestamp: Date(),
@@ -110,7 +110,9 @@ final class LibraryStore: ObservableObject, LibraryTranslationStoring {
             transcript: transcript,
             refined: refined,
             engine: engine,
-            sourceID: sourceID
+            sourceID: sourceID,
+            bundleID: bundleID,
+            durationSecs: durationSecs
         ), captureID: captureID)
         refresh()
         return stored.id
@@ -127,7 +129,9 @@ final class LibraryStore: ObservableObject, LibraryTranslationStoring {
             transcript: dictation.transcript,
             refined: dictation.refined,
             engine: dictation.engine,
-            sourceID: dictation.sourceID
+            sourceID: dictation.sourceID,
+            bundleID: dictation.bundleID,
+            durationSecs: dictation.durationSecs
         ), captureID: captureID)
         refresh()
         return stored
