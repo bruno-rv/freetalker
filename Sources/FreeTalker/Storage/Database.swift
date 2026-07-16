@@ -275,20 +275,41 @@ final class Database {
     }
 
     /// Full-text search over transcript + refined output, falling back to a LIKE scan if the
-    /// FTS query syntax is rejected (e.g. bare punctuation in the query).
+    /// FTS query syntax is rejected. Unlimited — the Library view's live as-you-type search.
+    /// Delegates to `search(query:limit:)`, the ONE search path also used by the Dictation
+    /// History Quick Panel (F3.3) from its own dedicated actor connection.
     func searchDictations(query: String) throws -> [Dictation] {
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return try allDictations() }
+        try search(query: query, limit: nil)
+    }
+
+    /// The ONE search path shared by every caller (`searchDictations` above, and the Dictation
+    /// History Quick Panel's dedicated `LibraryReadActor`, which opens its own connection to this
+    /// same database file — see PLAN.md F3.3). `limit`, when non-nil, is bound as a SQL `LIMIT`
+    /// parameter (never string-interpolated) so a bounded caller can never accidentally scan/
+    /// return an unbounded result set. `query` is bounded and trimmed by
+    /// `DictationSearchQuery.bounded` before it ever reaches SQLite.
+    func search(query: String, limit: Int?) throws -> [Dictation] {
+        let bounded = DictationSearchQuery.bounded(query)
+        let limitValue = Int32(limit ?? -1) // SQLite: LIMIT -1 means unlimited.
+
+        guard !bounded.isEmpty else {
+            let stmt = try prepare("SELECT \(Self.dictationColumns) FROM dictations ORDER BY ts DESC, id DESC LIMIT ?;")
+            defer { sqlite3_finalize(stmt) }
+            sqlite3_bind_int(stmt, 1, limitValue)
+            return try readAll(stmt)
+        }
 
         let ftsSQL = """
         SELECT \(Self.dictationColumnsPrefixedD)
         FROM dictations d
         JOIN dictations_fts f ON f.rowid = d.id
         WHERE dictations_fts MATCH ?
-        ORDER BY d.ts DESC, d.id DESC;
+        ORDER BY d.ts DESC, d.id DESC
+        LIMIT ?;
         """
         if let stmt = try? prepare(ftsSQL) {
-            bindText(stmt, 1, ftsMatchExpression(for: trimmed))
+            bindText(stmt, 1, DictationSearchQuery.ftsMatchExpression(for: bounded))
+            sqlite3_bind_int(stmt, 2, limitValue)
             if let results = try? readAll(stmt) {
                 sqlite3_finalize(stmt)
                 return results
@@ -296,24 +317,21 @@ final class Database {
             sqlite3_finalize(stmt)
         }
 
-        // Fallback: plain LIKE scan.
+        // Fallback: plain LIKE scan, explicit ESCAPE clause (see `DictationSearchQuery`).
         let likeSQL = """
         SELECT \(Self.dictationColumns) FROM dictations
-        WHERE transcript LIKE ? OR refined LIKE ?
-        ORDER BY ts DESC, id DESC;
+        WHERE transcript LIKE ? ESCAPE '\(DictationSearchQuery.likeEscapeCharacter)'
+           OR refined LIKE ? ESCAPE '\(DictationSearchQuery.likeEscapeCharacter)'
+        ORDER BY ts DESC, id DESC
+        LIMIT ?;
         """
         let stmt = try prepare(likeSQL)
         defer { sqlite3_finalize(stmt) }
-        let pattern = "%\(trimmed)%"
+        let pattern = DictationSearchQuery.likePattern(for: bounded)
         bindText(stmt, 1, pattern)
         bindText(stmt, 2, pattern)
+        sqlite3_bind_int(stmt, 3, limitValue)
         return try readAll(stmt)
-    }
-
-    private func ftsMatchExpression(for query: String) -> String {
-        // Quote each token so punctuation/prefixes in free text don't break FTS5 query syntax.
-        let tokens = query.split(separator: " ").map { "\"\($0)\"*" }
-        return tokens.joined(separator: " ")
     }
 
     /// Scans every row via `sqlite3_step`, throwing unless the loop ends at a clean `SQLITE_DONE`

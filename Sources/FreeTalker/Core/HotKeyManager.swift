@@ -1,3 +1,4 @@
+import AppKit
 import ApplicationServices
 import CoreGraphics
 import Foundation
@@ -22,6 +23,12 @@ final class HotKeyManager {
     /// key. Voice-edit target capture must observe the exact focus/selection that owned the
     /// hotkey event rather than a later main-actor turn.
     var onVoiceEditKeyDown: (@MainActor (TimeInterval) -> Void)?
+    /// Fired for the Dictation History Quick Panel hotkey (F3). Carries the `InsertionTarget`
+    /// snapshotted SYNCHRONOUSLY in the tap callback (see `handle(type:event:)`) — before the
+    /// `Task { @MainActor in ... }` hop below dispatches this closure — so the panel always opens
+    /// against the target that was frontmost at key-up, never whatever happens to be frontmost by
+    /// the time the deferred hop actually runs. See PLAN.md F3.2.
+    var onHistoryPanelKeyDown: (@MainActor (TimeInterval, InsertionTarget?) -> Void)?
 
     /// True while a hands-free recording is in progress (ptt or locked) — mirrored synchronously
     /// by `AppCoordinator` on every `recordingState` transition. Both run on the main thread (the
@@ -39,6 +46,7 @@ final class HotKeyManager {
     private var matcher = HotKeyMatcher(spec: .default)
     private var insertLastDictationMatcher: HotKeyMatcher?
     private var voiceEditMatcher: HotKeyMatcher?
+    private var historyPanelMatcher: HotKeyMatcher?
     /// Key-downs swallowed by an old matcher generation whose physical key-up may arrive after
     /// a settings-driven tap restart. Repeated reconfiguration can accumulate old generations,
     /// so insertion is explicitly capped by `maximumSwallowedKeyUpTombstones`.
@@ -72,6 +80,7 @@ final class HotKeyManager {
         var pttReleased = false
         var insertLastDictationEngaged = false
         var voiceEditEngaged = false
+        var historyPanelEngaged = false
         var swallow = false
     }
 
@@ -82,39 +91,46 @@ final class HotKeyManager {
         isAutorepeat: Bool,
         matcher: inout HotKeyMatcher,
         insertLastDictationMatcher: inout HotKeyMatcher?,
-        voiceEditMatcher: inout HotKeyMatcher?
+        voiceEditMatcher: inout HotKeyMatcher?,
+        historyPanelMatcher: inout HotKeyMatcher?
     ) -> DispatchOutcome {
         let outcome = matcher.handle(kind, keyCode: keyCode, flags: flags, isAutorepeat: isAutorepeat)
         let insertLastDictationOutcome = insertLastDictationMatcher?.handle(kind, keyCode: keyCode, flags: flags, isAutorepeat: isAutorepeat)
         let voiceEditOutcome = voiceEditMatcher?.handle(kind, keyCode: keyCode, flags: flags, isAutorepeat: isAutorepeat)
+        let historyPanelOutcome = historyPanelMatcher?.handle(kind, keyCode: keyCode, flags: flags, isAutorepeat: isAutorepeat)
         return DispatchOutcome(
             pttEngaged: outcome.engaged,
             pttReleased: outcome.released,
             insertLastDictationEngaged: insertLastDictationOutcome?.engaged == true,
             voiceEditEngaged: voiceEditOutcome?.engaged == true,
-            swallow: outcome.swallow || insertLastDictationOutcome?.swallow == true || voiceEditOutcome?.swallow == true
+            historyPanelEngaged: historyPanelOutcome?.engaged == true,
+            swallow: outcome.swallow || insertLastDictationOutcome?.swallow == true || voiceEditOutcome?.swallow == true || historyPanelOutcome?.swallow == true
         )
     }
 
     nonisolated static func resetMatchers(
         matcher: inout HotKeyMatcher,
         insertLastDictationMatcher: inout HotKeyMatcher?,
-        voiceEditMatcher: inout HotKeyMatcher?
+        voiceEditMatcher: inout HotKeyMatcher?,
+        historyPanelMatcher: inout HotKeyMatcher?
     ) {
         matcher = HotKeyMatcher(spec: matcher.spec)
         insertLastDictationMatcher = insertLastDictationMatcher.map { HotKeyMatcher(spec: $0.spec) }
         voiceEditMatcher = voiceEditMatcher.map { HotKeyMatcher(spec: $0.spec) }
+        historyPanelMatcher = historyPanelMatcher.map { HotKeyMatcher(spec: $0.spec) }
     }
 
     nonisolated static func captureSwallowedKeyUpTombstones(
         matcher: HotKeyMatcher,
         insertLastDictationMatcher: HotKeyMatcher?,
-        voiceEditMatcher: HotKeyMatcher?
+        voiceEditMatcher: HotKeyMatcher?,
+        historyPanelMatcher: HotKeyMatcher?
     ) -> Set<UInt16> {
         Set([
             matcher.swallowedKeyCodeAwaitingKeyUp,
             insertLastDictationMatcher?.swallowedKeyCodeAwaitingKeyUp,
-            voiceEditMatcher?.swallowedKeyCodeAwaitingKeyUp
+            voiceEditMatcher?.swallowedKeyCodeAwaitingKeyUp,
+            historyPanelMatcher?.swallowedKeyCodeAwaitingKeyUp
         ].compactMap { $0 })
     }
 
@@ -181,11 +197,12 @@ final class HotKeyManager {
     /// (missing Accessibility/Input Monitoring permission — both TCC states are logged for
     /// diagnosis).
     @discardableResult
-    func start(spec: HotKeySpec, insertLastDictationSpec: HotKeySpec?, voiceEditSpec: HotKeySpec? = nil) -> Bool {
+    func start(spec: HotKeySpec, insertLastDictationSpec: HotKeySpec?, voiceEditSpec: HotKeySpec? = nil, historyPanelSpec: HotKeySpec? = nil) -> Bool {
         stop()
         matcher = HotKeyMatcher(spec: spec)
         insertLastDictationMatcher = insertLastDictationSpec.map { HotKeyMatcher(spec: $0) }
         voiceEditMatcher = voiceEditSpec.map { HotKeyMatcher(spec: $0) }
+        historyPanelMatcher = historyPanelSpec.map { HotKeyMatcher(spec: $0) }
 
         let axTrusted = AXIsProcessTrusted()
         let hidAccess = IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)
@@ -250,7 +267,8 @@ final class HotKeyManager {
         Self.mergeSwallowedKeyUpTombstones(Self.captureSwallowedKeyUpTombstones(
             matcher: matcher,
             insertLastDictationMatcher: insertLastDictationMatcher,
-            voiceEditMatcher: voiceEditMatcher
+            voiceEditMatcher: voiceEditMatcher,
+            historyPanelMatcher: historyPanelMatcher
         ), into: &swallowedKeyUpTombstones)
         if let tap = eventTap {
             CGEvent.tapEnable(tap: tap, enable: false)
@@ -260,7 +278,7 @@ final class HotKeyManager {
         }
         eventTap = nil
         runLoopSource = nil
-        Self.resetMatchers(matcher: &matcher, insertLastDictationMatcher: &insertLastDictationMatcher, voiceEditMatcher: &voiceEditMatcher)
+        Self.resetMatchers(matcher: &matcher, insertLastDictationMatcher: &insertLastDictationMatcher, voiceEditMatcher: &voiceEditMatcher, historyPanelMatcher: &historyPanelMatcher)
     }
 
     /// Runs on the main thread (the tap's run-loop source is on the main run loop), so
@@ -301,7 +319,7 @@ final class HotKeyManager {
         ) == .swallowWithoutDispatch {
             return nil
         }
-        let outcome = Self.dispatch(kind: kind, keyCode: keyCode, flags: event.flags.rawValue, isAutorepeat: isAutorepeat, matcher: &matcher, insertLastDictationMatcher: &insertLastDictationMatcher, voiceEditMatcher: &voiceEditMatcher)
+        let outcome = Self.dispatch(kind: kind, keyCode: keyCode, flags: event.flags.rawValue, isAutorepeat: isAutorepeat, matcher: &matcher, insertLastDictationMatcher: &insertLastDictationMatcher, voiceEditMatcher: &voiceEditMatcher, historyPanelMatcher: &historyPanelMatcher)
         // CGEventTimestamp is nanoseconds since system startup (excluding sleep) — converted to
         // seconds here, at the tap callback, so `AppCoordinator`'s tap-vs-hold elapsed-time
         // calculation is immune to any delay between this event firing and the hop to the
@@ -322,6 +340,14 @@ final class HotKeyManager {
                 eventSeconds: eventSeconds,
                 action: onVoiceEditKeyDown
             )
+        }
+        if outcome.historyPanelEngaged {
+            // Synchronous snapshot, taken here inside the tap callback (already MainActor-
+            // isolated — see `MainActor.assumeIsolated` above), BEFORE the `Task` hop below
+            // dispatches `onHistoryPanelKeyDown` — see PLAN.md F3.2 and the doc comment on
+            // `onHistoryPanelKeyDown`.
+            let target = Insertion.snapshotTarget(app: NSWorkspace.shared.frontmostApplication)
+            Task { @MainActor in self.onHistoryPanelKeyDown?(eventSeconds, target) }
         }
         return outcome.swallow ? nil : Unmanaged.passUnretained(event)
     }

@@ -48,12 +48,18 @@ final class AppSettings: ObservableObject {
             // two settings consistent no matter how `hotKeySpec` changes;
             // `insertLastDictationHotKeySpec`'s own `didSet` below handles dropping the now-stale
             // persisted key. See Round 1 Codex finding 10.
-            if let insertLastDictationHotKeySpec, HotKeySpec.validInsertLastDictationSpec(insertLastDictationHotKeySpec, pttSpec: hotKeySpec) == nil {
+            // Each of the three action specs is re-checked only against the NEW PTT (2-way:
+            // collision + shadow), not against its siblings — a PTT change can't itself create an
+            // action-vs-action collision, since those pairs were already validated against each
+            // other when each was bound. See Round 1 Codex finding 10.
+            if let insertLastDictationHotKeySpec, HotKeySpec.validActionSpec(insertLastDictationHotKeySpec, pttSpec: hotKeySpec, otherActionSpecs: []) == nil {
                 self.insertLastDictationHotKeySpec = nil
             }
-            if let voiceEditHotKeySpec,
-               HotKeySpec.validActionSpec(voiceEditHotKeySpec, pttSpec: hotKeySpec, otherActionSpec: insertLastDictationHotKeySpec) == nil {
+            if let voiceEditHotKeySpec, HotKeySpec.validActionSpec(voiceEditHotKeySpec, pttSpec: hotKeySpec, otherActionSpecs: []) == nil {
                 self.voiceEditHotKeySpec = nil
+            }
+            if let historyPanelHotKeySpec, HotKeySpec.validActionSpec(historyPanelHotKeySpec, pttSpec: hotKeySpec, otherActionSpecs: []) == nil {
+                self.historyPanelHotKeySpec = nil
             }
         }
     }
@@ -74,7 +80,7 @@ final class AppSettings: ObservableObject {
             // this falls straight through to the persistence branch below on the next (nil)
             // value. See Round 1 Codex finding 10.
             if let insertLastDictationHotKeySpec,
-               HotKeySpec.validActionSpec(insertLastDictationHotKeySpec, pttSpec: hotKeySpec, otherActionSpec: voiceEditHotKeySpec) == nil {
+               HotKeySpec.validActionSpec(insertLastDictationHotKeySpec, pttSpec: hotKeySpec, otherActionSpecs: [voiceEditHotKeySpec, historyPanelHotKeySpec]) == nil {
                 self.insertLastDictationHotKeySpec = nil
                 defaults.removeObject(forKey: Keys.insertLastDictationHotKeySpec)
                 return
@@ -90,7 +96,7 @@ final class AppSettings: ObservableObject {
     @Published var voiceEditHotKeySpec: HotKeySpec? {
         didSet {
             if let voiceEditHotKeySpec,
-               HotKeySpec.validActionSpec(voiceEditHotKeySpec, pttSpec: hotKeySpec, otherActionSpec: insertLastDictationHotKeySpec) == nil {
+               HotKeySpec.validActionSpec(voiceEditHotKeySpec, pttSpec: hotKeySpec, otherActionSpecs: [insertLastDictationHotKeySpec, historyPanelHotKeySpec]) == nil {
                 self.voiceEditHotKeySpec = nil
                 defaults.removeObject(forKey: Keys.voiceEditHotKeySpec)
                 return
@@ -99,6 +105,25 @@ final class AppSettings: ObservableObject {
                 defaults.set(data, forKey: Keys.voiceEditHotKeySpec)
             } else {
                 defaults.removeObject(forKey: Keys.voiceEditHotKeySpec)
+            }
+        }
+    }
+
+    /// Fourth fixed hotkey slot (PLAN.md F3.1): opens the Dictation History Quick Panel.
+    /// Unbound by default — the menu-bar "Dictation History…" item is the always-available
+    /// fallback. Validated the same way as the other two action slots (`validActionSpec`).
+    @Published var historyPanelHotKeySpec: HotKeySpec? {
+        didSet {
+            if let historyPanelHotKeySpec,
+               HotKeySpec.validActionSpec(historyPanelHotKeySpec, pttSpec: hotKeySpec, otherActionSpecs: [insertLastDictationHotKeySpec, voiceEditHotKeySpec]) == nil {
+                self.historyPanelHotKeySpec = nil
+                defaults.removeObject(forKey: Keys.historyPanelHotKeySpec)
+                return
+            }
+            if let historyPanelHotKeySpec, let data = try? JSONEncoder().encode(historyPanelHotKeySpec) {
+                defaults.set(data, forKey: Keys.historyPanelHotKeySpec)
+            } else {
+                defaults.removeObject(forKey: Keys.historyPanelHotKeySpec)
             }
         }
     }
@@ -634,6 +659,7 @@ final class AppSettings: ObservableObject {
         /// Insert Last Dictation binding. Only the Swift-facing name changed.
         static let insertLastDictationHotKeySpec = "redoHotKeySpec"
         static let voiceEditHotKeySpec = "voiceEditHotKeySpec"
+        static let historyPanelHotKeySpec = "historyPanelHotKeySpec"
         /// Legacy (read-only, for migration): single-modifier NX device mask bit.
         static let legacyHotKeyDeviceMask = "hotKeyDeviceMask"
         static let sttEngine = "sttEngine"
@@ -688,6 +714,11 @@ final class AppSettings: ObservableObject {
             voiceEditHotKeySpec = try? JSONDecoder().decode(HotKeySpec.self, from: data)
         } else {
             voiceEditHotKeySpec = nil
+        }
+        if let data = defaults.data(forKey: Keys.historyPanelHotKeySpec) {
+            historyPanelHotKeySpec = try? JSONDecoder().decode(HotKeySpec.self, from: data)
+        } else {
+            historyPanelHotKeySpec = nil
         }
         sttEngine = STTEngineKind(rawValue: defaults.string(forKey: Keys.sttEngine) ?? "") ?? .whisperKit
         // One-time load normalization: a value stored before setter-level stripping existed (or
@@ -813,14 +844,19 @@ final class AppSettings: ObservableObject {
         // the `insertLastDictationHotKeySpec =` above) doesn't trigger its own `didSet` (same
         // reasoning as `vocabularyText`'s clamp above). See Round 1 Codex finding 10.
         if let insertLastDictationHotKeySpec,
-           HotKeySpec.validActionSpec(insertLastDictationHotKeySpec, pttSpec: hotKeySpec, otherActionSpec: voiceEditHotKeySpec) == nil {
+           HotKeySpec.validActionSpec(insertLastDictationHotKeySpec, pttSpec: hotKeySpec, otherActionSpecs: [voiceEditHotKeySpec, historyPanelHotKeySpec]) == nil {
             self.insertLastDictationHotKeySpec = nil
             defaults.removeObject(forKey: Keys.insertLastDictationHotKeySpec)
         }
         if let voiceEditHotKeySpec,
-           HotKeySpec.validActionSpec(voiceEditHotKeySpec, pttSpec: hotKeySpec, otherActionSpec: insertLastDictationHotKeySpec) == nil {
+           HotKeySpec.validActionSpec(voiceEditHotKeySpec, pttSpec: hotKeySpec, otherActionSpecs: [insertLastDictationHotKeySpec, historyPanelHotKeySpec]) == nil {
             self.voiceEditHotKeySpec = nil
             defaults.removeObject(forKey: Keys.voiceEditHotKeySpec)
+        }
+        if let historyPanelHotKeySpec,
+           HotKeySpec.validActionSpec(historyPanelHotKeySpec, pttSpec: hotKeySpec, otherActionSpecs: [insertLastDictationHotKeySpec, voiceEditHotKeySpec]) == nil {
+            self.historyPanelHotKeySpec = nil
+            defaults.removeObject(forKey: Keys.historyPanelHotKeySpec)
         }
     }
 }
@@ -904,13 +940,12 @@ extension AppSettings {
     /// have no `UserDefaults` key at all.
     ///
     /// Internal (not private) so `BackupBundle.swift` can decode/apply against the same key set
-    /// the exporters emit. `historyPanelHotKeySpec` and `dictationLanguages` (F3/F5) are not yet
-    /// implemented — adding either is a one-line append here plus a matching `Keys.*` entry,
-    /// `exportableSettingsSnapshot()` case, and `SettingsPatch` field/decode/apply case.
+    /// the exporters emit.
     static let exportableKeys: [String] = [
         Keys.hotKeySpec,
         Keys.insertLastDictationHotKeySpec,
         Keys.voiceEditHotKeySpec,
+        Keys.historyPanelHotKeySpec,
         Keys.sttEngine,
         Keys.cloudSTTBaseURL,
         Keys.whisperModel,
@@ -987,6 +1022,7 @@ extension AppSettings {
         out[Keys.hotKeySpec] = jsonValue(hotKeySpec)
         out[Keys.insertLastDictationHotKeySpec] = insertLastDictationHotKeySpec.map(jsonValue) ?? NSNull()
         out[Keys.voiceEditHotKeySpec] = voiceEditHotKeySpec.map(jsonValue) ?? NSNull()
+        out[Keys.historyPanelHotKeySpec] = historyPanelHotKeySpec.map(jsonValue) ?? NSNull()
         out[Keys.sttEngine] = sttEngine.rawValue
         out[Keys.cloudSTTBaseURL] = cloudSTTBaseURL
         out[Keys.whisperModel] = whisperModel

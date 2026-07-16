@@ -47,19 +47,43 @@ import Testing
         var mutablePTT = ptt
         var mutableInsertLastDictation: HotKeyMatcher? = insertLastDictation
         var mutableVoice: HotKeyMatcher? = voice
+        var mutableHistoryPanel: HotKeyMatcher?
 
         let down = HotKeyManager.dispatch(
             kind: .keyDown, keyCode: 107, flags: 0, isAutorepeat: false,
-            matcher: &mutablePTT, insertLastDictationMatcher: &mutableInsertLastDictation, voiceEditMatcher: &mutableVoice
+            matcher: &mutablePTT, insertLastDictationMatcher: &mutableInsertLastDictation, voiceEditMatcher: &mutableVoice, historyPanelMatcher: &mutableHistoryPanel
         )
         #expect(down.voiceEditEngaged)
         #expect(down.swallow)
 
         let up = HotKeyManager.dispatch(
             kind: .keyUp, keyCode: 107, flags: 0, isAutorepeat: false,
-            matcher: &mutablePTT, insertLastDictationMatcher: &mutableInsertLastDictation, voiceEditMatcher: &mutableVoice
+            matcher: &mutablePTT, insertLastDictationMatcher: &mutableInsertLastDictation, voiceEditMatcher: &mutableVoice, historyPanelMatcher: &mutableHistoryPanel
         )
         #expect(!up.voiceEditEngaged)
+        #expect(up.swallow)
+    }
+
+    @Test func historyPanelHotkeyDispatchIsSynchronousAndSwallowed() {
+        var mutablePTT = HotKeyMatcher(spec: .default)
+        var mutableInsertLastDictation: HotKeyMatcher? = HotKeyMatcher(spec: HotKeySpec(modifiers: 0, keyCode: 105))
+        var mutableVoice: HotKeyMatcher? = HotKeyMatcher(spec: HotKeySpec(modifiers: 0, keyCode: 107))
+        var mutableHistoryPanel: HotKeyMatcher? = HotKeyMatcher(spec: HotKeySpec(modifiers: 0, keyCode: 4))
+
+        let down = HotKeyManager.dispatch(
+            kind: .keyDown, keyCode: 4, flags: 0, isAutorepeat: false,
+            matcher: &mutablePTT, insertLastDictationMatcher: &mutableInsertLastDictation, voiceEditMatcher: &mutableVoice, historyPanelMatcher: &mutableHistoryPanel
+        )
+        #expect(down.historyPanelEngaged)
+        #expect(down.swallow)
+        #expect(!down.voiceEditEngaged)
+        #expect(!down.insertLastDictationEngaged)
+
+        let up = HotKeyManager.dispatch(
+            kind: .keyUp, keyCode: 4, flags: 0, isAutorepeat: false,
+            matcher: &mutablePTT, insertLastDictationMatcher: &mutableInsertLastDictation, voiceEditMatcher: &mutableVoice, historyPanelMatcher: &mutableHistoryPanel
+        )
+        #expect(!up.historyPanelEngaged)
         #expect(up.swallow)
     }
 
@@ -196,12 +220,13 @@ import Testing
         var ptt = HotKeyMatcher(spec: .default)
         var insertLastDictation: HotKeyMatcher? = HotKeyMatcher(spec: HotKeySpec(modifiers: 0, keyCode: 105))
         var voice: HotKeyMatcher? = HotKeyMatcher(spec: HotKeySpec(modifiers: 0, keyCode: 107))
+        var historyPanel: HotKeyMatcher?
         _ = voice?.handle(.keyDown, keyCode: 107, flags: 0)
         var tombstones = HotKeyManager.captureSwallowedKeyUpTombstones(
-            matcher: ptt, insertLastDictationMatcher: insertLastDictation, voiceEditMatcher: voice
+            matcher: ptt, insertLastDictationMatcher: insertLastDictation, voiceEditMatcher: voice, historyPanelMatcher: historyPanel
         )
 
-        HotKeyManager.resetMatchers(matcher: &ptt, insertLastDictationMatcher: &insertLastDictation, voiceEditMatcher: &voice)
+        HotKeyManager.resetMatchers(matcher: &ptt, insertLastDictationMatcher: &insertLastDictation, voiceEditMatcher: &voice, historyPanelMatcher: &historyPanel)
 
         #expect(HotKeyManager.handleSwallowedKeyUpTombstone(
             kind: .keyUp, keyCode: 105, isAutorepeat: false, tombstones: &tombstones
@@ -258,13 +283,21 @@ import Testing
         #expect(HotKeyManager.eventTapThreadIsValid())
     }
 
-    @Test func threeHotkeysRejectEveryCollision() {
+    @Test func fourHotkeysRejectEveryCollision() {
         let ptt = HotKeySpec.default
         let insertLastDictation = HotKeySpec(modifiers: 0, keyCode: 105)
         let voice = HotKeySpec(modifiers: 0, keyCode: 107)
-        #expect(HotKeySpec.validActionSpec(voice, pttSpec: ptt, otherActionSpec: insertLastDictation) == voice)
-        #expect(HotKeySpec.validActionSpec(insertLastDictation, pttSpec: ptt, otherActionSpec: insertLastDictation) == nil)
-        #expect(HotKeySpec.validActionSpec(ptt, pttSpec: ptt, otherActionSpec: insertLastDictation) == nil)
+        let historyPanel = HotKeySpec(modifiers: 0, keyCode: 4)
+        // A candidate that collides with neither PTT nor either already-bound sibling is valid.
+        #expect(HotKeySpec.validActionSpec(voice, pttSpec: ptt, otherActionSpecs: [insertLastDictation, historyPanel]) == voice)
+        // Colliding with itself-as-a-sibling (re-binding the same chord to another slot) is rejected.
+        #expect(HotKeySpec.validActionSpec(insertLastDictation, pttSpec: ptt, otherActionSpecs: [insertLastDictation, historyPanel]) == nil)
+        // Colliding with a THIRD sibling (not just the first) is rejected too.
+        #expect(HotKeySpec.validActionSpec(historyPanel, pttSpec: ptt, otherActionSpecs: [insertLastDictation, historyPanel]) == nil)
+        // Colliding with PTT itself is rejected regardless of siblings.
+        #expect(HotKeySpec.validActionSpec(ptt, pttSpec: ptt, otherActionSpecs: [insertLastDictation]) == nil)
+        // A modifier-only candidate (no key) is never a valid action spec.
+        #expect(HotKeySpec.validActionSpec(HotKeySpec(modifiers: 0x40, keyCode: nil), pttSpec: ptt, otherActionSpecs: []) == nil)
     }
 
     @Test func voiceEditHotkeyPersistsAndInvalidAssignmentsAreDropped() {

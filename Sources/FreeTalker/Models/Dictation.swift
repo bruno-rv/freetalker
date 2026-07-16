@@ -12,7 +12,7 @@ struct SourceLanguage: RawRepresentable, Equatable, Sendable {
     }
 }
 
-struct Dictation: Identifiable, Equatable {
+struct Dictation: Identifiable, Equatable, Sendable {
     var id: Int64
     var timestamp: Date
     var sourceLanguage: SourceLanguage

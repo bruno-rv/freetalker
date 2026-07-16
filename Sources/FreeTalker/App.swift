@@ -163,6 +163,7 @@ private struct MenuBarContentView: View {
             Divider()
 
             Button("Scratchpad…") { ScratchpadWindowController.shared.open() }
+            Button("Dictation History…") { coordinator.openHistoryPanelFromMenu() }
             Button("Settings…") {
                 NSApplication.shared.activate(ignoringOtherApps: true)
                 openWindow(id: "settings")

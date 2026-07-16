@@ -115,11 +115,13 @@ struct UsageStatsSnapshot: Sendable, Equatable {
     }
 }
 
-/// Owns a dedicated read connection to the Library database and computes the stats snapshot off the
-/// main actor. `LibraryStore`'s `Database` handle is `@MainActor` and non-`Sendable`, so it must
-/// never be shared across actors — this actor opens its own connection (WAL allows concurrent
-/// readers). See PLAN.md F3.3/F4.4.
-actor UsageStatsComputer {
+/// Owns ONE dedicated read connection to the Library database, off the main actor.
+/// `LibraryStore`'s `Database` handle is `@MainActor` and non-`Sendable`, so it must never be
+/// shared across actors — this actor opens its own connection (WAL allows concurrent readers).
+/// Serves both Usage Statistics (`compute`, F4.4) and the Dictation History Quick Panel's search
+/// (`search`, F3.3) — one actor-owned connection, not two parallel ones, per PLAN.md F3.3's "the
+/// same actor-owned read connection serves F4's stats computation."
+actor LibraryReadActor {
     private let path: URL
     private var database: Database?
 
@@ -131,6 +133,15 @@ actor UsageStatsComputer {
         let database = try openIfNeeded()
         let rows = try database.statRows()
         return UsageStatsSnapshot.compute(rows: rows, now: now, calendar: calendar)
+    }
+
+    /// Bounded, debounced search for the Dictation History Quick Panel (PLAN.md F3.3). Delegates
+    /// to `Database.search(query:limit:)` — the ONE search path also used by `LibraryStore`'s
+    /// (unlimited) Library view search — from this actor's own connection, never `LibraryStore`'s
+    /// main-actor one.
+    func search(query: String, limit: Int) throws -> [Dictation] {
+        let database = try openIfNeeded()
+        return try database.search(query: query, limit: limit)
     }
 
     private func openIfNeeded() throws -> Database {

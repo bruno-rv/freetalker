@@ -315,6 +315,9 @@ private struct GeneralSettingsView: View {
     @State private var capturingVoiceEditHotKey = false
     @State private var voiceEditCaptureSession: HotKeyCapture.Session?
     @State private var voiceEditRecorderMessage: String?
+    @State private var capturingHistoryPanelHotKey = false
+    @State private var historyPanelCaptureSession: HotKeyCapture.Session?
+    @State private var historyPanelRecorderMessage: String?
     @State private var inputDevices: [AudioInputDevices.Device] = []
     @State private var runningApps: [NSRunningApplication] = []
     @State private var newRuleBundleID: String?
@@ -788,6 +791,31 @@ private struct GeneralSettingsView: View {
                     .foregroundStyle(.secondary)
                 if let voiceEditRecorderMessage {
                     Text(voiceEditRecorderMessage)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+                HStack {
+                    Text("Dictation History key: \(settings.historyPanelHotKeySpec?.displayLabel ?? "Unbound")")
+                    SettingsHelpButton(
+                        title: "Dictation History key",
+                        message: "Opens a search panel over your Dictation History for one-click insertion. The \"Dictation History…\" menu item is always available."
+                    )
+                    Spacer()
+                    Button("Clear") {
+                        settings.historyPanelHotKeySpec = nil
+                        historyPanelRecorderMessage = nil
+                    }
+                    .disabled(settings.historyPanelHotKeySpec == nil)
+                    Button(capturingHistoryPanelHotKey ? "Press a key or combination… (⎋ cancels)" : "Change…") {
+                        beginHistoryPanelCapture()
+                    }
+                    .disabled(capturingHistoryPanelHotKey)
+                }
+                Text("Opens a search panel over your Dictation History — click a result to insert it, or press Esc to close.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let historyPanelRecorderMessage {
+                    Text(historyPanelRecorderMessage)
                         .font(.caption)
                         .foregroundStyle(.red)
                 }
@@ -1273,20 +1301,28 @@ private struct GeneralSettingsView: View {
                 captureSession = nil
             }
             guard let spec else { return } // Escape cancelled the capture.
-            if let insertLastDictation = settings.insertLastDictationHotKeySpec {
-                if HotKeySpec.collides(spec, insertLastDictation) {
-                    hotKeyRecorderMessage = "Same as the Insert Last Dictation key — pick a different chord."
+            // Centralized four-way validation (PLAN.md F3.1): a new PTT candidate must not
+            // collide with, or be shadow-engaged before, ANY currently-bound action spec — not
+            // just Insert Last Dictation.
+            let actions: [(label: String, spec: HotKeySpec?)] = [
+                ("Insert Last Dictation", settings.insertLastDictationHotKeySpec),
+                ("Voice Edit", settings.voiceEditHotKeySpec),
+                ("Dictation History", settings.historyPanelHotKeySpec)
+            ]
+            for (label, action) in actions {
+                guard let action else { continue }
+                if HotKeySpec.collides(spec, action) {
+                    hotKeyRecorderMessage = "Same as the \(label) key — pick a different chord."
                     return
                 }
-                if HotKeySpec.insertLastDictationShadowsHeldPTT(pttSpec: spec, insertLastDictationSpec: insertLastDictation) {
-                    hotKeyRecorderMessage = "Would trigger before the Insert Last Dictation key — pick a different chord."
+                if HotKeySpec.insertLastDictationShadowsHeldPTT(pttSpec: spec, insertLastDictationSpec: action) {
+                    hotKeyRecorderMessage = "Would trigger before the \(label) key — pick a different chord."
                     return
                 }
             }
             hotKeyRecorderMessage = nil
-            // AppCoordinator re-plumbs the tap itself on any
-            // hotKeySpec/insertLastDictationHotKeySpec change (see its Combine subscriptions) —
-            // no manual call needed here.
+            // AppCoordinator re-plumbs the tap itself on any hotkey-spec change (see its Combine
+            // subscriptions) — no manual call needed here.
             settings.hotKeySpec = spec
         }
     }
@@ -1307,18 +1343,17 @@ private struct GeneralSettingsView: View {
                 insertLastDictationRecorderMessage = "Insert Last Dictation needs a key, not just modifiers."
                 return
             }
-            guard !HotKeySpec.collides(spec, settings.hotKeySpec) else {
-                insertLastDictationRecorderMessage = "Same as the push-to-talk key — pick a different chord."
-                return
-            }
-            guard !HotKeySpec.insertLastDictationShadowsHeldPTT(pttSpec: settings.hotKeySpec, insertLastDictationSpec: spec) else {
-                insertLastDictationRecorderMessage = "Would trigger push-to-talk before this key — pick a different chord."
+            guard HotKeySpec.validActionSpec(
+                spec,
+                pttSpec: settings.hotKeySpec,
+                otherActionSpecs: [settings.voiceEditHotKeySpec, settings.historyPanelHotKeySpec]
+            ) != nil else {
+                insertLastDictationRecorderMessage = "This conflicts with another hotkey — pick a different chord."
                 return
             }
             insertLastDictationRecorderMessage = nil
-            // AppCoordinator re-plumbs the tap itself on any
-            // hotKeySpec/insertLastDictationHotKeySpec change (see its Combine subscriptions) —
-            // no manual call needed here.
+            // AppCoordinator re-plumbs the tap itself on any hotkey-spec change (see its Combine
+            // subscriptions) — no manual call needed here.
             settings.insertLastDictationHotKeySpec = spec
         }
     }
@@ -1342,13 +1377,42 @@ private struct GeneralSettingsView: View {
             guard HotKeySpec.validActionSpec(
                 spec,
                 pttSpec: settings.hotKeySpec,
-                otherActionSpec: settings.insertLastDictationHotKeySpec
+                otherActionSpecs: [settings.insertLastDictationHotKeySpec, settings.historyPanelHotKeySpec]
             ) != nil else {
                 voiceEditRecorderMessage = "This conflicts with another hotkey — pick a different chord."
                 return
             }
             voiceEditRecorderMessage = nil
             settings.voiceEditHotKeySpec = spec
+        }
+    }
+
+    private func beginHistoryPanelCapture() {
+        capturingHistoryPanelHotKey = true
+        NSApp.activate()
+        NSApp.windows.first(where: { $0.title == "Settings" })?.makeKeyAndOrderFront(nil)
+        let session = HotKeyCapture.Session()
+        historyPanelCaptureSession = session
+        session.start { spec in
+            defer {
+                capturingHistoryPanelHotKey = false
+                historyPanelCaptureSession = nil
+            }
+            guard let spec else { return }
+            guard HotKeySpec.isValidInsertLastDictationSpec(spec) else {
+                historyPanelRecorderMessage = "Dictation History needs a key, not just modifiers."
+                return
+            }
+            guard HotKeySpec.validActionSpec(
+                spec,
+                pttSpec: settings.hotKeySpec,
+                otherActionSpecs: [settings.insertLastDictationHotKeySpec, settings.voiceEditHotKeySpec]
+            ) != nil else {
+                historyPanelRecorderMessage = "This conflicts with another hotkey — pick a different chord."
+                return
+            }
+            historyPanelRecorderMessage = nil
+            settings.historyPanelHotKeySpec = spec
         }
     }
 

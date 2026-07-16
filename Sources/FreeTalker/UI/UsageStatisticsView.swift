@@ -76,7 +76,7 @@ struct UsageStatisticsView: View {
 
     /// Held for the view's lifetime so opening the page repeatedly reuses the same read
     /// connection rather than reopening the Library database (which re-runs migrations) each time.
-    @State private var computer = UsageStatsComputer()
+    @State private var computer = LibraryReadActor()
     @State private var snapshot: UsageStatsSnapshot?
     @State private var isComputing = false
     @State private var loadError: String?

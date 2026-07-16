@@ -84,13 +84,12 @@ enum PatchField<T> {
 }
 
 /// Typed, key-by-key decode of a Backup Bundle's `settings` section — one field per
-/// `AppSettings.exportableKeys` entry. Adding `historyPanelHotKeySpec`/`dictationLanguages`
-/// (F3/F5) is a one-line field + a matching decode/apply/snapshot case, not a structural change.
-/// See PLAN.md F1.9.
+/// `AppSettings.exportableKeys` entry. See PLAN.md F1.9.
 struct SettingsPatch {
     var hotKeySpec: PatchField<HotKeySpec> = .absent
     var insertLastDictationHotKeySpec: PatchField<HotKeySpec?> = .absent
     var voiceEditHotKeySpec: PatchField<HotKeySpec?> = .absent
+    var historyPanelHotKeySpec: PatchField<HotKeySpec?> = .absent
     var sttEngine: PatchField<STTEngineKind> = .absent
     var cloudSTTBaseURL: PatchField<String> = .absent
     var whisperModel: PatchField<String> = .absent
@@ -121,14 +120,15 @@ struct SettingsPatch {
     var vocabularyText: PatchField<String> = .absent
 }
 
-/// What each hotkey slot in the trio (PTT / Insert Last Dictation / Voice Edit — a fourth
-/// `historyPanelHotKeySpec` slot lands with F3, see PLAN.md F1.9) SHOULD become once a patch is
-/// applied, resolved WITHOUT touching live state — so it can be validated as a whole before the
-/// first write (F1.4) and then applied transactionally (F1.6).
+/// What each hotkey slot in the quartet (PTT / Insert Last Dictation / Voice Edit / Dictation
+/// History Panel, F3) SHOULD become once a patch is applied, resolved WITHOUT touching live
+/// state — so it can be validated as a whole before the first write (F1.4) and then applied
+/// transactionally (F1.6).
 struct HotKeyQuartetTargets {
     let ptt: HotKeySpec
     let insertLastDictation: HotKeySpec?
     let voiceEdit: HotKeySpec?
+    let historyPanel: HotKeySpec?
 }
 
 extension SettingsPatch {
@@ -143,22 +143,29 @@ extension SettingsPatch {
         return HotKeyQuartetTargets(
             ptt: resolve(hotKeySpec, currentValue: current.hotKeySpec, defaultValue: .default),
             insertLastDictation: resolve(insertLastDictationHotKeySpec, currentValue: current.insertLastDictationHotKeySpec, defaultValue: nil),
-            voiceEdit: resolve(voiceEditHotKeySpec, currentValue: current.voiceEditHotKeySpec, defaultValue: nil)
+            voiceEdit: resolve(voiceEditHotKeySpec, currentValue: current.voiceEditHotKeySpec, defaultValue: nil),
+            historyPanel: resolve(historyPanelHotKeySpec, currentValue: current.historyPanelHotKeySpec, defaultValue: nil)
         )
     }
 }
 
-/// Validates the trio as a whole — not one setter-at-a-time, whose own sibling-invalidation logic
-/// would silently drop a valid-as-a-set combination applied in the wrong order (see PLAN.md
-/// F1.6). Any inconsistency rejects the ENTIRE restore before any write.
+/// Validates the quartet as a whole — not one setter-at-a-time, whose own sibling-invalidation
+/// logic would silently drop a valid-as-a-set combination applied in the wrong order (see
+/// PLAN.md F1.6). Every action spec is checked against PTT AND against the OTHER TWO action
+/// specs (not just one sibling), using the same centralized `validActionSpec` routine every
+/// other path runs (PLAN.md F3.1). Any inconsistency rejects the ENTIRE restore before any write.
 private func validateHotKeyQuartet(_ targets: HotKeyQuartetTargets) throws {
-    if let insert = targets.insertLastDictation,
-       HotKeySpec.validActionSpec(insert, pttSpec: targets.ptt, otherActionSpec: targets.voiceEdit) == nil {
-        throw BackupBundleError.invalidSettingsValue(key: AppSettings.Keys.insertLastDictationHotKeySpec)
-    }
-    if let voiceEdit = targets.voiceEdit,
-       HotKeySpec.validActionSpec(voiceEdit, pttSpec: targets.ptt, otherActionSpec: targets.insertLastDictation) == nil {
-        throw BackupBundleError.invalidSettingsValue(key: AppSettings.Keys.voiceEditHotKeySpec)
+    let actions: [(key: String, spec: HotKeySpec?)] = [
+        (AppSettings.Keys.insertLastDictationHotKeySpec, targets.insertLastDictation),
+        (AppSettings.Keys.voiceEditHotKeySpec, targets.voiceEdit),
+        (AppSettings.Keys.historyPanelHotKeySpec, targets.historyPanel)
+    ]
+    for (index, entry) in actions.enumerated() {
+        guard let spec = entry.spec else { continue }
+        let otherActionSpecs = actions.enumerated().compactMap { $0.offset == index ? nil : $0.element.spec }
+        guard HotKeySpec.validActionSpec(spec, pttSpec: targets.ptt, otherActionSpecs: otherActionSpecs) != nil else {
+            throw BackupBundleError.invalidSettingsValue(key: entry.key)
+        }
     }
 }
 
@@ -259,6 +266,9 @@ private enum SettingsPatchDecoding {
         }
         if let raw = dict[Keys.voiceEditHotKeySpec] {
             patch.voiceEditHotKeySpec = raw is NSNull ? .present(nil) : .present(try codable(HotKeySpec.self, raw, Keys.voiceEditHotKeySpec))
+        }
+        if let raw = dict[Keys.historyPanelHotKeySpec] {
+            patch.historyPanelHotKeySpec = raw is NSNull ? .present(nil) : .present(try codable(HotKeySpec.self, raw, Keys.historyPanelHotKeySpec))
         }
         if let raw = dict[Keys.sttEngine] {
             guard let value = STTEngineKind(rawValue: try str(raw, Keys.sttEngine)) else { throw BackupBundleError.invalidSettingsValue(key: Keys.sttEngine) }
@@ -406,9 +416,9 @@ extension AppSettings {
         apply(patch.edgeLauncherPosition, default: 0.5) { edgeLauncherPosition = $0 }
         apply(patch.launcherPanelPosition, default: nil) { launcherPanelPosition = $0 }
 
-        // 4. Hotkey trio, applied transactionally (clear both action specs, set PTT, then each
-        //    action spec) — see `applyHotKeyQuartet`. Already validated as a consistent set
-        //    before restore's first write (`validateHotKeyQuartet`, called from
+        // 4. Hotkey quartet, applied transactionally (clear all three action specs, set PTT,
+        //    then each action spec) — see `applyHotKeyQuartet`. Already validated as a consistent
+        //    set before restore's first write (`validateHotKeyQuartet`, called from
         //    `BackupBundle.restore`).
         applyHotKeyQuartet(patch.hotKeyQuartetTargets(current: self, resetAbsentToDefault: resetAbsentToDefault))
 
@@ -453,9 +463,11 @@ extension AppSettings {
     fileprivate func applyHotKeyQuartet(_ targets: HotKeyQuartetTargets) {
         insertLastDictationHotKeySpec = nil
         voiceEditHotKeySpec = nil
+        historyPanelHotKeySpec = nil
         hotKeySpec = targets.ptt
         insertLastDictationHotKeySpec = targets.insertLastDictation
         voiceEditHotKeySpec = targets.voiceEdit
+        historyPanelHotKeySpec = targets.historyPanel
     }
 }
 

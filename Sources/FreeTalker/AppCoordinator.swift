@@ -178,6 +178,11 @@ final class AppCoordinator: ObservableObject {
     }
 
     private let hotKeyManager = HotKeyManager()
+    /// The `InsertionTarget` snapshotted at the most recent non-FreeTalker app activation
+    /// (`NSWorkspace.didActivateApplicationNotification`) — the Dictation History Quick Panel's
+    /// menu-item fallback path uses this, since by the time the menu item is clicked FreeTalker
+    /// itself is already frontmost. See PLAN.md F3.2.
+    private var lastNonSelfFrontmostTarget: InsertionTarget?
     private let audioCapture = AudioCapture()
     private var captureAdmission = CaptureAdmissionReducer()
     private var activeCaptureJournal: ActiveCaptureJournal?
@@ -306,6 +311,22 @@ final class AppCoordinator: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.restartHotKeyListening() }
             .store(in: &cancellables)
+        AppSettings.shared.$historyPanelHotKeySpec
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.restartHotKeyListening() }
+            .store(in: &cancellables)
+        // Tracks the last non-FreeTalker frontmost app for the Dictation History Quick Panel's
+        // menu-item fallback (PLAN.md F3.2) — never removed, same lifetime as this singleton.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                  app.bundleIdentifier != Bundle.main.bundleIdentifier else { return }
+            Task { @MainActor in self?.lastNonSelfFrontmostTarget = Insertion.snapshotTarget(app: app) }
+        }
         AppSettings.shared.$dictationLanguages
             .dropFirst()
             .receive(on: DispatchQueue.main)
@@ -452,10 +473,14 @@ final class AppCoordinator: ObservableObject {
         Self.configureVoiceEditHotKey(manager: hotKeyManager) { [weak self] in
             self?.handleVoiceEditHotKey()
         }
+        hotKeyManager.onHistoryPanelKeyDown = { [weak self] _, target in
+            self?.handleHistoryPanelHotKey(target: target)
+        }
         if hotKeyManager.start(
             spec: AppSettings.shared.hotKeySpec,
             insertLastDictationSpec: AppSettings.shared.insertLastDictationHotKeySpec,
-            voiceEditSpec: AppSettings.shared.voiceEditHotKeySpec
+            voiceEditSpec: AppSettings.shared.voiceEditHotKeySpec,
+            historyPanelSpec: AppSettings.shared.historyPanelHotKeySpec
         ) {
             isHotKeyListening = true
             hotKeyStatusText = nil
@@ -3532,6 +3557,34 @@ final class AppCoordinator: ObservableObject {
             let posted = Insertion.insert(refined)
             hud.flash(Self.insertLastDictationResultMessage(posted: posted))
         }
+    }
+
+    /// Dictation History Quick Panel hotkey handler (PLAN.md F3.2): `target` is the
+    /// `InsertionTarget` `HotKeyManager` already snapshotted SYNCHRONOUSLY in the tap callback,
+    /// before the `Task` hop that delivers this closure — see `HotKeyManager.onHistoryPanelKeyDown`.
+    /// The recording gate itself is enforced by `HistoryPanelController.open`.
+    private func handleHistoryPanelHotKey(target: InsertionTarget?) {
+        HistoryPanelController.shared.open(target: target)
+    }
+
+    /// Menu-bar "Dictation History…" fallback (PLAN.md F3.1/F3.2): uses the tracked last
+    /// non-FreeTalker frontmost app rather than `NSWorkspace.shared.frontmostApplication`, since
+    /// clicking the menu item has already activated FreeTalker by the time this runs.
+    func openHistoryPanelFromMenu() {
+        HistoryPanelController.shared.open(target: lastNonSelfFrontmostTarget)
+    }
+
+    /// Row-click insert from the Dictation History Quick Panel (PLAN.md F3.4). Unlike
+    /// `insertLastDictation()` (which passes no target and therefore always attempts a synthetic
+    /// paste), this passes the panel's snapshotted `target` through to `Insertion.insert`'s own
+    /// drift guard — a stale or unverified target falls back to the same manual-paste HUD
+    /// messaging (`insertLastDictationResultMessage`) as every other insertion path. Never an
+    /// unverified paste. See PLAN.md F3.2.
+    @discardableResult
+    func insertFromHistoryPanel(_ text: String, target: InsertionTarget?) -> Bool {
+        let posted = Insertion.insert(text, target: target)
+        hud.flash(Self.insertLastDictationResultMessage(posted: posted))
+        return posted
     }
 }
 

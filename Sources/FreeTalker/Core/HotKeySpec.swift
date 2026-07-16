@@ -108,18 +108,24 @@ struct HotKeySpec: Codable, Equatable {
         return insertGeneric & pttGeneric == pttGeneric
     }
 
-    static func validInsertLastDictationSpec(_ candidate: HotKeySpec, pttSpec: HotKeySpec) -> HotKeySpec? {
-        guard isValidInsertLastDictationSpec(candidate), !collides(candidate, pttSpec), !insertLastDictationShadowsHeldPTT(pttSpec: pttSpec, insertLastDictationSpec: candidate) else {
-            return nil
-        }
-        return candidate
-    }
-
-    static func validActionSpec(_ candidate: HotKeySpec, pttSpec: HotKeySpec, otherActionSpec: HotKeySpec?) -> HotKeySpec? {
+    /// Centralized four-way hotkey validation (PLAN.md F3.1): whether `candidate` may be bound to
+    /// ONE of the three fixed action slots (Insert Last Dictation, Voice Edit, Dictation History
+    /// Panel) given the current PTT spec and whatever the OTHER two action slots are already
+    /// bound to. A candidate is valid when it carries a non-modifier key, doesn't
+    /// side-normalized-collide with PTT, isn't shadow-engaged by holding PTT's modifiers alone
+    /// (`insertLastDictationShadowsHeldPTT` — PTT is always modifier-only when this can trigger),
+    /// and doesn't collide with any other already-bound action spec (nil entries in
+    /// `otherActionSpecs` are ignored — an unbound sibling can't conflict). `otherActionSpecs`
+    /// takes an array (not a single optional) so a set of three siblings can be checked in one
+    /// call — every path that can change one of the four specs runs this SAME routine: both
+    /// recorder UIs, every `AppSettings` didSet, load-time re-validation, and Backup Bundle's
+    /// transactional quartet apply.
+    static func validActionSpec(_ candidate: HotKeySpec, pttSpec: HotKeySpec, otherActionSpecs: [HotKeySpec?]) -> HotKeySpec? {
         guard isValidInsertLastDictationSpec(candidate),
               !collides(candidate, pttSpec),
               !insertLastDictationShadowsHeldPTT(pttSpec: pttSpec, insertLastDictationSpec: candidate),
-              otherActionSpec.map({ !collides(candidate, $0) }) ?? true else { return nil }
+              otherActionSpecs.compactMap({ $0 }).allSatisfy({ !collides(candidate, $0) })
+        else { return nil }
         return candidate
     }
 

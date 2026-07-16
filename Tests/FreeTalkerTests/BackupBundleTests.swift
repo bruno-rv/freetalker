@@ -222,6 +222,7 @@ struct BackupBundleTests {
         settingsA.hotKeySpec = HotKeySpec(modifiers: 0x0001, keyCode: nil)
         settingsA.insertLastDictationHotKeySpec = HotKeySpec(modifiers: 0, keyCode: 2)
         settingsA.voiceEditHotKeySpec = HotKeySpec(modifiers: 0, keyCode: 3)
+        settingsA.historyPanelHotKeySpec = HotKeySpec(modifiers: 0, keyCode: 4)
         settingsA.sttEngine = .cloud
         settingsA.cloudSTTBaseURL = "https://user:pass@api.example.com/v1"
         settingsA.setWhisperModelFromUser("openai_whisper-tiny")
