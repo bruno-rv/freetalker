@@ -11,5 +11,9 @@ protocol TranscriptionEngine: Sendable {
     var name: String { get }
     /// Free-text status for the menu bar / Settings (e.g. download progress, "Ready").
     @MainActor var statusText: String { get }
-    func transcribe(samples: [Float], forcedLanguage: String?) async throws -> TranscriptionOutput
+    /// `candidateLanguages`: the configured Dictation Language Set (F5), an immutable snapshot
+    /// taken at Recording start. Local WhisperKit only — it constrains the engine's own
+    /// auto-detect argmax when `forcedLanguage` is nil. Cloud engines ignore this parameter
+    /// entirely; their API only ever takes a single `forcedLanguage`. See PLAN.md F5.3.
+    func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String]) async throws -> TranscriptionOutput
 }

@@ -71,8 +71,12 @@ final class HUDController {
         var activeTemplateName: String
         var localContextScopeName: String
         var localContextPermissionHint: String?
-        /// nil / "en" / "pt" — which one-shot choice (if any) is currently highlighted.
+        /// nil, or a code from `languageOptions` — which one-shot choice (if any) is currently
+        /// highlighted.
         var oneShotLanguage: String?
+        /// The Dictation Language Set snapshotted at Recording start (F5.5) — feeds this panel's
+        /// `TranslationControls` spoken-language menu. See `AppCoordinator.recordingLanguageSnapshot`.
+        var languageOptions: [String] = []
         var translationState: TranslationControlsState
     }
 
@@ -451,6 +455,7 @@ struct HUDView: View {
 
             TranslationControls(
                 languagePin: state.oneShotLanguage ?? "auto",
+                languageOptions: state.languageOptions,
                 state: state.translationState,
                 onLanguage: panelCallbacks.onLanguage,
                 onOutput: panelCallbacks.onOutput

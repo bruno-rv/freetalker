@@ -34,6 +34,7 @@ struct MediaImportPipeline: Sendable {
     private let diarizer: any SpeakerDiarizing
     private let language: String?
     private let model: String
+    private let candidateLanguages: [String]
 
     init(
         store: any MediaImportPipelineStoring,
@@ -42,7 +43,8 @@ struct MediaImportPipeline: Sendable {
         transcriber: any TimestampedTranscribing,
         diarizer: any SpeakerDiarizing,
         language: String?,
-        model: String
+        model: String,
+        candidateLanguages: [String] = []
     ) {
         self.store = store
         self.jobsDirectory = jobsDirectory
@@ -51,6 +53,7 @@ struct MediaImportPipeline: Sendable {
         self.diarizer = diarizer
         self.language = language
         self.model = model
+        self.candidateLanguages = candidateLanguages
     }
 
     func localJobRunner(
@@ -140,7 +143,7 @@ struct MediaImportPipeline: Sendable {
             try cancellation.checkCancellation()
             try await store.advanceMediaStage(jobID: job.id, owner: owner, stage: .transcribing)
             await changes?.stage(job.id)
-            let segments = try await transcriber.transcribeFile(at: inferenceAudio.url, language: language, model: model)
+            let segments = try await transcriber.transcribeFile(at: inferenceAudio.url, language: language, model: model, candidateLanguages: candidateLanguages)
             try cancellation.checkCancellation()
             try ownedDirectory.revalidateIdentity()
             try await store.persistTranscript(jobID: job.id, owner: owner, segments: segments)

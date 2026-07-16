@@ -4,6 +4,7 @@ struct FloatingControlsView: View {
     let state: FloatingControlsHoverState
     let edge: LauncherEdge
     let languagePin: String
+    var languageOptions: [String] = []
     let translationState: TranslationControlsState
     let callbacks: FloatingControlsController.Callbacks
 
@@ -38,6 +39,7 @@ struct FloatingControlsView: View {
         launcherButton("Open FreeTalker", systemImage: "gearshape.fill", action: callbacks.onOpenSettings)
         TranslationControls(
             languagePin: languagePin,
+            languageOptions: languageOptions,
             state: translationState,
             onLanguage: callbacks.onLanguage,
             onOutput: callbacks.onOutput

@@ -119,7 +119,7 @@ private struct MenuBarContentView: View {
 
             // Persistent Auto/English/Portuguese toggle forcing Transcript language, absent a
             // more specific override (an app rule, or the panel's one-shot choice).
-            ForEach(Self.languagePinOptions, id: \.code) { option in
+            ForEach(languagePinOptions, id: \.code) { option in
                 Button {
                     settings.languagePin = option.code
                 } label: {
@@ -182,11 +182,11 @@ private struct MenuBarContentView: View {
         .onAppear { accessibilityTrusted = Permissions.isAccessibilityTrusted() }
     }
 
-    private static let languagePinOptions: [(code: String, label: String)] = [
-        ("auto", "Auto"),
-        ("en", "English"),
-        ("pt", "Portuguese")
-    ]
+    /// "Auto" plus the configured Dictation Language Set (F5.5) — the single presentation
+    /// helper feeds this list; no menu-bar-specific selector array is hardcoded.
+    private var languagePinOptions: [(code: String, label: String)] {
+        [(code: "auto", label: "Auto")] + DictationLanguagePresentation.options(for: settings.dictationLanguages)
+    }
 }
 
 /// Activates FreeTalker before presenting — mirrors the "Settings…" button above. Without

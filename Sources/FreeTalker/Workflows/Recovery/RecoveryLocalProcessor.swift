@@ -6,7 +6,7 @@ enum RecoveryLocalProcessingError: LocalizedError {
 }
 
 protocol RecoveryLocalTranscribing: Sendable {
-    func transcribe(samples: [Float], forcedLanguage: String?, exactModel: String) async throws -> TranscriptionOutput
+    func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String], exactModel: String) async throws -> TranscriptionOutput
 }
 
 extension WhisperKitEngine: RecoveryLocalTranscribing {}
@@ -14,10 +14,16 @@ extension WhisperKitEngine: RecoveryLocalTranscribing {}
 struct RecoveryLocalProcessor: Sendable {
     let transcriber: any RecoveryLocalTranscribing
 
-    func process(samples: [Float], configuration: AttemptConfiguration, defaultModel: String) async throws -> TranscriptionOutput {
+    /// `candidateLanguages`: the Dictation Language Set to constrain auto-detect with when
+    /// `configuration.language` is nil. Recovery/retry runs detached from any live Recording (it
+    /// can happen after a relaunch), so there's no "Recording start" snapshot to reuse here — the
+    /// caller passes the live configured set at the time this retry actually runs. See PLAN.md
+    /// F5.3.
+    func process(samples: [Float], configuration: AttemptConfiguration, candidateLanguages: [String] = [], defaultModel: String) async throws -> TranscriptionOutput {
         let output = try await transcriber.transcribe(
             samples: samples,
             forcedLanguage: configuration.language,
+            candidateLanguages: candidateLanguages,
             exactModel: configuration.speechModel ?? defaultModel
         )
         guard !output.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw RecoveryLocalProcessingError.emptyTranscript }

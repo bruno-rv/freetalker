@@ -280,6 +280,7 @@ final class FloatingControlsController {
             state: state,
             edge: settings.edgeLauncherEdge,
             languagePin: presentedLanguagePin ?? settings.languagePin,
+            languageOptions: settings.dictationLanguages,
             translationState: presentedTranslationState,
             callbacks: viewCallbacks
         )

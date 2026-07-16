@@ -297,7 +297,7 @@ final class AppSettings: ObservableObject {
 
     @Published var languagePin: String {
         didSet {
-            let normalized = Self.normalizeLanguagePin(languagePin)
+            let normalized = Self.normalizeLanguagePin(languagePin, allowed: dictationLanguages)
             guard normalized == languagePin else {
                 languagePin = normalized
                 defaults.set(normalized, forKey: Keys.languagePin)
@@ -313,7 +313,7 @@ final class AppSettings: ObservableObject {
 
     @Published var appLanguageRules: [String: String] {
         didSet {
-            let sanitized = Self.sanitizedLanguageRules(appLanguageRules)
+            let sanitized = Self.sanitizedLanguageRules(appLanguageRules, allowed: dictationLanguages)
             guard sanitized == appLanguageRules else {
                 appLanguageRules = sanitized
                 defaults.set(sanitized, forKey: Keys.appLanguageRules)
@@ -323,23 +323,82 @@ final class AppSettings: ObservableObject {
         }
     }
 
-    nonisolated static func normalizeLanguageCode(_ raw: String) -> String? {
+    /// The user-configured Dictation Language Set (F5): the subset of `DictationLanguage`'s
+    /// curated 8 that constrains on-device (WhisperKit-only, see `WhisperKitEngine`) spoken-
+    /// language auto-detection. Cloud STT is unchanged — it only ever takes a single
+    /// `forcedLanguage`. See PLAN.md F5 and `CONTEXT.md`'s "Dictation Language Set" glossary
+    /// entry.
+    @Published var dictationLanguages: [String] {
+        didSet {
+            let normalized = Self.normalizeDictationLanguages(dictationLanguages)
+            guard normalized == dictationLanguages else {
+                dictationLanguages = normalized
+                defaults.set(normalized, forKey: Keys.dictationLanguages)
+                coerceLanguageDependents()
+                return
+            }
+            defaults.set(dictationLanguages, forKey: Keys.dictationLanguages)
+            coerceLanguageDependents()
+        }
+    }
+
+    /// Coercion at set-change time (PLAN.md F5.4, "not lazily"): re-validates `languagePin`/
+    /// `appLanguageRules` against the just-changed `dictationLanguages` set the moment it
+    /// changes, rather than leaving a now-invalid pin/rule sitting in `UserDefaults` until the
+    /// next unrelated read. Re-assigns through the public setters (not private field writes) so
+    /// each property's own didSet/persistence logic runs unchanged — same idiom as
+    /// `hotKeySpec`'s sibling-invalidation above. Active one-shot language coercion is
+    /// AppCoordinator-owned state (not part of `AppSettings`) and is handled there via a
+    /// `$dictationLanguages` subscription — see `AppCoordinator.handleDictationLanguagesChange`.
+    private func coerceLanguageDependents() {
+        let normalizedPin = Self.normalizeLanguagePin(languagePin, allowed: dictationLanguages)
+        if normalizedPin != languagePin { languagePin = normalizedPin }
+        let sanitizedRules = Self.sanitizedLanguageRules(appLanguageRules, allowed: dictationLanguages)
+        if sanitizedRules != appLanguageRules { appLanguageRules = sanitizedRules }
+    }
+
+    /// Validates a candidate spoken-language code (an app-rule value or a one-shot selection)
+    /// against `allowed` — the configured Dictation Language Set (or, at Backup Bundle decode
+    /// time before the restored set is known, the full curated 8; see
+    /// `SettingsPatchDecoding`). An unknown/garbage/removed code is rejected, not silently
+    /// coerced.
+    nonisolated static func normalizeLanguageCode(_ raw: String, allowed: [String]) -> String? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return ["en", "pt"].contains(trimmed) ? trimmed : nil
+        return allowed.contains(trimmed) ? trimmed : nil
     }
 
     /// Normalizes the `languagePin` property's own value, whose valid domain also includes
     /// "auto" (unlike a rule/one-shot candidate) — any other value falls back to "auto".
-    nonisolated static func normalizeLanguagePin(_ raw: String) -> String {
+    nonisolated static func normalizeLanguagePin(_ raw: String, allowed: [String]) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return ["auto", "en", "pt"].contains(trimmed) ? trimmed : "auto"
+        return trimmed == "auto" || allowed.contains(trimmed) ? trimmed : "auto"
     }
 
-    /// Drops any `appLanguageRules` entry whose value doesn't normalize to a valid language code
-    /// — an unknown/garbage code is dropped, not silently coerced. Keys (bundle ids) are passed
-    /// through unchanged.
-    nonisolated static func sanitizedLanguageRules(_ raw: [String: String]) -> [String: String] {
-        raw.compactMapValues { normalizeLanguageCode($0) }
+    /// Drops any `appLanguageRules` entry whose value doesn't normalize to a code in `allowed` —
+    /// an unknown/garbage/removed code is dropped, not silently coerced. Keys (bundle ids) are
+    /// passed through unchanged. This is the "appLanguageRules entries pointing at a removed
+    /// language are DELETED" half of PLAN.md F5.4's set-change coercion.
+    nonisolated static func sanitizedLanguageRules(_ raw: [String: String], allowed: [String]) -> [String: String] {
+        raw.compactMapValues { normalizeLanguageCode($0, allowed: allowed) }
+    }
+
+    /// Default Dictation Language Set (PLAN.md F5.1) — also the normalizer's fallback when every
+    /// candidate is invalid/duplicate/unknown (never an empty set).
+    nonisolated static let defaultDictationLanguages = ["en", "pt"]
+
+    /// Subset of `DictationLanguage`'s curated 8, deduped (first occurrence wins, order
+    /// preserved), minimum one — an empty or all-invalid input falls back to
+    /// `defaultDictationLanguages` rather than persisting an empty set (PLAN.md F5.1).
+    nonisolated static func normalizeDictationLanguages(_ raw: [String]) -> [String] {
+        let curated = Set(DictationLanguage.allCases.map(\.rawValue))
+        var seen = Set<String>()
+        var kept: [String] = []
+        for code in raw {
+            let trimmed = code.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard curated.contains(trimmed), seen.insert(trimmed).inserted else { continue }
+            kept.append(trimmed)
+        }
+        return kept.isEmpty ? defaultDictationLanguages : kept
     }
 
     struct AppRuleRow: Identifiable, Equatable {
@@ -604,6 +663,7 @@ final class AppSettings: ObservableObject {
         static let languagePin = "languagePin"
         static let defaultOutputLanguage = "defaultOutputLanguage"
         static let appLanguageRules = "appLanguageRules"
+        static let dictationLanguages = "dictationLanguages"
         static let microphoneDeviceUID = "microphoneDeviceUID"
         static let vocabularyText = "vocabularyText"
     }
@@ -703,8 +763,19 @@ final class AppSettings: ObservableObject {
         let storedHandsFreeMaxMinutes = defaults.object(forKey: Keys.handsFreeMaxMinutes) as? Int ?? 5
         handsFreeMaxMinutes = Self.clampHandsFreeMaxMinutes(storedHandsFreeMaxMinutes)
         appRules = defaults.dictionary(forKey: Keys.appRules) as? [String: String] ?? [:]
+        // Loaded into a local first (same reasoning as `resolvedProviderDefaults` above): `self`
+        // can't be read until every stored property is initialized, so `languagePin`/
+        // `appLanguageRules`' own load-time normalization below — which must validate against
+        // the just-loaded Dictation Language Set, not the hardcoded en/pt pair — uses this local
+        // rather than `self.dictationLanguages`. See PLAN.md F5.1/F5.4.
+        let storedDictationLanguages = defaults.array(forKey: Keys.dictationLanguages) as? [String] ?? Self.defaultDictationLanguages
+        let normalizedDictationLanguages = Self.normalizeDictationLanguages(storedDictationLanguages)
+        dictationLanguages = normalizedDictationLanguages
+        if normalizedDictationLanguages != storedDictationLanguages {
+            defaults.set(normalizedDictationLanguages, forKey: Keys.dictationLanguages)
+        }
         let storedLanguagePin = defaults.string(forKey: Keys.languagePin) ?? "auto"
-        let normalizedLanguagePin = Self.normalizeLanguagePin(storedLanguagePin)
+        let normalizedLanguagePin = Self.normalizeLanguagePin(storedLanguagePin, allowed: normalizedDictationLanguages)
         languagePin = normalizedLanguagePin
         if normalizedLanguagePin != storedLanguagePin {
             defaults.set(normalizedLanguagePin, forKey: Keys.languagePin)
@@ -716,7 +787,7 @@ final class AppSettings: ObservableObject {
             defaults.set(normalizedDefaultOutputLanguage.rawValue, forKey: Keys.defaultOutputLanguage)
         }
         let storedLanguageRules = defaults.dictionary(forKey: Keys.appLanguageRules) as? [String: String] ?? [:]
-        let sanitizedLanguageRulesAtLoad = Self.sanitizedLanguageRules(storedLanguageRules)
+        let sanitizedLanguageRulesAtLoad = Self.sanitizedLanguageRules(storedLanguageRules, allowed: normalizedDictationLanguages)
         appLanguageRules = sanitizedLanguageRulesAtLoad
         if sanitizedLanguageRulesAtLoad != storedLanguageRules {
             defaults.set(sanitizedLanguageRulesAtLoad, forKey: Keys.appLanguageRules)
@@ -865,6 +936,7 @@ extension AppSettings {
         Keys.languagePin,
         Keys.defaultOutputLanguage,
         Keys.appLanguageRules,
+        Keys.dictationLanguages,
         Keys.microphoneDeviceUID,
         Keys.vocabularyText
     ]
@@ -940,6 +1012,7 @@ extension AppSettings {
         out[Keys.languagePin] = languagePin
         out[Keys.defaultOutputLanguage] = defaultOutputLanguage.rawValue
         out[Keys.appLanguageRules] = appLanguageRules
+        out[Keys.dictationLanguages] = dictationLanguages
         out[Keys.microphoneDeviceUID] = microphoneDeviceUID ?? NSNull()
         out[Keys.vocabularyText] = vocabularyText
         return out

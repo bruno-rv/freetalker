@@ -14,7 +14,7 @@ struct RecordingDestinationTests {
 
         let context = RecordingProcessingContext(
             destination: .scratchpad(token), spokenLanguage: "pt", outputLanguage: .spanish,
-            template: template, cloudSnapshot: snapshot
+            template: template, cloudSnapshot: snapshot, candidateLanguages: ["en", "pt"]
         )
 
         #expect(context.destination == .scratchpad(token))
@@ -22,6 +22,26 @@ struct RecordingDestinationTests {
         #expect(context.outputLanguage == .spanish)
         #expect(context.template == template)
         #expect(context.cloudSnapshot == snapshot)
+    }
+
+    @Test func transcriptionLanguageIsNilWhenSpokenLanguageIsOutsideTheCandidateSet() {
+        let template = Template(id: "captured", name: "Captured", prompt: "Captured prompt")
+        let withinSet = RecordingProcessingContext(
+            destination: .external, spokenLanguage: "es", outputLanguage: .sameAsSpoken,
+            template: template, cloudSnapshot: nil, candidateLanguages: ["en", "es"]
+        )
+        let outsideSet = RecordingProcessingContext(
+            destination: .external, spokenLanguage: "es", outputLanguage: .sameAsSpoken,
+            template: template, cloudSnapshot: nil, candidateLanguages: ["en", "pt"]
+        )
+        let noSpokenLanguage = RecordingProcessingContext(
+            destination: .external, spokenLanguage: nil, outputLanguage: .sameAsSpoken,
+            template: template, cloudSnapshot: nil, candidateLanguages: ["en", "pt"]
+        )
+
+        #expect(withinSet.transcriptionLanguage == "es")
+        #expect(outsideSet.transcriptionLanguage == nil)
+        #expect(noSpokenLanguage.transcriptionLanguage == nil)
     }
 
     @Test func scratchpadDestinationKeepsItsInsertionToken() {

@@ -511,7 +511,7 @@ private actor PipelineTranscribeProbe: TimestampedTranscribing {
     private(set) var calls = 0
     let segments: [TranscriptSegment]
     init(segments: [TranscriptSegment] = [.init(start: 0, end: 1, text: "text")]) { self.segments = segments }
-    func transcribeFile(at url: URL, language: String?, model: String) async throws -> [TranscriptSegment] { calls += 1; return segments }
+    func transcribeFile(at url: URL, language: String?, model: String, candidateLanguages: [String]) async throws -> [TranscriptSegment] { calls += 1; return segments }
 }
 
 private actor PipelineDiarizeProbe: SpeakerDiarizing {

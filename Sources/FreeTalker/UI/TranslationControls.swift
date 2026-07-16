@@ -51,6 +51,10 @@ struct OutputChoiceAccessibilityPolicy: Equatable {
 
 struct TranslationControls: View {
     let languagePin: String
+    /// The configured Dictation Language Set's codes (F5.5) — the ONE source every spoken-
+    /// language selector (this one included) reads from; no selector hardcodes its own list.
+    /// See `DictationLanguagePresentation`.
+    let languageOptions: [String]
     let state: TranslationControlsState
     let onLanguage: (String) -> Void
     let onOutput: (OutputLanguage) -> Void
@@ -64,8 +68,9 @@ struct TranslationControls: View {
             Text(TranslationControlsPresentation.spokenLabel)
             Menu {
                 spokenButton("Auto", code: "auto")
-                spokenButton("English", code: "en")
-                spokenButton("Portuguese", code: "pt")
+                ForEach(DictationLanguagePresentation.options(for: languageOptions), id: \.code) { option in
+                    spokenButton(option.label, code: option.code)
+                }
             } label: {
                 Text(spokenName)
             }
@@ -91,11 +96,7 @@ struct TranslationControls: View {
     private static let outputChoices = TranslationControlsPresentation.outputChoices
 
     private var spokenName: String {
-        switch languagePin {
-        case "en": "English"
-        case "pt": "Portuguese"
-        default: "Auto"
-        }
+        languagePin == "auto" ? "Auto" : DictationLanguagePresentation.displayName(for: languagePin)
     }
 
     private func spokenButton(_ label: String, code: String) -> some View {

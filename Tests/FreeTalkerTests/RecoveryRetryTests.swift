@@ -348,7 +348,7 @@ import Testing
 
 private actor RecoveryLocalTranscriberProbe: RecoveryLocalTranscribing {
     private(set) var requests: [String] = []
-    func transcribe(samples: [Float], forcedLanguage: String?, exactModel: String) async throws -> TranscriptionOutput {
+    func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String], exactModel: String) async throws -> TranscriptionOutput {
         requests.append("\(forcedLanguage ?? "auto")|\(exactModel)")
         return .init(text: "local transcript", language: forcedLanguage ?? "en")
     }

@@ -31,7 +31,10 @@ final class CloudSTTEngine: ObservableObject, TranscriptionEngine, @unchecked Se
         }
     }
 
-    func transcribe(samples: [Float], forcedLanguage: String?) async throws -> TranscriptionOutput {
+    /// `candidateLanguages` is ignored — the OpenAI-compatible `/audio/transcriptions` API only
+    /// ever takes a single `forcedLanguage` (or provider auto-detect when nil); there's no
+    /// candidate-set concept to constrain it with. See PLAN.md F5.3.
+    func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String]) async throws -> TranscriptionOutput {
         guard let apiKey = Keychain.get(account: Keychain.Account.cloudSTTKey), !apiKey.isEmpty else {
             throw CloudSTTError.missingAPIKey
         }

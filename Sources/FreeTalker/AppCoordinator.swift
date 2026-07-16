@@ -136,6 +136,15 @@ final class AppCoordinator: ObservableObject {
     /// Ticks the HUD's elapsed/cap display roughly once a second while `locked`.
     private var lockedHUDTimer: Timer?
     private var oneShotLanguage: String?
+    /// The configured Dictation Language Set, snapshotted at the start of the current capture
+    /// (both `beginCapture` and `beginVoiceEditInstructionRecording` — the two capture-start
+    /// paths) and held immutable for its duration, per "Settings that affect capture take effect
+    /// at the start of the next Recording, never mid-Recording" (CONTEXT.md). Used to validate
+    /// the pin/app-rule/one-shot language resolution (`resolveLanguage`) and as the local
+    /// WhisperKit candidate set for every transcription request this capture makes. See PLAN.md
+    /// F5.3/F5.4. Defaults to the live set so a coordinator-level call made before any capture
+    /// starts still has a sane value.
+    private var recordingLanguageSnapshot: [String] = AppSettings.shared.dictationLanguages
     @Published private(set) var recordingOutputSelection = RecordingOutputSelection()
 
     let speechModelDownloadCoordinator: SpeechModelDownloadCoordinator
@@ -296,6 +305,11 @@ final class AppCoordinator: ObservableObject {
             .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.restartHotKeyListening() }
+            .store(in: &cancellables)
+        AppSettings.shared.$dictationLanguages
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] newSet in self?.handleDictationLanguagesChange(newSet) }
             .store(in: &cancellables)
         AppSettings.shared.$mediaImportRetention
             .dropFirst()
@@ -516,6 +530,7 @@ final class AppCoordinator: ObservableObject {
                 deviceUID: AppSettings.shared.microphoneDeviceUID,
                 noiseSuppression: AppSettings.shared.noiseSuppressionEnabled
             )
+            recordingLanguageSnapshot = AppSettings.shared.dictationLanguages
             captureOwner = .voiceEdit
             isRecording = true
             hotKeyManager.isRecording = true
@@ -558,7 +573,7 @@ final class AppCoordinator: ObservableObject {
             do {
                 // Voice Edit is deliberately pinned to the on-device engine even when normal
                 // dictation is configured for cloud STT.
-                let transcription = try await whisperEngine.transcribe(samples: samples, forcedLanguage: nil)
+                let transcription = try await whisperEngine.transcribe(samples: samples, forcedLanguage: nil, candidateLanguages: recordingLanguageSnapshot)
                 let instruction = transcription.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !instruction.isEmpty else {
                     hud.flash("No voice instruction recognized")
@@ -1088,6 +1103,23 @@ final class AppCoordinator: ObservableObject {
         }
     }
 
+    /// Eager one-shot coercion (PLAN.md F5.4): the moment the configured Dictation Language Set
+    /// changes, an active one-shot selection referencing a language no longer in it is cleared
+    /// rather than surviving until the next stop-time read. A `nil`/still-valid current value is
+    /// left untouched.
+    nonisolated static func coercedOneShotLanguage(current: String?, allowed: [String]) -> String? {
+        guard let current, !allowed.contains(current) else { return current }
+        return nil
+    }
+
+    private func handleDictationLanguagesChange(_ newSet: [String]) {
+        let coerced = Self.coercedOneShotLanguage(current: oneShotLanguage, allowed: newSet)
+        guard coerced != oneShotLanguage else { return }
+        oneShotLanguage = coerced
+        guard recordingState != .idle else { return }
+        updateRecordingPanel()
+    }
+
     private func handlePanelOneShotLanguage(_ code: String) {
         guard recordingState != .idle else { return }
         oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .panelLanguageTap(code))
@@ -1157,6 +1189,7 @@ final class AppCoordinator: ObservableObject {
         }
         recordingDestination = nil
         oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .clear)
+        recordingLanguageSnapshot = AppSettings.shared.dictationLanguages
         let micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
         Self.logger.log("key down: micAuthorizationStatus=\(micStatus.rawValue, privacy: .public)")
         // Guard unconditionally rather than proceeding to record silence — a denied/stale TCC
@@ -1710,6 +1743,7 @@ final class AppCoordinator: ObservableObject {
             localContextScopeName: contextScope.displayName,
             localContextPermissionHint: contextPermissionHint,
             oneShotLanguage: oneShotLanguage,
+            languageOptions: recordingLanguageSnapshot,
             translationState: presentedTranslationState
         )
         recordingHUDWillPresent()
@@ -1973,11 +2007,18 @@ final class AppCoordinator: ObservableObject {
         let activeTemplateID = AppSettings.shared.activeTemplateID
         let automaticStyleEnabled = AppSettings.shared.automaticStyleEnabled
         let processor = capturedOutputLanguage == .sameAsSpoken ? resolveActiveProcessor() : nil
+        // Snapshotted synchronously here, alongside engine/template/appRules above — see that
+        // comment block. `recordingLanguageSnapshot` was itself frozen at Recording start
+        // (`beginCapture`); reading it into a local now (rather than inside the `Task` below)
+        // additionally guards against a new Recording starting and overwriting it before the
+        // async pipeline task actually runs.
+        let candidateLanguages = recordingLanguageSnapshot
         let forcedLanguage = Self.resolveLanguage(
             oneShot: capturedOneShotLanguage,
             bundleID: bundleID,
             appLanguageRules: AppSettings.shared.appLanguageRules,
-            pin: AppSettings.shared.languagePin
+            pin: AppSettings.shared.languagePin,
+            candidateSet: candidateLanguages
         )
 
         let hudGeneration = recordingHUDWillPresent()
@@ -2031,6 +2072,7 @@ final class AppCoordinator: ObservableObject {
                     appName: appName,
                     target: insertionTarget,
                     forcedLanguage: forcedLanguage,
+                    candidateLanguages: candidateLanguages,
                     outputLanguage: capturedOutputLanguage,
                     cloudSnapshot: capturedCloudSnapshot,
                     skipPostProcessing: stopRequest.skipPostProcessing,
@@ -2216,21 +2258,29 @@ final class AppCoordinator: ObservableObject {
         )
     }
 
+    /// `candidateSet`: the Dictation Language Set the oneShot/rule/pin value is validated
+    /// against — the set snapshotted at Recording start (`recordingLanguageSnapshot`), NOT
+    /// necessarily the live `AppSettings.shared.dictationLanguages` at the moment this runs. The
+    /// one-shot selection itself is still read live (it's deliberately a stop-time override —
+    /// see `oneShotLanguage`/`handlePanelOneShotLanguage`), but it's validated against this same
+    /// snapshotted set so a language removed from the configuration mid-recording can't leak
+    /// through as a forced language. See PLAN.md F5.4.
     nonisolated static func resolveLanguage(
         oneShot: String?,
         bundleID: String?,
         appLanguageRules: [String: String],
-        pin: String
+        pin: String,
+        candidateSet: [String]
     ) -> String? {
-        if let oneShot, let normalized = AppSettings.normalizeLanguageCode(oneShot) {
+        if let oneShot, let normalized = AppSettings.normalizeLanguageCode(oneShot, allowed: candidateSet) {
             return normalized
         }
-        if let bundleID, let ruleValue = appLanguageRules[bundleID], let normalized = AppSettings.normalizeLanguageCode(ruleValue) {
+        if let bundleID, let ruleValue = appLanguageRules[bundleID], let normalized = AppSettings.normalizeLanguageCode(ruleValue, allowed: candidateSet) {
             return normalized
         }
         // "auto" (or any other invalid value) normalizes to nil here — auto-detect — which is
         // exactly this function's own final fallback, so no extra branch is needed.
-        return AppSettings.normalizeLanguageCode(pin)
+        return AppSettings.normalizeLanguageCode(pin, allowed: candidateSet)
     }
 
     nonisolated static func isCloudLLMConfigured(snapshot: CloudLLMSettingsSnapshot) -> Bool {
@@ -2360,7 +2410,7 @@ final class AppCoordinator: ObservableObject {
         // cancelled/early-stopped attempt throws and lands here as `try?`. Errors are otherwise
         // non-fatal — the unchanged final pipeline still owns the real result; just let the next
         // tick retry.
-        guard let result = try? await whisperEngine.transcribe(samples: window, forcedLanguage: nil, allowEarlyCancel: true) else { return }
+        guard let result = try? await whisperEngine.transcribe(samples: window, forcedLanguage: nil, candidateLanguages: recordingLanguageSnapshot, allowEarlyCancel: true) else { return }
 
         guard Self.shouldAcceptLivePreviewResult(isRecording: isRecording, resultGeneration: generation, currentGeneration: livePreviewGeneration) else { return }
 
@@ -2475,7 +2525,7 @@ final class AppCoordinator: ObservableObject {
         }
     }
 
-    private func runPipeline(samples: [Float], engine: any TranscriptionEngine, engineName: String, template: Template, appName: String?, target: InsertionTarget?, forcedLanguage: String?, outputLanguage: OutputLanguage, cloudSnapshot: CloudLLMSettingsSnapshot, skipPostProcessing: Bool, processor: (any PostProcessor)? = nil, localContext: LocalProcessingContext? = nil, recovery: ForegroundRecovery, hudGeneration: UUID) async {
+    private func runPipeline(samples: [Float], engine: any TranscriptionEngine, engineName: String, template: Template, appName: String?, target: InsertionTarget?, forcedLanguage: String?, candidateLanguages: [String], outputLanguage: OutputLanguage, cloudSnapshot: CloudLLMSettingsSnapshot, skipPostProcessing: Bool, processor: (any PostProcessor)? = nil, localContext: LocalProcessingContext? = nil, recovery: ForegroundRecovery, hudGeneration: UUID) async {
         defer {
             isProcessing = false
             recordingHUDDidReachTerminalState(generation: hudGeneration)
@@ -2486,6 +2536,7 @@ final class AppCoordinator: ObservableObject {
                 try await processDictation(
                     samples: samples, engine: engine, engineName: engineName, template: template,
                     appName: appName, target: target, forcedLanguage: forcedLanguage,
+                    candidateLanguages: candidateLanguages,
                     skipPostProcessing: skipPostProcessing, outputLanguage: outputLanguage,
                     cloudSnapshot: cloudSnapshot.eligibility.isEligible ? cloudSnapshot : nil,
                     processor: processor, localContext: localContext,
@@ -2589,7 +2640,8 @@ final class AppCoordinator: ObservableObject {
             oneShot: oneShotLanguage,
             bundleID: nil,
             appLanguageRules: [:],
-            pin: AppSettings.shared.languagePin
+            pin: AppSettings.shared.languagePin,
+            candidateSet: recordingLanguageSnapshot
         )
         isProcessing = true
         let hudGeneration = recordingHUDWillPresent()
@@ -2597,7 +2649,8 @@ final class AppCoordinator: ObservableObject {
         let context = RecordingProcessingContext(
             destination: .scratchpad(token), spokenLanguage: forcedLanguage,
             outputLanguage: outputLanguage, template: template,
-            cloudSnapshot: cloudSnapshot.eligibility.isEligible ? cloudSnapshot : nil
+            cloudSnapshot: cloudSnapshot.eligibility.isEligible ? cloudSnapshot : nil,
+            candidateLanguages: recordingLanguageSnapshot
         )
         let processor = outputLanguage == .sameAsSpoken ? resolveActiveProcessor() : nil
 
@@ -2769,6 +2822,7 @@ final class AppCoordinator: ObservableObject {
         appName: String? = nil,
         target: InsertionTarget? = nil,
         forcedLanguage: String? = nil,
+        candidateLanguages: [String] = [],
         skipPostProcessing: Bool = false,
         outputLanguage: OutputLanguage = .sameAsSpoken,
         cloudSnapshot: CloudLLMSettingsSnapshot? = nil,
@@ -2792,7 +2846,8 @@ final class AppCoordinator: ObservableObject {
             spokenLanguage: forcedLanguage,
             outputLanguage: outputLanguage,
             template: template,
-            cloudSnapshot: cloudSnapshot
+            cloudSnapshot: cloudSnapshot,
+            candidateLanguages: candidateLanguages
         )
         return try await processDictation(
             samples: samples, engine: engine, engineName: engineName, context: context,
@@ -2870,7 +2925,7 @@ final class AppCoordinator: ObservableObject {
         translator: any Translating,
         localContext: LocalProcessingContext?
     ) async throws -> DictationProcessingResult {
-        let transcription = try await engine.transcribe(samples: samples, forcedLanguage: context.transcriptionLanguage)
+        let transcription = try await engine.transcribe(samples: samples, forcedLanguage: context.transcriptionLanguage, candidateLanguages: context.candidateLanguages)
         guard !transcription.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw PipelineError.emptyTranscript
         }
@@ -2887,7 +2942,8 @@ final class AppCoordinator: ObservableObject {
                 spokenLanguage: transcription.language,
                 outputLanguage: context.outputLanguage,
                 template: context.template,
-                cloudSnapshot: context.cloudSnapshot
+                cloudSnapshot: context.cloudSnapshot,
+                candidateLanguages: context.candidateLanguages
             )
             guard let snapshot = context.cloudSnapshot, snapshot.eligibility.isEligible else {
                 throw OutputTranslationFailure(
@@ -3249,7 +3305,8 @@ final class AppCoordinator: ObservableObject {
             transcriber: TimestampedWhisperTranscriber(backend: whisperEngine),
             diarizer: LocalFluidAudioDiarizer(),
             language: AppSettings.shared.languagePin == "auto" ? nil : AppSettings.shared.languagePin,
-            model: AppSettings.shared.whisperModel
+            model: AppSettings.shared.whisperModel,
+            candidateLanguages: AppSettings.shared.dictationLanguages
         )
         let runner = pipeline.localJobRunner(executionAuthority: localJobExecutionAuthority) { [weak jobLibraryStore] _ in
             try? await jobLibraryStore?.refresh()
@@ -3293,6 +3350,7 @@ final class AppCoordinator: ObservableObject {
         let transcription = try await RecoveryLocalProcessor(transcriber: whisperEngine).process(
             samples: samples,
             configuration: configuration,
+            candidateLanguages: AppSettings.shared.dictationLanguages,
             defaultModel: AppSettings.shared.whisperModel
         )
         let dictation = RecoveryDictation(

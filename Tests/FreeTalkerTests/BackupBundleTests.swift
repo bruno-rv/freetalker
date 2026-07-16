@@ -246,6 +246,12 @@ struct BackupBundleTests {
         settingsA.languagePin = "en"
         settingsA.defaultOutputLanguage = .spanish
         settingsA.appLanguageRules = ["com.example.bar": "pt"]
+        // A superset of "en"/"pt" (not just the default pair) so this exercises the actual F5
+        // key while keeping `languagePin`/`appLanguageRules` above meaningful — a set that
+        // excluded either would eagerly coerce them away before export ever runs, and the
+        // round-trip would pass vacuously (both sides coerced identically) rather than actually
+        // testing the new key. See PLAN.md F1.9/F5.1.
+        settingsA.dictationLanguages = ["en", "pt", "es"]
         settingsA.microphoneDeviceUID = "some-uid"
         settingsA.vocabularyText = "Kubernetes\nPostgres"
 

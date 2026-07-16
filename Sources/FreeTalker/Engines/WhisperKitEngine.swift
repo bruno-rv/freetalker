@@ -385,15 +385,29 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, WhisperFile
         }
     }
 
-    private static let supportedLanguages = ["en", "pt"]
+    /// Fallback candidate set when a caller passes an empty `candidateLanguages` (shouldn't
+    /// happen on any real capture path — `AppSettings.dictationLanguages` is never empty — but
+    /// keeps `constrainedLanguage` total rather than crashing on `.max`'s empty-sequence case).
+    private static let fallbackLanguages = AppSettings.defaultDictationLanguages
 
-    func transcribe(samples: [Float], forcedLanguage: String?, allowEarlyCancel: Bool) async throws -> TranscriptionOutput {
+    /// Pure argmax pick over `candidates` restricted to WhisperKit's own detected
+    /// language-probability distribution — same shape as `earlyStopDecision`/`shouldReload`
+    /// (pure, `nonisolated`, independently testable without loading a model). Restricting the
+    /// winner to the app's configured Dictation Language Set (rather than WhisperKit's full
+    /// ~99-language auto-detect) is what keeps short-utterance misfires (e.g. English hallucinated
+    /// as another language) contained — see PLAN.md F5.3.
+    nonisolated static func constrainedLanguage(langProbs: [String: Float], candidates: [String]) -> String {
+        let pool = candidates.isEmpty ? fallbackLanguages : candidates
+        return pool.max { langProbs[$0, default: -.infinity] < langProbs[$1, default: -.infinity] } ?? pool[0]
+    }
+
+    func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String], allowEarlyCancel: Bool) async throws -> TranscriptionOutput {
         guard allowEarlyCancel else {
-            return try await gate.run { [self] in try await performTranscribe(samples: samples, forcedLanguage: forcedLanguage, cancelFlag: nil) }
+            return try await gate.run { [self] in try await performTranscribe(samples: samples, forcedLanguage: forcedLanguage, candidateLanguages: candidateLanguages, cancelFlag: nil) }
         }
         let cancelFlag = OSAllocatedUnfairLock(initialState: false)
         return try await withTaskCancellationHandler {
-            try await gate.run { [self] in try await performTranscribe(samples: samples, forcedLanguage: forcedLanguage, cancelFlag: cancelFlag) }
+            try await gate.run { [self] in try await performTranscribe(samples: samples, forcedLanguage: forcedLanguage, candidateLanguages: candidateLanguages, cancelFlag: cancelFlag) }
         } onCancel: {
             cancelFlag.withLock { $0 = true }
         }
@@ -401,14 +415,14 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, WhisperFile
 
     /// `TranscriptionEngine` conformance — the final-transcription entry point. Always
     /// `allowEarlyCancel: false`; see the overload above.
-    func transcribe(samples: [Float], forcedLanguage: String?) async throws -> TranscriptionOutput {
-        try await transcribe(samples: samples, forcedLanguage: forcedLanguage, allowEarlyCancel: false)
+    func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String]) async throws -> TranscriptionOutput {
+        try await transcribe(samples: samples, forcedLanguage: forcedLanguage, candidateLanguages: candidateLanguages, allowEarlyCancel: false)
     }
 
-    func transcribe(samples: [Float], forcedLanguage: String?, exactModel: String) async throws -> TranscriptionOutput {
+    func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String], exactModel: String) async throws -> TranscriptionOutput {
         try await gate.run {
             let kit = try await self.kitForFileTranscription(model: exactModel)
-            return try await self.performTranscribe(samples: samples, forcedLanguage: forcedLanguage, cancelFlag: nil, kitOverride: kit)
+            return try await self.performTranscribe(samples: samples, forcedLanguage: forcedLanguage, candidateLanguages: candidateLanguages, cancelFlag: nil, kitOverride: kit)
         }
     }
 
@@ -419,10 +433,23 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, WhisperFile
                 try Task.checkCancellation()
                 let kit = try await self.kitForFileTranscription(model: request.model)
                 try Task.checkCancellation()
+                // Media import (F5.3) — WhisperKit's own `detectLanguage` covers its full
+                // ~99-language pool; the app instead constrains the winner to the configured
+                // Dictation Language Set, same as the live-array `performTranscribe` path below,
+                // rather than letting `kit.transcribe(audioPath:)`'s built-in `detectLanguage`
+                // flag run unconstrained.
+                let language: String?
+                if let requested = request.language {
+                    language = requested
+                } else {
+                    let (_, langProbs) = try await kit.detectLanguage(audioPath: request.url.path)
+                    try Task.checkCancellation()
+                    language = Self.constrainedLanguage(langProbs: langProbs, candidates: request.candidateLanguages)
+                }
                 var options = DecodingOptions()
-                options.language = request.language
+                options.language = language
                 options.usePrefillPrompt = true
-                options.detectLanguage = request.language == nil
+                options.detectLanguage = false
                 let callback: TranscriptionCallback = { _ in
                     Self.earlyStopDecision(cancelled: cancelFlag.withLock { $0 })
                 }
@@ -476,7 +503,7 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, WhisperFile
         }
     }
 
-    private func performTranscribe(samples: [Float], forcedLanguage: String?, cancelFlag: OSAllocatedUnfairLock<Bool>?, kitOverride: WhisperKit? = nil) async throws -> TranscriptionOutput {
+    private func performTranscribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String], cancelFlag: OSAllocatedUnfairLock<Bool>?, kitOverride: WhisperKit? = nil) async throws -> TranscriptionOutput {
         let kit: WhisperKit
         if let kitOverride { kit = kitOverride }
         else { kit = try await kitForTranscription() }
@@ -490,11 +517,13 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, WhisperFile
                 await setStatus("Detecting language…")
                 // Whisper's unconstrained auto-detect spans ~99 languages and misfires badly on
                 // short utterances (e.g. English "Hello, 1 2 3 4 5 6" hallucinated as Portuguese).
-                // Restrict the winner to the two languages this app actually supports, then pin
-                // the real decode to it instead of letting WhisperKit detect+decode freely.
+                // Restrict the winner to the caller's configured Dictation Language Set
+                // (`candidateLanguages` — an immutable per-request snapshot, see PLAN.md F5.3),
+                // then pin the real decode to it instead of letting WhisperKit detect+decode
+                // freely.
                 let (_, langProbs) = try await kit.detectLangauge(audioArray: samples)
                 try checkPreviewCancellation(cancelFlag)
-                language = Self.supportedLanguages.max { langProbs[$0, default: -.infinity] < langProbs[$1, default: -.infinity] } ?? "en"
+                language = Self.constrainedLanguage(langProbs: langProbs, candidates: candidateLanguages)
             }
 
             await setStatus("Transcribing…")

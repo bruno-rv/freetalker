@@ -116,6 +116,7 @@ struct SettingsPatch {
     var languagePin: PatchField<String> = .absent
     var defaultOutputLanguage: PatchField<OutputLanguage> = .absent
     var appLanguageRules: PatchField<[String: String]> = .absent
+    var dictationLanguages: PatchField<[String]> = .absent
     var microphoneDeviceUID: PatchField<String?> = .absent
     var vocabularyText: PatchField<String> = .absent
 }
@@ -333,8 +334,15 @@ private enum SettingsPatchDecoding {
             try validateRuleDict(value, field: "appRules")
             patch.appRules = .present(value)
         }
+        // Decode-time normalization validates against the FULL curated 8 (`DictationLanguage`),
+        // not yet the specific `dictationLanguages` set this same bundle may also restore —
+        // that narrower, set-change coercion happens at apply time via each property's own
+        // didSet once `dictationLanguages` has actually landed (see `applySettingsPatch`'s
+        // ordering comment and PLAN.md F5.4). This decode step only rejects garbage/unknown
+        // codes, the same domain-safety role it played before F5 introduced a configurable set.
+        let curatedCodes = DictationLanguage.allCases.map(\.rawValue)
         if let raw = dict[Keys.languagePin] {
-            patch.languagePin = .present(AppSettings.normalizeLanguagePin(try str(raw, Keys.languagePin)))
+            patch.languagePin = .present(AppSettings.normalizeLanguagePin(try str(raw, Keys.languagePin), allowed: curatedCodes))
         }
         if let raw = dict[Keys.defaultOutputLanguage] {
             patch.defaultOutputLanguage = .present(OutputLanguage.persisted(rawValue: try str(raw, Keys.defaultOutputLanguage)))
@@ -342,7 +350,11 @@ private enum SettingsPatchDecoding {
         if let raw = dict[Keys.appLanguageRules] {
             let value = try stringDict(raw, Keys.appLanguageRules)
             try validateRuleDict(value, field: "appLanguageRules")
-            patch.appLanguageRules = .present(AppSettings.sanitizedLanguageRules(value))
+            patch.appLanguageRules = .present(AppSettings.sanitizedLanguageRules(value, allowed: curatedCodes))
+        }
+        if let raw = dict[Keys.dictationLanguages] {
+            guard let value = raw as? [String] else { throw BackupBundleError.invalidSettingsValue(key: Keys.dictationLanguages) }
+            patch.dictationLanguages = .present(AppSettings.normalizeDictationLanguages(value))
         }
         if let raw = dict[Keys.microphoneDeviceUID] {
             patch.microphoneDeviceUID = raw is NSNull ? .present(nil) : .present(try str(raw, Keys.microphoneDeviceUID))
@@ -405,6 +417,13 @@ extension AppSettings {
         //    incoming template (see `TemplateStore.importTemplates`).
         apply(patch.activeTemplateID, default: Template.defaultID) { activeTemplateID = templateIDMap[$0] ?? $0 }
         apply(patch.appRules, default: [:]) { rules in appRules = rules.mapValues { templateIDMap[$0] ?? $0 } }
+
+        // 5b. Dictation Language Set cluster: `dictationLanguages` MUST land before
+        //     `languagePin`/`appLanguageRules` below — its didSet re-validates both against the
+        //     restored set (PLAN.md F5.4's set-change coercion), so applying it first means the
+        //     restored pin/rules are checked against their FINAL sibling value rather than
+        //     whatever `dictationLanguages` happened to hold before this restore.
+        apply(patch.dictationLanguages, default: AppSettings.defaultDictationLanguages) { dictationLanguages = $0 }
 
         // 6. Everything else — order-independent.
         apply(patch.sttEngine, default: .whisperKit) { sttEngine = $0 }

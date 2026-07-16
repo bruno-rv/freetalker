@@ -24,16 +24,27 @@ struct RecordingProcessingContext: Equatable, Sendable {
     let outputLanguage: OutputLanguage
     let template: Template
     let cloudSnapshot: CloudLLMSettingsSnapshot?
+    /// The Dictation Language Set this dictation's local WhisperKit request is constrained to —
+    /// the Recording-start snapshot (`AppCoordinator.recordingLanguageSnapshot`), not
+    /// necessarily the live configured set. Defaults to `[]` so existing/test call sites that
+    /// don't exercise the language-resolution path (most already construct this without caring)
+    /// keep compiling; every real production call site passes the actual snapshot. See PLAN.md
+    /// F5.3/F5.4.
+    var candidateLanguages: [String] = []
 
+    /// Re-validates `spokenLanguage` against `candidateLanguages` before it's handed to the
+    /// engine as `forcedLanguage` — `resolveLanguage` already validates its inputs, so this is
+    /// defense in depth against a stale/mismatched context rather than the primary check.
     var transcriptionLanguage: String? {
-        guard spokenLanguage == "en" || spokenLanguage == "pt" else { return nil }
+        guard let spokenLanguage, candidateLanguages.contains(spokenLanguage) else { return nil }
         return spokenLanguage
     }
 
     var recoverySafe: Self {
         Self(
             destination: destination, spokenLanguage: spokenLanguage,
-            outputLanguage: outputLanguage, template: template, cloudSnapshot: nil
+            outputLanguage: outputLanguage, template: template, cloudSnapshot: nil,
+            candidateLanguages: candidateLanguages
         )
     }
 }

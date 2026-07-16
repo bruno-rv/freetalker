@@ -10,7 +10,7 @@ struct OutputTranslationPipelineTests {
         let engine = PipelineEngineSpy(output: .init(text: "source", language: "en"))
         _ = try await AppCoordinator.shared.processDictation(
             samples: [0.5], engine: engine, engineName: "Spy", template: Self.template,
-            forcedLanguage: argument.0, skipPostProcessing: true,
+            forcedLanguage: argument.0, candidateLanguages: ["en", "pt"], skipPostProcessing: true,
             insert: { _, _ in true }, record: { _ in }
         )
 
@@ -264,7 +264,7 @@ private actor PipelineEngineSpy: TranscriptionEngine {
 
     init(output: TranscriptionOutput) { self.output = output }
 
-    func transcribe(samples: [Float], forcedLanguage: String?) async throws -> TranscriptionOutput {
+    func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String]) async throws -> TranscriptionOutput {
         forcedLanguages.append(forcedLanguage)
         return output
     }

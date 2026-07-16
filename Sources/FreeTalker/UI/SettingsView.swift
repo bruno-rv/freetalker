@@ -656,7 +656,7 @@ private struct GeneralSettingsView: View {
                             .foregroundStyle(.secondary)
                     }
                     if let language = row.language {
-                        Text(language == "en" ? "EN" : "PT")
+                        Text(language.uppercased())
                             .font(.caption)
                             .padding(.horizontal, 6)
                             .padding(.vertical, 2)
@@ -685,8 +685,9 @@ private struct GeneralSettingsView: View {
                 }
                 Picker("Language", selection: $newRuleLanguage) {
                     Text("No language").tag(nil as String?)
-                    Text("English").tag("en" as String?)
-                    Text("Portuguese").tag("pt" as String?)
+                    ForEach(DictationLanguagePresentation.options(for: settings.dictationLanguages), id: \.code) { option in
+                        Text(option.label).tag(option.code as String?)
+                    }
                 }
                 Button("Add") {
                     guard let newRuleBundleID, newRuleTemplateID != nil || newRuleLanguage != nil else { return }
@@ -830,8 +831,9 @@ private struct GeneralSettingsView: View {
             .disabled(!settings.edgeLauncherEnabled)
             Picker("Dictation language", selection: $settings.languagePin) {
                 Text("Auto").tag("auto")
-                Text("English").tag("en")
-                Text("Portuguese").tag("pt")
+                ForEach(DictationLanguagePresentation.options(for: settings.dictationLanguages), id: \.code) { option in
+                    Text(option.label).tag(option.code)
+                }
             }
             .padding(.vertical, 8)
             .disabled(!settings.edgeLauncherEnabled)
@@ -973,6 +975,7 @@ private struct GeneralSettingsView: View {
             Text(coordinator.engineStatusText)
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            dictationLanguagesSection
             if settings.sttEngine == .whisperKit {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Speech model")
@@ -1026,6 +1029,44 @@ private struct GeneralSettingsView: View {
             }
         }
         .padding(.vertical, 12)
+    }
+
+    @ViewBuilder
+    private var dictationLanguagesSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 5) {
+                Text("Dictation languages")
+                    .font(.headline)
+                SettingsHelpButton(
+                    title: "Dictation languages",
+                    message: "Constrains on-device (WhisperKit) spoken-language auto-detection to this set. Cloud STT does not honor this set — it only accepts a single forced language, chosen elsewhere. Transcribability is also bounded by the selected Speech model."
+                )
+            }
+            Text("Constrains on-device (WhisperKit) spoken-language auto-detection. Cloud STT does not honor this set.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            ForEach(DictationLanguage.allCases, id: \.rawValue) { language in
+                let isOn = settings.dictationLanguages.contains(language.rawValue)
+                Toggle(language.displayName, isOn: Binding(
+                    get: { isOn },
+                    set: { newValue in
+                        var codes = settings.dictationLanguages
+                        if newValue {
+                            if !codes.contains(language.rawValue) { codes.append(language.rawValue) }
+                        } else {
+                            codes.removeAll { $0 == language.rawValue }
+                        }
+                        settings.dictationLanguages = codes
+                    }
+                ))
+                // Prevents unchecking the last remaining language from the UI — the normalizer
+                // (min 1, falls back to the default pair) is the safety net, not the primary
+                // guard, so this stays in sync with it rather than surprising the user by
+                // silently re-adding English/Portuguese. See PLAN.md F5.1/F5.6.
+                .disabled(isOn && settings.dictationLanguages.count == 1)
+            }
+        }
+        .padding(.top, 8)
     }
 
     @ViewBuilder
