@@ -229,6 +229,38 @@ struct DictationLanguageTests {
         #expect(settings.dictationLanguages == ["es", "fr", "de"])
     }
 
+    @Test func captureRecordingLanguageSnapshotFreezesPinAndAppLanguageRulesAtCaptureTimeNotLive() {
+        // `AppCoordinator.captureRecordingLanguageSnapshot` is called once at Recording start
+        // (`beginCapture`/`beginVoiceEditInstructionRecording`) and its RESULT — not a live
+        // re-read of `AppSettings` — is what the stop-time `resolveLanguage` call must consult.
+        // This proves the capture step itself: value-type fields captured from `settings` are
+        // inherently frozen against later mutation of that same `settings` instance, exactly the
+        // seam `recordingPinSnapshot`/`recordingAppLanguageRulesSnapshot` rely on to avoid the
+        // stop-time live `AppSettings.shared.languagePin`/`appLanguageRules` read this fixes. See
+        // Codex finding: stop-time live language-pin/appLanguageRules read.
+        let defaults = isolatedDefaults()
+        defer { remove(defaults) }
+        let settings = AppSettings(defaults: defaults)
+        settings.dictationLanguages = ["en", "pt"]
+        settings.languagePin = "en"
+        settings.appLanguageRules = ["com.example.app": "pt"]
+
+        let snapshot = AppCoordinator.captureRecordingLanguageSnapshot(from: settings)
+
+        // Mutate the SAME settings instance AFTER capturing — simulating the user changing the
+        // pin (or an app rule) mid-Recording.
+        settings.languagePin = "pt"
+        settings.appLanguageRules = ["com.example.app": "en"]
+
+        #expect(snapshot.pin == "en")
+        #expect(snapshot.appLanguageRules == ["com.example.app": "pt"])
+        #expect(snapshot.candidateLanguages == ["en", "pt"])
+        // The live settings really did change — proving the snapshot's stability isn't an
+        // accident of nothing having mutated.
+        #expect(settings.languagePin == "pt")
+        #expect(settings.appLanguageRules == ["com.example.app": "en"])
+    }
+
     // MARK: - Helpers
 
     private func isolatedDefaults() -> UserDefaults {

@@ -214,6 +214,55 @@ struct BackupBundleTests {
         #expect(!raw.contains("user:pass"))
     }
 
+    // MARK: - Absent LLM fields resolve from the RESTORED provider, not a hardcoded one (Codex finding: cross-provider mix)
+
+    @Test func v2RestoresOllamaProviderDefaultsWhenBaseURLAndModelAreAbsent() async throws {
+        let env = try makeEnv()
+        // Live state before restore starts on the OTHER provider, with Anthropic-shaped values —
+        // if the absent-field default were still hardcoded to Anthropic, this would be
+        // indistinguishable from a correct restore, so start from a neutral/different baseline.
+        env.settings.llmProvider = .anthropic
+        env.settings.cloudLLMBaseURL = "https://api.anthropic.com/v1"
+        env.settings.cloudLLMModel = "claude-sonnet-4-5"
+
+        let data = try json(v2Payload(settings: ["llmProvider": "ollama"]))
+        _ = try await BackupBundle.restore(data: data, settings: env.settings, templateStore: env.templateStore, snippetStore: env.snippetStore)
+
+        #expect(env.settings.llmProvider == .ollama)
+        #expect(env.settings.cloudLLMBaseURL == "https://ollama.com/v1")
+        #expect(env.settings.cloudLLMModel == "gpt-oss:120b")
+    }
+
+    @Test func v2RestoresAnthropicProviderDefaultsWhenBaseURLAndModelAreAbsent() async throws {
+        let env = try makeEnv()
+        env.settings.llmProvider = .ollama
+        env.settings.cloudLLMBaseURL = "https://ollama.com/v1"
+        env.settings.cloudLLMModel = "gpt-oss:120b"
+
+        let data = try json(v2Payload(settings: ["llmProvider": "anthropic"]))
+        _ = try await BackupBundle.restore(data: data, settings: env.settings, templateStore: env.templateStore, snippetStore: env.snippetStore)
+
+        #expect(env.settings.llmProvider == .anthropic)
+        #expect(env.settings.cloudLLMBaseURL == "https://api.anthropic.com/v1")
+        #expect(env.settings.cloudLLMModel == "claude-sonnet-4-5")
+    }
+
+    @Test func v2RestoresOpenAICompatibleProviderHasNoKnownDefaultSoFieldsClearToEmpty() async throws {
+        // openAICompatible has no known (baseURL, model) default — an absent field must resolve
+        // to empty, never silently inherit whatever the previous provider had configured.
+        let env = try makeEnv()
+        env.settings.llmProvider = .anthropic
+        env.settings.cloudLLMBaseURL = "https://api.anthropic.com/v1"
+        env.settings.cloudLLMModel = "claude-sonnet-4-5"
+
+        let data = try json(v2Payload(settings: ["llmProvider": "openAICompatible"]))
+        _ = try await BackupBundle.restore(data: data, settings: env.settings, templateStore: env.templateStore, snippetStore: env.snippetStore)
+
+        #expect(env.settings.llmProvider == .openAICompatible)
+        #expect(env.settings.cloudLLMBaseURL == "")
+        #expect(env.settings.cloudLLMModel == "")
+    }
+
     // MARK: - Full round-trip over the current key set (PLAN.md F1.9: run now, batch-final gate later)
 
     @Test func fullRoundTripPreservesEveryExportableSetting() async throws {

@@ -219,6 +219,42 @@ import Testing
         #expect(reason == nil)
     }
 
+    @Test func shouldSynthesizePasteTreatsNilSnapshotBundleIDAsUnverifiableRegardlessOfPidOrElementMatch() {
+        // A non-nil target with no bundle id at all has no verifiable identity — a matching pid
+        // alone doesn't prove it (pid reuse), and neither does an `.unavailable` element
+        // comparison. Must drift (return false), not fall through to the pid/element checks.
+        #expect(Insertion.shouldSynthesizePaste(
+            hasTarget: true, snapshotBundleID: nil, currentBundleID: "com.example.current",
+            pidMatch: true, elementComparison: .unavailable
+        ) == false)
+        // Even a current bundle id of nil (matching the snapshot's nil) must not be treated as
+        // "identity confirmed" — there is nothing to compare.
+        #expect(Insertion.shouldSynthesizePaste(
+            hasTarget: true, snapshotBundleID: nil, currentBundleID: nil,
+            pidMatch: true, elementComparison: .unavailable
+        ) == false)
+        // A positive AX element match doesn't rescue a nil-bundle-id snapshot either — the fix
+        // is unconditional on bundle id, matching the finding's "nil bundleID or otherwise
+        // unverifiable" wording.
+        #expect(Insertion.shouldSynthesizePaste(
+            hasTarget: true, snapshotBundleID: nil, currentBundleID: "com.example.current",
+            pidMatch: true, elementComparison: .match
+        ) == false)
+    }
+
+    @Test func classifyPreflightFailureTreatsNilSnapshotBundleIDAsTargetDrift() {
+        // End-to-end through `classifyPreflightFailure`: the PID-reuse bypass (nil snapshot
+        // bundle id + matching pid + unavailable AX comparison) must classify as `.targetDrift`,
+        // not fall through to a successful (nil) classification. See Codex finding: nil-bundle-
+        // id identity bypass.
+        let reason = Insertion.classifyPreflightFailure(
+            hasTarget: true, snapshotBundleID: nil, currentBundleID: "com.example.current",
+            pidMatch: true, elementComparison: .unavailable,
+            hasEditableFocusedElement: true, accessibilityTrusted: true
+        )
+        #expect(reason == .targetDrift)
+    }
+
     @Test func insertReportsTargetDriftForAMismatchedBundleIDRegardlessOfEnvironment() {
         // Exercises the real `Insertion.insert` end to end: a target snapshotted against a
         // bundle ID that cannot possibly be the live frontmost app is a deterministic drift
@@ -231,5 +267,37 @@ import Testing
         let outcome = Insertion.insert("Permission Diagnosis test text", target: target)
         #expect(outcome == .failure(.targetDrift))
         #expect(!outcome.isPermissionClassFailure)
+    }
+
+    // MARK: - AppRelaunch argument construction (Codex finding: relaunch command injection)
+
+    @Test func openArgumentsIsAnArgvArrayNeverAShellString() {
+        // No shell is ever consulted — a path containing shell metacharacters must stay a single
+        // inert argv element, never be parsed/executed as command syntax.
+        #expect(AppRelaunch.openArguments(bundlePath: "/Applications/FreeTalker.app") == ["-n", "/Applications/FreeTalker.app"])
+    }
+
+    @Test func openArgumentsKeepsACraftedInstallPathAsASingleInertArgument() {
+        let crafted = "/tmp/evil\"; rm -rf ~ #.app"
+        let arguments = AppRelaunch.openArguments(bundlePath: crafted)
+        #expect(arguments.count == 2)
+        #expect(arguments[0] == "-n")
+        #expect(arguments[1] == crafted)
+
+        let commandSubstitution = "/tmp/$(rm -rf ~).app"
+        let arguments2 = AppRelaunch.openArguments(bundlePath: commandSubstitution)
+        #expect(arguments2 == ["-n", commandSubstitution])
+    }
+
+    @Test @MainActor func relaunchSpawnsWithTheBundlePathThenTerminates() {
+        var spawnedPath: String?
+        var terminated = false
+        AppRelaunch.relaunch(
+            bundlePath: "/Applications/FreeTalker.app",
+            spawn: { path in spawnedPath = path },
+            terminate: { terminated = true }
+        )
+        #expect(spawnedPath == "/Applications/FreeTalker.app")
+        #expect(terminated)
     }
 }

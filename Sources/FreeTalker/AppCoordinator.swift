@@ -5,6 +5,19 @@ import Foundation
 import os
 import SwiftUI
 
+/// The Dictation Language Set, language pin, and per-app language rules snapshotted TOGETHER at
+/// Recording start and held immutable for that Recording's duration — see
+/// `AppCoordinator.captureRecordingLanguageSnapshot`. Value types make the freeze inherent: once
+/// captured, no later mutation of the live `AppSettings` singleton can reach these fields. Used
+/// at stop time so `resolveLanguage` is never handed a pin/rule value the user changed mid-
+/// Recording, matching the Dictation Language Set's own existing start-snapshot semantics. See
+/// Codex finding: stop-time live language-pin/appLanguageRules read.
+struct RecordingLanguageSnapshot: Equatable {
+    let candidateLanguages: [String]
+    let pin: String
+    let appLanguageRules: [String: String]
+}
+
 @MainActor
 final class AppCoordinator: ObservableObject {
     enum CaptureOwner: Equatable {
@@ -152,6 +165,11 @@ final class AppCoordinator: ObservableObject {
     /// F5.3/F5.4. Defaults to the live set so a coordinator-level call made before any capture
     /// starts still has a sane value.
     private var recordingLanguageSnapshot: [String] = AppSettings.shared.dictationLanguages
+    /// The language pin and per-app language rules, snapshotted alongside
+    /// `recordingLanguageSnapshot` at the same two capture-start sites — see
+    /// `RecordingLanguageSnapshot`'s doc comment and `captureRecordingLanguageSnapshot`.
+    private var recordingPinSnapshot: String = AppSettings.shared.languagePin
+    private var recordingAppLanguageRulesSnapshot: [String: String] = AppSettings.shared.appLanguageRules
     @Published private(set) var recordingOutputSelection = RecordingOutputSelection()
 
     let speechModelDownloadCoordinator: SpeechModelDownloadCoordinator
@@ -571,7 +589,10 @@ final class AppCoordinator: ObservableObject {
                 deviceUID: AppSettings.shared.microphoneDeviceUID,
                 noiseSuppression: AppSettings.shared.noiseSuppressionEnabled
             )
-            recordingLanguageSnapshot = AppSettings.shared.dictationLanguages
+            let languageSnapshot = Self.captureRecordingLanguageSnapshot(from: AppSettings.shared)
+            recordingLanguageSnapshot = languageSnapshot.candidateLanguages
+            recordingPinSnapshot = languageSnapshot.pin
+            recordingAppLanguageRulesSnapshot = languageSnapshot.appLanguageRules
             captureOwner = .voiceEdit
             isRecording = true
             hotKeyManager.isRecording = true
@@ -1264,7 +1285,10 @@ final class AppCoordinator: ObservableObject {
         }
         recordingDestination = nil
         oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .clear)
-        recordingLanguageSnapshot = AppSettings.shared.dictationLanguages
+        let languageSnapshot = Self.captureRecordingLanguageSnapshot(from: AppSettings.shared)
+        recordingLanguageSnapshot = languageSnapshot.candidateLanguages
+        recordingPinSnapshot = languageSnapshot.pin
+        recordingAppLanguageRulesSnapshot = languageSnapshot.appLanguageRules
         let micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
         Self.logger.log("key down: micAuthorizationStatus=\(micStatus.rawValue, privacy: .public)")
         // Guard unconditionally rather than proceeding to record silence — a denied/stale TCC
@@ -2090,16 +2114,21 @@ final class AppCoordinator: ObservableObject {
         let automaticStyleEnabled = AppSettings.shared.automaticStyleEnabled
         let processor = capturedOutputLanguage == .sameAsSpoken ? resolveActiveProcessor() : nil
         // Snapshotted synchronously here, alongside engine/template/appRules above — see that
-        // comment block. `recordingLanguageSnapshot` was itself frozen at Recording start
-        // (`beginCapture`); reading it into a local now (rather than inside the `Task` below)
-        // additionally guards against a new Recording starting and overwriting it before the
-        // async pipeline task actually runs.
+        // comment block. `recordingLanguageSnapshot`/`recordingPinSnapshot`/
+        // `recordingAppLanguageRulesSnapshot` were themselves frozen TOGETHER at Recording start
+        // (`beginCapture`, via `captureRecordingLanguageSnapshot`); reading them into locals now
+        // (rather than inside the `Task` below) additionally guards against a new Recording
+        // starting and overwriting them before the async pipeline task actually runs. The pin and
+        // app-language-rules were previously read live from `AppSettings.shared` here — a pin
+        // change mid-Recording could retroactively change which language this stop resolves to,
+        // contradicting the Dictation Language Set's own start-snapshot semantics. See Codex
+        // finding: stop-time live language-pin/appLanguageRules read.
         let candidateLanguages = recordingLanguageSnapshot
         let forcedLanguage = Self.resolveLanguage(
             oneShot: capturedOneShotLanguage,
             bundleID: bundleID,
-            appLanguageRules: AppSettings.shared.appLanguageRules,
-            pin: AppSettings.shared.languagePin,
+            appLanguageRules: recordingAppLanguageRulesSnapshot,
+            pin: recordingPinSnapshot,
             candidateSet: candidateLanguages
         )
 
@@ -2339,6 +2368,20 @@ final class AppCoordinator: ObservableObject {
                 activeTemplateID: activeTemplateID
             ),
             false
+        )
+    }
+
+    /// Reads the three fields `RecordingLanguageSnapshot` bundles together, all at once, from
+    /// `settings` — called at each capture-start site (`beginCapture`,
+    /// `beginVoiceEditInstructionRecording`) so the freeze happens at exactly the same instant
+    /// `recordingLanguageSnapshot` itself is frozen. Takes `settings` as a parameter (rather than
+    /// reading `AppSettings.shared` internally) purely so this capture step is testable against
+    /// an injected `AppSettings` instance — production call sites always pass `.shared`.
+    static func captureRecordingLanguageSnapshot(from settings: AppSettings) -> RecordingLanguageSnapshot {
+        RecordingLanguageSnapshot(
+            candidateLanguages: settings.dictationLanguages,
+            pin: settings.languagePin,
+            appLanguageRules: settings.appLanguageRules
         )
     }
 
@@ -2726,7 +2769,7 @@ final class AppCoordinator: ObservableObject {
             oneShot: oneShotLanguage,
             bundleID: nil,
             appLanguageRules: [:],
-            pin: AppSettings.shared.languagePin,
+            pin: recordingPinSnapshot,
             candidateSet: recordingLanguageSnapshot
         )
         isProcessing = true
@@ -3385,15 +3428,25 @@ final class AppCoordinator: ObservableObject {
             return
         }
         let service = MediaImportService(store: recoveryStore)
+        // `resolveLanguageSettings` is called by the pipeline at each job's start, not once here
+        // at pipeline construction — see `MediaImportPipeline`'s doc comment. Settings changes
+        // made while an earlier queued job is running apply to the next job to start.
         let pipeline = MediaImportPipeline(
             store: recoveryStore,
             jobsDirectory: Self.mediaImportsDirectory,
             decoder: service,
             transcriber: TimestampedWhisperTranscriber(backend: whisperEngine),
             diarizer: LocalFluidAudioDiarizer(),
-            language: AppSettings.shared.languagePin == "auto" ? nil : AppSettings.shared.languagePin,
-            model: AppSettings.shared.whisperModel,
-            candidateLanguages: AppSettings.shared.dictationLanguages
+            resolveLanguageSettings: {
+                await MainActor.run {
+                    let settings = AppSettings.shared
+                    return MediaImportLanguageSettings(
+                        language: settings.languagePin == "auto" ? nil : settings.languagePin,
+                        model: settings.whisperModel,
+                        candidateLanguages: settings.dictationLanguages
+                    )
+                }
+            }
         )
         let runner = pipeline.localJobRunner(executionAuthority: localJobExecutionAuthority) { [weak jobLibraryStore] _ in
             try? await jobLibraryStore?.refresh()
@@ -3628,8 +3681,37 @@ final class AppCoordinator: ObservableObject {
     /// Menu-bar "Dictation History…" fallback (PLAN.md F3.1/F3.2): uses the tracked last
     /// non-FreeTalker frontmost app rather than `NSWorkspace.shared.frontmostApplication`, since
     /// clicking the menu item has already activated FreeTalker by the time this runs.
+    ///
+    /// `lastNonSelfFrontmostTarget` is only refreshed on app ACTIVATION
+    /// (`NSWorkspace.didActivateApplicationNotification`) — same-app document/tab/field changes
+    /// since that activation (a different Slack channel, a different Mail draft) leave it
+    /// pointing at a stale focused element. Re-querying the tracked app's CURRENT focused AX
+    /// element right before opening keeps the app identity already tracked but refreshes the
+    /// element/window `Insertion.insert`'s own drift guard compares against. See Codex finding:
+    /// stale AX target for menu-opened panel.
     func openHistoryPanelFromMenu() {
-        HistoryPanelController.shared.open(target: lastNonSelfFrontmostTarget)
+        HistoryPanelController.shared.open(target: Self.refreshedTarget(
+            stale: lastNonSelfFrontmostTarget,
+            refresh: { stale in
+                guard let app = NSRunningApplication(processIdentifier: stale.pid) else { return nil }
+                return Insertion.snapshotTarget(app: app)
+            }
+        ))
+    }
+
+    /// Re-snapshots `stale`'s tracked app via `refresh`, falling back to `stale` unchanged if the
+    /// app can no longer be found or re-snapshotted (e.g. it quit) — `Insertion.insert`'s own
+    /// drift guard treats an unrefreshed stale target as the existing manual-paste fallback, so
+    /// there's no separate failure path to handle here. Pure aside from `refresh` itself, which
+    /// production callers point at a live AX/`NSRunningApplication` lookup and tests point at a
+    /// deterministic stub — see `AppLifecycleWindowPolicy`-style injectable defaults elsewhere in
+    /// this file for the same testability pattern.
+    nonisolated static func refreshedTarget(
+        stale: InsertionTarget?,
+        refresh: (InsertionTarget) -> InsertionTarget?
+    ) -> InsertionTarget? {
+        guard let stale else { return nil }
+        return refresh(stale) ?? stale
     }
 
     /// Row-click insert from the Dictation History Quick Panel (PLAN.md F3.4). Unlike

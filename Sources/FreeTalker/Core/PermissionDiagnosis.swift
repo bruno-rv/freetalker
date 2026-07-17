@@ -220,16 +220,29 @@ struct PermissionDiagnosis: Equatable, Sendable {
 /// Dedicated relaunch helper for `staleGranted` recovery (PLAN.md F2.2) — deliberately NOT
 /// `scripts/self-update.sh` (which pulls git and rebuilds); this only restarts the current
 /// bundle so a fresh process re-establishes the capabilities TCC already claims to grant it.
-/// Spawns a detached shell that waits for this process to fully exit before running `open -n`,
-/// rather than racing `AppInstanceLease`'s own single-instance reconciliation (App.swift).
+/// Runs `/usr/bin/open` directly with an argument array — never a shell — so `bundlePath`
+/// (normally `Bundle.main.bundlePath`, but a caller-suppliable install path) can never be
+/// interpreted as shell syntax. See Codex finding: relaunch command injection via install path.
+///
+/// No pre-`open` wait: `AppLifecycleWindowPolicy.claimInstance` (App.swift) already retries
+/// acquiring the single-instance flock up to 10× at 50ms apart (~500ms) — the exact window a
+/// prior blind `sleep 0.5` bought — and reconciles by activating whichever instance still holds
+/// it, so the new instance launched here doesn't need this process to have exited first.
 enum AppRelaunch {
+    /// `["-n", bundlePath]` — `-n` opens a new instance unconditionally, `bundlePath` is a single
+    /// argv element (never shell-parsed). Extracted so the argument construction itself — the
+    /// actual injection surface — is testable independent of spawning a real process.
+    nonisolated static func openArguments(bundlePath: String) -> [String] {
+        ["-n", bundlePath]
+    }
+
     @MainActor
     static func relaunch(
         bundlePath: String = Bundle.main.bundlePath,
         spawn: (String) -> Void = { path in
             let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/bin/sh")
-            process.arguments = ["-c", "sleep 0.5 && /usr/bin/open -n \"\(path)\""]
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+            process.arguments = AppRelaunch.openArguments(bundlePath: path)
             try? process.run()
         },
         terminate: () -> Void = { NSApplication.shared.terminate(nil) }

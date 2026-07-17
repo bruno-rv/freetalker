@@ -181,9 +181,13 @@ enum Insertion {
         elementComparison: ElementComparison = .unavailable
     ) -> Bool {
         guard hasTarget else { return true }
-        if let snapshotBundleID {
-            guard let currentBundleID, snapshotBundleID == currentBundleID else { return false }
-        }
+        // A snapshotted target with no bundle id at all has no verifiable identity — `pidMatch`
+        // alone doesn't substitute for it (pids are reused after a process exits, so a matching
+        // pid doesn't prove it's still the same app instance), and an `.unavailable` element
+        // comparison gives no information either. Treat this as drifted rather than accept an
+        // unverified paste. See Round 4 Codex finding: nil-bundle-id identity bypass (PID reuse).
+        guard let snapshotBundleID else { return false }
+        guard let currentBundleID, snapshotBundleID == currentBundleID else { return false }
         guard pidMatch else { return false }
         switch elementComparison {
         case .mismatch: return false

@@ -419,6 +419,47 @@ import Testing
         #expect(try Data(contentsOf: unknown) == Data("keep".utf8))
         #expect(try await fixture.store.job(id: job.id) != nil)
     }
+
+    // MARK: - Language settings resolved per job start, not frozen at pipeline construction (Codex finding)
+
+    @Test func languageSettingsAreResolvedFreshAtEachJobsStartNotFrozenAtPipelineConstruction() async throws {
+        let fixture = try MediaPipelineFixture()
+
+        let jobA = try await fixture.store.create(kind: .mediaImport, source: .init(reference: fixture.source.path), now: .now)
+        try FileManager.default.createDirectory(at: fixture.jobDirectory(jobA.id), withIntermediateDirectories: true)
+        try writeValidWAV(to: fixture.audioURL(jobA.id))
+        let ownerA = try await fixture.claim(jobA.id)
+        let tokenA = CancellationToken(); tokenA.installLeaseOwner(ownerA)
+
+        let jobB = try await fixture.store.create(kind: .mediaImport, source: .init(reference: fixture.source.path), now: .now)
+        try FileManager.default.createDirectory(at: fixture.jobDirectory(jobB.id), withIntermediateDirectories: true)
+        try writeValidWAV(to: fixture.audioURL(jobB.id))
+        let ownerB = try await fixture.claim(jobB.id)
+        let tokenB = CancellationToken(); tokenB.installLeaseOwner(ownerB)
+
+        let provider = MutableLanguageSettingsProvider(initial: .init(language: "en", model: "model-v1", candidateLanguages: ["en"]))
+        let transcriber = PipelineTranscribeRecordingProbe()
+        let pipeline = MediaImportPipeline(
+            store: fixture.store, jobsDirectory: fixture.root,
+            decoder: PipelineDecodeProbe(), transcriber: transcriber, diarizer: PipelineDiarizeProbe(),
+            resolveLanguageSettings: { await provider.current() }
+        )
+
+        try await pipeline.execute(job: try #require(await fixture.store.job(id: jobA.id)), cancellation: tokenA)
+        let firstReceived = await transcriber.lastReceived
+        #expect(firstReceived?.language == "en")
+        #expect(firstReceived?.model == "model-v1")
+
+        // A Settings change made between the two jobs (e.g. while jobA was still queued or
+        // running) must reach jobB — it must NOT be frozen at pipeline construction time, which
+        // happened once, before either job ran.
+        await provider.update(.init(language: "fr", model: "model-v2", candidateLanguages: ["fr"]))
+
+        try await pipeline.execute(job: try #require(await fixture.store.job(id: jobB.id)), cancellation: tokenB)
+        let secondReceived = await transcriber.lastReceived
+        #expect(secondReceived?.language == "fr")
+        #expect(secondReceived?.model == "model-v2")
+    }
 }
 
 private enum PipelineTestError: Error, LocalizedError { case failed; var errorDescription: String? { "failed" } }
@@ -512,6 +553,26 @@ private actor PipelineTranscribeProbe: TimestampedTranscribing {
     let segments: [TranscriptSegment]
     init(segments: [TranscriptSegment] = [.init(start: 0, end: 1, text: "text")]) { self.segments = segments }
     func transcribeFile(at url: URL, language: String?, model: String, candidateLanguages: [String]) async throws -> [TranscriptSegment] { calls += 1; return segments }
+}
+
+/// Records the exact `(language, model, candidateLanguages)` each `transcribeFile` call
+/// received — used to prove `MediaImportPipeline` resolves language settings fresh per job
+/// rather than reusing whatever was frozen at pipeline construction.
+private actor PipelineTranscribeRecordingProbe: TimestampedTranscribing {
+    private(set) var lastReceived: (language: String?, model: String, candidateLanguages: [String])?
+    func transcribeFile(at url: URL, language: String?, model: String, candidateLanguages: [String]) async throws -> [TranscriptSegment] {
+        lastReceived = (language, model, candidateLanguages)
+        return [.init(start: 0, end: 1, text: "text")]
+    }
+}
+
+/// A `MediaImportLanguageSettings` provider whose current value can be changed BETWEEN jobs —
+/// stands in for `AppSettings.shared` mid-queue changes in `languageSettingsAreResolvedFreshAtEachJobsStartNotFrozenAtPipelineConstruction`.
+private actor MutableLanguageSettingsProvider {
+    private var value: MediaImportLanguageSettings
+    init(initial: MediaImportLanguageSettings) { value = initial }
+    func current() -> MediaImportLanguageSettings { value }
+    func update(_ newValue: MediaImportLanguageSettings) { value = newValue }
 }
 
 private actor PipelineDiarizeProbe: SpeakerDiarizing {

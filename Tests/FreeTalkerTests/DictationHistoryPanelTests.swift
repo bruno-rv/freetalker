@@ -133,6 +133,72 @@ import Testing
         #expect(HistoryPanelRow.displayText(for: withoutRefined) == "raw only")
     }
 
+    // MARK: - Stale cached row revalidated before insert (Codex finding: permanently-deleted row still inserted)
+
+    @Test func shouldInsertRowOnlyWhenAffirmativelyConfirmedToStillExist() {
+        #expect(HistoryPanelController.shouldInsertRow(exists: true) == true)
+        #expect(HistoryPanelController.shouldInsertRow(exists: false) == false)
+        // nil ("store unavailable, can't verify") refuses just like a confirmed-gone `false` —
+        // never treated as "assume it's still there".
+        #expect(HistoryPanelController.shouldInsertRow(exists: nil) == false)
+    }
+
+    @Test func libraryStoreExistsReflectsARowDeletedAfterThePanelCachedIt() throws {
+        // Mirrors `selectRow`'s real revalidation call (`LibraryStore.shared.exists(id:)`)
+        // against an isolated temporary store rather than the process-wide singleton — proves
+        // the exact contract `selectRow` depends on: a row present when the panel's search ran,
+        // then deleted (singly, or via Delete All) before the row is clicked, reads back as
+        // `exists == false`, which `shouldInsertRow` refuses.
+        let store = try LibraryStore.temporary()
+        let id = try store.record(
+            language: "en", template: "Clean", transcript: "raw", refined: "cached text", engine: "local"
+        )
+        #expect(store.exists(id: id) == true)
+        #expect(HistoryPanelController.shouldInsertRow(exists: store.exists(id: id)) == true)
+
+        try store.delete(id: id)
+
+        #expect(store.exists(id: id) == false)
+        #expect(HistoryPanelController.shouldInsertRow(exists: store.exists(id: id)) == false)
+    }
+
+    @Test func libraryStoreExistsReflectsDeleteAllOfACachedRow() throws {
+        let store = try LibraryStore.temporary()
+        let id = try store.record(
+            language: "en", template: "Clean", transcript: "raw", refined: "cached text", engine: "local"
+        )
+        #expect(store.exists(id: id) == true)
+
+        try store.deleteAll()
+
+        #expect(HistoryPanelController.shouldInsertRow(exists: store.exists(id: id)) == false)
+    }
+
+    // MARK: - Menu-driven panel open refreshes a stale AX target (Codex finding: same-app focus drift)
+
+    @Test func refreshedTargetReturnsNilWhenNoStaleTargetWasTracked() {
+        #expect(AppCoordinator.refreshedTarget(stale: nil, refresh: { _ in fatalError("must not be called") }) == nil)
+    }
+
+    @Test func refreshedTargetFallsBackToTheStaleTargetWhenTheAppCanNoLongerBeRefreshed() {
+        let stale = InsertionTarget(bundleID: "com.example.app", pid: 42, focusedElement: nil, window: nil)
+        let result = AppCoordinator.refreshedTarget(stale: stale, refresh: { _ in nil })
+        #expect(result?.bundleID == stale.bundleID)
+        #expect(result?.pid == stale.pid)
+    }
+
+    @Test func refreshedTargetReturnsTheFreshlySnapshottedTargetWhenTheAppIsStillFound() {
+        let stale = InsertionTarget(bundleID: "com.example.app", pid: 42, focusedElement: nil, window: nil)
+        let fresh = InsertionTarget(bundleID: "com.example.app", pid: 42, focusedElement: nil, window: nil)
+        var receivedStale: InsertionTarget?
+        let result = AppCoordinator.refreshedTarget(stale: stale, refresh: { candidate in
+            receivedStale = candidate
+            return fresh
+        })
+        #expect(receivedStale?.pid == stale.pid)
+        #expect(result?.bundleID == fresh.bundleID)
+    }
+
     // MARK: - Fourth hotkey slot in the Backup Bundle quartet
 
     @Test func backupBundleRejectsHistoryPanelHotKeyCollidingWithSibling() async throws {

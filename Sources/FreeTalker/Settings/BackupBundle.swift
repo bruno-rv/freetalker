@@ -397,11 +397,16 @@ extension AppSettings {
         }
 
         // 1. LLM provider cluster: provider first (its didSet can overwrite baseURL/model with
-        //    provider defaults), then the exact restored baseURL/model land last and stick.
+        //    provider defaults), then the exact restored baseURL/model land last and stick. An
+        //    ABSENT baseURL/model's default is resolved from the EFFECTIVE RESTORED provider
+        //    (just set above) — not a hardcoded provider — so a v2 bundle that restores
+        //    `.ollama` but omits `cloudLLMBaseURL`/`cloudLLMModel` lands on Ollama's own
+        //    defaults, never Anthropic's. See Codex finding: cross-provider endpoint/model mix
+        //    on partial v2 restore.
         apply(patch.llmProvider, default: .anthropic) { llmProvider = $0 }
-        let anthropicDefaults = Self.resolveProviderDefaults(provider: .anthropic, baseURL: "", model: "")
-        apply(patch.cloudLLMBaseURL, default: anthropicDefaults.baseURL) { cloudLLMBaseURL = $0 }
-        apply(patch.cloudLLMModel, default: anthropicDefaults.model) { cloudLLMModel = $0 }
+        let providerDefaults = Self.resolveProviderDefaults(provider: llmProvider, baseURL: "", model: "")
+        apply(patch.cloudLLMBaseURL, default: providerDefaults.baseURL) { cloudLLMBaseURL = $0 }
+        apply(patch.cloudLLMModel, default: providerDefaults.model) { cloudLLMModel = $0 }
 
         // 2. Whisper model cluster: `whisperModel` is `private(set)`, applied through
         //    `applyAutomaticWhisperModel` (normalizes; leaves `whisperModelChosen` untouched, so

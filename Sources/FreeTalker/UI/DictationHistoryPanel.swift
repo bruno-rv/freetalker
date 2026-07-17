@@ -118,8 +118,26 @@ final class HistoryPanelController: ObservableObject {
         runSearch(query: text)
     }
 
+    /// True only when the row's id was affirmatively found to still exist. `nil` (store
+    /// unavailable — can't verify) refuses just like `false` (confirmed gone) — insertion never
+    /// proceeds on an unverifiable id. See Codex finding: stale cached row inserted after
+    /// permanent deletion while the panel was open.
+    nonisolated static func shouldInsertRow(exists: Bool?) -> Bool {
+        exists == true
+    }
+
+    /// Revalidates `id` against the Library store immediately before insertion — the row cache
+    /// (`dictationsByID`) is populated once per search and never invalidated while the panel
+    /// stays open, so a row deleted (singly or via Delete All) after that point would otherwise
+    /// still insert its stale cached text. A failed revalidation drops the row from the panel
+    /// instead of inserting. See Codex finding: cached-row insert after permanent deletion.
     func selectRow(id: Int64) {
         guard let dictation = dictationsByID[id] else { return }
+        guard Self.shouldInsertRow(exists: LibraryStore.shared.exists(id: id)) else {
+            dictationsByID.removeValue(forKey: id)
+            rows.removeAll { $0.id == id }
+            return
+        }
         AppCoordinator.shared.insertFromHistoryPanel(HistoryPanelRow.displayText(for: dictation), target: target)
         close()
     }
