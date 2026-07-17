@@ -69,21 +69,31 @@ final class HistoryPanelController: ObservableObject {
     private var target: InsertionTarget?
 
     private init() {
-        recordingGateCancellable = Publishers.CombineLatest(
+        recordingGateCancellable = Publishers.CombineLatest3(
             AppCoordinator.shared.$isRecording,
-            AppCoordinator.shared.$isProcessing
+            AppCoordinator.shared.$isProcessing,
+            AppCoordinator.shared.$isCaptureLifecycleActive
         )
         .receive(on: DispatchQueue.main)
-        .sink { [weak self] isRecording, isProcessing in
-            guard let self, Self.isBlockedByRecording(isRecording: isRecording, isProcessing: isProcessing) else { return }
+        .sink { [weak self] isRecording, isProcessing, isCaptureLifecycleActive in
+            guard let self, Self.isBlockedByRecording(
+                isRecording: isRecording, isProcessing: isProcessing,
+                isCaptureLifecycleActive: isCaptureLifecycleActive
+            ) else { return }
             self.close()
         }
     }
 
-    /// Recording gate (PLAN.md F3.4): true while an active recording/processing means the panel
-    /// must refuse to open, or force-close if already open.
-    nonisolated static func isBlockedByRecording(isRecording: Bool, isProcessing: Bool) -> Bool {
-        isRecording || isProcessing
+    /// Recording gate (PLAN.md F3.4): true while an active recording/processing/finalizing means
+    /// the panel must refuse to open, or force-close if already open. `isCaptureLifecycleActive`
+    /// (`captureAdmission.state.isActive`) covers the async journal finalization window between a
+    /// stop request landing and `stopAndTranscribe`'s continuation running — `recordingState` is
+    /// already back to `.idle` and `isProcessing` never turns true during that window. See P2
+    /// finding: history panel could open/insert while capture was still finalizing.
+    nonisolated static func isBlockedByRecording(
+        isRecording: Bool, isProcessing: Bool, isCaptureLifecycleActive: Bool
+    ) -> Bool {
+        isRecording || isProcessing || isCaptureLifecycleActive
     }
 
     /// True when a completed search's request generation has been superseded by a newer
@@ -95,7 +105,8 @@ final class HistoryPanelController: ObservableObject {
     func open(target: InsertionTarget?) {
         guard !Self.isBlockedByRecording(
             isRecording: AppCoordinator.shared.isRecording,
-            isProcessing: AppCoordinator.shared.isProcessing
+            isProcessing: AppCoordinator.shared.isProcessing,
+            isCaptureLifecycleActive: AppCoordinator.shared.isCaptureLifecycleActive
         ) else { return }
         generation += 1
         self.target = target
@@ -141,7 +152,8 @@ final class HistoryPanelController: ObservableObject {
         // async, selectRow had no synchronous guard.
         guard !Self.isBlockedByRecording(
             isRecording: AppCoordinator.shared.isRecording,
-            isProcessing: AppCoordinator.shared.isProcessing
+            isProcessing: AppCoordinator.shared.isProcessing,
+            isCaptureLifecycleActive: AppCoordinator.shared.isCaptureLifecycleActive
         ) else {
             close()
             return

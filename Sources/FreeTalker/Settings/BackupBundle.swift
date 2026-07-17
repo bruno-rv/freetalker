@@ -230,30 +230,41 @@ private enum SettingsPatchDecoding {
             guard let value = raw as? String else { throw BackupBundleError.invalidSettingsValue(key: key) }
             return value
         }
+        // JSON has no distinct boolean NSNumber subtype from Swift's perspective — a JSON `true`
+        // bridges to `NSNumber` and satisfies `as? Int`/`as? Double`/`as? Bool` all at once, and a
+        // JSON `1` likewise satisfies `as? Bool`. `type(of:)` can't tell them apart either (both
+        // box through the same tagged-pointer `NSNumber` machinery), but the underlying CFType
+        // does: only a real CFBoolean reports `CFBooleanGetTypeID()`. See P2 finding: JSON
+        // booleans silently decoded as 1/1.0 for int/double-typed keys.
+        func isCFBoolean(_ number: NSNumber) -> Bool {
+            CFGetTypeID(number) == CFBooleanGetTypeID()
+        }
         func bool(_ raw: Any, _ key: String) throws -> Bool {
-            guard let value = raw as? Bool else { throw BackupBundleError.invalidSettingsValue(key: key) }
-            return value
+            guard let number = raw as? NSNumber, isCFBoolean(number) else {
+                throw BackupBundleError.invalidSettingsValue(key: key)
+            }
+            return number.boolValue
         }
         func double(_ raw: Any, _ key: String) throws -> Double {
-            if let value = raw as? Double { return value }
-            if let number = raw as? NSNumber { return number.doubleValue }
-            throw BackupBundleError.invalidSettingsValue(key: key)
+            guard let number = raw as? NSNumber, !isCFBoolean(number) else {
+                throw BackupBundleError.invalidSettingsValue(key: key)
+            }
+            return number.doubleValue
         }
         func int(_ raw: Any, _ key: String) throws -> Int {
-            if let value = raw as? Int { return value }
-            if let number = raw as? NSNumber {
-                // `NSNumber.intValue` truncates toward zero — a fractional JSON value (e.g.
-                // `5.9`) would silently become `5` instead of being rejected. Reject anything
-                // that isn't a whole number rather than coerce it. See P2 finding: fractional
-                // integer-setting truncation.
-                let double = number.doubleValue
-                guard double.truncatingRemainder(dividingBy: 1) == 0,
-                      double >= Double(Int.min), double <= Double(Int.max) else {
-                    throw BackupBundleError.invalidSettingsValue(key: key)
-                }
-                return number.intValue
+            guard let number = raw as? NSNumber, !isCFBoolean(number) else {
+                throw BackupBundleError.invalidSettingsValue(key: key)
             }
-            throw BackupBundleError.invalidSettingsValue(key: key)
+            // `NSNumber.intValue` truncates toward zero — a fractional JSON value (e.g.
+            // `5.9`) would silently become `5` instead of being rejected. Reject anything
+            // that isn't a whole number rather than coerce it. See P2 finding: fractional
+            // integer-setting truncation.
+            let double = number.doubleValue
+            guard double.truncatingRemainder(dividingBy: 1) == 0,
+                  double >= Double(Int.min), double <= Double(Int.max) else {
+                throw BackupBundleError.invalidSettingsValue(key: key)
+            }
+            return number.intValue
         }
         func stringDict(_ raw: Any, _ key: String) throws -> [String: String] {
             guard let value = raw as? [String: String] else { throw BackupBundleError.invalidSettingsValue(key: key) }
@@ -369,7 +380,15 @@ private enum SettingsPatchDecoding {
             patch.languagePin = .present(AppSettings.normalizeLanguagePin(try str(raw, Keys.languagePin), allowed: curatedCodes))
         }
         if let raw = dict[Keys.defaultOutputLanguage] {
-            patch.defaultOutputLanguage = .present(OutputLanguage.persisted(rawValue: try str(raw, Keys.defaultOutputLanguage)))
+            // `OutputLanguage.persisted` is intentionally lenient (falls back to `.sameAsSpoken`)
+            // for reading old/foreign UserDefaults values at app launch — that fallback doesn't
+            // belong here. Restore is validate-then-apply: an unknown raw value must reject the
+            // whole bundle naming this key, not silently coerce. See P2 finding: invalid
+            // `defaultOutputLanguage` silently coerced instead of throwing.
+            guard let value = OutputLanguage(rawValue: try str(raw, Keys.defaultOutputLanguage)) else {
+                throw BackupBundleError.invalidSettingsValue(key: Keys.defaultOutputLanguage)
+            }
+            patch.defaultOutputLanguage = .present(value)
         }
         if let raw = dict[Keys.appLanguageRules] {
             let value = try stringDict(raw, Keys.appLanguageRules)

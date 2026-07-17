@@ -110,10 +110,15 @@ import Testing
     // MARK: - Recording gate
 
     @Test func recordingGateBlocksOpenAndForcesCloseWhileActive() {
-        #expect(HistoryPanelController.isBlockedByRecording(isRecording: false, isProcessing: false) == false)
-        #expect(HistoryPanelController.isBlockedByRecording(isRecording: true, isProcessing: false) == true)
-        #expect(HistoryPanelController.isBlockedByRecording(isRecording: false, isProcessing: true) == true)
-        #expect(HistoryPanelController.isBlockedByRecording(isRecording: true, isProcessing: true) == true)
+        #expect(HistoryPanelController.isBlockedByRecording(isRecording: false, isProcessing: false, isCaptureLifecycleActive: false) == false)
+        #expect(HistoryPanelController.isBlockedByRecording(isRecording: true, isProcessing: false, isCaptureLifecycleActive: false) == true)
+        #expect(HistoryPanelController.isBlockedByRecording(isRecording: false, isProcessing: true, isCaptureLifecycleActive: false) == true)
+        #expect(HistoryPanelController.isBlockedByRecording(isRecording: true, isProcessing: true, isCaptureLifecycleActive: false) == true)
+        // The capture-journal finalization window: `recordingState` is already `.idle` and
+        // `isProcessing` never turns true, but `captureAdmission.state` is still active
+        // (`.preparing`/`.finalizing`) — the gate must still block. See P2 finding: history panel
+        // could open/insert while capture was still finalizing.
+        #expect(HistoryPanelController.isBlockedByRecording(isRecording: false, isProcessing: false, isCaptureLifecycleActive: true) == true)
     }
 
     // MARK: - Row display text (refined-else-transcript)

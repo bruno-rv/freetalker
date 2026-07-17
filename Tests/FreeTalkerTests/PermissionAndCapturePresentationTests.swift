@@ -48,6 +48,25 @@ import Testing
         #expect(AppCoordinator.capturedAudioIssue(sampleCount: 16_000, peak: 0.4, rms: 0.05) == nil)
     }
 
+    // MARK: - Microphone capture-health classification (shared by `stopAndTranscribe` and Voice
+    // Edit's `finishVoiceEditInstructionRecording` via `applyCaptureHealth`). See P2 finding:
+    // Voice Edit never assigned `microphoneCaptureHealth`, leaving Privacy showing stale health
+    // after a silent Voice Edit.
+
+    @Test func captureHealthIsNoSignalWithRouteFailureForASilentCapture() {
+        let diagnostics = CaptureDiagnostics(
+            peak: 0, rms: 0, inputDeviceUID: "device-1", routeFailure: "input vanished"
+        )
+        #expect(AppCoordinator.captureHealth(for: diagnostics) == .noSignal(route: "input vanished"))
+    }
+
+    @Test func captureHealthIsOKForANormalSignal() {
+        let diagnostics = CaptureDiagnostics(
+            peak: 0.4, rms: 0.05, inputDeviceUID: "device-1", routeFailure: nil
+        )
+        #expect(AppCoordinator.captureHealth(for: diagnostics) == .ok)
+    }
+
     // MARK: - PLAN.md F2: Permission Diagnosis state model
 
     @Test func accessibilityTrustedButTapDeadIsStaleGrantedOnlyWhenInputMonitoringAlsoClaimsGranted() {

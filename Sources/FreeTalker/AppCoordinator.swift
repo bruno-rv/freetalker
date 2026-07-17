@@ -116,6 +116,13 @@ final class AppCoordinator: ObservableObject {
     /// permission) and we're waiting for the user to grant it. See Round 1 Codex finding 8.
     @Published private(set) var hotKeyStatusText: String?
     @Published private(set) var isHotKeyListening = false
+    /// Mirrors `captureAdmission.state.isActive` for Combine consumers outside the coordinator
+    /// (e.g. `HistoryPanelController`). `recordingState` returns to `.idle` — and `isProcessing`
+    /// never turns true — for the async journal finalization window between a stop request and
+    /// `stopAndTranscribe`'s continuation landing (`.preparing`/`.finalizing` in
+    /// `CaptureAdmissionState`); `isRecording`/`isProcessing` alone can't see that window. See P2
+    /// finding: history panel could open/insert while capture was still finalizing.
+    @Published private(set) var isCaptureLifecycleActive = false
     /// Health of the most recently completed microphone capture (PLAN.md F2.1) — `.unknown`
     /// until a capture has actually run, set from `AudioCapture.signalDiagnostics()` at capture
     /// stop (see `stopAndTranscribe`). Never conflated with Microphone's TCC authorization.
@@ -264,6 +271,7 @@ final class AppCoordinator: ObservableObject {
     ) -> CaptureAdmissionAction {
         let action = captureAdmission.reduce(event)
         hotKeyManager.isCaptureLifecycleActive = captureAdmission.state.isActive
+        isCaptureLifecycleActive = captureAdmission.state.isActive
         return action
     }
 
@@ -614,6 +622,15 @@ final class AppCoordinator: ObservableObject {
         hotKeyManager.isRecording = false
         let samples = audioCapture.stop()
         let (peak, rms) = AudioLevel.peakAndRMS(samples)
+        // Voice Edit is a capture path too — Privacy's capture-health signal must reflect it the
+        // same way `stopAndTranscribe` does, or a silent Voice Edit leaves Privacy showing
+        // whatever health a prior normal dictation last reported. See P2 finding: Voice Edit
+        // never assigned `microphoneCaptureHealth`/refreshed the diagnosis.
+        applyCaptureHealth(diagnostics: CaptureDiagnostics(
+            peak: peak, rms: rms,
+            inputDeviceUID: AppSettings.shared.microphoneDeviceUID,
+            routeFailure: audioCapture.signalDiagnostics().routeFailure
+        ))
         if let issue = Self.capturedAudioIssue(sampleCount: samples.count, peak: peak, rms: rms) {
             hud.flash(issue)
             recordingHUDDidReachTerminalState()
@@ -1897,6 +1914,27 @@ final class AppCoordinator: ObservableObject {
         )
     }
 
+    /// Pure classification a completed capture's diagnostics map to for Permission Diagnosis's
+    /// Microphone capture-health signal (PLAN.md F2.1).
+    nonisolated static func captureHealth(for diagnostics: CaptureDiagnostics) -> MicrophoneCaptureHealth {
+        diagnostics.indicatesSilence ? .noSignal(route: diagnostics.routeFailure) : .ok
+    }
+
+    /// Applies a completed capture's silence classification to `microphoneCaptureHealth` — shared
+    /// by `stopAndTranscribe` (normal dictation) and `finishVoiceEditInstructionRecording` (Voice
+    /// Edit) so a silent capture on either path updates the signal and refreshes
+    /// `permissionDiagnosis` the same way. See P2 finding: Voice Edit computed peak/RMS + silence
+    /// detection but never assigned `microphoneCaptureHealth`, leaving Privacy showing stale
+    /// health after a silent Voice Edit. `permissionDiagnosis` is a snapshot, not a live
+    /// projection of `microphoneCaptureHealth` — it must be recomputed here or the Privacy tab
+    /// keeps showing whatever health value was true the last time something else refreshed it.
+    @discardableResult
+    private func applyCaptureHealth(diagnostics: CaptureDiagnostics) -> CaptureDiagnostics {
+        microphoneCaptureHealth = Self.captureHealth(for: diagnostics)
+        refreshPermissionDiagnosis()
+        return diagnostics
+    }
+
     private func stopAndTranscribe(
         preSnapshotted: (app: NSRunningApplication?, target: InsertionTarget?, contextTarget: ContextTargetSnapshot)? = nil,
         skipPostProcessing: Bool = false,
@@ -1931,17 +1969,7 @@ final class AppCoordinator: ObservableObject {
                 routeFailure: signal.routeFailure
             )
             active.writer.updateDiagnostics(diagnostics)
-            // Permission Diagnosis's Microphone capture-health signal (PLAN.md F2.1): reuses
-            // the exact silence classification the recovery path already applies to this same
-            // capture — read-only, no changes to `AudioCapture`'s own watchdog logic.
-            microphoneCaptureHealth = diagnostics.indicatesSilence
-                ? .noSignal(route: diagnostics.routeFailure)
-                : .ok
-            // `permissionDiagnosis` is a snapshot, not a live projection of `microphoneCaptureHealth`
-            // — recompute it now or the Privacy tab keeps showing whatever health value was true
-            // the last time something else refreshed it. See P2 finding: stale capture-health
-            // snapshot after this assignment.
-            refreshPermissionDiagnosis()
+            applyCaptureHealth(diagnostics: diagnostics)
             let service = CaptureJournalService(
                 fileSystem: LocalJournalFileSystem(), ledger: recoveryStore,
                 recoveryRoot: Self.recoveryDirectory

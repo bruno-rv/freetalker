@@ -107,6 +107,76 @@ struct BackupBundleTests {
         #expect(env.settings.handsFreeMaxMinutes == 7)
     }
 
+    @Test func rejectsABooleanJSONValueForAnIntegerSetting() async throws {
+        // A JSON `true`/`false` bridges to `NSNumber` and satisfies `as? Int` (as `1`/`0`) just
+        // like a real integer would — reject it instead of silently decoding
+        // `handsFreeMaxMinutes: true` as `1`. See P2 finding: JSON booleans bridge to NSNumber
+        // and silently decode as 1 for int-typed keys.
+        let env = try makeEnv()
+        env.settings.handsFreeMaxMinutes = 20
+        let data = try json(v2Payload(settings: ["handsFreeMaxMinutes": true]))
+
+        await #expect(throws: BackupBundleError.invalidSettingsValue(key: AppSettings.Keys.handsFreeMaxMinutes)) {
+            try await BackupBundle.restore(data: data, settings: env.settings, templateStore: env.templateStore, snippetStore: env.snippetStore)
+        }
+        #expect(env.settings.handsFreeMaxMinutes == 20)
+    }
+
+    @Test func rejectsABooleanJSONValueForADoubleSetting() async throws {
+        // Same bridging hazard as the integer case, for a double-typed key:
+        // `edgeLauncherPosition: true` must not silently decode as `1.0`.
+        let env = try makeEnv()
+        env.settings.edgeLauncherPosition = 0.25
+        let data = try json(v2Payload(settings: ["edgeLauncherPosition": true]))
+
+        await #expect(throws: BackupBundleError.invalidSettingsValue(key: AppSettings.Keys.edgeLauncherPosition)) {
+            try await BackupBundle.restore(data: data, settings: env.settings, templateStore: env.templateStore, snippetStore: env.snippetStore)
+        }
+        #expect(env.settings.edgeLauncherPosition == 0.25)
+    }
+
+    @Test func rejectsANumericJSONValueForABooleanSetting() async throws {
+        // Symmetric with the int/double fix above: `raw as? Bool` also succeeds for a plain
+        // numeric `NSNumber` (`1 as? Bool == true`), so a JSON `1` for a boolean-typed key
+        // (`noiseSuppressionEnabled`) must reject rather than silently decode as `true`. Locks in
+        // the reject-numeric-for-bool direction of the symmetry fix. See P2 finding: bool decode
+        // helper's reciprocal bridging hazard.
+        let env = try makeEnv()
+        env.settings.noiseSuppressionEnabled = true
+        let data = try json(v2Payload(settings: ["noiseSuppressionEnabled": 1]))
+
+        await #expect(throws: BackupBundleError.invalidSettingsValue(key: AppSettings.Keys.noiseSuppressionEnabled)) {
+            try await BackupBundle.restore(data: data, settings: env.settings, templateStore: env.templateStore, snippetStore: env.snippetStore)
+        }
+        #expect(env.settings.noiseSuppressionEnabled == true)
+    }
+
+    @Test func acceptsARealJSONBooleanForABooleanSetting() async throws {
+        // Guards the symmetry fix against over-rejecting: an actual JSON `false` still decodes
+        // cleanly for a boolean-typed key.
+        let env = try makeEnv()
+        env.settings.noiseSuppressionEnabled = true
+        let data = try json(v2Payload(settings: ["noiseSuppressionEnabled": false]))
+
+        _ = try await BackupBundle.restore(data: data, settings: env.settings, templateStore: env.templateStore, snippetStore: env.snippetStore)
+        #expect(env.settings.noiseSuppressionEnabled == false)
+    }
+
+    @Test func rejectsAnUnknownDefaultOutputLanguageInsteadOfCoercingToSameAsSpoken() async throws {
+        // `OutputLanguage.persisted` coerces any unrecognized raw value to `.sameAsSpoken` — that
+        // leniency is correct for reading old/foreign UserDefaults at app launch, but restore is
+        // validate-then-apply: an unknown raw value must reject the whole bundle naming this key.
+        // See P2 finding: invalid defaultOutputLanguage silently coerced instead of throwing.
+        let env = try makeEnv()
+        env.settings.defaultOutputLanguage = .english
+        let data = try json(v2Payload(settings: ["defaultOutputLanguage": "klingon"]))
+
+        await #expect(throws: BackupBundleError.invalidSettingsValue(key: AppSettings.Keys.defaultOutputLanguage)) {
+            try await BackupBundle.restore(data: data, settings: env.settings, templateStore: env.templateStore, snippetStore: env.snippetStore)
+        }
+        #expect(env.settings.defaultOutputLanguage == .english)
+    }
+
     @Test func rejectsTooManyAppRulesEntries() async throws {
         let env = try makeEnv()
         var appRules: [String: String] = [:]
