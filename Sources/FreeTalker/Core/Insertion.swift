@@ -206,7 +206,17 @@ enum Insertion {
         guard pidMatch else { return false }
         switch elementComparison {
         case .mismatch: return false
-        case .match, .unavailable: return true
+        case .match: return true
+        // Matching bundle id/pid only proves it's the same APP, not the same focused field — a
+        // same-app focus change (e.g. the user tabbed to a different field, or a new window took
+        // focus) between snapshot and paste is exactly as unverifiable as the nil-bundle-id case
+        // above when the element comparison itself is AX-opaque. Non-strict (ordinary dictation)
+        // callers keep the pre-fix permissive behavior since they have no better signal to fall
+        // back on; `strict` callers (the History panel, replaying old text into whatever is
+        // frontmost right now) must never paste on an unverified identity. See P1 finding: strict
+        // mode accepted `.unavailable` and could paste history text into the wrong field after a
+        // same-app focus change.
+        case .unavailable: return !strict
         }
     }
 

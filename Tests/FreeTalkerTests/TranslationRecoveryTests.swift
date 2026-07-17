@@ -360,6 +360,26 @@ struct TranslationRecoveryTests {
         #expect(controller.pendingRecoveries.isEmpty)
     }
 
+    @Test func externalRetryThreadsTheOriginalCaptureDurationIntoTheResolvedHistoryRecord() async {
+        // The duration is captured at enqueue time (`OutputTranslationFailure` doesn't carry it)
+        // and must survive `replacingGeneration()` on retry to reach `recordResolved`. See P2
+        // finding 4: translation recovery recorded resolved output without the original duration.
+        var records: [TranslationRecoveryHistoryRecord] = []
+        let failure = Self.failure(source: "raw source")
+        let controller = PendingTranslationRecoveryController(
+            snapshot: { Self.snapshot(model: "fresh") },
+            translate: { _, _, _, _ in "translated" },
+            deliver: { _, _, _ in true },
+            recordResolved: { records.append($0) }
+        )
+        controller.enqueue(failure, durationSecs: 12.5)
+
+        await controller.retryTranslation(id: failure.id)
+
+        #expect(records.count == 1)
+        #expect(records.first?.durationSecs == 12.5)
+    }
+
     @Test func externalSourceRecoveryRecordsSourceAsFinalExactlyOnce() {
         var records: [TranslationRecoveryHistoryRecord] = []
         var deliveries = 0

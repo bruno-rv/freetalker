@@ -241,7 +241,18 @@ private enum SettingsPatchDecoding {
         }
         func int(_ raw: Any, _ key: String) throws -> Int {
             if let value = raw as? Int { return value }
-            if let number = raw as? NSNumber { return number.intValue }
+            if let number = raw as? NSNumber {
+                // `NSNumber.intValue` truncates toward zero — a fractional JSON value (e.g.
+                // `5.9`) would silently become `5` instead of being rejected. Reject anything
+                // that isn't a whole number rather than coerce it. See P2 finding: fractional
+                // integer-setting truncation.
+                let double = number.doubleValue
+                guard double.truncatingRemainder(dividingBy: 1) == 0,
+                      double >= Double(Int.min), double <= Double(Int.max) else {
+                    throw BackupBundleError.invalidSettingsValue(key: key)
+                }
+                return number.intValue
+            }
             throw BackupBundleError.invalidSettingsValue(key: key)
         }
         func stringDict(_ raw: Any, _ key: String) throws -> [String: String] {

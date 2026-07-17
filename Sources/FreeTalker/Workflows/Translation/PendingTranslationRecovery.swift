@@ -16,12 +16,18 @@ struct PendingTranslationRecovery {
     let generation: UUID
     let capturedExternalTarget: InsertionTarget?
     var recoverableText: String
+    /// Original capture duration in seconds, captured by the caller enqueueing this failure (see
+    /// `AppCoordinator.handleOutputTranslationFailure`) — `OutputTranslationFailure` itself
+    /// doesn't carry it, so it's threaded in here rather than read off `failure`. See P2 finding:
+    /// translation recovery records resolved output without the original capture duration.
+    let durationSecs: Double?
 
     init(
         failure: OutputTranslationFailure,
         generation: UUID = UUID(),
         capturedExternalTarget: InsertionTarget? = nil,
-        recoverableText: String? = nil
+        recoverableText: String? = nil,
+        durationSecs: Double? = nil
     ) {
         failureID = failure.id
         sourceTranscript = failure.source
@@ -36,6 +42,7 @@ struct PendingTranslationRecovery {
         self.generation = generation
         self.capturedExternalTarget = capturedExternalTarget
         self.recoverableText = recoverableText ?? failure.source
+        self.durationSecs = durationSecs
     }
 
     private init(replacingGenerationOf recovery: Self, with generation: UUID) {
@@ -49,6 +56,7 @@ struct PendingTranslationRecovery {
         self.generation = generation
         capturedExternalTarget = recovery.capturedExternalTarget
         recoverableText = recovery.recoverableText
+        durationSecs = recovery.durationSecs
     }
 
     func replacingGeneration(with generation: UUID = UUID()) -> Self {
@@ -66,6 +74,9 @@ struct TranslationRecoveryHistoryRecord: Equatable {
     /// Destination app known from the captured external target, if any. NULL for scratchpad
     /// destinations or when no target was captured. See PLAN.md F4.2.
     var bundleID: String? = nil
+    /// Original capture duration in seconds, when known. See P2 finding: translation recovery
+    /// records resolved output without the original capture duration.
+    var durationSecs: Double? = nil
 }
 
 struct TranslationRecoveryPresentation: Equatable {
@@ -130,9 +141,11 @@ final class PendingTranslationRecoveryController {
 
     var pendingRecoveries: [PendingTranslationRecovery] { recoveries }
 
-    func enqueue(_ failure: OutputTranslationFailure, externalTarget: InsertionTarget? = nil) {
+    func enqueue(_ failure: OutputTranslationFailure, externalTarget: InsertionTarget? = nil, durationSecs: Double? = nil) {
         guard !recoveries.contains(where: { $0.failureID == failure.id }) else { return }
-        recoveries.append(PendingTranslationRecovery(failure: failure, capturedExternalTarget: externalTarget))
+        recoveries.append(PendingTranslationRecovery(
+            failure: failure, capturedExternalTarget: externalTarget, durationSecs: durationSecs
+        ))
         onChange()
     }
 
@@ -253,7 +266,8 @@ final class PendingTranslationRecoveryController {
                 requestedOutputLanguage: OutputLanguage(rawValue: recovery.outputLanguage.rawValue) ?? .sameAsSpoken,
                 templateName: recovery.template.name,
                 engineName: recovery.engineName,
-                bundleID: recovery.capturedExternalTarget?.bundleID
+                bundleID: recovery.capturedExternalTarget?.bundleID,
+                durationSecs: recovery.durationSecs
             ))
         } catch {
             onHistoryFailure("Library save failed")

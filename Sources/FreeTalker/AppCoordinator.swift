@@ -866,10 +866,11 @@ final class AppCoordinator: ObservableObject {
 
     func handleOutputTranslationFailure(
         _ failure: OutputTranslationFailure,
-        externalTarget: InsertionTarget?
+        externalTarget: InsertionTarget?,
+        durationSecs: Double? = nil
     ) -> String {
         enqueueOutputTranslationFailure(failure)
-        translationRecoveryController.enqueue(failure, externalTarget: externalTarget)
+        translationRecoveryController.enqueue(failure, externalTarget: externalTarget, durationSecs: durationSecs)
         return failure.localizedDescription
     }
 
@@ -909,7 +910,8 @@ final class AppCoordinator: ObservableObject {
                     transcript: record.rawTranscript,
                     refined: record.finalOutput,
                     engine: record.engineName,
-                    bundleID: record.bundleID
+                    bundleID: record.bundleID,
+                    durationSecs: record.durationSecs
                 )
             },
             onHistoryFailure: { [weak self] message in self?.hud.flash(message) },
@@ -1935,6 +1937,11 @@ final class AppCoordinator: ObservableObject {
             microphoneCaptureHealth = diagnostics.indicatesSilence
                 ? .noSignal(route: diagnostics.routeFailure)
                 : .ok
+            // `permissionDiagnosis` is a snapshot, not a live projection of `microphoneCaptureHealth`
+            // — recompute it now or the Privacy tab keeps showing whatever health value was true
+            // the last time something else refreshed it. See P2 finding: stale capture-health
+            // snapshot after this assignment.
+            refreshPermissionDiagnosis()
             let service = CaptureJournalService(
                 fileSystem: LocalJournalFileSystem(), ledger: recoveryStore,
                 recoveryRoot: Self.recoveryDirectory
@@ -2722,7 +2729,11 @@ final class AppCoordinator: ObservableObject {
                     stage: .postProcessing,
                     message: failure.localizedDescription
                 ))
-                let message = handleOutputTranslationFailure(failure, externalTarget: target)
+                // `durationSecs` is this call's own parameter (computed by the caller from the
+                // original capture's sample count) — still in scope here, so thread it through
+                // rather than losing it. See P2 finding: translation recovery records resolved
+                // output without the original capture duration.
+                let message = handleOutputTranslationFailure(failure, externalTarget: target, durationSecs: durationSecs)
                 lastError = message
             },
             onFailure: { error in
@@ -2875,7 +2886,13 @@ final class AppCoordinator: ObservableObject {
                                     stage: .postProcessing,
                                     message: failure.localizedDescription
                                 ))
-                                let message = handleOutputTranslationFailure(failure)
+                                // Passed for symmetry with the external-destination call site;
+                                // `recordHistoryIfNeeded` only persists `.external` recoveries, so
+                                // this duration is currently inert for scratchpad destinations.
+                                let message = handleOutputTranslationFailure(
+                                    failure, externalTarget: nil,
+                                    durationSecs: Double(staged.sampleCount) / Double(CaptureSegmentCodec.sampleRate)
+                                )
                                 lastError = message
                             },
                             onFailure: { error in
@@ -3498,7 +3515,15 @@ final class AppCoordinator: ObservableObject {
             template: template.name,
             transcript: transcription.text,
             refined: transcription.text,
-            engine: "WhisperKit"
+            engine: "WhisperKit",
+            // `samples` is the exact PCM this recovery job just decoded from the recovery wav
+            // (`RecoveryRetryPipeline.loadSamples`) — those files are always written at
+            // `CaptureSegmentCodec.sampleRate` (16kHz), the same constant the live-capture path
+            // uses to compute duration (see `durationSecs: Double(staged.sampleCount) / ...`
+            // elsewhere in this file). So the duration IS recoverable here even though the
+            // original segments/StagedCapture are long gone by the time a recovery job runs. See
+            // P2 finding: recovered rows persisted with NULL duration.
+            duration: Double(samples.count) / Double(CaptureSegmentCodec.sampleRate)
         )
         try Self.persistRecoveredDictation(dictation, captureID: captureID)
         return dictation
@@ -3519,7 +3544,8 @@ final class AppCoordinator: ObservableObject {
                     transcript: dictation.transcript,
                     refined: dictation.refined,
                     engine: dictation.engine,
-                    captureID: captureID
+                    captureID: captureID,
+                    durationSecs: dictation.duration
                 )
             }
         } catch {

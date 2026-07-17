@@ -4,14 +4,20 @@ import Testing
 
 @Suite struct RecoveryRetryTests {
     @MainActor @Test func recoveredDictationMustPersistBeforeItsAudioCanBeFinalized() throws {
+        // `duration: 3.5` here proves the field carries through `persistRecoveredDictation` to the
+        // record boundary (`persisted == dictation` compares it). The upstream computation
+        // (`samples.count / CaptureSegmentCodec.sampleRate` in `processRecoveredDictation`) stays
+        // whisper-bound and isn't exercised here. See P2 finding 3.
         let dictation = RecoveryDictation(
-            language: "pt", template: "Clean", transcript: "raw", refined: "refined", engine: "WhisperKit"
+            language: "pt", template: "Clean", transcript: "raw", refined: "refined",
+            engine: "WhisperKit", duration: 3.5
         )
         var persisted: RecoveryDictation?
 
         try AppCoordinator.persistRecoveredDictation(dictation) { persisted = $0 }
 
         #expect(persisted == dictation)
+        #expect(persisted?.duration == 3.5)
     }
 
     @MainActor @Test func recoveredDictationPersistenceFailureIsClassifiedAsPersisting() {

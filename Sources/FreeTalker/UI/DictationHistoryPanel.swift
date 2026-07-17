@@ -132,6 +132,20 @@ final class HistoryPanelController: ObservableObject {
     /// still insert its stale cached text. A failed revalidation drops the row from the panel
     /// instead of inserting. See Codex finding: cached-row insert after permanent deletion.
     func selectRow(id: Int64) {
+        // `recordingGateCancellable`'s Combine pipeline (`init` above) is the async path that
+        // force-closes the panel when recording/processing starts — `.receive(on:)` always hops
+        // through `DispatchQueue.main.async` even when already on the main queue, so there's a
+        // window between the state change and that close() where a click can still reach this
+        // method. Check the state directly and synchronously, same predicate `open()` uses,
+        // before touching the row cache or inserting. See P2 finding: close-on-recording gate is
+        // async, selectRow had no synchronous guard.
+        guard !Self.isBlockedByRecording(
+            isRecording: AppCoordinator.shared.isRecording,
+            isProcessing: AppCoordinator.shared.isProcessing
+        ) else {
+            close()
+            return
+        }
         guard let dictation = dictationsByID[id] else { return }
         guard Self.shouldInsertRow(exists: LibraryStore.shared.exists(id: id)) else {
             dictationsByID.removeValue(forKey: id)

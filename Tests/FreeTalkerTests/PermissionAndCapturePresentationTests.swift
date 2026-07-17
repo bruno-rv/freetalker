@@ -283,6 +283,40 @@ import Testing
         ) == true)
     }
 
+    @Test func strictModeTreatsAnUnavailableElementComparisonAsDrift() {
+        // Matching bundle id + matching pid proves the same APP, not the same focused field. When
+        // the element comparison is AX-opaque (`.unavailable`), a same-app focus change between
+        // snapshot and paste can't be ruled out. Non-strict (ordinary dictation) keeps pasting —
+        // it has no better signal — but `strict` (the History panel replaying old text into
+        // whatever is frontmost now) must refuse. See P1 finding.
+        #expect(Insertion.shouldSynthesizePaste(
+            hasTarget: true, snapshotBundleID: "com.example.app", currentBundleID: "com.example.app",
+            pidMatch: true, elementComparison: .unavailable, strict: false
+        ) == true)
+        #expect(Insertion.shouldSynthesizePaste(
+            hasTarget: true, snapshotBundleID: "com.example.app", currentBundleID: "com.example.app",
+            pidMatch: true, elementComparison: .unavailable, strict: true
+        ) == false)
+    }
+
+    @Test func classifyPreflightFailureUnderStrictModeReportsDriftForUnavailableElementIdentity() {
+        // End-to-end through `classifyPreflightFailure`: matching bundle/pid but an `.unavailable`
+        // element comparison under strict mode is `.targetDrift` (manual paste), never a
+        // successful (nil) classification.
+        let reason = Insertion.classifyPreflightFailure(
+            hasTarget: true, snapshotBundleID: "com.example.app", currentBundleID: "com.example.app",
+            pidMatch: true, elementComparison: .unavailable,
+            hasEditableFocusedElement: true, accessibilityTrusted: true, strict: true
+        )
+        #expect(reason == .targetDrift)
+        // Same inputs, non-strict: still proceeds (nil = no preflight failure).
+        #expect(Insertion.classifyPreflightFailure(
+            hasTarget: true, snapshotBundleID: "com.example.app", currentBundleID: "com.example.app",
+            pidMatch: true, elementComparison: .unavailable,
+            hasEditableFocusedElement: true, accessibilityTrusted: true, strict: false
+        ) == nil)
+    }
+
     @Test func classifyPreflightFailureUnderStrictModeReportsTargetDriftForANilTarget() {
         // End-to-end through `classifyPreflightFailure`: the panel's strict nil-target case
         // classifies as `.targetDrift` (posted = false, manual-paste HUD messaging), never as a

@@ -82,6 +82,31 @@ struct BackupBundleTests {
         }
     }
 
+    @Test func rejectsFractionalValueForAnIntegerSettingInsteadOfTruncating() async throws {
+        // A JSON number with a fractional part for an integer-typed key (handsFreeMaxMinutes)
+        // must reject the whole bundle naming the key, not silently truncate 5.9 -> 5 via
+        // NSNumber.intValue. See P2 finding: integer decode truncates fractional JSON silently.
+        let env = try makeEnv()
+        env.settings.handsFreeMaxMinutes = 20
+        let data = try json(v2Payload(settings: ["handsFreeMaxMinutes": 5.9]))
+
+        await #expect(throws: BackupBundleError.invalidSettingsValue(key: AppSettings.Keys.handsFreeMaxMinutes)) {
+            try await BackupBundle.restore(data: data, settings: env.settings, templateStore: env.templateStore, snippetStore: env.snippetStore)
+        }
+        // Reject-before-write: the pre-restore value is untouched.
+        #expect(env.settings.handsFreeMaxMinutes == 20)
+    }
+
+    @Test func acceptsAWholeNumberJSONValueForAnIntegerSetting() async throws {
+        // Guards the fractional-reject change against over-rejecting: a whole-number double
+        // (JSON has no int/double distinction) still decodes cleanly.
+        let env = try makeEnv()
+        let data = try json(v2Payload(settings: ["handsFreeMaxMinutes": 7.0]))
+
+        _ = try await BackupBundle.restore(data: data, settings: env.settings, templateStore: env.templateStore, snippetStore: env.snippetStore)
+        #expect(env.settings.handsFreeMaxMinutes == 7)
+    }
+
     @Test func rejectsTooManyAppRulesEntries() async throws {
         let env = try makeEnv()
         var appRules: [String: String] = [:]

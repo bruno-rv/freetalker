@@ -7,6 +7,12 @@ struct RecoveryDictation: Sendable, Equatable {
     let transcript: String
     let refined: String
     let engine: String
+    /// Original capture duration in seconds, when the caller building this value has it (e.g. from
+    /// the sample count it just decoded the recovery audio into). `var`+default rather than a
+    /// required `let` so existing call sites (including tests) that don't have a duration to
+    /// report keep compiling unchanged. See P2 finding: recovered rows persisted with NULL
+    /// duration even when it was recoverable.
+    var duration: Double? = nil
 }
 
 protocol RecoveryRetryStoring: Sendable {
