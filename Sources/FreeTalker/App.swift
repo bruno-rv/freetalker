@@ -53,6 +53,9 @@ struct FreeTalkerApp: App {
         // One unified entry point: creates the tap, or (on failure) starts the 2s retry poll
         // and status text — the same path also used by app activation and hotkey reassignment.
         AppCoordinator.shared.ensureHotKeyListening()
+        // `ensureHotKeyListening()` settles `isHotKeyListening` synchronously, so this catches
+        // the real tap-operational status in the launch-time Permission Diagnosis snapshot.
+        AppCoordinator.shared.refreshPermissionDiagnosis()
         _ = ScratchpadWindowController.shared
 
         let floatingControlsController = FloatingControlsController(
@@ -82,8 +85,10 @@ struct FreeTalkerApp: App {
     }
 
     var body: some Scene {
-        MenuBarExtra("FreeTalker", systemImage: "waveform") {
+        MenuBarExtra {
             MenuBarContentView()
+        } label: {
+            MenuBarIconLabel()
         }
 
         Window("Settings", id: "settings") {
@@ -91,6 +96,24 @@ struct FreeTalkerApp: App {
                 .background(SettingsWindowConfigurator())
         }
         .windowResizability(.contentSize)
+    }
+}
+
+/// The `MenuBarExtra`'s label — bound to `AppCoordinator.permissionDiagnosis` so it can swap
+/// visually when a required permission goes `denied`/`staleGranted` (PLAN.md F2.3). A static
+/// `MenuBarExtra("FreeTalker", systemImage:)` label can't do this at all — SwiftUI only
+/// re-renders a label supplied via the closure-based initializer.
+private struct MenuBarIconLabel: View {
+    @ObservedObject private var coordinator = AppCoordinator.shared
+
+    var body: some View {
+        if coordinator.permissionDiagnosis.requiresWarning {
+            Image(systemName: "waveform.badge.exclamationmark")
+                .accessibilityLabel("FreeTalker — a required permission needs attention")
+        } else {
+            Image(systemName: "waveform")
+                .accessibilityLabel("FreeTalker")
+        }
     }
 }
 
@@ -180,7 +203,12 @@ private struct MenuBarContentView: View {
             Button("Quit FreeTalker") { NSApplication.shared.terminate(nil) }
                 .keyboardShortcut("q")
         }
-        .onAppear { accessibilityTrusted = Permissions.isAccessibilityTrusted() }
+        .onAppear {
+            accessibilityTrusted = Permissions.isAccessibilityTrusted()
+            // Menu open is one of Permission Diagnosis's explicit recompute triggers
+            // (PLAN.md F2.3).
+            coordinator.refreshPermissionDiagnosis()
+        }
     }
 
     /// "Auto" plus the configured Dictation Language Set (F5.5) — the single presentation

@@ -19,6 +19,34 @@ struct InsertionTarget {
     let window: AXUIElement?
 }
 
+/// `Insertion.insert`'s structured failure reason (PLAN.md F2.4). Only `axDenied` is
+/// permission-class — `targetDrift`/`noFocusedElement`/`pasteFailed` are expected steady-state
+/// outcomes (a drifted target, an empty focus target, a CGEvent post glitch), not permission
+/// regressions, so Permission Diagnosis recompute is gated on `isPermissionClassFailure`.
+enum InsertionFailureReason: Equatable, Sendable {
+    case axDenied
+    case targetDrift
+    case noFocusedElement
+    case pasteFailed
+}
+
+/// Replaces the bare `Bool` `Insertion.insert` used to return: `posted` preserves the exact
+/// truthiness every existing caller already branches on, `failureReason` adds the classification
+/// PLAN.md F2.4 asks for without changing that truthiness at any return point.
+struct InsertionOutcome: Equatable, Sendable {
+    let posted: Bool
+    let failureReason: InsertionFailureReason?
+
+    static let success = InsertionOutcome(posted: true, failureReason: nil)
+    static func failure(_ reason: InsertionFailureReason) -> InsertionOutcome {
+        InsertionOutcome(posted: false, failureReason: reason)
+    }
+
+    var isPermissionClassFailure: Bool {
+        failureReason == .axDenied
+    }
+}
+
 enum Insertion {
     /// Compares a snapshotted focused element/window against what's focused now. `.unavailable`
     /// covers both "no snapshot was taken at all" and "the snapshot app was AX-opaque, so
@@ -54,7 +82,7 @@ enum Insertion {
     /// re-process) preserves the pre-fix behavior of always pasting. See Codex finding: paste-
     /// target drift / same-app target drift.
     @discardableResult
-    static func insert(_ text: String, target: InsertionTarget? = nil) -> Bool {
+    static func insert(_ text: String, target: InsertionTarget? = nil) -> InsertionOutcome {
         let pasteboard = NSPasteboard.general
         let savedItems: [[NSPasteboard.PasteboardType: Data]] = pasteboard.pasteboardItems?.map { item in
             var dict: [NSPasteboard.PasteboardType: Data] = [:]
@@ -81,22 +109,19 @@ enum Insertion {
         let pidMatch = target.map { $0.pid == currentApp?.processIdentifier } ?? true
         let elementComparison = compareElements(snapshot: target, currentElement: currentElement, currentWindow: currentWindow)
 
-        guard shouldSynthesizePaste(
+        if let reason = classifyPreflightFailure(
             hasTarget: target != nil,
             snapshotBundleID: target?.bundleID,
             currentBundleID: currentBundleID,
             pidMatch: pidMatch,
-            elementComparison: elementComparison
-        ) else {
-            // Identity drifted since the snapshot — leave the text on the pasteboard for a
-            // manual paste rather than pasting into whatever now has focus.
-            return false
-        }
-
-        guard isEditableFocusedElement(currentElement) else {
-            // No focused element, or AX affirmatively says it's not a text control — leave our
-            // text on the pasteboard and don't touch it further. See Round 2 Codex finding 1.
-            return false
+            elementComparison: elementComparison,
+            hasEditableFocusedElement: isEditableFocusedElement(currentElement),
+            accessibilityTrusted: Permissions.isAccessibilityTrusted()
+        ) {
+            // Either identity drifted since the snapshot (leave the text on the pasteboard for
+            // a manual paste rather than pasting into whatever now has focus), or there's no
+            // focused element to paste into — see Round 2 Codex finding 1.
+            return .failure(reason)
         }
 
         let posted = postCommandV()
@@ -114,7 +139,38 @@ enum Insertion {
                 restore(savedItems, to: pasteboard)
             }
         }
-        return posted
+        return posted ? .success : .failure(.pasteFailed)
+    }
+
+    /// Pure classification of `insert`'s pre-paste failure reason (PLAN.md F2.4), factored out of
+    /// `insert` so it's testable without a live AX/pasteboard environment — same style as
+    /// `shouldSynthesizePaste` below. Returns nil when the paste should proceed.
+    nonisolated static func classifyPreflightFailure(
+        hasTarget: Bool,
+        snapshotBundleID: String?,
+        currentBundleID: String?,
+        pidMatch: Bool,
+        elementComparison: ElementComparison,
+        hasEditableFocusedElement: Bool,
+        accessibilityTrusted: Bool
+    ) -> InsertionFailureReason? {
+        guard shouldSynthesizePaste(
+            hasTarget: hasTarget,
+            snapshotBundleID: snapshotBundleID,
+            currentBundleID: currentBundleID,
+            pidMatch: pidMatch,
+            elementComparison: elementComparison
+        ) else {
+            return .targetDrift
+        }
+        guard hasEditableFocusedElement else {
+            // No focused element is the visible symptom both of a genuinely empty focus target
+            // and of Accessibility not being trusted (the AX queries in `insert` silently return
+            // nil either way) — disambiguate since only the latter is Permission Diagnosis-
+            // relevant.
+            return accessibilityTrusted ? .noFocusedElement : .axDenied
+        }
+        return nil
     }
 
     nonisolated static func shouldSynthesizePaste(

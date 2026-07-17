@@ -103,6 +103,13 @@ final class AppCoordinator: ObservableObject {
     /// permission) and we're waiting for the user to grant it. See Round 1 Codex finding 8.
     @Published private(set) var hotKeyStatusText: String?
     @Published private(set) var isHotKeyListening = false
+    /// Health of the most recently completed microphone capture (PLAN.md F2.1) — `.unknown`
+    /// until a capture has actually run, set from `AudioCapture.signalDiagnostics()` at capture
+    /// stop (see `stopAndTranscribe`). Never conflated with Microphone's TCC authorization.
+    @Published private(set) var microphoneCaptureHealth: MicrophoneCaptureHealth = .unknown
+    /// Coordinator-owned Permission Diagnosis snapshot (PLAN.md F2, CONTEXT.md). Recomputed on
+    /// demand via `refreshPermissionDiagnosis()` — never polled.
+    @Published private(set) var permissionDiagnosis = PermissionDiagnosis()
 
     /// Source of truth for the hands-free gesture (Amendment B): idle / pttRecording /
     /// locked. `isRecording` and `hotKeyManager.isRecording` (consulted synchronously by the
@@ -377,6 +384,10 @@ final class AppCoordinator: ObservableObject {
                 Self.recoverHotKeyListeningIfNeeded(isListening: self.hotKeyManager.isListening) {
                     self.ensureHotKeyListening()
                 }
+                // App activation is one of Permission Diagnosis's explicit recompute triggers
+                // (PLAN.md F2.3) — catches permissions granted/revoked in System Settings while
+                // this app was backgrounded.
+                self.refreshPermissionDiagnosis()
             }
         }
         // Amendment B3: clicking the HUD pill locks an in-progress PTT recording or stops a
@@ -391,6 +402,10 @@ final class AppCoordinator: ObservableObject {
         hud.onPanelLock = { [weak self] in self?.handlePillClick() }
         hud.onRetryTranslation = { [weak self] in self?.retryNextTranslation() }
         hud.onInsertSourceText = { [weak self] in self?.insertNextTranslationSource() }
+        // Seeds an initial Permission Diagnosis snapshot; `ensureHotKeyListening()` (called by
+        // App.swift right after construction) settles `isHotKeyListening` before the menu bar or
+        // Privacy tab can first observe it.
+        refreshPermissionDiagnosis()
     }
 
     func selectRecordingOutput(_ language: OutputLanguage) {
@@ -548,6 +563,7 @@ final class AppCoordinator: ObservableObject {
         guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
             hud.flash("Microphone not authorized — check System Settings")
             pendingVoiceEditSelection = nil
+            refreshPermissionDiagnosis()
             return
         }
         do {
@@ -696,6 +712,37 @@ final class AppCoordinator: ObservableObject {
         ensureHotKeyListening()
     }
 
+    /// Recomputes `permissionDiagnosis` from current TCC/AX/IOHID claims plus the tap's actual
+    /// operational status (PLAN.md F2.1/F2.3). Deliberately on-demand only — call sites are:
+    /// app activation, menu-bar menu open, the Privacy tab's "Run Diagnosis" button, and
+    /// permission-class insertion/capture failures. Never polled.
+    func refreshPermissionDiagnosis() {
+        let settings = AppSettings.shared
+        let inputMonitoringRequired = PermissionDiagnosis.anyHotKeyBound(
+            pttSpec: settings.hotKeySpec,
+            insertLastDictationSpec: settings.insertLastDictationHotKeySpec,
+            voiceEditSpec: settings.voiceEditHotKeySpec,
+            historyPanelSpec: settings.historyPanelHotKeySpec
+        )
+        let inputMonitoringRawAuthorized = Permissions.isInputMonitoringAuthorized()
+        permissionDiagnosis = PermissionDiagnosis(
+            accessibility: PermissionDiagnosis.accessibilityState(
+                rawTrusted: Permissions.isAccessibilityTrusted(),
+                hotKeyOperational: isHotKeyListening,
+                inputMonitoringRawAuthorized: inputMonitoringRawAuthorized
+            ),
+            microphone: PermissionDiagnosis.microphoneAuthorizationState(
+                AVCaptureDevice.authorizationStatus(for: .audio)
+            ),
+            microphoneCaptureHealth: microphoneCaptureHealth,
+            inputMonitoring: PermissionDiagnosis.inputMonitoringState(
+                rawAuthorized: inputMonitoringRawAuthorized,
+                hotKeyOperational: isHotKeyListening
+            ),
+            inputMonitoringRequired: inputMonitoringRequired
+        )
+    }
+
     nonisolated static func captureStartFailureMessage(errorDescription: String) -> String {
         "Could not start recording: \(errorDescription)"
     }
@@ -826,7 +873,9 @@ final class AppCoordinator: ObservableObject {
                 guard let self else { return false }
                 switch destination {
                 case .external:
-                    return Insertion.insert(text, target: externalTarget)
+                    let outcome = Insertion.insert(text, target: externalTarget)
+                    if outcome.isPermissionClassFailure { self.refreshPermissionDiagnosis() }
+                    return outcome.posted
                 case .scratchpad(let token):
                     return self.scratchpadRecordingRouter?.completeTranslationRecovery(text, for: token) ?? false
                 }
@@ -1226,6 +1275,7 @@ final class AppCoordinator: ObservableObject {
             recordingOutputSelection.resolveTerminal()
             let message = "Microphone not authorized — check System Settings › Privacy & Security › Microphone"
             hud.flash(message)
+            refreshPermissionDiagnosis()
             _ = destinationLifecycle.begin(destination, start: { false }, failureMessage: { message })
             return false
         }
@@ -1855,6 +1905,12 @@ final class AppCoordinator: ObservableObject {
                 routeFailure: signal.routeFailure
             )
             active.writer.updateDiagnostics(diagnostics)
+            // Permission Diagnosis's Microphone capture-health signal (PLAN.md F2.1): reuses
+            // the exact silence classification the recovery path already applies to this same
+            // capture — read-only, no changes to `AudioCapture`'s own watchdog logic.
+            microphoneCaptureHealth = diagnostics.indicatesSilence
+                ? .noSignal(route: diagnostics.routeFailure)
+                : .ok
             let service = CaptureJournalService(
                 fileSystem: LocalJournalFileSystem(), ledger: recoveryStore,
                 recoveryRoot: Self.recoveryDirectory
@@ -2860,7 +2916,7 @@ final class AppCoordinator: ObservableObject {
         processor: (any PostProcessor)? = nil,
         translator: any Translating = TranslationService(),
         localContext: LocalProcessingContext? = nil,
-        insert: (String, InsertionTarget?) -> Bool = { Insertion.insert($0, target: $1) },
+        insert: (String, InsertionTarget?) -> Bool = { Insertion.insert($0, target: $1).posted },
         record: (RecordingProcessingResult) throws -> Void = { result in
             try LibraryStore.shared.record(
                 language: result.sourceLanguage.rawValue,
@@ -2900,7 +2956,7 @@ final class AppCoordinator: ObservableObject {
         processor: (any PostProcessor)? = nil,
         translator: any Translating = TranslationService(),
         localContext: LocalProcessingContext? = nil,
-        insert: (String, InsertionTarget?) -> Bool = { Insertion.insert($0, target: $1) },
+        insert: (String, InsertionTarget?) -> Bool = { Insertion.insert($0, target: $1).posted },
         record: (RecordingProcessingResult) throws -> Void = { result in
             try LibraryStore.shared.record(
                 language: result.sourceLanguage.rawValue,
@@ -3484,7 +3540,8 @@ final class AppCoordinator: ObservableObject {
             refined = dictation.transcript
             fallbackReason = .error(error)
         }
-        Insertion.insert(refined)
+        let reprocessOutcome = Insertion.insert(refined)
+        if reprocessOutcome.isPermissionClassFailure { refreshPermissionDiagnosis() }
         if LibraryStore.shared.exists(id: dictation.id) == false {
             return
         }
@@ -3554,8 +3611,9 @@ final class AppCoordinator: ObservableObject {
         case .libraryUnavailable:
             hud.flash("Library unavailable")
         case .insert(let refined):
-            let posted = Insertion.insert(refined)
-            hud.flash(Self.insertLastDictationResultMessage(posted: posted))
+            let outcome = Insertion.insert(refined)
+            if outcome.isPermissionClassFailure { refreshPermissionDiagnosis() }
+            hud.flash(Self.insertLastDictationResultMessage(posted: outcome.posted))
         }
     }
 
@@ -3582,9 +3640,10 @@ final class AppCoordinator: ObservableObject {
     /// unverified paste. See PLAN.md F3.2.
     @discardableResult
     func insertFromHistoryPanel(_ text: String, target: InsertionTarget?) -> Bool {
-        let posted = Insertion.insert(text, target: target)
-        hud.flash(Self.insertLastDictationResultMessage(posted: posted))
-        return posted
+        let outcome = Insertion.insert(text, target: target)
+        if outcome.isPermissionClassFailure { refreshPermissionDiagnosis() }
+        hud.flash(Self.insertLastDictationResultMessage(posted: outcome.posted))
+        return outcome.posted
     }
 }
 

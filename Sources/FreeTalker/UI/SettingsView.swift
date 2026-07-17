@@ -355,6 +355,7 @@ private struct GeneralSettingsView: View {
                 subtitle: "Permissions and on-device context"
             ) {
                 permissionsCard
+                permissionDiagnosisCard
                 SettingsCard(title: "Local privacy", subtitle: "Choose what on-device context FreeTalker may use") {
                     localContextSection
                 }
@@ -574,6 +575,65 @@ private struct GeneralSettingsView: View {
                     .foregroundStyle(.orange)
                     .padding(.bottom, 8)
             }
+        }
+    }
+
+    /// Permission Diagnosis (PLAN.md F2.2, CONTEXT.md): on-demand check of real capability
+    /// (tap-operational status) rather than the raw TCC claims `permissionsCard` above shows.
+    @ViewBuilder
+    private var permissionDiagnosisCard: some View {
+        SettingsCard(
+            title: "Permission Diagnosis",
+            subtitle: "Check whether granted-looking permissions actually work"
+        ) {
+            Button("Run Diagnosis") { coordinator.refreshPermissionDiagnosis() }
+                .padding(.bottom, 8)
+            let items = coordinator.permissionDiagnosis.items
+            ForEach(Array(items.enumerated()), id: \.offset) { index, item in
+                permissionDiagnosisRow(item)
+                if index < items.count - 1 {
+                    Divider()
+                }
+            }
+        }
+    }
+
+    private func permissionDiagnosisRow(_ item: PermissionDiagnosisItem) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Circle()
+                    .fill(Self.diagnosisColor(for: item.state))
+                    .frame(width: 8, height: 8)
+                Text(item.title)
+                Spacer()
+                if item.showsRelaunch {
+                    Button("Relaunch FreeTalker") { AppRelaunch.relaunch() }
+                }
+                if item.showsOpenSystemSettings {
+                    Button("Open System Settings") { Self.openSystemSettings(for: item.kind) }
+                }
+            }
+            Text(item.detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 8)
+    }
+
+    private static func diagnosisColor(for state: PermissionState) -> Color {
+        switch state {
+        case .granted: return .green
+        case .denied: return .red
+        case .staleGranted: return .orange
+        case .notDetermined, .unknown: return .gray
+        }
+    }
+
+    private static func openSystemSettings(for kind: PermissionKind) {
+        switch kind {
+        case .accessibility: Permissions.openAccessibilitySettings()
+        case .microphone: Permissions.openMicrophoneSettings()
+        case .inputMonitoring: Permissions.openInputMonitoringSettings()
         }
     }
 
