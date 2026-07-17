@@ -24,6 +24,18 @@ struct BackupBundleTests {
         }
     }
 
+    @Test func rejectsABooleanFormatVersionInsteadOfBridgingToOne() async throws {
+        // A JSON `true` NSNumber-bridges to `Int 1` — without the CFBoolean rejection a
+        // corrupted/edited v2 backup with `formatVersion: true` would be silently accepted as
+        // v1 (settings-only), skipping templates/snippets with a success report. See P2 finding.
+        let env = try makeEnv()
+        let data = try json(["app": "FreeTalker", "formatVersion": true, "settings": [String: Any]()])
+
+        await #expect(throws: BackupBundleError.unsupportedFormatVersion(-1)) {
+            try await BackupBundle.restore(data: data, settings: env.settings, templateStore: env.templateStore, snippetStore: env.snippetStore)
+        }
+    }
+
     @Test func rejectsOversizedFile() async throws {
         let env = try makeEnv()
         let padding = String(repeating: "a", count: 6 * 1024 * 1024)

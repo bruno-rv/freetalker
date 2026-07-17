@@ -222,6 +222,35 @@ private func validateRuleDict(_ dict: [String: String], field: String) throws {
 /// mismatches reject the WHOLE bundle (validate-all-then-apply, PLAN.md F1.4) rather than
 /// silently coercing, unlike the live setters' own robustness-first coercion.
 private enum SettingsPatchDecoding {
+    // JSON has no distinct boolean NSNumber subtype from Swift's perspective — a JSON `true`
+    // bridges to `NSNumber` and satisfies `as? Int`/`as? Double`/`as? Bool` all at once, and a
+    // JSON `1` likewise satisfies `as? Bool`. `type(of:)` can't tell them apart either (both
+    // box through the same tagged-pointer `NSNumber` machinery), but the underlying CFType
+    // does: only a real CFBoolean reports `CFBooleanGetTypeID()`. See P2 finding: JSON
+    // booleans silently decoded as 1/1.0 for int/double-typed keys. Shared (not nested in
+    // `decode`) so the envelope-level `formatVersion` check below can reuse it too.
+    static func isCFBoolean(_ number: NSNumber) -> Bool {
+        CFGetTypeID(number) == CFBooleanGetTypeID()
+    }
+
+    /// Rejects CFBoolean and any non-whole-number `NSNumber` (e.g. `5.9`), returning `nil`
+    /// instead of throwing so both a keyed settings value and the top-level `formatVersion`
+    /// envelope field can apply their own error type. See P2 finding: `formatVersion` decode
+    /// still `NSNumber`-bridges a JSON `true` to `Int 1`.
+    static func integralValue(_ raw: Any) -> Int? {
+        guard let number = raw as? NSNumber, !isCFBoolean(number) else { return nil }
+        // `NSNumber.intValue` truncates toward zero — a fractional JSON value (e.g.
+        // `5.9`) would silently become `5` instead of being rejected. Reject anything
+        // that isn't a whole number rather than coerce it. See P2 finding: fractional
+        // integer-setting truncation.
+        let double = number.doubleValue
+        guard double.truncatingRemainder(dividingBy: 1) == 0,
+              double >= Double(Int.min), double <= Double(Int.max) else {
+            return nil
+        }
+        return number.intValue
+    }
+
     static func decode(_ dict: [String: Any]) throws -> SettingsPatch {
         typealias Keys = AppSettings.Keys
         var patch = SettingsPatch()
@@ -229,15 +258,6 @@ private enum SettingsPatchDecoding {
         func str(_ raw: Any, _ key: String) throws -> String {
             guard let value = raw as? String else { throw BackupBundleError.invalidSettingsValue(key: key) }
             return value
-        }
-        // JSON has no distinct boolean NSNumber subtype from Swift's perspective — a JSON `true`
-        // bridges to `NSNumber` and satisfies `as? Int`/`as? Double`/`as? Bool` all at once, and a
-        // JSON `1` likewise satisfies `as? Bool`. `type(of:)` can't tell them apart either (both
-        // box through the same tagged-pointer `NSNumber` machinery), but the underlying CFType
-        // does: only a real CFBoolean reports `CFBooleanGetTypeID()`. See P2 finding: JSON
-        // booleans silently decoded as 1/1.0 for int/double-typed keys.
-        func isCFBoolean(_ number: NSNumber) -> Bool {
-            CFGetTypeID(number) == CFBooleanGetTypeID()
         }
         func bool(_ raw: Any, _ key: String) throws -> Bool {
             guard let number = raw as? NSNumber, isCFBoolean(number) else {
@@ -252,19 +272,10 @@ private enum SettingsPatchDecoding {
             return number.doubleValue
         }
         func int(_ raw: Any, _ key: String) throws -> Int {
-            guard let number = raw as? NSNumber, !isCFBoolean(number) else {
+            guard let value = integralValue(raw) else {
                 throw BackupBundleError.invalidSettingsValue(key: key)
             }
-            // `NSNumber.intValue` truncates toward zero — a fractional JSON value (e.g.
-            // `5.9`) would silently become `5` instead of being rejected. Reject anything
-            // that isn't a whole number rather than coerce it. See P2 finding: fractional
-            // integer-setting truncation.
-            let double = number.doubleValue
-            guard double.truncatingRemainder(dividingBy: 1) == 0,
-                  double >= Double(Int.min), double <= Double(Int.max) else {
-                throw BackupBundleError.invalidSettingsValue(key: key)
-            }
-            return number.intValue
+            return value
         }
         func stringDict(_ raw: Any, _ key: String) throws -> [String: String] {
             guard let value = raw as? [String: String] else { throw BackupBundleError.invalidSettingsValue(key: key) }
@@ -553,8 +564,12 @@ enum BackupBundle {
         guard top["app"] as? String == "FreeTalker" else {
             throw BackupBundleError.notFreeTalkerBundle
         }
-        guard let formatVersion = top["formatVersion"] as? Int, formatVersion == 1 || formatVersion == 2 else {
-            throw BackupBundleError.unsupportedFormatVersion((top["formatVersion"] as? Int) ?? -1)
+        // Same CFBoolean-rejection + integral check as keyed settings values (see
+        // `SettingsPatchDecoding.integralValue`) — otherwise a JSON `true` NSNumber-bridges to
+        // `Int 1` and a corrupted/edited v1 backup is silently accepted. See P2 finding.
+        let formatVersionValue = top["formatVersion"].flatMap(SettingsPatchDecoding.integralValue)
+        guard let formatVersion = formatVersionValue, formatVersion == 1 || formatVersion == 2 else {
+            throw BackupBundleError.unsupportedFormatVersion(formatVersionValue ?? -1)
         }
 
         // v2 resets every absent settings key to its default (`resetAbsentToDefault` below) — if

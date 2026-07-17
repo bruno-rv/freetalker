@@ -74,6 +74,26 @@ struct TemplateImportTests {
         #expect(result.idMap == ["raw": "raw"])
     }
 
+    @Test func doesNotTrapWhenExistingLibraryAlreadyHasDuplicateContent() throws {
+        // Reachable via "+" clicked twice (two "New Template"/empty-prompt rows) before this
+        // fix shipped. `Dictionary(uniqueKeysWithValues:)` would trap building the dedupe index
+        // from `templates` itself; must instead dedupe against the first of the two.
+        let store = try makeStore()
+        let first = Template(id: "dup-1", name: "New Template", prompt: "")
+        let second = Template(id: "dup-2", name: "New Template", prompt: "")
+        try store.upsert(first)
+        try store.upsert(second)
+
+        let incoming = Template(id: "incoming", name: "New Template", prompt: "")
+        let result = try store.importTemplates(from: encode([incoming]))
+
+        #expect(result.importedCount == 0)
+        #expect(result.skippedCount == 1)
+        // Deduped against the FIRST existing colliding template, not the second.
+        #expect(result.idMap == ["incoming": "dup-1"])
+        #expect(store.templates.filter { $0.name == "New Template" && $0.prompt == "" }.count == 2)
+    }
+
     @Test func malformedJSONThrows() throws {
         let store = try makeStore()
         let malformed = Data("{ not valid json".utf8)

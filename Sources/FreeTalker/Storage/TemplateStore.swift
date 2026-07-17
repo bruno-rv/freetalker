@@ -115,7 +115,13 @@ final class TemplateStore: ObservableObject {
     /// this ever runs (PLAN.md F1.4/F1.5), so this method itself does no bounds checking.
     func importTemplates(_ incoming: [Template]) throws -> ImportResult {
         var existingIDs = Set(templates.map(\.id))
-        var existingIDByDedupeKey = Dictionary(uniqueKeysWithValues: templates.map { (Self.dedupeKey($0), $0.id) })
+        // `templates` can itself already contain two entries with the same (name, prompt) —
+        // e.g. clicking "+" twice creates two "New Template"/empty-prompt rows — so
+        // `uniqueKeysWithValues:` (which traps on a duplicate key) is unsafe here. Keep the
+        // FIRST occurrence deterministically: it's the earliest-created of the colliding
+        // templates, so it's the one dedupe/remap logic below treats as canonical. See P1 crash
+        // finding.
+        var existingIDByDedupeKey = Dictionary(templates.map { (Self.dedupeKey($0), $0.id) }, uniquingKeysWith: { first, _ in first })
         var idMap: [String: String] = [:]
         var toImport: [Template] = []
 
