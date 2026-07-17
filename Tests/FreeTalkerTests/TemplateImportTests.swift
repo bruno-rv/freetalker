@@ -134,6 +134,13 @@ struct TemplateImportTests {
         #expect(roundTripStore.template(id: custom.id) == custom)
     }
 
+    @Test func seedsPromptEngineerAsABuiltIn() throws {
+        let store = try makeStore()
+
+        #expect(Template.builtIns.contains { $0.id == "prompt-engineer" && $0.name == "Prompt Engineer" })
+        #expect(store.templates.contains { $0.id == "prompt-engineer" && $0.name == "Prompt Engineer" })
+    }
+
     @Test func rejectsOversizedImportData() throws {
         let store = try makeStore()
         let oversized = Data(repeating: 0, count: 5 * 1024 * 1024 + 1)

@@ -27,6 +27,11 @@ struct Template: Identifiable, Equatable, Codable, Sendable {
             id: "email",
             name: "Email",
             prompt: "Rewrite this raw speech transcript as a professional email body, in the same language as the transcript. Remove filler words, hesitations, and accidental repetitions. When the speaker corrects or contradicts something they said earlier — even in a previous sentence (e.g. \"it didn't work… actually, it works\") — keep only the corrected intent and drop the superseded statement entirely. Fix grammar and add appropriate structure (greeting/body/sign-off only if implied by content). Preserve names and quoted text. Output only the email body, no commentary. " + spokenCommandsSection
+        ),
+        Template(
+            id: "prompt-engineer",
+            name: "Prompt Engineer",
+            prompt: "Treat this raw speech transcript as a rough prompt, task description, or underperforming prompt, in the same language as the transcript. Rewrite it into an optimized prompt for Claude following Anthropic's best practices: open with a focused role sentence; state the task, output format, and every constraint as explicitly as a new colleague with no context would need; attach the \"why\" behind non-obvious constraints; for format- or tone-sensitive tasks, add 3-5 diverse examples in <example> tags; separate instructions, context, and input with descriptive XML tags, long documents first and the request last; phrase format instructions as what to do, not what to avoid; calibrate action language to the task — imperative and proactive for agentic work, conservative otherwise; add a self-check step when correctness matters; mark variable content with {{PLACEHOLDERS}}. Output exactly two sections: <optimized_prompt> with the complete rewritten prompt, then <design_notes> with 3-5 bullets on the rules applied and any assumptions made. No other commentary. " + spokenCommandsSection
         )
     ]
 
