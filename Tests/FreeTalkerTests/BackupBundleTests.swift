@@ -406,6 +406,15 @@ struct BackupBundleTests {
         #expect(env.settings.cloudLLMModel == "")
     }
 
+    @Test func rejectsUnknownCloudSTTProvider() async throws {
+        let env = try makeEnv()
+        let data = try json(v2Payload(settings: ["cloudSTTProvider": "anthropic"]))
+
+        await #expect(throws: BackupBundleError.invalidSettingsValue(key: AppSettings.Keys.cloudSTTProvider)) {
+            try await BackupBundle.restore(data: data, settings: env.settings, templateStore: env.templateStore, snippetStore: env.snippetStore)
+        }
+    }
+
     // MARK: - Full round-trip over the current key set (PLAN.md F1.9: run now, batch-final gate later)
 
     @Test func fullRoundTripPreservesEveryExportableSetting() async throws {
@@ -416,7 +425,9 @@ struct BackupBundleTests {
         settingsA.voiceEditHotKeySpec = HotKeySpec(modifiers: 0, keyCode: 3)
         settingsA.historyPanelHotKeySpec = HotKeySpec(modifiers: 0, keyCode: 4)
         settingsA.sttEngine = .cloud
+        settingsA.cloudSTTProvider = .openAICompatible
         settingsA.cloudSTTBaseURL = "https://user:pass@api.example.com/v1"
+        settingsA.cloudSTTModel = "custom-transcription-model"
         settingsA.setWhisperModelFromUser("openai_whisper-tiny")
         settingsA.livePreviewEnabled = false
         settingsA.noiseSuppressionEnabled = false

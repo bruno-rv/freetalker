@@ -35,13 +35,15 @@ final class CloudSTTEngine: ObservableObject, TranscriptionEngine, @unchecked Se
     /// ever takes a single `forcedLanguage` (or provider auto-detect when nil); there's no
     /// candidate-set concept to constrain it with. See PLAN.md F5.3.
     func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String]) async throws -> TranscriptionOutput {
-        guard let apiKey = Keychain.get(account: Keychain.Account.cloudSTTKey), !apiKey.isEmpty else {
+        let provider = await AppSettings.shared.cloudSTTProvider
+        let baseURL = await AppSettings.shared.cloudSTTBaseURL
+        let model = await AppSettings.shared.cloudSTTModel
+        let apiKeyAccount = Keychain.Account.cloudSTTKey(for: provider)
+        guard let apiKey = Keychain.get(account: apiKeyAccount), !apiKey.isEmpty else {
             throw CloudSTTError.missingAPIKey
         }
         await setStatus("Uploading…")
         defer { Task { await setStatus("Ready") } }
-
-        let baseURL = await AppSettings.shared.cloudSTTBaseURL
         guard let url = URL(string: baseURL)?.appendingPathComponent("audio/transcriptions") else {
             throw CloudSTTError.badResponse(status: 0, hint: CloudSTTError.classifyHint(status: 0))
         }
@@ -54,7 +56,7 @@ final class CloudSTTEngine: ObservableObject, TranscriptionEngine, @unchecked Se
         request.httpMethod = "POST"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        request.httpBody = multipartBody(boundary: boundary, wavData: wavData, vocabulary: vocabulary, forcedLanguage: forcedLanguage)
+        request.httpBody = multipartBody(boundary: boundary, wavData: wavData, model: model, vocabulary: vocabulary, forcedLanguage: forcedLanguage)
 
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
@@ -97,13 +99,13 @@ final class CloudSTTEngine: ObservableObject, TranscriptionEngine, @unchecked Se
         return (response as? HTTPURLResponse)?.statusCode ?? 0
     }
 
-    private func multipartBody(boundary: String, wavData: Data, vocabulary: [String], forcedLanguage: String?) -> Data {
+    func multipartBody(boundary: String, wavData: Data, model: String, vocabulary: [String], forcedLanguage: String?) -> Data {
         var body = Data()
         func append(_ string: String) { body.append(Data(string.utf8)) }
 
         append("--\(boundary)\r\n")
         append("Content-Disposition: form-data; name=\"model\"\r\n\r\n")
-        append("whisper-1\r\n")
+        append("\(model)\r\n")
 
         if let forcedLanguage {
             append("--\(boundary)\r\n")
