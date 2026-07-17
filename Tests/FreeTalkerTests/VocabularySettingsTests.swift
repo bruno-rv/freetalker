@@ -33,4 +33,22 @@ struct VocabularySettingsTests {
         #expect(reloaded.vocabularyText == raw)
         #expect(reloaded.vocabulary == ["OpenAI", "ScreenCaptureKit"])
     }
+
+    @Test("shared vocabulary survives transcription-engine switches and reload")
+    @MainActor
+    func vocabularyIsIndependentOfTranscriptionEngine() throws {
+        let suite = "VocabularySettingsTests.shared.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let settings = AppSettings(defaults: defaults)
+        settings.vocabularyText = "OpenAI\nScreenCaptureKit"
+        settings.sttEngine = .cloud
+        #expect(settings.vocabulary == ["OpenAI", "ScreenCaptureKit"])
+        settings.sttEngine = .whisperKit
+
+        let reloaded = AppSettings(defaults: defaults)
+        #expect(reloaded.vocabularyText == "OpenAI\nScreenCaptureKit")
+        #expect(reloaded.vocabulary == ["OpenAI", "ScreenCaptureKit"])
+    }
 }

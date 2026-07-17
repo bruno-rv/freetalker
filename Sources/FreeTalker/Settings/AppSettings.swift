@@ -10,6 +10,18 @@ enum STTEngineKind: String, CaseIterable, Codable {
     case cloud
 }
 
+enum CloudSTTProviderKind: String, CaseIterable, Codable, Hashable, Sendable {
+    case openAI
+    case openAICompatible
+
+    var settingsName: String {
+        switch self {
+        case .openAI: "OpenAI"
+        case .openAICompatible: "Custom OpenAI-compatible"
+        }
+    }
+}
+
 enum LLMProviderKind: String, CaseIterable, Codable, Sendable {
     case anthropic
     case ollama
@@ -131,6 +143,18 @@ final class AppSettings: ObservableObject {
     @Published var sttEngine: STTEngineKind {
         didSet { defaults.set(sttEngine.rawValue, forKey: Keys.sttEngine) }
     }
+    @Published var cloudSTTProvider: CloudSTTProviderKind {
+        didSet {
+            defaults.set(cloudSTTProvider.rawValue, forKey: Keys.cloudSTTProvider)
+            let resolved = Self.resolveCloudSTTDefaults(
+                provider: cloudSTTProvider,
+                baseURL: cloudSTTBaseURL,
+                model: cloudSTTModel
+            )
+            if resolved.baseURL != cloudSTTBaseURL { cloudSTTBaseURL = resolved.baseURL }
+            if resolved.model != cloudSTTModel { cloudSTTModel = resolved.model }
+        }
+    }
     /// Stripped to scheme + host + port + path at the setter level (see `strippedBaseURL`) so a
     /// credential typed into userinfo/query/fragment is never persisted, let alone exported. See
     /// PLAN.md F1.3.
@@ -144,6 +168,9 @@ final class AppSettings: ObservableObject {
             }
             defaults.set(cloudSTTBaseURL, forKey: Keys.cloudSTTBaseURL)
         }
+    }
+    @Published var cloudSTTModel: String {
+        didSet { defaults.set(cloudSTTModel, forKey: Keys.cloudSTTModel) }
     }
     @Published private(set) var whisperModel: String {
         didSet { defaults.set(whisperModel, forKey: Keys.whisperModel) }
@@ -625,6 +652,46 @@ final class AppSettings: ObservableObject {
         return stripped.string ?? trimmed
     }
 
+    nonisolated static func isValidHTTPBaseURL(_ raw: String) -> Bool {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard
+            let components = URLComponents(string: trimmed),
+            let scheme = components.scheme?.lowercased(),
+            scheme == "http" || scheme == "https",
+            let host = components.host?.lowercased(),
+            !host.isEmpty,
+            let schemeEnd = trimmed.range(of: "://")
+        else {
+            return false
+        }
+        let remainder = trimmed[schemeEnd.upperBound...]
+        let authorityEnd = remainder.firstIndex { "/?#".contains($0) } ?? remainder.endIndex
+        let authority = remainder[..<authorityEnd]
+        if authority.hasSuffix(":") { return false }
+        guard let port = components.port else { return true }
+        return (1...65_535).contains(port)
+    }
+
+    nonisolated static let cloudSTTDefaultBaseURL = "https://api.openai.com/v1"
+    nonisolated static let cloudSTTDefaultModel = "whisper-1"
+
+    nonisolated static func resolveCloudSTTDefaults(
+        provider: CloudSTTProviderKind,
+        baseURL: String,
+        model: String
+    ) -> (baseURL: String, model: String) {
+        let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedModel = trimmedModel.isEmpty ? cloudSTTDefaultModel : trimmedModel
+        switch provider {
+        case .openAI:
+            return (cloudSTTDefaultBaseURL, resolvedModel)
+        case .openAICompatible:
+            let trimmedBaseURL = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            let resolvedBaseURL = trimmedBaseURL == cloudSTTDefaultBaseURL ? "" : trimmedBaseURL
+            return (resolvedBaseURL, resolvedModel)
+        }
+    }
+
     nonisolated static let knownProviderDefaults: [LLMProviderKind: LLMProviderDefault] = [
         .anthropic: LLMProviderDefault(baseURL: "https://api.anthropic.com/v1", model: "claude-sonnet-4-5"),
         .ollama: LLMProviderDefault(baseURL: "https://ollama.com/v1", model: "gpt-oss:120b"),
@@ -663,7 +730,9 @@ final class AppSettings: ObservableObject {
         /// Legacy (read-only, for migration): single-modifier NX device mask bit.
         static let legacyHotKeyDeviceMask = "hotKeyDeviceMask"
         static let sttEngine = "sttEngine"
+        static let cloudSTTProvider = "cloudSTTProvider"
         static let cloudSTTBaseURL = "cloudSTTBaseURL"
+        static let cloudSTTModel = "cloudSTTModel"
         static let whisperModel = "whisperModel"
         static let whisperModelChosen = "whisperModelChosen"
         static let livePreviewEnabled = "livePreviewEnabled"
@@ -725,11 +794,36 @@ final class AppSettings: ObservableObject {
         // hand-edited) may still carry userinfo/query/fragment credentials — strip and persist
         // back so on-disk state converges to the same invariant the setter now enforces. See
         // PLAN.md F1.3.
-        let storedCloudSTTBaseURL = defaults.string(forKey: Keys.cloudSTTBaseURL) ?? "https://api.openai.com/v1"
+        let storedCloudSTTBaseURL = defaults.string(forKey: Keys.cloudSTTBaseURL) ?? Self.cloudSTTDefaultBaseURL
         let strippedCloudSTTBaseURL = Self.strippedBaseURL(storedCloudSTTBaseURL)
-        cloudSTTBaseURL = strippedCloudSTTBaseURL
-        if strippedCloudSTTBaseURL != storedCloudSTTBaseURL {
-            defaults.set(strippedCloudSTTBaseURL, forKey: Keys.cloudSTTBaseURL)
+        let storedCloudSTTModel = defaults.string(forKey: Keys.cloudSTTModel) ?? ""
+        let loadedCloudSTTProvider: CloudSTTProviderKind
+        if let rawProvider = defaults.string(forKey: Keys.cloudSTTProvider),
+           let provider = CloudSTTProviderKind(rawValue: rawProvider) {
+            loadedCloudSTTProvider = provider
+        } else {
+            // Before the provider field existed, the OpenAI URL was the implicit default. Any
+            // other saved URL was therefore an existing custom OpenAI-compatible endpoint.
+            loadedCloudSTTProvider = strippedCloudSTTBaseURL == Self.cloudSTTDefaultBaseURL
+                ? .openAI
+                : .openAICompatible
+        }
+        let resolvedCloudSTT = Self.resolveCloudSTTDefaults(
+            provider: loadedCloudSTTProvider,
+            baseURL: strippedCloudSTTBaseURL,
+            model: storedCloudSTTModel
+        )
+        cloudSTTProvider = loadedCloudSTTProvider
+        cloudSTTBaseURL = resolvedCloudSTT.baseURL
+        cloudSTTModel = resolvedCloudSTT.model
+        if defaults.string(forKey: Keys.cloudSTTProvider) != loadedCloudSTTProvider.rawValue {
+            defaults.set(loadedCloudSTTProvider.rawValue, forKey: Keys.cloudSTTProvider)
+        }
+        if resolvedCloudSTT.baseURL != storedCloudSTTBaseURL {
+            defaults.set(resolvedCloudSTT.baseURL, forKey: Keys.cloudSTTBaseURL)
+        }
+        if resolvedCloudSTT.model != storedCloudSTTModel {
+            defaults.set(resolvedCloudSTT.model, forKey: Keys.cloudSTTModel)
         }
         let storedWhisperModel = defaults.string(forKey: Keys.whisperModel) ?? SpeechModelCatalog.defaultID
         let normalizedWhisperModel = SpeechModelCatalog.normalize(storedWhisperModel)
@@ -947,7 +1041,9 @@ extension AppSettings {
         Keys.voiceEditHotKeySpec,
         Keys.historyPanelHotKeySpec,
         Keys.sttEngine,
+        Keys.cloudSTTProvider,
         Keys.cloudSTTBaseURL,
+        Keys.cloudSTTModel,
         Keys.whisperModel,
         Keys.whisperModelChosen,
         Keys.livePreviewEnabled,
@@ -1024,7 +1120,9 @@ extension AppSettings {
         out[Keys.voiceEditHotKeySpec] = voiceEditHotKeySpec.map(jsonValue) ?? NSNull()
         out[Keys.historyPanelHotKeySpec] = historyPanelHotKeySpec.map(jsonValue) ?? NSNull()
         out[Keys.sttEngine] = sttEngine.rawValue
+        out[Keys.cloudSTTProvider] = cloudSTTProvider.rawValue
         out[Keys.cloudSTTBaseURL] = cloudSTTBaseURL
+        out[Keys.cloudSTTModel] = cloudSTTModel
         out[Keys.whisperModel] = whisperModel
         out[Keys.whisperModelChosen] = whisperModelChosen
         out[Keys.livePreviewEnabled] = livePreviewEnabled

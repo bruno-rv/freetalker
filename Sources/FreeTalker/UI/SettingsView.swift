@@ -324,7 +324,7 @@ private struct GeneralSettingsView: View {
     @State private var newRuleTemplateID: String?
     @State private var newRuleLanguage: String?
 
-    @State private var cloudSTTKey = Keychain.get(account: Keychain.Account.cloudSTTKey) ?? ""
+    @State private var cloudSTTKey = Keychain.get(account: Keychain.Account.cloudSTTKey(for: AppSettings.shared.cloudSTTProvider)) ?? ""
     @State private var cloudLLMKey = Keychain.get(account: Keychain.Account.cloudLLMKey(for: AppSettings.shared.llmProvider)) ?? ""
     // Set when Keychain.set(_:account:) returns false, so the UI never claims a key was saved
     // when it wasn't. The field itself is left as typed so the user can retry. See Round 2
@@ -1062,7 +1062,11 @@ private struct GeneralSettingsView: View {
             }
             .pickerStyle(.segmented)
             .onChange(of: settings.sttEngine) { _, newValue in
-                if newValue == .whisperKit {
+                if newValue == .cloud {
+                    cloudSTTKey = Keychain.get(account: Keychain.Account.cloudSTTKey(for: settings.cloudSTTProvider)) ?? ""
+                    cloudSTTKeyError = false
+                    cloudSTTTestResult = nil
+                } else if newValue == .whisperKit {
                     Task { await coordinator.whisperEngine.preload() }
                 }
             }
@@ -1099,10 +1103,28 @@ private struct GeneralSettingsView: View {
                     .foregroundStyle(.secondary)
             }
             if settings.sttEngine == .cloud {
+                Picker("Provider", selection: $settings.cloudSTTProvider) {
+                    ForEach(CloudSTTProviderKind.allCases, id: \.self) { provider in
+                        Text(provider.settingsName).tag(provider)
+                    }
+                }
+                .onChange(of: settings.cloudSTTProvider) { _, newProvider in
+                    cloudSTTKey = Keychain.get(account: Keychain.Account.cloudSTTKey(for: newProvider)) ?? ""
+                    cloudSTTKeyError = false
+                    cloudSTTTestResult = nil
+                }
+                TextField("Model", text: $settings.cloudSTTModel)
                 TextField("Base URL", text: $settings.cloudSTTBaseURL)
+                    .disabled(settings.cloudSTTProvider == .openAI)
+                    .help(settings.cloudSTTProvider == .openAI
+                        ? "OpenAI uses https://api.openai.com/v1."
+                        : "Custom OpenAI-compatible endpoint serving /audio/transcriptions.")
                 SecureField("API key", text: $cloudSTTKey)
                     .onChange(of: cloudSTTKey) { _, newValue in
-                        cloudSTTKeyError = !Keychain.set(newValue, account: Keychain.Account.cloudSTTKey)
+                        cloudSTTKeyError = !CloudSTTCredentialWriter.update(
+                            newValue,
+                            account: Keychain.Account.cloudSTTKey(for: settings.cloudSTTProvider)
+                        )
                     }
                 if cloudSTTKeyError {
                     Text("Failed to save key to Keychain")
@@ -1111,7 +1133,12 @@ private struct GeneralSettingsView: View {
                 }
                 HStack {
                     Button("Test connection") { testCloudSTTConnection() }
-                        .disabled(cloudSTTTesting || !AppCoordinator.isCloudSTTConfigured(baseURL: settings.cloudSTTBaseURL, key: cloudSTTKey))
+                        .disabled(cloudSTTTesting || !AppCoordinator.isCloudSTTConfigured(
+                            provider: settings.cloudSTTProvider,
+                            model: settings.cloudSTTModel,
+                            baseURL: settings.cloudSTTBaseURL,
+                            key: cloudSTTKey
+                        ))
                     if cloudSTTTesting {
                         ProgressView().controlSize(.small)
                     } else if let cloudSTTTestResult {
@@ -1120,6 +1147,9 @@ private struct GeneralSettingsView: View {
                             .foregroundStyle(cloudSTTTestResult.hasSuffix("Connected ✓") ? .green : .red)
                     }
                 }
+                Text("Cloud STT sends audio to the selected provider's OpenAI-compatible /audio/transcriptions endpoint. Anthropic and Ollama are available for Cloud processing only; they do not provide this transcription endpoint.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
         .padding(.vertical, 12)
@@ -1168,7 +1198,7 @@ private struct GeneralSettingsView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Vocabulary")
                 .font(.headline)
-            Text("One term per line — proper nouns, names, or jargon that should be recognized and spelled correctly. Used to bias transcription and post-processing.")
+            Text("Shared across WhisperKit, Cloud STT, and post-processing. One term per line — proper nouns, names, or jargon that should be recognized and spelled correctly.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             VocabularyEditorField(text: $settings.vocabularyText)
@@ -1476,7 +1506,8 @@ private struct GeneralSettingsView: View {
         }
     }
 
-    /// "Test connection" for the Cloud STT (BYOK) section. Snapshots the base URL/key into
+    /// "Test connection" for the Cloud STT (BYOK) section. Snapshots the provider, model, base
+    /// URL, and key into
     /// locals before the `await` so a mid-flight edit to the fields can't retroactively change
     /// the connection target. `ConnectionTestOutcome.message` is the only thing ever assigned to
     /// `cloudSTTTestResult` — never the thrown error's description, which could carry a response
@@ -1484,11 +1515,17 @@ private struct GeneralSettingsView: View {
     private func testCloudSTTConnection() {
         cloudSTTTesting = true
         cloudSTTTestResult = nil
+        let provider = settings.cloudSTTProvider
+        let model = settings.cloudSTTModel
         let baseURL = settings.cloudSTTBaseURL
         let key = cloudSTTKey
         Task {
             let outcome: ConnectionTestOutcome
             do {
+                // The endpoint probe is provider/model agnostic, but capture these fields with
+                // the request so the result cannot be associated with a later edit.
+                _ = provider
+                _ = model
                 let status = try await CloudSTTEngine.testConnection(baseURL: baseURL, apiKey: key)
                 outcome = .fromStatusCode(status)
             } catch {

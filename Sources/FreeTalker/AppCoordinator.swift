@@ -2449,15 +2449,30 @@ final class AppCoordinator: ObservableObject {
         snapshot.eligibility.isEligible
     }
 
-    /// Same shape as `isCloudLLMConfigured` for Cloud STT's config: trimmed base URL and trimmed
-    /// API key both non-empty. (Cloud STT has no user-configurable model field — `CloudSTTEngine`
-    /// always sends `model: "whisper-1"` — so unlike the LLM check there's no model to validate.)
-    /// Used to gate both the real Cloud STT engine selection contract and the Settings "Test
-    /// connection" button's enabled state, so they can never disagree about what counts as
-    /// "configured".
-    nonisolated static func isCloudSTTConfigured(baseURL: String, key: String) -> Bool {
-        !baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    /// Same shape as `isCloudLLMConfigured` for Cloud STT's config: the selected provider,
+    /// model, base URL, and API key must all be present. Used by Settings to gate the "Test
+    /// connection" button; the Cloud engine remains selectable so an incomplete setup can be
+    /// corrected in place.
+    nonisolated static func isCloudSTTConfigured(
+        provider: CloudSTTProviderKind,
+        model: String,
+        baseURL: String,
+        key: String
+    ) -> Bool {
+        _ = provider
+        return !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && AppSettings.isValidHTTPBaseURL(baseURL)
             && !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Compatibility overload for callers that only have the legacy Cloud STT fields.
+    nonisolated static func isCloudSTTConfigured(baseURL: String, key: String) -> Bool {
+        isCloudSTTConfigured(
+            provider: .openAI,
+            model: AppSettings.cloudSTTDefaultModel,
+            baseURL: baseURL,
+            key: key
+        )
     }
 
     /// Picks the Post-Processor for the dictation currently being handled: one `AppSettings`

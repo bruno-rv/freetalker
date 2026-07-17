@@ -36,6 +36,10 @@ struct FreeTalkerApp: App {
         // provider's scoped account. Deliberately placed here rather than in `AppSettings.init`
         // so it runs once during app startup against the real Keychain.
         CloudLLMKeyMigration.migrateIfNeeded(provider: AppSettings.shared.llmProvider, store: KeychainSecretStore())
+        // Same one-time migration for Cloud STT's former shared account. Existing custom
+        // endpoints are already classified by AppSettings before this runs, so the key follows
+        // the migrated provider without exposing it to another provider's account.
+        CloudSTTKeyMigration.migrateIfNeeded(provider: AppSettings.shared.cloudSTTProvider, store: KeychainSecretStore())
         // Triggers the system Accessibility prompt on first launch if not already granted
         // (a no-op, no dialog, if already trusted or already declined once).
         Permissions.requestAccessibility()

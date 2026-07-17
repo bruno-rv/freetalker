@@ -57,7 +57,12 @@ enum Keychain {
     }
 
     enum Account {
+        /// Legacy shared Cloud STT account retained for one-time migration. New writes use the
+        /// provider-scoped account below so switching providers cannot overwrite a secret.
         static let cloudSTTKey = "cloudSTTAPIKey"
+        static func cloudSTTKey(for provider: CloudSTTProviderKind) -> String {
+            "cloudSTTAPIKey-\(provider.rawValue)"
+        }
         /// Legacy shared BYOK LLM key account, from before per-provider scoping. Migrated once
         /// at real app startup into the active provider's scoped
         /// account — see `CloudLLMKeyMigration`. Kept as a named constant so the migration (and
@@ -79,6 +84,20 @@ struct KeychainSecretStore: SecretStore {
     func get(account: String) -> String? { Keychain.get(account: account) }
     @discardableResult func set(_ value: String, account: String) -> Bool { Keychain.set(value, account: account) }
     @discardableResult func delete(account: String) -> Bool { Keychain.delete(account: account) }
+}
+
+enum CloudSTTCredentialWriter {
+    @discardableResult
+    static func update(
+        _ value: String,
+        account: String,
+        store: SecretStore = KeychainSecretStore()
+    ) -> Bool {
+        let succeeded = value.isEmpty
+            ? store.delete(account: account)
+            : store.set(value, account: account)
+        return succeeded
+    }
 }
 
 enum CloudLLMCredentialWriter {
@@ -106,6 +125,22 @@ enum CloudLLMKeyMigration {
             return
         }
         let legacyAccount = Keychain.Account.legacyCloudLLMKey
+        guard let legacyValue = store.get(account: legacyAccount), !legacyValue.isEmpty else { return }
+        guard store.set(legacyValue, account: targetAccount) else { return }
+        guard store.get(account: targetAccount) == legacyValue else { return }
+        _ = store.delete(account: legacyAccount)
+    }
+}
+
+enum CloudSTTKeyMigration {
+    static func migrateIfNeeded(provider: CloudSTTProviderKind, store: SecretStore) {
+        let targetAccount = Keychain.Account.cloudSTTKey(for: provider)
+        if let existing = store.get(account: targetAccount),
+           !existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            _ = store.delete(account: Keychain.Account.cloudSTTKey)
+            return
+        }
+        let legacyAccount = Keychain.Account.cloudSTTKey
         guard let legacyValue = store.get(account: legacyAccount), !legacyValue.isEmpty else { return }
         guard store.set(legacyValue, account: targetAccount) else { return }
         guard store.get(account: targetAccount) == legacyValue else { return }

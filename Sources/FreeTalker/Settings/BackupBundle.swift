@@ -94,7 +94,9 @@ struct SettingsPatch {
     var voiceEditHotKeySpec: PatchField<HotKeySpec?> = .absent
     var historyPanelHotKeySpec: PatchField<HotKeySpec?> = .absent
     var sttEngine: PatchField<STTEngineKind> = .absent
+    var cloudSTTProvider: PatchField<CloudSTTProviderKind> = .absent
     var cloudSTTBaseURL: PatchField<String> = .absent
+    var cloudSTTModel: PatchField<String> = .absent
     var whisperModel: PatchField<String> = .absent
     var whisperModelChosen: PatchField<Bool> = .absent
     var livePreviewEnabled: PatchField<Bool> = .absent
@@ -310,8 +312,15 @@ private enum SettingsPatchDecoding {
             guard let value = STTEngineKind(rawValue: try str(raw, Keys.sttEngine)) else { throw BackupBundleError.invalidSettingsValue(key: Keys.sttEngine) }
             patch.sttEngine = .present(value)
         }
+        if let raw = dict[Keys.cloudSTTProvider] {
+            guard let value = CloudSTTProviderKind(rawValue: try str(raw, Keys.cloudSTTProvider)) else { throw BackupBundleError.invalidSettingsValue(key: Keys.cloudSTTProvider) }
+            patch.cloudSTTProvider = .present(value)
+        }
         if let raw = dict[Keys.cloudSTTBaseURL] {
             patch.cloudSTTBaseURL = .present(AppSettings.strippedBaseURL(try str(raw, Keys.cloudSTTBaseURL)))
+        }
+        if let raw = dict[Keys.cloudSTTModel] {
+            patch.cloudSTTModel = .present(try str(raw, Keys.cloudSTTModel))
         }
         if let raw = dict[Keys.whisperModel] {
             patch.whisperModel = .present(SpeechModelCatalog.normalize(try str(raw, Keys.whisperModel)))
@@ -452,41 +461,48 @@ extension AppSettings {
         apply(patch.cloudLLMBaseURL, default: providerDefaults.baseURL) { cloudLLMBaseURL = $0 }
         apply(patch.cloudLLMModel, default: providerDefaults.model) { cloudLLMModel = $0 }
 
-        // 2. Whisper model cluster: `whisperModel` is `private(set)`, applied through
+        // 2. Cloud STT provider cluster: provider first (its didSet can set the base URL/model
+        // defaults), then the exact restored base URL/model land last and stick. An absent
+        // base/model under v2 resolves against the effective restored provider.
+        apply(patch.cloudSTTProvider, default: .openAI) { cloudSTTProvider = $0 }
+        let cloudSTTDefaults = Self.resolveCloudSTTDefaults(provider: cloudSTTProvider, baseURL: "", model: "")
+        apply(patch.cloudSTTBaseURL, default: cloudSTTDefaults.baseURL) { cloudSTTBaseURL = $0 }
+        apply(patch.cloudSTTModel, default: cloudSTTDefaults.model) { cloudSTTModel = $0 }
+
+        // 3. Whisper model cluster: `whisperModel` is `private(set)`, applied through
         //    `applyAutomaticWhisperModel` (normalizes; leaves `whisperModelChosen` untouched, so
         //    that key is applied separately right after).
         apply(patch.whisperModel, default: SpeechModelCatalog.normalize(SpeechModelCatalog.defaultID)) { applyAutomaticWhisperModel($0) }
         apply(patch.whisperModelChosen, default: false) { whisperModelChosen = $0 }
 
-        // 3. Launcher-position cluster: edge + position first — both call
+        // 4. Launcher-position cluster: edge + position first — both call
         //    `resetLauncherPanelPosition()` (nils it) on change — then the restored panel
         //    position last, so it isn't immediately wiped by the two setters above it.
         apply(patch.edgeLauncherEdge, default: .right) { edgeLauncherEdge = $0 }
         apply(patch.edgeLauncherPosition, default: 0.5) { edgeLauncherPosition = $0 }
         apply(patch.launcherPanelPosition, default: nil) { launcherPanelPosition = $0 }
 
-        // 4. Hotkey quartet, applied transactionally (clear all three action specs, set PTT,
+        // 5. Hotkey quartet, applied transactionally (clear all three action specs, set PTT,
         //    then each action spec) — see `applyHotKeyQuartet`. Already validated as a consistent
         //    set before restore's first write (`validateHotKeyQuartet`, called from
         //    `BackupBundle.restore`).
         applyHotKeyQuartet(patch.hotKeyQuartetTargets(current: self, resetAbsentToDefault: resetAbsentToDefault))
 
-        // 5. `activeTemplateID`/`appRules` rewritten through the templates-import ID map so a
+        // 6. `activeTemplateID`/`appRules` rewritten through the templates-import ID map so a
         //    restored reference never dangles — including one that pointed at a deduplicated
         //    incoming template (see `TemplateStore.importTemplates`).
         apply(patch.activeTemplateID, default: Template.defaultID) { activeTemplateID = templateIDMap[$0] ?? $0 }
         apply(patch.appRules, default: [:]) { rules in appRules = rules.mapValues { templateIDMap[$0] ?? $0 } }
 
-        // 5b. Dictation Language Set cluster: `dictationLanguages` MUST land before
+        // 6b. Dictation Language Set cluster: `dictationLanguages` MUST land before
         //     `languagePin`/`appLanguageRules` below — its didSet re-validates both against the
         //     restored set (PLAN.md F5.4's set-change coercion), so applying it first means the
         //     restored pin/rules are checked against their FINAL sibling value rather than
         //     whatever `dictationLanguages` happened to hold before this restore.
         apply(patch.dictationLanguages, default: AppSettings.defaultDictationLanguages) { dictationLanguages = $0 }
 
-        // 6. Everything else — order-independent.
+        // 7. Everything else — order-independent.
         apply(patch.sttEngine, default: .whisperKit) { sttEngine = $0 }
-        apply(patch.cloudSTTBaseURL, default: "https://api.openai.com/v1") { cloudSTTBaseURL = $0 }
         apply(patch.livePreviewEnabled, default: true) { livePreviewEnabled = $0 }
         apply(patch.noiseSuppressionEnabled, default: true) { noiseSuppressionEnabled = $0 }
         apply(patch.edgeLauncherEnabled, default: false) { edgeLauncherEnabled = $0 }
