@@ -75,6 +75,11 @@ final class FloatingControlsController {
     private var activeSpaceObserver: FloatingControlsObserverToken?
     private(set) var presentedLanguagePin: String?
     private(set) var presentedTranslationState: TranslationControlsState
+    /// The language menu options as of the last render — mirrors `presentedLanguagePin`/
+    /// `presentedTranslationState`'s role of making render-time state independently testable
+    /// without reaching into the private `panel`/`hostingView`. See Codex finding: stale
+    /// language menu ($dictationLanguages wasn't observed).
+    private(set) var presentedLanguageOptions: [String] = []
 
     init(
         settings: AppSettings = .shared,
@@ -146,7 +151,12 @@ final class FloatingControlsController {
             settings.$cloudLLMBaseURL,
             settings.$cloudLLMModel
         ).dropFirst().map { _ in () }.eraseToAnyPublisher()
-        Publishers.Merge(outputUpdates, configurationUpdates)
+        // The language menu's options come straight from `settings.dictationLanguages` on every
+        // render (see `renderAndPosition` below), but nothing previously triggered a re-render
+        // when that set changed — the launcher's menu went stale until some unrelated setting
+        // happened to fire a render. See Codex finding: stale language menu.
+        let languageOptionUpdates = settings.$dictationLanguages.dropFirst().map { _ in () }.eraseToAnyPublisher()
+        Publishers.Merge3(outputUpdates, configurationUpdates, languageOptionUpdates)
         .receive(on: DispatchQueue.main)
         .sink { [weak self] in
             DispatchQueue.main.async { self?.refreshOutputPresentation() }
@@ -276,11 +286,12 @@ final class FloatingControlsController {
         }
         var viewCallbacks = callbacks
         viewCallbacks.onOutput = { [weak self] language in self?.selectOutput(language) }
+        presentedLanguageOptions = settings.dictationLanguages
         let view = FloatingControlsView(
             state: state,
             edge: settings.edgeLauncherEdge,
             languagePin: presentedLanguagePin ?? settings.languagePin,
-            languageOptions: settings.dictationLanguages,
+            languageOptions: presentedLanguageOptions,
             translationState: presentedTranslationState,
             callbacks: viewCallbacks
         )

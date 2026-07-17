@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Testing
 @testable import FreeTalker
@@ -197,6 +198,34 @@ import Testing
         })
         #expect(receivedStale?.pid == stale.pid)
         #expect(result?.bundleID == fresh.bundleID)
+    }
+
+    // MARK: - PID-reuse wrong-app menu-path target (Codex finding: refreshedTarget accepted ANY
+    // process found at the tracked pid, so an OS-reused pid could resolve to an unrelated app)
+
+    /// Finder is always running, non-sandboxed, on any macOS box this suite runs on — a stable
+    /// real `NSRunningApplication` with a non-nil bundle id, unlike this test executable's own
+    /// `NSRunningApplication.current` (whose `bundleIdentifier` is nil for a bare CLI binary).
+    private static func requireFinder() throws -> NSRunningApplication {
+        try #require(NSWorkspace.shared.runningApplications.first { $0.bundleIdentifier == "com.apple.finder" })
+    }
+
+    @Test func verifiedRunningApplicationRequiresTheAppsBundleIDToMatchTheTrackedOne() throws {
+        let finder = try Self.requireFinder()
+        #expect(AppCoordinator.verifiedRunningApplication(finder, matchesBundleID: "com.apple.finder"))
+        // A pid that now resolves to a DIFFERENT app than the one originally tracked (the OS
+        // reused the pid) must never be accepted as a legitimate refresh — its bundle id won't
+        // match the tracked one.
+        #expect(!AppCoordinator.verifiedRunningApplication(finder, matchesBundleID: "com.example.a-completely-different-app"))
+    }
+
+    @Test func verifiedRunningApplicationRejectsUnverifiableNilCases() throws {
+        let finder = try Self.requireFinder()
+        // No app found at the tracked pid at all (it quit) — unverifiable.
+        #expect(!AppCoordinator.verifiedRunningApplication(nil, matchesBundleID: "com.apple.finder"))
+        // A found app but no tracked bundle id to compare against — neither side of the
+        // comparison is trustworthy on its own.
+        #expect(!AppCoordinator.verifiedRunningApplication(finder, matchesBundleID: nil))
     }
 
     // MARK: - Fourth hotkey slot in the Backup Bundle quartet

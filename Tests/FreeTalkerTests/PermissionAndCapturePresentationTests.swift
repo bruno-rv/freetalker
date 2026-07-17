@@ -255,6 +255,56 @@ import Testing
         #expect(reason == .targetDrift)
     }
 
+    // MARK: - `strict` closes the permissive nil-target branch for the History panel only
+    // (Codex finding: unverified panel paste reaching Insertion's permissive nil-target branch)
+
+    @Test func strictModeTreatsANilTargetAsDriftWhileTheDefaultStaysPermissive() {
+        // Ordinary dictation (no snapshot at all, e.g. `AppCoordinator.reprocess`) keeps the
+        // pre-fix permissive behavior: nothing to contradict, so paste anyway.
+        #expect(Insertion.shouldSynthesizePaste(
+            hasTarget: false, snapshotBundleID: nil, currentBundleID: "com.example.current"
+        ) == true)
+        #expect(Insertion.shouldSynthesizePaste(
+            hasTarget: false, snapshotBundleID: nil, currentBundleID: "com.example.current", strict: false
+        ) == true)
+        // The History panel's `strict: true` call site must never fall through to that
+        // permissiveness — a nil/unverified target is drift, full stop.
+        #expect(Insertion.shouldSynthesizePaste(
+            hasTarget: false, snapshotBundleID: nil, currentBundleID: "com.example.current", strict: true
+        ) == false)
+    }
+
+    @Test func strictModeDoesNotAffectAnAlreadyVerifiedMatchingTarget() {
+        // `strict` only closes the nil-target branch — a real, matching, non-drifted target
+        // still pastes under strict mode exactly as it would without it.
+        #expect(Insertion.shouldSynthesizePaste(
+            hasTarget: true, snapshotBundleID: "com.example.app", currentBundleID: "com.example.app",
+            pidMatch: true, elementComparison: .match, strict: true
+        ) == true)
+    }
+
+    @Test func classifyPreflightFailureUnderStrictModeReportsTargetDriftForANilTarget() {
+        // End-to-end through `classifyPreflightFailure`: the panel's strict nil-target case
+        // classifies as `.targetDrift` (posted = false, manual-paste HUD messaging), never as a
+        // successful (nil) classification.
+        let reason = Insertion.classifyPreflightFailure(
+            hasTarget: false, snapshotBundleID: nil, currentBundleID: "com.example.current",
+            pidMatch: true, elementComparison: .unavailable,
+            hasEditableFocusedElement: true, accessibilityTrusted: true, strict: true
+        )
+        #expect(reason == .targetDrift)
+    }
+
+    @Test func insertWithStrictAndNoTargetLeavesTextOnThePasteboardInsteadOfPasting() {
+        // Exercises the real `Insertion.insert` end to end: the History panel's call shape (no
+        // target, `strict: true`) must report `.targetDrift`/`posted == false` — the manual-
+        // paste flow — never an unverified synthetic paste, regardless of this process's own
+        // Accessibility/AX-trust state.
+        let outcome = Insertion.insert("Panel strict-mode test text", target: nil, strict: true)
+        #expect(outcome == .failure(.targetDrift))
+        #expect(!outcome.isPermissionClassFailure)
+    }
+
     @Test func insertReportsTargetDriftForAMismatchedBundleIDRegardlessOfEnvironment() {
         // Exercises the real `Insertion.insert` end to end: a target snapshotted against a
         // bundle ID that cannot possibly be the live frontmost app is a deterministic drift

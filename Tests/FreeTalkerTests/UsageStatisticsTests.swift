@@ -16,14 +16,15 @@ import Testing
         engine: String = "local",
         bundleID: String? = "com.apple.TextEdit",
         durationSecs: Double? = nil,
-        refined: String = "hello world"
+        refined: String = "hello world",
+        transcript: String = ""
     ) -> DictationStatRow {
         let calendar = utcCalendar()
         let now = calendar.date(from: DateComponents(year: 2026, month: 7, day: 16, hour: 12))!
         let timestamp = calendar.date(byAdding: .day, value: -daysAgo, to: now)!
         return DictationStatRow(
             timestamp: timestamp, language: language, template: template, engine: engine,
-            bundleID: bundleID, durationSecs: durationSecs, refined: refined
+            bundleID: bundleID, durationSecs: durationSecs, refined: refined, transcript: transcript
         )
     }
 
@@ -128,6 +129,31 @@ import Testing
         ]
         let snapshot = UsageStatsSnapshot.compute(rows: rows, now: Self.referenceNow, calendar: Self.utcCalendar())
         #expect(snapshot.totalWords == 5)
+    }
+
+    // MARK: - Refined-else-transcript fallback (Codex finding: raw-only/legacy rows counted as
+    // zero words) — same rule as `HistoryPanelRow.displayText`.
+
+    @Test func rawOnlyRowFallsBackToTranscriptForWordCountAndTimeSaved() {
+        // `refined` empty (never post-processed, e.g. skip-post-processing or a legacy row) must
+        // still contribute its transcript's word count and time-saved estimate, not zero.
+        let rawOnly = Self.row(durationSecs: 1, refined: "", transcript: "five raw words here now")
+        let refinedRow = Self.row(refined: "two words")
+
+        let snapshot = UsageStatsSnapshot.compute(
+            rows: [rawOnly, refinedRow], now: Self.referenceNow, calendar: Self.utcCalendar()
+        )
+
+        #expect(snapshot.totalWords == 7)
+        #expect(snapshot.rowsWithDuration == 1)
+        // 5 words at 40 WPM -> 7.5s typing time, minus a 1s recording -> 6.5s saved.
+        #expect(abs(snapshot.timeSavedSeconds - 6.5) < 0.001)
+    }
+
+    @Test func refinedRowNeverFallsBackToTranscriptEvenWhenTranscriptIsLonger() {
+        let row = Self.row(refined: "one", transcript: "one two three four five")
+        let snapshot = UsageStatsSnapshot.compute(rows: [row], now: Self.referenceNow, calendar: Self.utcCalendar())
+        #expect(snapshot.totalWords == 1)
     }
 
     // MARK: - Database integration: statRows() round-trips what insertDictation stored

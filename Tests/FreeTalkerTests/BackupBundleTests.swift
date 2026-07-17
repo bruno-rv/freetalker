@@ -123,6 +123,42 @@ struct BackupBundleTests {
         #expect(env.settings.languagePin == "auto")
     }
 
+    // MARK: - v2 envelope requires a `settings` dictionary (Codex finding: missing/malformed
+    // `settings` silently resets everything after templates/snippets already imported)
+
+    @Test func v2RejectsMissingSettingsSectionBeforeAnyWrites() async throws {
+        let env = try makeEnv()
+        env.settings.languagePin = "en"
+        let now = Date()
+        let templates = try encodeArray([Template(id: "t", name: "T", prompt: "p")])
+        let snippets = try encodeArray([Snippet(id: "s", name: "S", triggers: ["trig"], expansion: "e", createdAt: now, updatedAt: now)])
+        var payload = v2Payload(templates: templates, snippets: snippets)
+        payload.removeValue(forKey: "settings")
+        let data = try json(payload)
+
+        await #expect(throws: BackupBundleError.invalidSettingsSection) {
+            try await BackupBundle.restore(data: data, settings: env.settings, templateStore: env.templateStore, snippetStore: env.snippetStore)
+        }
+        // Nothing was imported — the envelope-level check runs before the templates/snippets
+        // stages, and never resets `languagePin` to default either.
+        #expect(env.templateStore.templates.count == Template.builtIns.count)
+        #expect(try await env.snippetStore.snippets().isEmpty)
+        #expect(env.settings.languagePin == "en")
+    }
+
+    @Test func v2RejectsNonDictionarySettingsSectionBeforeAnyWrites() async throws {
+        let env = try makeEnv()
+        env.settings.languagePin = "en"
+        var payload = v2Payload()
+        payload["settings"] = "not-a-dictionary"
+        let data = try json(payload)
+
+        await #expect(throws: BackupBundleError.invalidSettingsSection) {
+            try await BackupBundle.restore(data: data, settings: env.settings, templateStore: env.templateStore, snippetStore: env.snippetStore)
+        }
+        #expect(env.settings.languagePin == "en")
+    }
+
     // MARK: - Snippet dedupe/skip counts (PLAN.md F1.7)
 
     @Test func snippetImportSkipsCollidingTriggerAndReportsCounts() async throws {

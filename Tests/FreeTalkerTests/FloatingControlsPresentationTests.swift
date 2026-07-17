@@ -95,6 +95,30 @@ import Testing
         #expect(controller.presentedLanguagePin == "pt")
     }
 
+    @Test func dictationLanguagesChangeRebuildsTheLauncherLanguageMenu() async {
+        let suite = "FloatingControlsPresentationTests.languages.\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = AppSettings(defaults: defaults)
+        settings.dictationLanguages = ["en"]
+        settings.edgeLauncherEnabled = true
+        let controller = FloatingControlsController(
+            settings: settings,
+            callbacks: .init(
+                onDictation: {}, onScratchpad: {}, onOpenSettings: {}, onLanguage: { _ in }, onOutput: { _ in }
+            )
+        )
+        controller.start()
+        defer { controller.stop() }
+
+        #expect(controller.presentedLanguageOptions == ["en"])
+
+        settings.dictationLanguages = ["en", "pt"]
+
+        await waitUntil { controller.presentedLanguageOptions == ["en", "pt"] }
+        #expect(controller.presentedLanguageOptions == ["en", "pt"])
+    }
+
     @Test func translationControlsUseExplicitLabelsAndCanonicalOutputOrder() {
         #expect(TranslationControlsPresentation.spokenLabel == "Speak:")
         #expect(TranslationControlsPresentation.outputLabel == "Output:")

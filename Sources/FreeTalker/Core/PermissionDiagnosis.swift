@@ -224,10 +224,15 @@ struct PermissionDiagnosis: Equatable, Sendable {
 /// (normally `Bundle.main.bundlePath`, but a caller-suppliable install path) can never be
 /// interpreted as shell syntax. See Codex finding: relaunch command injection via install path.
 ///
-/// No pre-`open` wait: `AppLifecycleWindowPolicy.claimInstance` (App.swift) already retries
-/// acquiring the single-instance flock up to 10× at 50ms apart (~500ms) — the exact window a
-/// prior blind `sleep 0.5` bought — and reconciles by activating whichever instance still holds
-/// it, so the new instance launched here doesn't need this process to have exited first.
+/// A brief in-process pre-`open` wait runs synchronously inside `spawn` below — restoring, without
+/// a shell, the dwell time a prior blind `sleep 0.5` (run inside a now-removed shell string) used
+/// to buy this process before the new instance's own `claimInstance` retry loop even starts.
+/// `AppLifecycleWindowPolicy.claimInstance` (App.swift) backs this up independently: 10 attempts
+/// to acquire the single-instance flock, waiting 50ms between each of the first 9 (9 × 50ms ≈
+/// 450ms total — the 10th attempt is never followed by a wait, since a wait after the last try
+/// would just be discarded time with no further attempt to spend it on), reconciling by
+/// activating whichever instance still holds the lock. The new instance launched here relies on
+/// this pre-launch delay AND that retry window together, not the retry window alone.
 enum AppRelaunch {
     /// `["-n", bundlePath]` — `-n` opens a new instance unconditionally, `bundlePath` is a single
     /// argv element (never shell-parsed). Extracted so the argument construction itself — the
@@ -240,6 +245,10 @@ enum AppRelaunch {
     static func relaunch(
         bundlePath: String = Bundle.main.bundlePath,
         spawn: (String) -> Void = { path in
+            // In-process, no shell involved (see Codex finding: relaunch command injection) —
+            // gives this (about to terminate) process a head start on releasing the single-
+            // instance flock before the new instance even begins its own claim attempts.
+            Thread.sleep(forTimeInterval: 0.5)
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
             process.arguments = AppRelaunch.openArguments(bundlePath: path)

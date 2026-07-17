@@ -396,7 +396,7 @@ final class Database {
     /// history streams through with no `Dictation` allocation overhead. Word counts are computed in
     /// Swift from `refined`, never in SQL. See PLAN.md F4.4.
     func statRows() throws -> [DictationStatRow] {
-        let stmt = try prepare("SELECT ts, language, template, engine, bundle_id, duration_secs, refined FROM dictations;")
+        let stmt = try prepare("SELECT ts, language, template, engine, bundle_id, duration_secs, refined, transcript FROM dictations;")
         defer { sqlite3_finalize(stmt) }
         var rows: [DictationStatRow] = []
         var result = sqlite3_step(stmt)
@@ -408,7 +408,8 @@ final class Database {
                 engine: columnText(stmt, 3),
                 bundleID: optionalColumnText(stmt, 4),
                 durationSecs: sqlite3_column_type(stmt, 5) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 5),
-                refined: columnText(stmt, 6)
+                refined: columnText(stmt, 6),
+                transcript: columnText(stmt, 7)
             ))
             result = sqlite3_step(stmt)
         }

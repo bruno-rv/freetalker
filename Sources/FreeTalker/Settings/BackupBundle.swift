@@ -9,6 +9,7 @@ enum BackupBundleError: LocalizedError, Equatable {
     case notFreeTalkerBundle
     case unsupportedFormatVersion(Int)
     case invalidSettingsValue(key: String)
+    case invalidSettingsSection
     case invalidTemplatesSection
     case invalidSnippetsSection
     case tooManyTemplates(max: Int)
@@ -32,6 +33,8 @@ enum BackupBundleError: LocalizedError, Equatable {
             return "This backup uses a format (\(version)) this version of FreeTalker doesn't support."
         case .invalidSettingsValue(let key):
             return "The backup's \"\(key)\" setting is invalid."
+        case .invalidSettingsSection:
+            return "The backup's settings section is missing or invalid."
         case .invalidTemplatesSection:
             return "The backup's templates section is invalid."
         case .invalidSnippetsSection:
@@ -524,9 +527,23 @@ enum BackupBundle {
             throw BackupBundleError.unsupportedFormatVersion((top["formatVersion"] as? Int) ?? -1)
         }
 
-        let settingsDict = (top["settings"] as? [String: Any]) ?? [:]
-        let patch = try SettingsPatchDecoding.decode(settingsDict)
+        // v2 resets every absent settings key to its default (`resetAbsentToDefault` below) — if
+        // `settings` were silently treated as `{}` here (missing key, or present but not a
+        // dictionary), that reset would fire against an EMPTY patch and wipe every setting after
+        // templates/snippets had already been imported. v1 is settings-only and already leaves
+        // absent keys untouched, so this envelope-level requirement is v2-specific. See Codex
+        // finding: v2 bundle with a missing/malformed `settings` key silently resets everything.
         let resetAbsentToDefault = formatVersion == 2
+        let settingsDict: [String: Any]
+        if resetAbsentToDefault {
+            guard let dict = top["settings"] as? [String: Any] else {
+                throw BackupBundleError.invalidSettingsSection
+            }
+            settingsDict = dict
+        } else {
+            settingsDict = (top["settings"] as? [String: Any]) ?? [:]
+        }
+        let patch = try SettingsPatchDecoding.decode(settingsDict)
 
         var templates: [Template] = []
         var snippets: [Snippet] = []

@@ -79,10 +79,16 @@ enum Insertion {
     /// the same app's wrong — focused field, so this skips the paste and leaves the text on the
     /// pasteboard instead, same as the no-focused-element case. A nil `target` (e.g.
     /// `AppCoordinator.reprocess`, which has no frontmost-app snapshot for a historical
-    /// re-process) preserves the pre-fix behavior of always pasting. See Codex finding: paste-
-    /// target drift / same-app target drift.
+    /// re-process) preserves the pre-fix behavior of always pasting, UNLESS `strict` is set. See
+    /// Codex finding: paste-target drift / same-app target drift.
+    ///
+    /// `strict`, when true, closes off that nil-target permissiveness: a nil (or otherwise
+    /// unverifiable) target is treated as drifted rather than as "nothing to contradict, so
+    /// paste anyway." Every existing caller keeps the permissive default (`false`) — this is
+    /// opt-in per call site, not a global behavior change. See Codex finding: unverified panel
+    /// paste reaching the permissive nil-target branch.
     @discardableResult
-    static func insert(_ text: String, target: InsertionTarget? = nil) -> InsertionOutcome {
+    static func insert(_ text: String, target: InsertionTarget? = nil, strict: Bool = false) -> InsertionOutcome {
         let pasteboard = NSPasteboard.general
         let savedItems: [[NSPasteboard.PasteboardType: Data]] = pasteboard.pasteboardItems?.map { item in
             var dict: [NSPasteboard.PasteboardType: Data] = [:]
@@ -116,7 +122,8 @@ enum Insertion {
             pidMatch: pidMatch,
             elementComparison: elementComparison,
             hasEditableFocusedElement: isEditableFocusedElement(currentElement),
-            accessibilityTrusted: Permissions.isAccessibilityTrusted()
+            accessibilityTrusted: Permissions.isAccessibilityTrusted(),
+            strict: strict
         ) {
             // Either identity drifted since the snapshot (leave the text on the pasteboard for
             // a manual paste rather than pasting into whatever now has focus), or there's no
@@ -152,14 +159,16 @@ enum Insertion {
         pidMatch: Bool,
         elementComparison: ElementComparison,
         hasEditableFocusedElement: Bool,
-        accessibilityTrusted: Bool
+        accessibilityTrusted: Bool,
+        strict: Bool = false
     ) -> InsertionFailureReason? {
         guard shouldSynthesizePaste(
             hasTarget: hasTarget,
             snapshotBundleID: snapshotBundleID,
             currentBundleID: currentBundleID,
             pidMatch: pidMatch,
-            elementComparison: elementComparison
+            elementComparison: elementComparison,
+            strict: strict
         ) else {
             return .targetDrift
         }
@@ -178,9 +187,15 @@ enum Insertion {
         snapshotBundleID: String?,
         currentBundleID: String?,
         pidMatch: Bool = true,
-        elementComparison: ElementComparison = .unavailable
+        elementComparison: ElementComparison = .unavailable,
+        strict: Bool = false
     ) -> Bool {
-        guard hasTarget else { return true }
+        // `strict` callers (e.g. the Dictation History panel — see `AppCoordinator.
+        // insertFromHistoryPanel`) always have — or explicitly lack — a snapshotted target, so a
+        // nil target there is exactly as unverifiable as a nil bundle id below: never paste. Non-
+        // strict callers (ordinary dictation) have no frontmost-app snapshot to compare against
+        // at all, so a nil target there has nothing to contradict and stays permissive.
+        guard hasTarget else { return !strict }
         // A snapshotted target with no bundle id at all has no verifiable identity — `pidMatch`
         // alone doesn't substitute for it (pids are reused after a process exits, so a matching
         // pid doesn't prove it's still the same app instance), and an `.unavailable` element

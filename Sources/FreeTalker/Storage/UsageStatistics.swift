@@ -1,6 +1,10 @@
 import Foundation
 
 /// One Library row projected down to just what the Usage Statistics aggregation needs.
+/// `transcript` backs the refined-else-transcript fallback (`UsageStatsSnapshot.wordCount`
+/// input) — the same rule `HistoryPanelRow.displayText` uses — so raw-only/legacy rows (no
+/// post-processing ever ran, `refined` empty) still contribute their word count and time-saved
+/// estimate instead of silently counting as zero. See Codex finding: refined-only word count.
 struct DictationStatRow: Sendable, Equatable {
     let timestamp: Date
     let language: String
@@ -9,6 +13,7 @@ struct DictationStatRow: Sendable, Equatable {
     let bundleID: String?
     let durationSecs: Double?
     let refined: String
+    let transcript: String
 }
 
 /// A single grouped bucket (by language / template / engine / app).
@@ -73,7 +78,11 @@ struct UsageStatsSnapshot: Sendable, Equatable {
         let windowStart = calendar.date(byAdding: .day, value: -(trailingDayCount - 1), to: today) ?? today
 
         for row in rows {
-            let words = wordCount(row.refined)
+            // Refined-else-transcript (PLAN.md F4.4) — same rule as `HistoryPanelRow.
+            // displayText`: a raw-only/legacy row (never post-processed, `refined` empty) still
+            // contributes its transcript's word count rather than counting as zero words and
+            // zero time-saved.
+            let words = wordCount(row.refined.isEmpty ? row.transcript : row.refined)
             snapshot.totalWords += words
 
             languageCounts[row.language, default: 0] += 1

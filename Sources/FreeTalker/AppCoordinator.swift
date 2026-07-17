@@ -3693,10 +3693,24 @@ final class AppCoordinator: ObservableObject {
         HistoryPanelController.shared.open(target: Self.refreshedTarget(
             stale: lastNonSelfFrontmostTarget,
             refresh: { stale in
-                guard let app = NSRunningApplication(processIdentifier: stale.pid) else { return nil }
+                let app = NSRunningApplication(processIdentifier: stale.pid)
+                guard Self.verifiedRunningApplication(app, matchesBundleID: stale.bundleID) else { return nil }
                 return Insertion.snapshotTarget(app: app)
             }
         ))
+    }
+
+    /// True only when `app` is still the SAME app instance `bundleID` was recorded for — a bare
+    /// pid lookup isn't enough, since the OS reuses pids after a process exits: a stale tracked
+    /// pid can resolve to an entirely different (unrelated) running app by the time this refresh
+    /// runs. Nil `app`/`bundleID`, or a mismatch, are both unverifiable and must not be treated as
+    /// a legitimate refresh target — the caller's `refresh` closure returns nil in that case, and
+    /// `refreshedTarget` falls back to the untouched `stale` target instead (which `Insertion.
+    /// insert`'s own drift guard re-verifies again at paste time). See Codex finding: PID-reuse
+    /// wrong-app menu-path target.
+    nonisolated static func verifiedRunningApplication(_ app: NSRunningApplication?, matchesBundleID bundleID: String?) -> Bool {
+        guard let app, let appBundleID = app.bundleIdentifier, let bundleID else { return false }
+        return appBundleID == bundleID
     }
 
     /// Re-snapshots `stale`'s tracked app via `refresh`, falling back to `stale` unchanged if the
@@ -3719,10 +3733,17 @@ final class AppCoordinator: ObservableObject {
     /// paste), this passes the panel's snapshotted `target` through to `Insertion.insert`'s own
     /// drift guard — a stale or unverified target falls back to the same manual-paste HUD
     /// messaging (`insertLastDictationResultMessage`) as every other insertion path. Never an
-    /// unverified paste. See PLAN.md F3.2.
+    /// unverified paste.
+    ///
+    /// `strict: true` closes `Insertion.insert`'s intentionally-permissive nil-target branch for
+    /// THIS call site only: ordinary dictation flows pass no target at all (no frontmost-app
+    /// snapshot exists to compare against) and are meant to always attempt a synthetic paste, but
+    /// the panel always has — or explicitly lacks — a snapshotted target, so a nil/unverified
+    /// target here must fall back to the pasteboard-only manual-paste flow instead of silently
+    /// reusing that permissive branch. See PLAN.md F3.2; Codex finding: unverified panel paste.
     @discardableResult
     func insertFromHistoryPanel(_ text: String, target: InsertionTarget?) -> Bool {
-        let outcome = Insertion.insert(text, target: target)
+        let outcome = Insertion.insert(text, target: target, strict: true)
         if outcome.isPermissionClassFailure { refreshPermissionDiagnosis() }
         hud.flash(Self.insertLastDictationResultMessage(posted: outcome.posted))
         return outcome.posted

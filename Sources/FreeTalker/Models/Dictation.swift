@@ -73,4 +73,3 @@ struct DictationInsertRequest: Equatable, Sendable {
         self.durationSecs = durationSecs
     }
 }
-
