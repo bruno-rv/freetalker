@@ -113,6 +113,76 @@ struct TemplateImportTests {
         #expect(store.templates.contains { $0.name == "Single Import" })
     }
 
+    @Test func exportsTemplatesAsStableJSONThatRoundTripsUserTemplates() throws {
+        let store = try makeStore()
+        let custom = Template(id: "custom-id", name: "Meeting Notes", prompt: "Summarize this meeting.")
+        try store.upsert(custom)
+
+        let data = try store.exportTemplatesJSON()
+        let repeatedData = try store.exportTemplatesJSON()
+        let decoded = try JSONDecoder().decode([Template].self, from: data)
+        let jsonArray = try #require(JSONSerialization.jsonObject(with: data) as? [[String: Any]])
+
+        #expect(decoded == store.templates)
+        #expect(data == repeatedData)
+        #expect(jsonArray.allSatisfy { Set($0.keys) == ["id", "name", "prompt"] })
+        #expect(String(decoding: data, as: UTF8.self).contains("\n"))
+
+        let roundTripStore = try makeStore()
+        let result = try roundTripStore.importTemplates(from: data)
+        #expect(result.importedCount == 1)
+        #expect(roundTripStore.template(id: custom.id) == custom)
+    }
+
+    @Test func rejectsOversizedImportData() throws {
+        let store = try makeStore()
+        let oversized = Data(repeating: 0, count: 5 * 1024 * 1024 + 1)
+
+        #expect(throws: TemplateStore.TemplateStoreError.fileTooLarge(maxBytes: 5 * 1024 * 1024)) {
+            try store.importTemplates(from: oversized)
+        }
+    }
+
+    @Test func boundedFileLoaderRejectsOversizedImportBeforeDecoding() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("template-import-file-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let fileURL = directory.appendingPathComponent("oversized.json")
+        try Data(repeating: 0, count: 5 * 1024 * 1024 + 1).write(to: fileURL)
+
+        #expect(throws: TemplateStore.TemplateStoreError.fileTooLarge(maxBytes: 5 * 1024 * 1024)) {
+            try TemplateStore.loadTemplates(from: fileURL)
+        }
+    }
+
+    @Test func rejectsTooManyImportedTemplates() throws {
+        let store = try makeStore()
+        let incoming = (0..<501).map { index in
+            Template(id: "template-\(index)", name: "Template \(index)", prompt: "Prompt \(index)")
+        }
+
+        #expect(throws: TemplateStore.TemplateStoreError.tooManyTemplates(max: 500)) {
+            try store.importTemplates(from: encode(incoming))
+        }
+    }
+
+    @Test func rejectsOversizedImportedTemplateFields() throws {
+        let store = try makeStore()
+        let oversizedID = Template(id: String(repeating: "i", count: 501), name: "Name", prompt: "Prompt")
+        let oversizedName = Template(id: "long-name", name: String(repeating: "n", count: 501), prompt: "Prompt")
+        let oversizedPrompt = Template(id: "long-prompt", name: "Name", prompt: String(repeating: "p", count: 50_001))
+
+        #expect(throws: TemplateStore.TemplateStoreError.stringTooLong(field: "template id", maxBytes: 500)) {
+            try store.importTemplates(from: encode(oversizedID))
+        }
+        #expect(throws: TemplateStore.TemplateStoreError.stringTooLong(field: "template name", maxBytes: 500)) {
+            try store.importTemplates(from: encode(oversizedName))
+        }
+        #expect(throws: TemplateStore.TemplateStoreError.stringTooLong(field: "template prompt", maxBytes: 50_000)) {
+            try store.importTemplates(from: encode(oversizedPrompt))
+        }
+    }
+
     private func makeStore() throws -> TemplateStore {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("template-import-\(UUID().uuidString)", isDirectory: true)

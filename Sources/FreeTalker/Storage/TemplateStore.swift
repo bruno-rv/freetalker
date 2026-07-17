@@ -6,9 +6,12 @@ final class TemplateStore: ObservableObject {
 
     nonisolated static let rawTranscriptTemplateName = "Raw Transcript"
 
-    enum TemplateStoreError: LocalizedError {
+    enum TemplateStoreError: LocalizedError, Equatable, Sendable {
         case reservedName
         case invalidImportData
+        case fileTooLarge(maxBytes: Int)
+        case tooManyTemplates(max: Int)
+        case stringTooLong(field: String, maxBytes: Int)
 
         var errorDescription: String? {
             switch self {
@@ -16,9 +19,21 @@ final class TemplateStore: ObservableObject {
                 return "\"\(TemplateStore.rawTranscriptTemplateName)\" is reserved for raw dictations and can't be used as a Template name."
             case .invalidImportData:
                 return "This file doesn't contain valid FreeTalker templates."
+            case .fileTooLarge(let maxBytes):
+                return "This template file is larger than the \(maxBytes / (1024 * 1024)) MB limit."
+            case .tooManyTemplates(let max):
+                return "This file has more than \(max) templates."
+            case .stringTooLong(let field, let maxBytes):
+                return "A \(field) in the template file exceeds the \(maxBytes)-byte limit."
             }
         }
     }
+
+    nonisolated private static let maxImportFileBytes = BackupBundleBounds.maxFileBytes
+    nonisolated private static let maxImportTemplates = BackupBundleBounds.maxTemplates
+    nonisolated private static let maxImportTemplateIDBytes = BackupBundleBounds.maxTemplateNameBytes
+    nonisolated private static let maxImportTemplateNameBytes = BackupBundleBounds.maxTemplateNameBytes
+    nonisolated private static let maxImportTemplatePromptBytes = BackupBundleBounds.maxTemplatePromptBytes
 
     /// Complete old→new ID map covering EVERY template `importTemplates` was asked to import:
     /// appended-with-fresh-ID → new ID, appended-keeping-ID → same ID, and skipped-as-duplicate
@@ -97,6 +112,18 @@ final class TemplateStore: ObservableObject {
     /// tab's file importer, `TemplateImportTests`).
     @discardableResult
     func importTemplates(from data: Data) throws -> ImportResult {
+        let incoming = try Self.decodeTemplates(from: data)
+        return try importTemplates(incoming)
+    }
+
+    /// Decodes and validates a template import without touching MainActor state. Callers that
+    /// read an external file can run this helper off-main, then pass the validated templates to
+    /// `importTemplates(_:)` on the main actor.
+    nonisolated static func decodeTemplates(from data: Data) throws -> [Template] {
+        guard data.count <= maxImportFileBytes else {
+            throw TemplateStoreError.fileTooLarge(maxBytes: maxImportFileBytes)
+        }
+
         let incoming: [Template]
         if let array = try? JSONDecoder().decode([Template].self, from: data) {
             incoming = array
@@ -105,7 +132,39 @@ final class TemplateStore: ObservableObject {
         } else {
             throw TemplateStoreError.invalidImportData
         }
-        return try importTemplates(incoming)
+
+        guard incoming.count <= maxImportTemplates else {
+            throw TemplateStoreError.tooManyTemplates(max: maxImportTemplates)
+        }
+        for template in incoming {
+            guard template.id.utf8.count <= maxImportTemplateIDBytes else {
+                throw TemplateStoreError.stringTooLong(field: "template id", maxBytes: maxImportTemplateIDBytes)
+            }
+            guard template.name.utf8.count <= maxImportTemplateNameBytes else {
+                throw TemplateStoreError.stringTooLong(field: "template name", maxBytes: maxImportTemplateNameBytes)
+            }
+            guard template.prompt.utf8.count <= maxImportTemplatePromptBytes else {
+                throw TemplateStoreError.stringTooLong(field: "template prompt", maxBytes: maxImportTemplatePromptBytes)
+            }
+        }
+        return incoming
+    }
+
+    /// Reads at most one byte beyond the import limit before delegating to the pure decoder, so
+    /// external files can be rejected without allocating an unbounded `Data` value.
+    nonisolated static func loadTemplates(from url: URL) throws -> [Template] {
+        let maxRead = maxImportFileBytes + 1
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+
+        var data = Data()
+        while data.count < maxRead {
+            guard let chunk = try handle.read(upToCount: maxRead - data.count), !chunk.isEmpty else {
+                break
+            }
+            data.append(chunk)
+        }
+        return try decodeTemplates(from: data)
     }
 
     /// Merges already-decoded `incoming` templates into the existing library. Never deletes or
@@ -155,6 +214,18 @@ final class TemplateStore: ObservableObject {
             templates.append(contentsOf: renamed)
         }
         return ImportResult(idMap: idMap, importedCount: renamed.count, skippedCount: skippedCount)
+    }
+
+    /// Encodes only the template library as stable, human-readable JSON suitable for sharing or
+    /// importing back through `importTemplates(from:)`.
+    func exportTemplatesJSON() throws -> Data {
+        try Self.encodeTemplates(templates)
+    }
+
+    nonisolated static func encodeTemplates(_ templates: [Template]) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return try encoder.encode(templates)
     }
 
     private static func dedupeKey(_ template: Template) -> String {
