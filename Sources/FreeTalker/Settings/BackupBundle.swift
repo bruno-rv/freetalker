@@ -64,7 +64,7 @@ struct BackupBundleImportResult: Equatable, Sendable {
 
 /// Input bounds enforced before/at decode (PLAN.md F1.4) — new, since the repo has no
 /// template/snippet field clamps today.
-private enum BackupBundleBounds {
+enum BackupBundleBounds {
     static let maxFileBytes = 5 * 1024 * 1024
     static let maxTemplates = 500
     static let maxSnippets = 1_000
