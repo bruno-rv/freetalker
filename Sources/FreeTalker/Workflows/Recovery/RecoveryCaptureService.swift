@@ -55,10 +55,21 @@ protocol RecoveryJobStoring: Sendable {
 
 extension TranscriptionJobStore: RecoveryJobStoring {}
 
-enum RecoveryFinalizationError: Error, Equatable {
+enum RecoveryFinalizationError: Error, Equatable, LocalizedError {
     case libraryOwnershipMissing(UUID)
     case captureIdentityMismatch
     case recoveryJobMismatch
+
+    var errorDescription: String? {
+        switch self {
+        case .libraryOwnershipMissing(let id):
+            "Recovery \(id) is missing its Library ownership record."
+        case .captureIdentityMismatch:
+            "Recovery capture identity does not match the expected recording."
+        case .recoveryJobMismatch:
+            "Recovery job does not match the expected recording."
+        }
+    }
 }
 
 struct RecoveryCaptureService: Sendable {

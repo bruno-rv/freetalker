@@ -25,7 +25,7 @@ struct DurableArtifactWriter: Sendable {
     }
 }
 
-enum JournalPersistenceError: Error, Equatable {
+enum JournalPersistenceError: Error, Equatable, LocalizedError {
     case createDirectory(path: String, code: Int32)
     case write(path: String, code: Int32)
     case synchronizeFile(path: String, code: Int32)
@@ -33,6 +33,29 @@ enum JournalPersistenceError: Error, Equatable {
     case synchronizeDirectory(path: String, code: Int32)
     case read(path: String, code: Int32)
     case remove(path: String, code: Int32)
+
+    private static func reason(_ code: Int32) -> String {
+        String(cString: strerror(code))
+    }
+
+    var errorDescription: String? {
+        switch self {
+        case .createDirectory(let path, let code):
+            "Could not create recovery folder at \(path): \(Self.reason(code))"
+        case .write(let path, let code):
+            "Could not write recovery data to \(path): \(Self.reason(code))"
+        case .synchronizeFile(let path, let code):
+            "Could not save recovery data for \(path): \(Self.reason(code))"
+        case .rename(let source, let destination, let code):
+            "Could not finalize recovery file (\(source) → \(destination)): \(Self.reason(code))"
+        case .synchronizeDirectory(let path, let code):
+            "Could not save recovery folder \(path): \(Self.reason(code))"
+        case .read(let path, let code):
+            "Could not read recovery data from \(path): \(Self.reason(code))"
+        case .remove(let path, let code):
+            "Could not remove recovery file \(path): \(Self.reason(code))"
+        }
+    }
 }
 
 struct LocalJournalFileSystem: JournalFileSystem {
