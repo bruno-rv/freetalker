@@ -102,6 +102,7 @@ struct SettingsPatch {
     var livePreviewEnabled: PatchField<Bool> = .absent
     var noiseSuppressionEnabled: PatchField<Bool> = .absent
     var edgeLauncherEnabled: PatchField<Bool> = .absent
+    var notchpadEnabled: PatchField<Bool> = .absent
     var edgeLauncherEdge: PatchField<LauncherEdge> = .absent
     var edgeLauncherPosition: PatchField<Double> = .absent
     var launcherPanelPosition: PatchField<NormalizedWindowPosition?> = .absent
@@ -337,6 +338,9 @@ private enum SettingsPatchDecoding {
         if let raw = dict[Keys.edgeLauncherEnabled] {
             patch.edgeLauncherEnabled = .present(try bool(raw, Keys.edgeLauncherEnabled))
         }
+        if let raw = dict[Keys.notchpadEnabled] {
+            patch.notchpadEnabled = .present(try bool(raw, Keys.notchpadEnabled))
+        }
         if let raw = dict[Keys.edgeLauncherEdge] {
             guard let value = LauncherEdge(rawValue: try str(raw, Keys.edgeLauncherEdge)) else { throw BackupBundleError.invalidSettingsValue(key: Keys.edgeLauncherEdge) }
             patch.edgeLauncherEdge = .present(value)
@@ -506,6 +510,7 @@ extension AppSettings {
         apply(patch.livePreviewEnabled, default: true) { livePreviewEnabled = $0 }
         apply(patch.noiseSuppressionEnabled, default: true) { noiseSuppressionEnabled = $0 }
         apply(patch.edgeLauncherEnabled, default: false) { edgeLauncherEnabled = $0 }
+        apply(patch.notchpadEnabled, default: false) { notchpadEnabled = $0 }
         apply(patch.recordingHUDPosition, default: nil) { recordingHUDPosition = $0 }
         apply(patch.transientHUDPosition, default: nil) { transientHUDPosition = $0 }
         apply(patch.recoveryRetention, default: .sevenDays) { recoveryRetention = $0 }

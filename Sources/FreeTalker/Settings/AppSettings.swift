@@ -200,6 +200,10 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(edgeLauncherEnabled, forKey: Keys.edgeLauncherEnabled) }
     }
 
+    @Published var notchpadEnabled: Bool {
+        didSet { defaults.set(notchpadEnabled, forKey: Keys.notchpadEnabled) }
+    }
+
     @Published var edgeLauncherEdge: LauncherEdge {
         didSet {
             defaults.set(edgeLauncherEdge.rawValue, forKey: Keys.edgeLauncherEdge)
@@ -738,6 +742,7 @@ final class AppSettings: ObservableObject {
         static let livePreviewEnabled = "livePreviewEnabled"
         static let noiseSuppressionEnabled = "noiseSuppressionEnabled"
         static let edgeLauncherEnabled = "edgeLauncherEnabled"
+        static let notchpadEnabled = "notchpadEnabled"
         static let edgeLauncherEdge = "edgeLauncherEdge"
         static let edgeLauncherPosition = "edgeLauncherPosition"
         static let launcherPanelPosition = "launcherPanelPosition"
@@ -837,6 +842,7 @@ final class AppSettings: ObservableObject {
         livePreviewEnabled = defaults.object(forKey: Keys.livePreviewEnabled) as? Bool ?? true
         noiseSuppressionEnabled = defaults.object(forKey: Keys.noiseSuppressionEnabled) as? Bool ?? true
         edgeLauncherEnabled = defaults.object(forKey: Keys.edgeLauncherEnabled) as? Bool ?? false
+        notchpadEnabled = defaults.object(forKey: Keys.notchpadEnabled) as? Bool ?? false
         edgeLauncherEdge = LauncherEdge(rawValue: defaults.string(forKey: Keys.edgeLauncherEdge) ?? "") ?? .right
         let storedEdgeLauncherPosition = defaults.object(forKey: Keys.edgeLauncherPosition) as? Double ?? 0.5
         edgeLauncherPosition = Self.clampNormalizedPosition(storedEdgeLauncherPosition)
@@ -1049,6 +1055,7 @@ extension AppSettings {
         Keys.livePreviewEnabled,
         Keys.noiseSuppressionEnabled,
         Keys.edgeLauncherEnabled,
+        Keys.notchpadEnabled,
         Keys.edgeLauncherEdge,
         Keys.edgeLauncherPosition,
         Keys.launcherPanelPosition,
@@ -1128,6 +1135,7 @@ extension AppSettings {
         out[Keys.livePreviewEnabled] = livePreviewEnabled
         out[Keys.noiseSuppressionEnabled] = noiseSuppressionEnabled
         out[Keys.edgeLauncherEnabled] = edgeLauncherEnabled
+        out[Keys.notchpadEnabled] = notchpadEnabled
         out[Keys.edgeLauncherEdge] = edgeLauncherEdge.rawValue
         out[Keys.edgeLauncherPosition] = edgeLauncherPosition
         out[Keys.launcherPanelPosition] = launcherPanelPosition.map(jsonValue) ?? NSNull()

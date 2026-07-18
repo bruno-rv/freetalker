@@ -103,11 +103,32 @@ struct FloatingControlsSettingsTests {
         let settings = AppSettings(defaults: defaults)
 
         #expect(settings.edgeLauncherEnabled == false)
+        #expect(settings.notchpadEnabled == false)
         #expect(settings.edgeLauncherEdge == .right)
         #expect(settings.edgeLauncherPosition == 0.5)
         #expect(settings.launcherPanelPosition == nil)
         #expect(settings.recordingHUDPosition == nil)
         #expect(settings.transientHUDPosition == nil)
+    }
+
+    @Test func notchpadEnabledDefaultsFalseAndRoundTrips() {
+        let defaults = isolatedDefaults()
+        defer { remove(defaults) }
+
+        var settings: AppSettings? = AppSettings(defaults: defaults)
+        #expect(settings?.notchpadEnabled == false)
+
+        settings?.notchpadEnabled = true
+        #expect(defaults.object(forKey: "notchpadEnabled") as? Bool == true)
+
+        settings = AppSettings(defaults: defaults)
+        #expect(settings?.notchpadEnabled == true)
+
+        settings?.notchpadEnabled = false
+        #expect(defaults.object(forKey: "notchpadEnabled") as? Bool == false)
+
+        settings = AppSettings(defaults: defaults)
+        #expect(settings?.notchpadEnabled == false)
     }
 
     @Test(arguments: LauncherEdge.allCases)

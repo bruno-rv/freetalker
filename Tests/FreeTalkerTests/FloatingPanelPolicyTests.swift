@@ -4,6 +4,7 @@ import Testing
 
 @Suite @MainActor struct FloatingPanelPolicyTests {
     @Test func hudPanelRemainsNonactivatingAndVisibleAcrossSpaces() {
+        // Default surface style is floating (Notchpad off / unavailable).
         let panel = HUDController.makePanel(size: NSSize(width: 200, height: 60))
 
         #expect(panel.styleMask.contains(.nonactivatingPanel))
@@ -15,6 +16,14 @@ import Testing
         #expect(panel.canBecomeMain == false)
         #expect(panel.ignoresMouseEvents == false)
         #expect(panel.isMovableByWindowBackground == false)
+    }
+
+    @Test func defaultMakePanelMatchesExplicitFloatingStyle() {
+        let implicit = HUDController.makePanel(size: NSSize(width: 100, height: 40))
+        let explicit = HUDController.makePanel(size: NSSize(width: 100, height: 40), surfaceStyle: .floating)
+        #expect(implicit.level == explicit.level)
+        #expect(implicit.level == .floating)
+        #expect(implicit.collectionBehavior == explicit.collectionBehavior)
     }
 
     @Test func resizeClampsAgainstTheScreenCapturedBeforeTheWindowChangesScreens() {

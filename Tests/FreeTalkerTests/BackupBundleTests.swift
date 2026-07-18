@@ -230,6 +230,24 @@ struct BackupBundleTests {
         #expect(env.settings.languagePin == "auto")
     }
 
+    @Test func v2ResetsAbsentNotchpadEnabledToFalse() async throws {
+        let env = try makeEnv()
+        env.settings.notchpadEnabled = true
+
+        var settingsDict = env.settings.exportableSettingsSnapshot()
+        settingsDict.removeValue(forKey: AppSettings.Keys.notchpadEnabled)
+        let data = try json(v2Payload(settings: settingsDict))
+
+        _ = try await BackupBundle.restore(
+            data: data,
+            settings: env.settings,
+            templateStore: env.templateStore,
+            snippetStore: env.snippetStore
+        )
+
+        #expect(env.settings.notchpadEnabled == false)
+    }
+
     // MARK: - v2 envelope requires a `settings` dictionary (Codex finding: missing/malformed
     // `settings` silently resets everything after templates/snippets already imported)
 
@@ -432,6 +450,7 @@ struct BackupBundleTests {
         settingsA.livePreviewEnabled = false
         settingsA.noiseSuppressionEnabled = false
         settingsA.edgeLauncherEnabled = true
+        settingsA.notchpadEnabled = true
         settingsA.edgeLauncherEdge = .left
         settingsA.edgeLauncherPosition = 0.25
         settingsA.launcherPanelPosition = NormalizedWindowPosition(displayID: "disp1", x: 0.1, y: 0.2)
