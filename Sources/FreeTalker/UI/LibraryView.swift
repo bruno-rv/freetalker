@@ -109,12 +109,19 @@ struct LibraryView: View {
                 }
                 .padding(8)
             }
-            .frame(minWidth: 260)
+            .frame(
+                minWidth: SplitViewMetrics.libraryMaster.minimum,
+                idealWidth: SplitViewMetrics.libraryMaster.ideal,
+                maxWidth: SplitViewMetrics.libraryMaster.maximum
+            )
 
             if let selectedID, let dictation = store.dictations.first(where: { $0.id == selectedID }) {
                 DictationDetailView(dictation: dictation, onDeleteRequested: { pendingDeleteID = dictation.id })
+                    .frame(minWidth: SplitViewMetrics.detailMinimum, maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                Text("Select a Dictation").foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
+                Text("Select a Dictation")
+                    .foregroundStyle(.secondary)
+                    .frame(minWidth: SplitViewMetrics.detailMinimum, maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         // Same bug shape as Settings (Task 1): `.frame(width:height:)` is a FIXED frame — it

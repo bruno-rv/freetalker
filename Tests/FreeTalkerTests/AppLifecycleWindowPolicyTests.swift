@@ -5,6 +5,24 @@ import Testing
 
 @MainActor
 struct AppLifecycleWindowPolicyTests {
+    @Test func settingsWindowIsFullscreenPrimaryAndDoesNotJoinOtherSpacesOrApplications() {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 500, height: 500),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.collectionBehavior = [.canJoinAllSpaces, .canJoinAllApplications, .fullScreenAuxiliary]
+
+        AppLifecycleWindowPolicy.configureSettingsWindow(window)
+
+        #expect(window.collectionBehavior.contains(.fullScreenPrimary))
+        #expect(!window.collectionBehavior.contains(.fullScreenAuxiliary))
+        #expect(!window.collectionBehavior.contains(.canJoinAllSpaces))
+        #expect(!window.collectionBehavior.contains(.canJoinAllApplications))
+        #expect(window.level == .normal)
+    }
+
     @Test func settingsWindowJoinsOtherApplicationsFullScreenSpacesWithoutCoveringSystemPrompts() {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 500, height: 500),

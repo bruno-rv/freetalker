@@ -496,7 +496,7 @@ struct BackupBundleTests {
             .appendingPathExtension("sqlite")
         return Env(
             settings: AppSettings(defaults: defaults),
-            templateStore: TemplateStore(fileURL: templatesDirectory.appendingPathComponent("templates.json")),
+            templateStore: TemplateStore(fileURL: templatesDirectory.appendingPathComponent("templates.json"), defaults: defaults),
             snippetStore: try SnippetStore(databaseURL: snippetsDatabaseURL)
         )
     }

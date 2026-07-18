@@ -35,6 +35,9 @@ final class TemplateStore: ObservableObject {
     nonisolated private static let maxImportTemplateNameBytes = BackupBundleBounds.maxTemplateNameBytes
     nonisolated private static let maxImportTemplatePromptBytes = BackupBundleBounds.maxTemplatePromptBytes
 
+    private static let promptEngineerMigrationKey = "TemplateStore.migrations.promptEngineer.v1"
+    private static let promptEngineerMigrationVersion = 1
+
     /// Complete old→new ID map covering EVERY template `importTemplates` was asked to import:
     /// appended-with-fresh-ID → new ID, appended-keeping-ID → same ID, and skipped-as-duplicate
     /// → the matching EXISTING template's ID. Callers (e.g. Backup Bundle restore) use this to
@@ -52,19 +55,22 @@ final class TemplateStore: ObservableObject {
     private convenience init() {
         let dir = FreeTalkerPaths.applicationSupport
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        self.init(fileURL: dir.appendingPathComponent("templates.json"))
+        self.init(fileURL: dir.appendingPathComponent("templates.json"), defaults: .standard)
     }
 
     // Internal (not private) so tests can point the store at an isolated file — see
     // Tests/FreeTalkerTests/TemplateImportTests.swift.
-    init(fileURL: URL) {
+    convenience init(fileURL: URL) {
+        self.init(fileURL: fileURL, defaults: .standard)
+    }
+
+    init(fileURL: URL, defaults: UserDefaults) {
         self.fileURL = fileURL
 
         let loadedTemplates: [Template]
         let didSeed: Bool
         if let data = try? Data(contentsOf: fileURL),
-           let loaded = try? JSONDecoder().decode([Template].self, from: data),
-           !loaded.isEmpty {
+           let loaded = try? JSONDecoder().decode([Template].self, from: data) {
             loadedTemplates = loaded
             didSeed = false
         } else {
@@ -73,13 +79,37 @@ final class TemplateStore: ObservableObject {
         }
 
         let (upgraded, changed) = Template.upgradingBuiltIns(loadedTemplates)
-        let (renamed, renameChanged) = Self.renamingReservedNameCollisions(upgraded)
+        let (renamedTemplates, renameChanged) = Self.renamingReservedNameCollisions(upgraded)
+        var renamed = renamedTemplates
+        let migrationComplete = defaults.integer(forKey: Self.promptEngineerMigrationKey)
+            >= Self.promptEngineerMigrationVersion
+        let migrationNeeded = !migrationComplete
+        let hasPromptEngineer = renamed.contains { $0.id == "prompt-engineer" }
+        var addedPromptEngineer = false
+        var migrationReady = true
+        if migrationNeeded && !loadedTemplates.isEmpty && !hasPromptEngineer {
+            if let promptEngineer = Template.builtIns.first(where: { $0.id == "prompt-engineer" }) {
+                renamed.append(promptEngineer)
+                addedPromptEngineer = true
+            } else {
+                migrationReady = false
+            }
+        }
         templates = renamed
-        if didSeed || changed || renameChanged {
+        let needsSave = migrationNeeded || didSeed || changed || renameChanged || addedPromptEngineer
+        if needsSave {
             // ponytail: init can't throw here without changing every call site (this predates
             // throwing save()); a failed initial-seed write just means it retries on next
             // mutation, same as before this change. Upgrade path: surface via a published error.
-            try? save()
+            do {
+                try save()
+                if migrationNeeded && migrationReady {
+                    defaults.set(Self.promptEngineerMigrationVersion, forKey: Self.promptEngineerMigrationKey)
+                }
+            } catch {
+                // A failed migration save leaves its marker unset, so initialization retries it
+                // on the next launch without claiming that the on-disk library was updated.
+            }
         }
     }
 

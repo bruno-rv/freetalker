@@ -110,4 +110,10 @@ enum AppLifecycleWindowPolicy {
         window.collectionBehavior.formUnion([.canJoinAllSpaces, .canJoinAllApplications])
         window.level = .normal
     }
+
+    static func configureSettingsWindow(_ window: NSWindow) {
+        window.collectionBehavior.subtract([.fullScreenAuxiliary, .canJoinAllSpaces, .canJoinAllApplications])
+        window.collectionBehavior.insert(.fullScreenPrimary)
+        window.level = .normal
+    }
 }
