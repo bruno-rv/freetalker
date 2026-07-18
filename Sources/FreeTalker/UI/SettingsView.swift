@@ -1579,6 +1579,15 @@ private struct TemplatesSettingsView: View {
                     Button("Export…", systemImage: "square.and.arrow.up") {
                         exportTemplates()
                     }
+                    Button("New Template", systemImage: "plus") {
+                        let new = Template(id: UUID().uuidString, name: "New Template", prompt: "")
+                        try? store.upsert(new)
+                        selectedID = new.id
+                    }
+                    Button("Delete Template", systemImage: "minus") {
+                        if let selectedID { try? store.delete(id: selectedID); self.selectedID = nil }
+                    }
+                    .disabled(selectedID == nil)
                     Spacer()
                 }
 
@@ -1602,26 +1611,20 @@ private struct TemplatesSettingsView: View {
                     // width, HSplitView handed nearly all the window's width to this list and squeezed
                     // the editor down to its minimum — exactly the reported "list occupies almost the
                     // whole screen, prompt editor is shrunk" bug.
-                    .frame(minWidth: 160, idealWidth: 200, maxWidth: 260)
-                    .toolbar {
-                        ToolbarItemGroup {
-                            Button {
-                                let new = Template(id: UUID().uuidString, name: "New Template", prompt: "")
-                                try? store.upsert(new)
-                                selectedID = new.id
-                            } label: { Image(systemName: "plus") }
-                            Button {
-                                if let selectedID { try? store.delete(id: selectedID); self.selectedID = nil }
-                            } label: { Image(systemName: "minus") }
-                            .disabled(selectedID == nil)
-                        }
-                    }
+                    .frame(
+                        minWidth: SplitViewMetrics.templatesMaster.minimum,
+                        idealWidth: SplitViewMetrics.templatesMaster.ideal,
+                        maxWidth: SplitViewMetrics.templatesMaster.maximum
+                    )
 
                     if let selectedID, let template = store.template(id: selectedID) {
                         TemplateEditor(template: template)
                             .id(template.id)
+                            .frame(minWidth: SplitViewMetrics.detailMinimum, maxWidth: .infinity, maxHeight: .infinity)
                     } else {
-                        Text("Select a template").foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
+                        Text("Select a template")
+                            .foregroundStyle(.secondary)
+                            .frame(minWidth: SplitViewMetrics.detailMinimum, maxWidth: .infinity, maxHeight: .infinity)
                     }
                 }
             }

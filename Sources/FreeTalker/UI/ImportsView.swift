@@ -34,7 +34,11 @@ struct ImportsView: View {
                 }
                 .padding(10)
             }
-            .frame(minWidth: 280)
+            .frame(
+                minWidth: SplitViewMetrics.importsMaster.minimum,
+                idealWidth: SplitViewMetrics.importsMaster.ideal,
+                maxWidth: SplitViewMetrics.importsMaster.maximum
+            )
             .dropDestination(for: URL.self) { urls, _ in
                 let eligible = urls.filter(MediaImportPresentation.acceptsDrop)
                 guard !eligible.isEmpty else {
@@ -47,9 +51,10 @@ struct ImportsView: View {
 
             if let selectedID {
                 ImportDetailView(store: store, jobID: selectedID)
+                    .frame(minWidth: SplitViewMetrics.detailMinimum, maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ContentUnavailableView("Select an import", systemImage: "text.alignleft")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .frame(minWidth: SplitViewMetrics.detailMinimum, maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         .fileImporter(

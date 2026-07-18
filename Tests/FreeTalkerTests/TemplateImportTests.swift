@@ -141,6 +141,70 @@ struct TemplateImportTests {
         #expect(store.templates.contains { $0.id == "prompt-engineer" && $0.name == "Prompt Engineer" })
     }
 
+    @Test func migratesPromptEngineerIntoAnExistingPrePromptLibraryOnlyOnce() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("template-migration-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let fileURL = directory.appendingPathComponent("templates.json")
+        let legacyClean = Template(
+            id: "clean-dictation", name: "Clean Dictation",
+            prompt: try #require(Template.legacyPrompts["clean-dictation"]?.first)
+        )
+        let customizedEmail = Template(id: "email", name: "Email", prompt: "My customized email prompt")
+        let custom = Template(id: "custom", name: "My Template", prompt: "My prompt")
+        let prePromptTemplates = [legacyClean, customizedEmail, custom]
+        try encode(prePromptTemplates).write(to: fileURL)
+
+        let defaults = try isolatedDefaults()
+        let store = TemplateStore(fileURL: fileURL, defaults: defaults)
+
+        #expect(store.templates.count == prePromptTemplates.count + 1)
+        #expect(Set(store.templates.map(\.id)) == Set(["clean-dictation", "email", "custom", "prompt-engineer"]))
+        #expect(store.template(id: "clean-dictation")?.prompt == Template.builtIns.first { $0.id == "clean-dictation" }?.prompt)
+        #expect(store.template(id: "email") == customizedEmail)
+        #expect(store.template(id: "custom") == custom)
+        #expect(store.template(id: "prompt-engineer") == Template.builtIns.first { $0.id == "prompt-engineer" })
+        #expect(store.template(id: "refined-prompt") == nil)
+
+        try store.delete(id: "prompt-engineer")
+        let reloaded = TemplateStore(fileURL: fileURL, defaults: defaults)
+        #expect(reloaded.template(id: "prompt-engineer") == nil)
+        #expect(reloaded.templates == store.templates.filter { $0.id != "prompt-engineer" })
+    }
+
+    @Test func preservesAnExistingCustomizedPromptEngineerAndDoesNotReaddIt() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("template-migration-custom-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let fileURL = directory.appendingPathComponent("templates.json")
+        let customized = Template(id: "prompt-engineer", name: "Prompt Engineer", prompt: "My custom prompt")
+        try encode([customized]).write(to: fileURL)
+        let defaults = try isolatedDefaults()
+
+        let store = TemplateStore(fileURL: fileURL, defaults: defaults)
+        #expect(store.templates == [customized])
+
+        try store.delete(id: "prompt-engineer")
+        let reloaded = TemplateStore(fileURL: fileURL, defaults: defaults)
+        #expect(reloaded.template(id: "prompt-engineer") == nil)
+        #expect(reloaded.templates.isEmpty)
+    }
+
+    @Test func preservesAValidEmptyLibraryInsteadOfReseedingBuiltIns() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("template-migration-empty-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let fileURL = directory.appendingPathComponent("templates.json")
+        try encode([]).write(to: fileURL)
+        let defaults = try isolatedDefaults()
+
+        let store = TemplateStore(fileURL: fileURL, defaults: defaults)
+        #expect(store.templates.isEmpty)
+
+        let reloaded = TemplateStore(fileURL: fileURL, defaults: defaults)
+        #expect(reloaded.templates.isEmpty)
+    }
+
     @Test func rejectsOversizedImportData() throws {
         let store = try makeStore()
         let oversized = Data(repeating: 0, count: 5 * 1024 * 1024 + 1)
@@ -195,7 +259,11 @@ struct TemplateImportTests {
             .appendingPathComponent("template-import-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let fileURL = directory.appendingPathComponent("templates.json")
-        return TemplateStore(fileURL: fileURL)
+        return TemplateStore(fileURL: fileURL, defaults: try isolatedDefaults())
+    }
+
+    private func isolatedDefaults() throws -> UserDefaults {
+        try #require(UserDefaults(suiteName: "TemplateImportTests.\(UUID().uuidString)"))
     }
 
     private func encode(_ templates: [Template]) throws -> Data {

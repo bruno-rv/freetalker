@@ -246,7 +246,7 @@ import Testing
             .appendingPathComponent(UUID().uuidString).appendingPathExtension("sqlite")
 
         let settings = AppSettings(defaults: defaults)
-        let templateStore = TemplateStore(fileURL: templatesDirectory.appendingPathComponent("templates.json"))
+        let templateStore = TemplateStore(fileURL: templatesDirectory.appendingPathComponent("templates.json"), defaults: defaults)
         let snippetStore = try SnippetStore(databaseURL: snippetsDatabaseURL)
 
         var settingsDict = settings.exportableSettingsSnapshot()

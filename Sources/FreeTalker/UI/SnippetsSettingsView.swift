@@ -105,7 +105,11 @@ struct SnippetsSettingsView: View {
                             .disabled(selectedID == nil)
                         }
                     }
-                    .frame(minWidth: 180)
+                    .frame(
+                        minWidth: SplitViewMetrics.snippetsMaster.minimum,
+                        idealWidth: SplitViewMetrics.snippetsMaster.ideal,
+                        maxWidth: SplitViewMetrics.snippetsMaster.maximum
+                    )
 
                     // A plain VStack, not a Form: Form collapses a single labeled field into a
                     // cramped label column against the HSplitView divider (see TemplateEditor
@@ -136,7 +140,7 @@ struct SnippetsSettingsView: View {
                         }
                     }
                     .padding()
-                    .frame(minWidth: 320)
+                    .frame(minWidth: SplitViewMetrics.detailMinimum, maxWidth: .infinity, maxHeight: .infinity)
                 }
                 .disabled(store == nil)
             }
