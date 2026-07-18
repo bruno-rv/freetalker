@@ -20,6 +20,19 @@ struct RecordingLanguageSnapshot: Equatable {
 
 @MainActor
 final class AppCoordinator: ObservableObject {
+    enum RestoreBaseHUDFlashReason: CaseIterable, Equatable {
+        case voiceEditBusyFromHotKey
+        case voiceEditBusyBeforeCapture
+        case captureNoSignal
+        case captureRouteRestart
+    }
+
+    nonisolated static func hudFlashLifetime(
+        for _: RestoreBaseHUDFlashReason
+    ) -> HUDController.FlashLifetime {
+        .restoreBase
+    }
+
     enum CaptureOwner: Equatable {
         case none, dictation, voiceEdit
         var requiresDurableJournal: Bool { self == .dictation }
@@ -557,7 +570,11 @@ final class AppCoordinator: ObservableObject {
             finishVoiceEditInstructionRecording()
             return
         case .busy:
-            hud.flash("Finish the current recording first")
+            // Mid-recording notice: restore the recording panel after the flash (Notchpad PLAN step 4).
+            hud.flash(
+                "Finish the current recording first",
+                lifetime: Self.hudFlashLifetime(for: .voiceEditBusyFromHotKey)
+            )
             return
         case .start:
             break
@@ -582,7 +599,11 @@ final class AppCoordinator: ObservableObject {
             admissionState: captureAdmission.state
         ) == .start,
               !isProcessing else {
-            hud.flash("Finish the current recording first")
+            // Mid-recording notice: restore the recording panel after the flash (Notchpad PLAN step 4).
+            hud.flash(
+                "Finish the current recording first",
+                lifetime: Self.hudFlashLifetime(for: .voiceEditBusyBeforeCapture)
+            )
             pendingVoiceEditSelection = nil
             return
         }
@@ -1774,11 +1795,17 @@ final class AppCoordinator: ObservableObject {
         case .continueRecording:
             break
         case .warnNoSignal:
-            hud.flash("No microphone signal detected yet — recording continues")
+            hud.flash(
+                "No microphone signal detected yet — recording continues",
+                lifetime: Self.hudFlashLifetime(for: .captureNoSignal)
+            )
         case .restartForRouteFailure(let message):
             do {
                 try audioCapture.restartAfterCorroboratedFault()
-                hud.flash("Microphone input restarted after a route failure")
+                hud.flash(
+                    "Microphone input restarted after a route failure",
+                    lifetime: Self.hudFlashLifetime(for: .captureRouteRestart)
+                )
             } catch {
                 handleJournalConsumerFailure(
                     captureID: captureID,
@@ -1853,6 +1880,7 @@ final class AppCoordinator: ObservableObject {
             contextPermissionHint = nil
         }
         let state = HUDController.RecordingPanelState(
+            recordingGeneration: recordingGeneration,
             isLocked: isLocked,
             elapsed: elapsed,
             cap: cap,

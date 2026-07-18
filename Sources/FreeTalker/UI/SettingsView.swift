@@ -1,6 +1,11 @@
 import AppKit
 import SwiftUI
 
+enum NotchpadSettingsCopy {
+    static let toggleTitle = "Show FreeTalker in the notch"
+    static let caption = "All HUD presentations — recording panel, status flashes, and translation recovery — move to the notch on the built-in display; falls back to the floating panel in clamshell or external-only setups."
+}
+
 struct SpeechModelRowPresentation: Equatable {
     enum Action: Equatable { case none, download, delete }
 
@@ -393,9 +398,10 @@ private struct GeneralSettingsView: View {
             settingsPage(
                 .launcher,
                 title: "Launcher",
-                subtitle: "Show a compact launcher at the edge of the screen"
+                subtitle: "Edge launcher and Notchpad placement"
             ) {
                 floatingControlsCard
+                notchpadCard
             }
 
             settingsPage(
@@ -931,6 +937,18 @@ private struct GeneralSettingsView: View {
             }
             .padding(.vertical, 8)
             .disabled(!settings.edgeLauncherEnabled)
+        }
+    }
+
+    @ViewBuilder
+    private var notchpadCard: some View {
+        SettingsCard(title: "Notchpad", subtitle: "Show FreeTalker in the MacBook notch when available") {
+            Toggle(NotchpadSettingsCopy.toggleTitle, isOn: $settings.notchpadEnabled)
+                .padding(.vertical, 8)
+            Text(NotchpadSettingsCopy.caption)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.bottom, 8)
         }
     }
 

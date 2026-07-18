@@ -2,6 +2,12 @@ import Testing
 @testable import FreeTalker
 
 @Suite @MainActor struct HUDWarningPresentationTests {
+    @Test func allRecordingOwnedWarningCallsitesUseRestoreBaseLifetime() {
+        for reason in AppCoordinator.RestoreBaseHUDFlashReason.allCases {
+            #expect(AppCoordinator.hudFlashLifetime(for: reason) == .restoreBase)
+        }
+    }
+
     @Test func voiceEditInstructionComposesCaptureWarningsOnce() {
         let text = AppCoordinator.voiceEditRecordingHUDText(captureWarnings: [
             "Noise suppression unavailable; recording without it.",
