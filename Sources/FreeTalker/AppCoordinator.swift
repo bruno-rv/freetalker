@@ -3132,6 +3132,29 @@ final class AppCoordinator: ObservableObject {
         )
     }
 
+    /// Runs a post-processor invocation and applies the shared "never lose the user's words"
+    /// fallback: any thrown error or empty/whitespace-only output falls back to `transcript`
+    /// rather than failing the caller. Shared by the live pipeline's non-translate branch
+    /// (`transcribeAndRefine`) and recovery retry (`processRecoveredDictation`) so both apply
+    /// post-processing identically. See Round 1 Codex finding 3.
+    private func applyPostProcessing(
+        transcript: String,
+        invoke: () async throws -> String
+    ) async throws -> (refined: String, fallbackReason: PostProcessingFallbackReason?) {
+        do {
+            let trimmed = try await invoke().trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                return (transcript, .emptyOutput)
+            }
+            return (trimmed, nil)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            try Task.checkCancellation()
+            return (transcript, .error(error))
+        }
+    }
+
     private func transcribeAndRefine(
         samples: [Float],
         engine: any TranscriptionEngine,
@@ -3189,35 +3212,20 @@ final class AppCoordinator: ObservableObject {
             recordedTemplateName = context.template.name
         } else {
             let activeProcessor: any PostProcessor = processor ?? resolveActiveProcessor()
-            do {
-                let processed: String
-                let request = PostProcessingRequest(
-                    transcript: transcription.text,
-                    template: context.template,
-                    appName: appName,
-                    languagePolicy: .preserveSource
-                )
+            let request = PostProcessingRequest(
+                transcript: transcription.text,
+                template: context.template,
+                appName: appName,
+                languagePolicy: .preserveSource
+            )
+            let (refinedText, fallback) = try await applyPostProcessing(transcript: transcription.text) {
                 if let localProcessor = activeProcessor as? AppleFMProcessor, let localContext {
-                    processed = try await localProcessor.process(
-                        request: request,
-                        context: localContext
-                    )
-                } else {
-                    processed = try await activeProcessor.process(request)
+                    return try await localProcessor.process(request: request, context: localContext)
                 }
-                let trimmed = processed.trimmingCharacters(in: .whitespacesAndNewlines)
-                // Never lose the user's words — fall back to the raw transcript if post-processing
-                // returns empty output without throwing. See Round 1 Codex finding 3.
-                if trimmed.isEmpty {
-                    refined = transcription.text
-                    fallbackReason = .emptyOutput
-                } else {
-                    refined = trimmed
-                }
-            } catch {
-                refined = transcription.text
-                fallbackReason = .error(error)
+                return try await activeProcessor.process(request)
             }
+            refined = refinedText
+            fallbackReason = fallback
             recordedTemplateName = context.template.name
         }
 
@@ -3393,11 +3401,11 @@ final class AppCoordinator: ObservableObject {
         let pipeline = RecoveryRetryPipeline(
             directory: Self.recoveryDirectory,
             store: recoveryStore,
-            processDictation: { [weak self] samples, configuration, captureID in
+            processDictation: { [weak self] samples, configuration, captureID, checkCancellation in
                 guard let self else { throw CancellationError() }
                 return try await self.processRecoveredDictation(
                     samples: samples, configuration: configuration,
-                    captureID: captureID
+                    captureID: captureID, checkCancellation: checkCancellation
                 )
             },
             errorStage: { error in
@@ -3567,25 +3575,53 @@ final class AppCoordinator: ObservableObject {
         try? await jobLibraryStore?.refresh()
     }
 
-    private func processRecoveredDictation(
+    func processRecoveredDictation(
         samples: [Float],
         configuration: AttemptConfiguration,
-        captureID: UUID
+        captureID: UUID,
+        transcriber: (any RecoveryLocalTranscribing)? = nil,
+        processor: (any PostProcessor)? = nil,
+        record: ((RecoveryDictation) throws -> Void)? = nil,
+        // Defaults to Swift task cancellation for direct callers (e.g. tests). The recovery
+        // pipeline wires this to its `CancellationToken.checkCancellation`, which is the only
+        // thing a heartbeat lease-renewal failure actually cancels — see P2 finding: recovery
+        // could still persist after its runner token was cancelled.
+        checkCancellation: () throws -> Void = { try Task.checkCancellation() }
     ) async throws -> RecoveryDictation {
         let template = TemplateStore.shared.templates.first {
             $0.id == configuration.template || $0.name == configuration.template
         } ?? TemplateStore.shared.template(id: AppSettings.shared.activeTemplateID) ?? Template.builtIns[0]
-        let transcription = try await RecoveryLocalProcessor(transcriber: whisperEngine).process(
+        let transcription = try await RecoveryLocalProcessor(transcriber: transcriber ?? whisperEngine).process(
             samples: samples,
             configuration: configuration,
             candidateLanguages: AppSettings.shared.dictationLanguages,
             defaultModel: AppSettings.shared.whisperModel
         )
+        // Retry must apply the same post-processing (active processor + template) the live path
+        // does — transcription-only retries came back raw, silently skipping the configured
+        // CloudLLM/AppleFM processor and template. Transcription stays local WhisperKit
+        // (deliberate — recovery must not depend on the possibly-broken cloud STT), but
+        // refinement reuses the live pipeline's fallback: a post-processing failure must NOT
+        // fail the retry, since the transcription already succeeded.
+        let activeProcessor: any PostProcessor = processor ?? resolveActiveProcessor()
+        let request = PostProcessingRequest(
+            transcript: transcription.text,
+            template: template,
+            appName: nil,
+            languagePolicy: .preserveSource
+        )
+        let (refined, fallbackReason) = try await applyPostProcessing(transcript: transcription.text) {
+            try await activeProcessor.process(request)
+        }
+        if let fallbackReason {
+            logPostProcessingFallback(fallbackReason)
+        }
+        try checkCancellation()
         let dictation = RecoveryDictation(
             language: transcription.language,
             template: template.name,
             transcript: transcription.text,
-            refined: transcription.text,
+            refined: refined,
             engine: "WhisperKit",
             // `samples` is the exact PCM this recovery job just decoded from the recovery wav
             // (`RecoveryRetryPipeline.loadSamples`) — those files are always written at
@@ -3596,7 +3632,7 @@ final class AppCoordinator: ObservableObject {
             // P2 finding: recovered rows persisted with NULL duration.
             duration: Double(samples.count) / Double(CaptureSegmentCodec.sampleRate)
         )
-        try Self.persistRecoveredDictation(dictation, captureID: captureID)
+        try Self.persistRecoveredDictation(dictation, captureID: captureID, record: record)
         return dictation
     }
 

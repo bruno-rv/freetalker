@@ -1137,6 +1137,11 @@ private struct GeneralSettingsView: View {
                     .help(settings.cloudSTTProvider == .openAI
                         ? "OpenAI uses https://api.openai.com/v1."
                         : "Custom OpenAI-compatible endpoint serving /audio/transcriptions.")
+                if CloudSTTProviderKind.isKnownNonTranscriptionSTTBaseURL(settings.cloudSTTBaseURL) {
+                    Label("Ollama does not provide speech-to-text. This endpoint has no /audio/transcriptions — recordings will fail. Use WhisperKit for transcription and Ollama for Cloud processing only.", systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
                 SecureField("API key", text: $cloudSTTKey)
                     .onChange(of: cloudSTTKey) { _, newValue in
                         cloudSTTKeyError = !CloudSTTCredentialWriter.update(

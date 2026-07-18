@@ -56,6 +56,9 @@ final class CloudSTTEngine: ObservableObject, TranscriptionEngine, @unchecked Se
         request.httpMethod = "POST"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        // Multi-minute WAV multipart uploads plus server-side transcription commonly exceed
+        // URLRequest's 60s default. Not `testConnection`'s 10s timeout, which is deliberately short.
+        request.timeoutInterval = 300
         request.httpBody = multipartBody(boundary: boundary, wavData: wavData, model: model, vocabulary: vocabulary, forcedLanguage: forcedLanguage)
 
         let (data, response) = try await URLSession.shared.data(for: request)

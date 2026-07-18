@@ -20,6 +20,25 @@ enum CloudSTTProviderKind: String, CaseIterable, Codable, Hashable, Sendable {
         case .openAICompatible: "Custom OpenAI-compatible"
         }
     }
+
+    /// True when `baseURL`'s host is Ollama-shaped — Ollama (cloud, local, or a LAN/remote host
+    /// reached by hostname or IP) serves `GET /models`, so Test Connection passes, but has no
+    /// `/audio/transcriptions`, so a live recording against it always fails at the transcribing
+    /// stage. Any explicit port 11434 (Ollama's default) is treated as Ollama-shaped regardless
+    /// of host, since that port is Ollama's signature rather than loopback-ness. Mirrors the
+    /// URLComponents parsing style of `CloudLLMSettingsSnapshot.eligibility` above.
+    static func isKnownNonTranscriptionSTTBaseURL(_ baseURL: String) -> Bool {
+        let trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let components = URLComponents(string: trimmed),
+              let host = components.host?.lowercased(), !host.isEmpty
+        else { return false }
+
+        if host == "ollama.com" || host.hasSuffix(".ollama.com") {
+            return true
+        }
+
+        return components.port == 11434
+    }
 }
 
 enum LLMProviderKind: String, CaseIterable, Codable, Sendable {

@@ -39,7 +39,15 @@ protocol RecoveryLeaseStoring: RecoveryRetryStoring {
 extension TranscriptionJobStore: RecoveryRetryStoring {}
 
 struct RecoveryRetryPipeline: Sendable {
-    typealias ProcessDictation = @Sendable ([Float], AttemptConfiguration, UUID) async throws -> RecoveryDictation
+    /// The fourth parameter is the pipeline's `CancellationToken.checkCancellation`, threaded
+    /// through so the irreversible Library insert performed inside `processDictation` (see
+    /// `AppCoordinator.processRecoveredDictation`) can observe token cancellation — not just
+    /// Swift task cancellation — before it commits. See P2 finding: recovery could still persist
+    /// after its runner token was cancelled (e.g. by a heartbeat lease-renewal failure) because
+    /// this pipeline only checked the token after `processDictation` had already returned.
+    typealias ProcessDictation = @Sendable (
+        [Float], AttemptConfiguration, UUID, @Sendable () throws -> Void
+    ) async throws -> RecoveryDictation
 
     private let directory: URL
     private let store: any RecoveryRetryStoring
@@ -101,7 +109,7 @@ struct RecoveryRetryPipeline: Sendable {
             } else { try await store.transition(jobID, from: .processing, to: .processing(stage: .transcribing)) }
             let samples = try loadSamples(URL(fileURLWithPath: job.source.reference))
             try cancellation.checkCancellation()
-            _ = try await processDictation(samples, attempt.configuration, jobID)
+            _ = try await processDictation(samples, attempt.configuration, jobID, cancellation.checkCancellation)
             try cancellation.checkCancellation()
             try await cancellation.beginFinalization()
             if let libraryID = try await libraryDictationID(jobID),

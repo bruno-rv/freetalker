@@ -928,7 +928,7 @@ final class RecordingDurabilityHarness: @unchecked Sendable {
                 directory: recoveryRoot,
                 store: store,
                 loadSamples: { _ in audioLoads.increment(); return [] },
-                processDictation: { _, _, _ in
+                processDictation: { _, _, _, _ in
                     processCalls.increment()
                     return RecoveryDictation(
                         language: "en", template: "Default", transcript: "unexpected",

@@ -92,6 +92,9 @@ struct CloudLLMProcessor: PostProcessor {
         request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
         request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // Local/cold Ollama model loads and slow cloud responses commonly exceed URLRequest's
+        // 60s default. Not the 10s `testConnection` timeout, which is deliberately short.
+        request.timeoutInterval = 300
 
         request.httpBody = try Self.anthropicRequestBody(model: model, request: processingRequest, vocabulary: snapshot.vocabulary)
 
@@ -113,6 +116,8 @@ struct CloudLLMProcessor: PostProcessor {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         Self.applyOpenAICompatibleHeaders(apiKey: apiKey, to: &request)
+        // See callAnthropic: cold Ollama model loads commonly exceed the 60s default.
+        request.timeoutInterval = 300
 
         request.httpBody = try Self.openAICompatibleRequestBody(model: model, request: processingRequest, vocabulary: snapshot.vocabulary)
 

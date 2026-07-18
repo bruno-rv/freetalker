@@ -335,7 +335,9 @@ live in the macOS Keychain only; they're never written to disk unencrypted, bund
 app, or logged.
 
 - **Cloud STT** — Settings → Transcription → **Transcription engine**
-  toggles between WhisperKit (on-device, default) and Cloud.
+  toggles between WhisperKit (on-device, default) and Cloud. The provider must serve the
+  OpenAI-compatible `/audio/transcriptions` endpoint (e.g. OpenAI `whisper-1`). Ollama — cloud
+  or local — does not support transcription; use it for Cloud post-processing only.
 - **Cloud post-processing** — Settings → Processing → **Cloud
   post-processing** accepts a provider, base URL, and model. Supported
   providers are OpenAI-compatible endpoints
@@ -351,11 +353,13 @@ app, or logged.
 Both sections have a **Test connection** button, enabled once the required fields are filled
 in. It sends a single request and reports a fixed status hint — "Connected ✓", an HTTP failure
 like "Failed — HTTP 401 (check API key)", or "Failed — cannot reach host" — never the raw
-response body or the key itself.
+response body or the key itself. For Cloud STT this only verifies reachability and credentials
+via `GET /models`; it cannot confirm the provider actually supports transcription.
 
 For fully local LLM post-processing, run Ollama Desktop and use the existing
 OpenAI-compatible BYOK provider with `http://localhost:11434/v1`. Ollama's local endpoint
 doesn't require an API key; FreeTalker omits the Authorization header when the key is empty.
+This local endpoint applies to Cloud processing (LLM) only, not Cloud STT.
 
 ## Manual end-to-end checklist
 

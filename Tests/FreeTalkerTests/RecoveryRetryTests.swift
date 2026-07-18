@@ -34,6 +34,60 @@ import Testing
         }
     }
 
+    @MainActor @Test func retryAppliesActivePostProcessorToTranscribedText() async throws {
+        let transcriber = RecoveryLocalTranscriberProbe()
+        let processor = RecoveryPostProcessorSpy(output: "polished text")
+
+        let dictation = try await AppCoordinator.shared.processRecoveredDictation(
+            samples: [0.1],
+            configuration: .init(),
+            captureID: UUID(),
+            transcriber: transcriber,
+            processor: processor,
+            record: { _ in }
+        )
+
+        #expect(dictation.transcript == "local transcript")
+        #expect(dictation.refined == "polished text")
+        #expect(await processor.callCount == 1)
+    }
+
+    @MainActor @Test func retryFallsBackToRawTranscriptWhenPostProcessingFails() async throws {
+        let transcriber = RecoveryLocalTranscriberProbe()
+        let processor = RecoveryPostProcessorSpy(error: RetryTestError.database)
+
+        let dictation = try await AppCoordinator.shared.processRecoveredDictation(
+            samples: [0.1],
+            configuration: .init(),
+            captureID: UUID(),
+            transcriber: transcriber,
+            processor: processor,
+            record: { _ in }
+        )
+
+        #expect(dictation.transcript == "local transcript")
+        #expect(dictation.refined == "local transcript")
+    }
+
+    @MainActor @Test func retryCancellationDuringPostProcessingNeverRecords() async throws {
+        let transcriber = RecoveryLocalTranscriberProbe()
+        let processor = RecoveryPostProcessorSpy(error: CancellationError())
+        var recordCallCount = 0
+
+        await #expect(throws: CancellationError.self) {
+            try await AppCoordinator.shared.processRecoveredDictation(
+                samples: [0.1],
+                configuration: .init(),
+                captureID: UUID(),
+                transcriber: transcriber,
+                processor: processor,
+                record: { _ in recordCallCount += 1 }
+            )
+        }
+
+        #expect(recordCallCount == 0)
+    }
+
     @Test func recoveryLocalProcessorUsesExactLocalModelAndNoCloudBoundary() async throws {
         let local = RecoveryLocalTranscriberProbe()
         let cloudSTT = CloudBoundaryProbe()
@@ -140,7 +194,7 @@ import Testing
             directory: fixture.directory,
             store: fixture.store,
             loadSamples: { _ in [0.1] },
-            processDictation: { _, _, captureID in
+            processDictation: { _, _, captureID, _ in
                 try library.persistThenThrow(captureID: captureID)
             },
             libraryDictationID: { captureID in
@@ -171,7 +225,7 @@ import Testing
                 Issue.record("Relaunch must not reload Library-owned audio")
                 return []
             },
-            processDictation: { _, _, captureID in
+            processDictation: { _, _, captureID, _ in
                 try library.persistThenThrow(captureID: captureID)
             },
             libraryDictationID: { captureID in library.dictationID(captureID: captureID) },
@@ -350,6 +404,63 @@ import Testing
             JobFailure(stage: .persisting, message: "database")
         ))
     }
+
+    /// P2 regression: a heartbeat lease-renewal failure calls `token.cancel()` directly
+    /// (`LocalJobRunner.execute`'s heartbeat task), bypassing `LocalJobRunner.cancel(_:)`'s
+    /// executing/finalizing phase check entirely. Before the fix, `RecoveryRetryPipeline` only
+    /// consulted the token *after* `processDictation` returned — so a token cancelled while
+    /// `processDictation` (i.e. `AppCoordinator.processRecoveredDictation`) was still running
+    /// could not stop the irreversible Library insert it performs internally. This suspends the
+    /// processor mid-flight, cancels the token exactly as the heartbeat would, and asserts the
+    /// record closure is never reached and the job ends up cancelled — not silently `.ready`
+    /// with a Library row.
+    @Test func directTokenCancellationDuringProcessDictationNeverRecordsAndEndsCancelled() async throws {
+        let fixture = try await RetryFixture()
+        // `RetryFixture` leaves the job in `.processing` (see its `init`). `LocalJobRunner.execute`
+        // only picks up jobs in `.queued` state, so route back through `.failed` → `.queued` first —
+        // mirrors `cancellationAfterRecoveryFinalizationHandshakeIsTooLate` and
+        // `pipelineReadyRollbackImmediatelyFailsJobAndUnfinishedAttempt` above.
+        try await fixture.store.transition(
+            fixture.job.id,
+            from: .processing,
+            to: .failed(JobFailure(stage: .preparing, message: "retry"))
+        )
+        try await fixture.store.transition(fixture.job.id, from: .failed, to: .queued)
+        let gate = ProcessingSuspensionGate()
+        let recorded = RecordedFlag()
+        let pipeline = RecoveryRetryPipeline(
+            directory: fixture.directory,
+            store: fixture.store,
+            loadSamples: { _ in [0.1] },
+            processDictation: { _, _, _, checkCancellation in
+                await gate.signalSuspended()
+                await gate.waitForRelease()
+                // Mirrors `AppCoordinator.processRecoveredDictation`'s check immediately before
+                // its irreversible `persistRecoveredDictation` call.
+                try checkCancellation()
+                await recorded.markRecorded()
+                return RecoveryDictation(
+                    language: "pt", template: "Clean", transcript: "raw", refined: "raw", engine: "test"
+                )
+            }
+        )
+        let tokenBox = CancellationTokenBox()
+        let runner = LocalJobRunner(store: fixture.store, kind: .recovery, executorFinalizesJob: true) { job, token in
+            await tokenBox.set(token)
+            try await pipeline.execute(jobID: job.id, configuration: .init(), cancellation: token)
+        }
+
+        await runner.enqueue(fixture.job.id)
+        await gate.waitUntilSuspended()
+        // Simulate the heartbeat's direct `token.cancel()` on lease-renewal failure — not
+        // `runner.cancel(_:)`, which enforces the executing/finalizing phase boundary instead.
+        await tokenBox.cancel()
+        await gate.release()
+        await runner.waitUntilIdle()
+
+        #expect(await recorded.value == false)
+        #expect(try await fixture.store.job(id: fixture.job.id)?.state == .cancelled)
+    }
 }
 
 private actor RecoveryLocalTranscriberProbe: RecoveryLocalTranscribing {
@@ -363,6 +474,21 @@ private actor RecoveryLocalTranscriberProbe: RecoveryLocalTranscribing {
 private actor CloudBoundaryProbe {
     private(set) var calls = 0
     func call() { calls += 1 }
+}
+
+private actor RecoveryPostProcessorSpy: PostProcessor {
+    private let output: String?
+    private let error: Error?
+    private(set) var callCount = 0
+
+    init(output: String) { self.output = output; error = nil }
+    init(error: Error) { output = nil; self.error = error }
+
+    func process(_ request: PostProcessingRequest) async throws -> String {
+        callCount += 1
+        if let error { throw error }
+        return output ?? ""
+    }
 }
 
 private final class PersistentRetryLibrary: @unchecked Sendable {
@@ -419,6 +545,49 @@ private final class LockedRetryEvents: @unchecked Sendable {
     func append(_ value: String) { lock.withLock { storage.append(value) } }
 }
 
+/// Coordinates a test with a `processDictation` closure that must be suspended mid-flight so a
+/// token cancellation can be injected before it resumes — mirrors the real timing window between
+/// transcription/post-processing starting and the Library insert it performs.
+private actor ProcessingSuspensionGate {
+    private var isSuspended = false
+    private var suspendedContinuation: CheckedContinuation<Void, Never>?
+    private var isReleased = false
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func signalSuspended() {
+        isSuspended = true
+        suspendedContinuation?.resume()
+        suspendedContinuation = nil
+    }
+
+    func waitUntilSuspended() async {
+        guard !isSuspended else { return }
+        await withCheckedContinuation { suspendedContinuation = $0 }
+    }
+
+    func waitForRelease() async {
+        guard !isReleased else { return }
+        await withCheckedContinuation { releaseContinuation = $0 }
+    }
+
+    func release() {
+        isReleased = true
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+}
+
+private actor CancellationTokenBox {
+    private var token: CancellationToken?
+    func set(_ token: CancellationToken) { self.token = token }
+    func cancel() { token?.cancel() }
+}
+
+private actor RecordedFlag {
+    private(set) var value = false
+    func markRecorded() { value = true }
+}
+
 private final class RetryProbe: @unchecked Sendable {
     private let lock = NSLock()
     private var storedConfigurations: [AttemptConfiguration] = []
@@ -435,7 +604,11 @@ private final class RetryProbe: @unchecked Sendable {
         self.recordFails = recordFails
     }
 
-    func process(samples: [Float], configuration: AttemptConfiguration, captureID: UUID) async throws -> RecoveryDictation {
+    func process(
+        samples: [Float], configuration: AttemptConfiguration, captureID: UUID,
+        checkCancellation: () throws -> Void
+    ) async throws -> RecoveryDictation {
+        try checkCancellation()
         lock.withLock {
             storedConfigurations.append(configuration)
             storedEvents.append("transcribe")

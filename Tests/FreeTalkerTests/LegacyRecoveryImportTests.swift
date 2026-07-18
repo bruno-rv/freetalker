@@ -261,7 +261,7 @@ import Testing
         try await fixture.store.transition(job.id, from: .queued, to: .processing(stage: .preparing))
         let pipeline = RecoveryRetryPipeline(
             directory: fixture.root, store: fixture.store,
-            processDictation: { _, _, _ in
+            processDictation: { _, _, _, _ in
                 RecoveryDictation(
                     language: "en", template: "Raw Transcript", transcript: "words",
                     refined: "words", engine: "test"

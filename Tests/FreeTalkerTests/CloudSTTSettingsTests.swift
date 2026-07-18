@@ -105,6 +105,17 @@ struct CloudSTTSettingsTests {
         #expect(store.values[Keychain.Account.cloudSTTKey] == nil)
     }
 
+    @Test("detects Ollama-shaped base URLs that don't support transcription")
+    func detectsKnownNonTranscriptionSTTBaseURL() {
+        #expect(CloudSTTProviderKind.isKnownNonTranscriptionSTTBaseURL("https://ollama.com/v1"))
+        #expect(CloudSTTProviderKind.isKnownNonTranscriptionSTTBaseURL("http://localhost:11434/v1"))
+        #expect(CloudSTTProviderKind.isKnownNonTranscriptionSTTBaseURL("http://192.168.1.20:11434/v1"))
+        #expect(CloudSTTProviderKind.isKnownNonTranscriptionSTTBaseURL("http://mac-mini.local:11434/v1"))
+        #expect(!CloudSTTProviderKind.isKnownNonTranscriptionSTTBaseURL("https://api.openai.com/v1"))
+        #expect(!CloudSTTProviderKind.isKnownNonTranscriptionSTTBaseURL("http://localhost:8080/v1"))
+        #expect(!CloudSTTProviderKind.isKnownNonTranscriptionSTTBaseURL("not-a-url"))
+    }
+
     @Test("clearing a Cloud STT key removes the provider-scoped secret")
     func clearingKeyDeletesSecret() {
         let account = Keychain.Account.cloudSTTKey(for: .openAI)
