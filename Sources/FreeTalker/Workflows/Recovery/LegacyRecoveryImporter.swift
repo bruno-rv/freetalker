@@ -79,11 +79,22 @@ struct LegacyRecoveryImporter: Sendable {
             : "Damaged or unsupported recovery audio was quarantined"
         try await retrier.run {
             try await beforeRegistrationAttempt()
+            // Codex round-8 finding 3: read the capture session's durable voice-command snapshot
+            // BEFORE creating the quarantine job below, mirroring `RecoveryCaptureService.
+            // registerJournalCapture`/`RecoveryReconciler.registerCanonical`. Previously the job
+            // creation relied on the defaulted `nil`/`nil` parameters, silently discarding an
+            // already-persisted snapshot whenever `id` already had a `CaptureSession` row (e.g.
+            // `ensureQuarantine` below finds or the caller passed one) — a retry from the
+            // resulting job then used current command settings instead of the capture's stop-time
+            // policy.
+            let preexistingSession = try await ledger.session(id: id)
             var job = if let existing = try await store.job(id: id) {
                 existing
             } else {
                 try await store.createProvisionalRecovery(
-                    id: id, source: JobSource(reference: source.path), capturedAt: Self.creationDate(source)
+                    id: id, source: JobSource(reference: source.path), capturedAt: Self.creationDate(source),
+                    voiceCommandsEnabled: preexistingSession?.voiceCommandsEnabled,
+                    commandKeywords: preexistingSession?.commandKeywords
                 )
             }
             if !valid { try await ensureQuarantine(id: id, source: source, message: message) }

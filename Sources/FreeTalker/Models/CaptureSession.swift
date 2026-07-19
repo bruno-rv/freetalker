@@ -24,6 +24,14 @@ struct CaptureSession: Sendable, Equatable, Identifiable {
     let assetKind: RecoveryAssetKind
     let failureMessage: String?
     let contentHash: String?
+    /// Durable voice command snapshot (PLAN.md PR A, item 1b) — written once, atomically with (or
+    /// immediately before) the `.capturing -> .staged` transition at Recording stop, via
+    /// `CaptureLedgerStoring.recordVoiceCommandSnapshot`. `nil`/`nil` for every OTHER transition
+    /// (silent/damaged/cancelling/still-capturing) and for sessions created before this feature —
+    /// nullable at every level; "absent" means "legacy or never staged", not "disabled". Both
+    /// fields are set together or not at all.
+    var voiceCommandsEnabled: Bool? = nil
+    var commandKeywords: [String]? = nil
 }
 
 struct CaptureSegment: Sendable, Equatable {

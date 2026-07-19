@@ -14,17 +14,31 @@ extension TranscriptionJobStore: RecoveryLeaseStoring {
         return sqlite3_changes(handle) == 1
     }
 
+    /// `configuration.voiceCommandsEnabled`/`commandKeywords`, when the caller leaves them `nil`,
+    /// COALESCE against the JOB's own durable snapshot columns in the same INSERT — mirrors
+    /// `TranscriptionJobStore.beginAttempt`. Startup recovery (leased processing) must inherit the
+    /// job's snapshot exactly like the manual/automatic retry paths do, or an interrupted-then-
+    /// resumed attempt silently drops the stop-time policy. See PLAN.md PR A, item 1b.
     func beginOwnedAttempt(jobID: UUID, owner: UUID, configuration: AttemptConfiguration) throws -> JobAttempt {
         let statement = try recoveryLeasePrepare("""
-        INSERT INTO job_attempts (job_id, attempt_number, started_at, language, speech_model, template)
-        SELECT ?, COALESCE((SELECT MAX(attempt_number) FROM job_attempts WHERE job_id = ?), 0) + 1, ?, ?, ?, ?
+        INSERT INTO job_attempts
+            (job_id, attempt_number, started_at, language, speech_model, template,
+             voice_commands_enabled, command_keywords)
+        SELECT ?, COALESCE((SELECT MAX(attempt_number) FROM job_attempts WHERE job_id = ?), 0) + 1, ?, ?, ?, ?,
+               COALESCE(?, voice_commands_enabled), COALESCE(?, command_keywords)
         FROM transcription_jobs WHERE id = ? AND state = 'processing' AND lease_owner = ?
           AND lease_expires_at > ? AND deletion_claimed_at IS NULL AND purge_claimed_at IS NULL;
         """)
         defer { sqlite3_finalize(statement) }; let now = clock.now.timeIntervalSince1970
         recoveryLeaseBind(jobID.uuidString, 1, statement); recoveryLeaseBind(jobID.uuidString, 2, statement); sqlite3_bind_double(statement, 3, now)
         recoveryLeaseBindOptional(configuration.language, 4, statement); recoveryLeaseBindOptional(configuration.speechModel, 5, statement); recoveryLeaseBindOptional(configuration.template, 6, statement)
-        recoveryLeaseBind(jobID.uuidString, 7, statement); recoveryLeaseBind(owner.uuidString, 8, statement); sqlite3_bind_double(statement, 9, now); try recoveryLeaseStep(statement)
+        if let voiceCommandsEnabled = configuration.voiceCommandsEnabled {
+            sqlite3_bind_int(statement, 7, voiceCommandsEnabled ? 1 : 0)
+        } else {
+            sqlite3_bind_null(statement, 7)
+        }
+        recoveryLeaseBindOptional(configuration.commandKeywords?.joined(separator: ","), 8, statement)
+        recoveryLeaseBind(jobID.uuidString, 9, statement); recoveryLeaseBind(owner.uuidString, 10, statement); sqlite3_bind_double(statement, 11, now); try recoveryLeaseStep(statement)
         guard sqlite3_changes(handle) == 1, let attempt = try latestUnfinishedAttempt(jobID: jobID) else { throw JobStoreError.leaseLost }
         return attempt
     }

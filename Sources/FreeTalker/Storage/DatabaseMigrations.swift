@@ -6,7 +6,7 @@ enum DatabaseRole: Sendable {
 }
 
 enum DatabaseMigrator {
-    static let latestVersion = 12
+    static let latestVersion = 13
 
     static func migrate(_ db: OpaquePointer, role: DatabaseRole = .jobs) throws {
         try execute(db, "BEGIN IMMEDIATE;")
@@ -30,6 +30,8 @@ enum DatabaseMigrator {
                     try migrateCaptureV11(db, role: role)
                 } else if version == 12 {
                     try migrateLibraryStatsV12(db, role: role)
+                } else if version == 13 {
+                    try migrateVoiceCommandSnapshotV13(db, role: role)
                 } else {
                     try execute(db, migration)
                 }
@@ -237,8 +239,9 @@ enum DatabaseMigrator {
     private static let migration10 = ""
     private static let migration11 = ""
     private static let migration12 = ""
+    private static let migration13 = ""
 
-    private static let migrations = [migration1, migration2, migration3, migration4, migration5, migration6, migration7, migration8, migration9, migration10, migration11, migration12]
+    private static let migrations = [migration1, migration2, migration3, migration4, migration5, migration6, migration7, migration8, migration9, migration10, migration11, migration12, migration13]
 
     /// Adds the Usage Statistics columns to an existing Library `dictations` table. Runs only for
     /// the Library database (the jobs database has no `dictations`). Guarded by `columnExists` so a
@@ -252,6 +255,44 @@ enum DatabaseMigrator {
         }
         if try !columnExists("duration_secs", in: "dictations", db: db) {
             try execute(db, "ALTER TABLE dictations ADD COLUMN duration_secs REAL;")
+        }
+    }
+
+    /// Adds the durable voice command snapshot columns (PLAN.md PR A, item 1b): nullable
+    /// `voice_commands_enabled`/`command_keywords` on `capture_sessions`, `transcription_jobs`,
+    /// and `job_attempts` (jobs database), and nullable `voice_commands_active` on `dictations`
+    /// (library database). `command_keywords` is stored as a comma-joined string — validated
+    /// keywords are letters-only (see `AppSettings.normalizeCommandKeywords`), so a comma can
+    /// never collide with keyword content. NULL everywhere means "absent" (legacy/unknown), never
+    /// "disabled" — see each column's call site for how that's resolved.
+    private static func migrateVoiceCommandSnapshotV13(_ db: OpaquePointer, role: DatabaseRole) throws {
+        switch role {
+        case .jobs:
+            if try tableExists("capture_sessions", db: db) {
+                if try !columnExists("voice_commands_enabled", in: "capture_sessions", db: db) {
+                    try execute(db, "ALTER TABLE capture_sessions ADD COLUMN voice_commands_enabled INTEGER;")
+                }
+                if try !columnExists("command_keywords", in: "capture_sessions", db: db) {
+                    try execute(db, "ALTER TABLE capture_sessions ADD COLUMN command_keywords TEXT;")
+                }
+            }
+            if try !columnExists("voice_commands_enabled", in: "transcription_jobs", db: db) {
+                try execute(db, "ALTER TABLE transcription_jobs ADD COLUMN voice_commands_enabled INTEGER;")
+            }
+            if try !columnExists("command_keywords", in: "transcription_jobs", db: db) {
+                try execute(db, "ALTER TABLE transcription_jobs ADD COLUMN command_keywords TEXT;")
+            }
+            if try !columnExists("voice_commands_enabled", in: "job_attempts", db: db) {
+                try execute(db, "ALTER TABLE job_attempts ADD COLUMN voice_commands_enabled INTEGER;")
+            }
+            if try !columnExists("command_keywords", in: "job_attempts", db: db) {
+                try execute(db, "ALTER TABLE job_attempts ADD COLUMN command_keywords TEXT;")
+            }
+        case .library:
+            guard try tableExists("dictations", db: db) else { return }
+            if try !columnExists("voice_commands_active", in: "dictations", db: db) {
+                try execute(db, "ALTER TABLE dictations ADD COLUMN voice_commands_active INTEGER;")
+            }
         }
     }
 

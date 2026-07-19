@@ -19,6 +19,19 @@ protocol CaptureLedgerStoring: Sendable {
     func committedSegments(captureID: UUID) async throws -> [CaptureSegment]
     func removeCommittedSegments(captureID: UUID) async throws
     func removeCleanedSession(id: UUID) async throws
+    /// Persists the durable voice command snapshot on the session row (PLAN.md PR A, item 1b).
+    /// Callers must invoke this BEFORE the canonical WAV commit (`CaptureJournalWriter.finish`)
+    /// and the `.capturing -> .staged` transition — see `CaptureJournalService.finish`. That
+    /// ordering closes the crash window where a durable canonical file exists with no snapshot
+    /// attached: reconciliation only imports canonical audio it finds on disk for a `.capturing`
+    /// session, so the snapshot must already be durable before that file can be. Default no-op so
+    /// conformers unrelated to voice commands (most test doubles) keep compiling; only the real
+    /// store overrides it — see the `TranscriptionJobStore` extension below.
+    func recordVoiceCommandSnapshot(id: UUID, enabled: Bool, keywords: [String]) async throws
+}
+
+extension CaptureLedgerStoring {
+    func recordVoiceCommandSnapshot(id: UUID, enabled: Bool, keywords: [String]) async throws {}
 }
 
 extension TranscriptionJobStore: CaptureLedgerStoring {
@@ -160,7 +173,7 @@ extension TranscriptionJobStore: CaptureLedgerStoring {
         let statement = try capturePrepare("""
         SELECT id, state, directory, captured_at, sample_rate, channel_count,
                input_device_uid, destination, recovery_job_id, library_dictation_id,
-               asset_kind, failure_message, content_hash
+               asset_kind, failure_message, content_hash, voice_commands_enabled, command_keywords
         FROM capture_sessions WHERE id = ?;
         """)
         defer { sqlite3_finalize(statement) }
@@ -172,11 +185,43 @@ extension TranscriptionJobStore: CaptureLedgerStoring {
         }
     }
 
+    /// Called from `CaptureJournalService.finish` BEFORE `active.writer.finish()` — i.e. before
+    /// the canonical WAV is fsynced/renamed durable, and therefore also before the
+    /// `.capturing -> .staged` transition — see the protocol doc comment. Unconditional on
+    /// session state: `finish` is the only production call site and the session is always
+    /// `.capturing` at that point, so no state precondition is needed here (unlike `transition`,
+    /// which enforces legal state edges).
+    ///
+    /// `async` is REQUIRED here, not cosmetic: the protocol requirement has a default no-op
+    /// implementation in `extension CaptureLedgerStoring` above (for conformers that don't care
+    /// about voice commands). If this override's signature is `throws` instead of `async throws`,
+    /// it stops being an exact match for the requirement, so Swift resolves a direct concrete-type
+    /// call (`store.recordVoiceCommandSnapshot(...)`) to the protocol's default no-op witness
+    /// instead of this method, with no compiler warning. Existential calls (`any
+    /// CaptureLedgerStoring`, which is how `CaptureJournalService.finish` — the only production
+    /// call site — invokes it) are unaffected, since a sync `actor` method is still a valid
+    /// witness there. The concrete-call form only shows up in tests (e.g. a fixture calling
+    /// `fixture.store.recordVoiceCommandSnapshot(...)` directly to seed state), but a mismatch
+    /// here is a latent trap for any future concrete caller. Caught by
+    /// `RecoveryReconciliationTests.reconciliationInheritsVoiceCommandSnapshotIntoRecreatedJob`,
+    /// which exercises the real store rather than a hand-written test double.
+    func recordVoiceCommandSnapshot(id: UUID, enabled: Bool, keywords: [String]) async throws {
+        let statement = try capturePrepare("""
+        UPDATE capture_sessions SET voice_commands_enabled = ?, command_keywords = ? WHERE id = ?;
+        """)
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_int(statement, 1, enabled ? 1 : 0)
+        captureBind(keywords.joined(separator: ","), at: 2, in: statement)
+        captureBind(id.uuidString, at: 3, in: statement)
+        try captureStepDone(statement)
+        guard sqlite3_changes(handle) == 1 else { throw JobStoreError.invalidTransition }
+    }
+
     func unfinishedSessions() throws -> [CaptureSession] {
         let statement = try capturePrepare("""
         SELECT id, state, directory, captured_at, sample_rate, channel_count,
                input_device_uid, destination, recovery_job_id, library_dictation_id,
-               asset_kind, failure_message, content_hash
+               asset_kind, failure_message, content_hash, voice_commands_enabled, command_keywords
         FROM capture_sessions ORDER BY captured_at, id;
         """)
         defer { sqlite3_finalize(statement) }
@@ -275,6 +320,11 @@ extension TranscriptionJobStore: CaptureLedgerStoring {
         } else {
             recoveryJobID = nil
         }
+        let voiceCommandsEnabled: Bool? = sqlite3_column_type(statement, 13) == SQLITE_NULL
+            ? nil : sqlite3_column_int(statement, 13) == 1
+        let commandKeywords = captureOptionalText(statement, 14).map {
+            $0.split(separator: ",").map(String.init)
+        }
         return CaptureSession(
             id: id, state: state,
             directory: URL(fileURLWithPath: captureText(statement, 2)),
@@ -286,7 +336,9 @@ extension TranscriptionJobStore: CaptureLedgerStoring {
             libraryDictationID: sqlite3_column_type(statement, 9) == SQLITE_NULL
                 ? nil : sqlite3_column_int64(statement, 9),
             assetKind: assetKind, failureMessage: captureOptionalText(statement, 11),
-            contentHash: captureOptionalText(statement, 12)
+            contentHash: captureOptionalText(statement, 12),
+            voiceCommandsEnabled: voiceCommandsEnabled,
+            commandKeywords: commandKeywords
         )
     }
 

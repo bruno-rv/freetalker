@@ -51,18 +51,21 @@ final class AppCoordinator: ObservableObject {
         let oneShotLanguage: String?
         let outputLanguage: OutputLanguage
         let cloudSnapshot: CloudLLMSettingsSnapshot
+        let voiceCommands: VoiceCommandSnapshot
     }
 
     nonisolated static func captureStopSettingsSnapshot(
         oneShotLanguage: String?,
         selectedOutput: OutputLanguage?,
         defaultOutput: OutputLanguage,
-        cloudSnapshot: CloudLLMSettingsSnapshot
+        cloudSnapshot: CloudLLMSettingsSnapshot,
+        voiceCommands: VoiceCommandSnapshot
     ) -> CaptureStopSettingsSnapshot {
         CaptureStopSettingsSnapshot(
             oneShotLanguage: oneShotLanguage,
             outputLanguage: selectedOutput ?? defaultOutput,
-            cloudSnapshot: cloudSnapshot
+            cloudSnapshot: cloudSnapshot,
+            voiceCommands: voiceCommands
         )
     }
 
@@ -240,6 +243,7 @@ final class AppCoordinator: ObservableObject {
         let oneShotLanguage: String?
         let outputLanguage: OutputLanguage
         let cloudSnapshot: CloudLLMSettingsSnapshot
+        let voiceCommands: VoiceCommandSnapshot
     }
     private var pendingStopRequest: PendingStopRequest?
     private struct PendingCaptureCleanup {
@@ -949,7 +953,9 @@ final class AppCoordinator: ObservableObject {
                     refined: record.finalOutput,
                     engine: record.engineName,
                     bundleID: record.bundleID,
-                    durationSecs: record.durationSecs
+                    durationSecs: record.durationSecs,
+                    // PLAN.md PR A, item 2: the translation pipeline is hard-disabled, always.
+                    voiceCommandsActive: false
                 )
             },
             onHistoryFailure: { [weak self] message in self?.hud.flash(message) },
@@ -1931,14 +1937,16 @@ final class AppCoordinator: ObservableObject {
             oneShotLanguage: oneShotLanguage,
             selectedOutput: recordingOutputSelection.current,
             defaultOutput: AppSettings.shared.defaultOutputLanguage,
-            cloudSnapshot: AppSettings.shared.cloudLLMSnapshot
+            cloudSnapshot: AppSettings.shared.cloudLLMSnapshot,
+            voiceCommands: AppSettings.shared.voiceCommandSnapshot
         )
         return PendingStopRequest(
             destination: destination, snapshot: snapshot,
             skipPostProcessing: skipPostProcessing,
             oneShotLanguage: settings.oneShotLanguage,
             outputLanguage: settings.outputLanguage,
-            cloudSnapshot: settings.cloudSnapshot
+            cloudSnapshot: settings.cloudSnapshot,
+            voiceCommands: settings.voiceCommands
         )
     }
 
@@ -2038,7 +2046,7 @@ final class AppCoordinator: ObservableObject {
                         recordingHUDDidReachTerminalState()
                         return
                     }
-                    let staged = try await service.finish(active)
+                    let staged = try await service.finish(active, voiceCommands: stopRequest.voiceCommands)
                     ownershipTransitionCompleted = true
                     let url = staged.canonicalAudioURL
                     let downstreamSamples = try await CaptureCanonicalAudioLoader.load {
@@ -2096,6 +2104,7 @@ final class AppCoordinator: ObservableObject {
         let capturedOneShotLanguage = stopRequest.oneShotLanguage
         let capturedOutputLanguage = stopRequest.outputLanguage
         let capturedCloudSnapshot = stopRequest.cloudSnapshot
+        let capturedVoiceCommands = stopRequest.voiceCommands
         defer {
             oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .clear)
             recordingOutputSelection.resolveTerminal()
@@ -2108,6 +2117,7 @@ final class AppCoordinator: ObservableObject {
             stopAndTranscribeToScratchpad(
                 token: token, forcedLanguage: capturedOneShotLanguage,
                 outputLanguage: capturedOutputLanguage, cloudSnapshot: capturedCloudSnapshot,
+                voiceCommands: capturedVoiceCommands,
                 skipPostProcessing: stopRequest.skipPostProcessing,
                 stoppedCapture: stoppedCapture
             )
@@ -2249,6 +2259,7 @@ final class AppCoordinator: ObservableObject {
                     candidateLanguages: candidateLanguages,
                     outputLanguage: capturedOutputLanguage,
                     cloudSnapshot: capturedCloudSnapshot,
+                    voiceCommands: capturedVoiceCommands,
                     skipPostProcessing: stopRequest.skipPostProcessing,
                     processor: processor,
                     localContext: Self.localContextForProcessor(
@@ -2730,7 +2741,26 @@ final class AppCoordinator: ObservableObject {
         }
     }
 
-    private func runPipeline(samples: [Float], engine: any TranscriptionEngine, engineName: String, template: Template, appName: String?, target: InsertionTarget?, forcedLanguage: String?, candidateLanguages: [String], outputLanguage: OutputLanguage, cloudSnapshot: CloudLLMSettingsSnapshot, skipPostProcessing: Bool, processor: (any PostProcessor)? = nil, localContext: LocalProcessingContext? = nil, recovery: ForegroundRecovery, bundleID: String?, durationSecs: Double?, hudGeneration: UUID) async {
+    /// Centralizes the persisted `voice_commands_active` derivation (Codex round-5 finding 4) —
+    /// every call site below computed this independently and always persisted `false` once the
+    /// policy toggle was off, even when the ACTIVE template still carries an unrecognized legacy
+    /// spoken-command block. `buildProcessorUserContent` always includes `template.prompt` as
+    /// untrusted content on every pass regardless of policy (`PostProcessor.swift`), so a flagged
+    /// legacy template can still influence output with the policy off — persisting a hard `false`
+    /// there overclaims certainty. `nil` means "policy off, but this pass may still have been
+    /// command-influenced by template content — unknown." `ranCommandEligiblePass == false`
+    /// (skipped post-processing, or output translated away from the spoken language — the
+    /// command-interpreting instructions are keyed to `.sameAsSpoken`) means the command
+    /// interpreter never even ran: `false` is exact there, no ambiguity.
+    static func derivedVoiceCommandsActive(
+        policyEnabled: Bool, ranCommandEligiblePass: Bool, template: Template
+    ) -> Bool? {
+        guard ranCommandEligiblePass else { return false }
+        if policyEnabled { return true }
+        return Template.containsUnrecognizedLegacyCommandRuleVariant(template.prompt) ? nil : false
+    }
+
+    private func runPipeline(samples: [Float], engine: any TranscriptionEngine, engineName: String, template: Template, appName: String?, target: InsertionTarget?, forcedLanguage: String?, candidateLanguages: [String], outputLanguage: OutputLanguage, cloudSnapshot: CloudLLMSettingsSnapshot, voiceCommands: VoiceCommandSnapshot, skipPostProcessing: Bool, processor: (any PostProcessor)? = nil, localContext: LocalProcessingContext? = nil, recovery: ForegroundRecovery, bundleID: String?, durationSecs: Double?, hudGeneration: UUID) async {
         defer {
             isProcessing = false
             recordingHUDDidReachTerminalState(generation: hudGeneration)
@@ -2744,6 +2774,7 @@ final class AppCoordinator: ObservableObject {
                     candidateLanguages: candidateLanguages,
                     skipPostProcessing: skipPostProcessing, outputLanguage: outputLanguage,
                     cloudSnapshot: cloudSnapshot.eligibility.isEligible ? cloudSnapshot : nil,
+                    voiceCommands: voiceCommands,
                     processor: processor, localContext: localContext,
                     record: { result in
                         try LibraryStore.shared.record(
@@ -2755,7 +2786,14 @@ final class AppCoordinator: ObservableObject {
                             engine: result.engineName,
                             captureID: recovery.captureID,
                             bundleID: bundleID,
-                            durationSecs: durationSecs
+                            durationSecs: durationSecs,
+                            // PLAN.md PR A, item 1b: skipped post-processing (Raw) and translation
+                            // never ran the command-interpreting LLM pass regardless of policy.
+                            voiceCommandsActive: Self.derivedVoiceCommandsActive(
+                                policyEnabled: voiceCommands.enabled,
+                                ranCommandEligiblePass: !skipPostProcessing && outputLanguage == .sameAsSpoken,
+                                template: template
+                            )
                         )
                     }
                 )
@@ -2820,6 +2858,7 @@ final class AppCoordinator: ObservableObject {
         forcedLanguage oneShotLanguage: String?,
         outputLanguage: OutputLanguage,
         cloudSnapshot: CloudLLMSettingsSnapshot,
+        voiceCommands: VoiceCommandSnapshot,
         skipPostProcessing: Bool,
         stoppedCapture: (samples: [Float], peak: Float, rms: Float, staged: StagedCapture?)?
     ) {
@@ -2861,6 +2900,7 @@ final class AppCoordinator: ObservableObject {
             destination: .scratchpad(token), spokenLanguage: forcedLanguage,
             outputLanguage: outputLanguage, template: template,
             cloudSnapshot: cloudSnapshot.eligibility.isEligible ? cloudSnapshot : nil,
+            voiceCommandPolicy: voiceCommands.enabled ? .enabled(keywords: voiceCommands.keywords) : .disabled,
             candidateLanguages: recordingLanguageSnapshot
         )
         let processor = outputLanguage == .sameAsSpoken ? resolveActiveProcessor() : nil
@@ -2920,7 +2960,17 @@ final class AppCoordinator: ObservableObject {
                                         refined: result.refined,
                                         engine: result.engineName,
                                         captureID: staged.captureID,
-                                        durationSecs: Double(staged.sampleCount) / Double(CaptureSegmentCodec.sampleRate)
+                                        durationSecs: Double(staged.sampleCount) / Double(CaptureSegmentCodec.sampleRate),
+                                        // PLAN.md PR A, item 1b: skipped post-processing (Raw) and
+                                        // translation never ran the command-interpreting LLM pass.
+                                        voiceCommandsActive: Self.derivedVoiceCommandsActive(
+                                            policyEnabled: {
+                                                guard case .enabled = context.voiceCommandPolicy else { return false }
+                                                return true
+                                            }(),
+                                            ranCommandEligiblePass: !skipPostProcessing && outputLanguage == .sameAsSpoken,
+                                            template: context.template
+                                        )
                                     )
                                 } catch {
                                     await failForegroundRecovery(
@@ -3044,6 +3094,10 @@ final class AppCoordinator: ObservableObject {
         skipPostProcessing: Bool = false,
         outputLanguage: OutputLanguage = .sameAsSpoken,
         cloudSnapshot: CloudLLMSettingsSnapshot? = nil,
+        // Default matches `candidateLanguages`'s own default-for-uninvolved-call-sites reasoning
+        // above: existing/test call sites that don't exercise voice commands keep compiling;
+        // `runPipeline` (the real production caller) passes the actual stop-time snapshot.
+        voiceCommands: VoiceCommandSnapshot = VoiceCommandSnapshot(enabled: false, keywords: []),
         processor: (any PostProcessor)? = nil,
         translator: any Translating = TranslationService(),
         localContext: LocalProcessingContext? = nil,
@@ -3065,6 +3119,7 @@ final class AppCoordinator: ObservableObject {
             outputLanguage: outputLanguage,
             template: template,
             cloudSnapshot: cloudSnapshot,
+            voiceCommandPolicy: voiceCommands.enabled ? .enabled(keywords: voiceCommands.keywords) : .disabled,
             candidateLanguages: candidateLanguages
         )
         return try await processDictation(
@@ -3137,13 +3192,24 @@ final class AppCoordinator: ObservableObject {
     /// rather than failing the caller. Shared by the live pipeline's non-translate branch
     /// (`transcribeAndRefine`) and recovery retry (`processRecoveredDictation`) so both apply
     /// post-processing identically. See Round 1 Codex finding 3.
+    /// `voiceCommandPolicy` is only used for observability (PLAN.md PR A, item 8): logged
+    /// (non-content) when post-processing falls back with commands enabled, so misfires are
+    /// diagnosable — it never changes fallback BEHAVIOR. The single choke point for detecting a
+    /// fallback across both live dictation (`transcribeAndRefine`) and recovery retry
+    /// (`processRecoveredDictation`).
     private func applyPostProcessing(
         transcript: String,
+        voiceCommandPolicy: VoiceCommandPolicy = .disabled,
         invoke: () async throws -> String
     ) async throws -> (refined: String, fallbackReason: PostProcessingFallbackReason?) {
+        func logFallbackIfCommandsEnabled() {
+            guard case .enabled = voiceCommandPolicy else { return }
+            Self.logger.notice("post-processing fallback with voice commands enabled")
+        }
         do {
             let trimmed = try await invoke().trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty {
+                logFallbackIfCommandsEnabled()
                 return (transcript, .emptyOutput)
             }
             return (trimmed, nil)
@@ -3151,6 +3217,7 @@ final class AppCoordinator: ObservableObject {
             throw CancellationError()
         } catch {
             try Task.checkCancellation()
+            logFallbackIfCommandsEnabled()
             return (transcript, .error(error))
         }
     }
@@ -3184,6 +3251,7 @@ final class AppCoordinator: ObservableObject {
                 outputLanguage: context.outputLanguage,
                 template: context.template,
                 cloudSnapshot: context.cloudSnapshot,
+                voiceCommandPolicy: context.voiceCommandPolicy,
                 candidateLanguages: context.candidateLanguages
             )
             guard let snapshot = context.cloudSnapshot, snapshot.eligibility.isEligible else {
@@ -3216,9 +3284,18 @@ final class AppCoordinator: ObservableObject {
                 transcript: transcription.text,
                 template: context.template,
                 appName: appName,
-                languagePolicy: .preserveSource
+                languagePolicy: .preserveSource,
+                // PLAN.md PR A, item 2: live dictation (external paste, scratchpad recording,
+                // notchpad — all funnel through this one `transcribeAndRefine`) uses the
+                // stop-time snapshot carried on `context`.
+                voiceCommandPolicy: context.voiceCommandPolicy
             )
-            let (refinedText, fallback) = try await applyPostProcessing(transcript: transcription.text) {
+            if case .enabled = request.voiceCommandPolicy {
+                Self.logger.notice("post-processing request: voice command policy enabled")
+            }
+            let (refinedText, fallback) = try await applyPostProcessing(
+                transcript: transcription.text, voiceCommandPolicy: request.voiceCommandPolicy
+            ) {
                 if let localProcessor = activeProcessor as? AppleFMProcessor, let localContext {
                     return try await localProcessor.process(request: request, context: localContext)
                 }
@@ -3604,13 +3681,28 @@ final class AppCoordinator: ObservableObject {
         // refinement reuses the live pipeline's fallback: a post-processing failure must NOT
         // fail the retry, since the transcription already succeeded.
         let activeProcessor: any PostProcessor = processor ?? resolveActiveProcessor()
+        // PLAN.md PR A, item 1b/2: recovery retry uses the job's durable snapshot
+        // (`configuration.voiceCommandsEnabled`/`commandKeywords`, already COALESCEd from the
+        // job row at attempt-begin time — see `TranscriptionJobStore.beginAttempt`/
+        // `queueRecoveryRetry`) when present, else falls back to current settings — the second
+        // half of the two-level nullable fallback (job snapshot itself absent = legacy job).
+        let voiceCommandsEnabled = configuration.voiceCommandsEnabled ?? AppSettings.shared.voiceCommandsEnabled
+        let voiceCommandPolicy: VoiceCommandPolicy = voiceCommandsEnabled
+            ? .enabled(keywords: configuration.commandKeywords ?? AppSettings.shared.commandKeywords)
+            : .disabled
         let request = PostProcessingRequest(
             transcript: transcription.text,
             template: template,
             appName: nil,
-            languagePolicy: .preserveSource
+            languagePolicy: .preserveSource,
+            voiceCommandPolicy: voiceCommandPolicy
         )
-        let (refined, fallbackReason) = try await applyPostProcessing(transcript: transcription.text) {
+        if case .enabled = request.voiceCommandPolicy {
+            Self.logger.notice("post-processing request: voice command policy enabled (recovery retry)")
+        }
+        let (refined, fallbackReason) = try await applyPostProcessing(
+            transcript: transcription.text, voiceCommandPolicy: request.voiceCommandPolicy
+        ) {
             try await activeProcessor.process(request)
         }
         if let fallbackReason {
@@ -3630,7 +3722,15 @@ final class AppCoordinator: ObservableObject {
             // elsewhere in this file). So the duration IS recoverable here even though the
             // original segments/StagedCapture are long gone by the time a recovery job runs. See
             // P2 finding: recovered rows persisted with NULL duration.
-            duration: Double(samples.count) / Double(CaptureSegmentCodec.sampleRate)
+            duration: Double(samples.count) / Double(CaptureSegmentCodec.sampleRate),
+            // Recovery retry always runs post-processing with `.preserveSource` — the
+            // command-eligible pass always ran; only the policy/template legacy-content check
+            // decides `true`/`false`/`nil` (Codex round-5 finding 4).
+            voiceCommandsActive: Self.derivedVoiceCommandsActive(
+                policyEnabled: { guard case .enabled = voiceCommandPolicy else { return false }; return true }(),
+                ranCommandEligiblePass: true,
+                template: template
+            )
         )
         try Self.persistRecoveredDictation(dictation, captureID: captureID, record: record)
         return dictation
@@ -3652,7 +3752,8 @@ final class AppCoordinator: ObservableObject {
                     refined: dictation.refined,
                     engine: dictation.engine,
                     captureID: captureID,
-                    durationSecs: dictation.duration
+                    durationSecs: dictation.duration,
+                    voiceCommandsActive: dictation.voiceCommandsActive
                 )
             }
         } catch {
@@ -3704,6 +3805,12 @@ final class AppCoordinator: ObservableObject {
         let processor: PostProcessor = resolveActiveProcessor()
         let refined: String
         var fallbackReason: PostProcessingFallbackReason?
+        // A fresh LLM pass triggered now (not a snapshot of the original capture's stop-time
+        // settings) — uses CURRENT settings, same fallback semantics as recovery retry with an
+        // absent job snapshot. See PLAN.md PR A, item 2.
+        let voiceCommandPolicy: VoiceCommandPolicy = AppSettings.shared.voiceCommandsEnabled
+            ? .enabled(keywords: AppSettings.shared.commandKeywords)
+            : .disabled
         do {
             // No known frontmost app for a historical re-process — appName: nil.
             let processed = try await processor.process(
@@ -3711,7 +3818,8 @@ final class AppCoordinator: ObservableObject {
                     transcript: dictation.transcript,
                     template: template,
                     appName: nil,
-                    languagePolicy: .preserveSource
+                    languagePolicy: .preserveSource,
+                    voiceCommandPolicy: voiceCommandPolicy
                 )
             )
             let trimmed = processed.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3740,7 +3848,14 @@ final class AppCoordinator: ObservableObject {
                 engine: dictation.engine,
                 sourceID: dictation.sourceID ?? dictation.id,
                 bundleID: dictation.bundleID,
-                durationSecs: dictation.durationSecs
+                durationSecs: dictation.durationSecs,
+                // A fresh reprocessing pass always runs post-processing with `.preserveSource` —
+                // the command-eligible pass always ran (Codex round-5 finding 4).
+                voiceCommandsActive: Self.derivedVoiceCommandsActive(
+                    policyEnabled: { guard case .enabled = voiceCommandPolicy else { return false }; return true }(),
+                    ranCommandEligiblePass: true,
+                    template: template
+                )
             )
         } catch {
             hud.flash("Library save failed")

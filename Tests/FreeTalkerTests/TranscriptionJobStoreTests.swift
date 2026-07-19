@@ -83,6 +83,102 @@ import Darwin
         #expect(attempts[1].result == .succeeded)
     }
 
+    @Test func beginAttemptInheritsJobVoiceCommandSnapshotWhenConfigurationOmitsIt() async throws {
+        let database = try TemporaryJobDatabase()
+        let clock = FixedJobClock(now: Date(timeIntervalSince1970: 1_000))
+        let store = try TranscriptionJobStore(databaseURL: database.url, clock: clock)
+        let job = try await store.createProvisionalRecovery(
+            id: UUID(), source: .init(reference: "audio.wav"), capturedAt: clock.now,
+            voiceCommandsEnabled: true, commandKeywords: ["command", "comando"]
+        )
+
+        let attempt = try await store.beginAttempt(jobID: job.id, configuration: .init(language: "pt"))
+
+        #expect(attempt.configuration.voiceCommandsEnabled == true)
+        #expect(attempt.configuration.commandKeywords == ["command", "comando"])
+    }
+
+    @Test func beginAttemptConfigurationOverridesJobVoiceCommandSnapshotWhenSupplied() async throws {
+        let database = try TemporaryJobDatabase()
+        let clock = FixedJobClock(now: Date(timeIntervalSince1970: 1_000))
+        let store = try TranscriptionJobStore(databaseURL: database.url, clock: clock)
+        let job = try await store.createProvisionalRecovery(
+            id: UUID(), source: .init(reference: "audio.wav"), capturedAt: clock.now,
+            voiceCommandsEnabled: true, commandKeywords: ["command"]
+        )
+
+        let attempt = try await store.beginAttempt(
+            jobID: job.id,
+            configuration: .init(voiceCommandsEnabled: false, commandKeywords: ["override"])
+        )
+
+        #expect(attempt.configuration.voiceCommandsEnabled == false)
+        #expect(attempt.configuration.commandKeywords == ["override"])
+    }
+
+    @Test func queueRecoveryRetryInheritsJobVoiceCommandSnapshotWhenConfigurationOmitsIt() async throws {
+        let database = try TemporaryJobDatabase()
+        let clock = FixedJobClock(now: Date(timeIntervalSince1970: 1_000))
+        let store = try TranscriptionJobStore(databaseURL: database.url, clock: clock)
+        let job = try await store.createProvisionalRecovery(
+            id: UUID(), source: .init(reference: "audio.wav"), capturedAt: clock.now,
+            voiceCommandsEnabled: true, commandKeywords: ["command", "comando"]
+        )
+        try await store.transition(job.id, from: .processing, to: .failed(.init(stage: .transcribing, message: "offline")))
+
+        let attempt = try await store.queueRecoveryRetry(jobID: job.id, configuration: .init(language: "es"))
+
+        #expect(attempt.configuration.voiceCommandsEnabled == true)
+        #expect(attempt.configuration.commandKeywords == ["command", "comando"])
+    }
+
+    /// Regression for finding 2: leased startup recovery (`beginOwnedAttempt`, the path
+    /// `LocalJobRunner`/startup requeue uses) must inherit the job's durable voice-command
+    /// snapshot exactly like the manual (`beginAttempt`) and automatic-retry
+    /// (`queueRecoveryRetry`) paths above — mirrored via the same COALESCE-against-job pattern.
+    @Test func beginOwnedAttemptInheritsJobVoiceCommandSnapshotWhenConfigurationOmitsIt() async throws {
+        let database = try TemporaryJobDatabase()
+        let clock = FixedJobClock(now: Date(timeIntervalSince1970: 1_000))
+        let store = try TranscriptionJobStore(databaseURL: database.url, clock: clock)
+        let job = try await store.createProvisionalRecovery(
+            id: UUID(), source: .init(reference: "audio.wav"), capturedAt: clock.now,
+            voiceCommandsEnabled: true, commandKeywords: ["command", "comando"]
+        )
+        try await store.transition(job.id, from: .processing, to: .failed(.init(stage: .transcribing, message: "offline")))
+        try await store.transition(job.id, from: .failed, to: .queued)
+        let owner = UUID()
+        _ = try await store.claimQueuedJob(job.id, kind: .recovery, owner: owner, leaseDuration: 30)
+
+        let attempt = try await store.beginOwnedAttempt(
+            jobID: job.id, owner: owner, configuration: .init(language: "es")
+        )
+
+        #expect(attempt.configuration.voiceCommandsEnabled == true)
+        #expect(attempt.configuration.commandKeywords == ["command", "comando"])
+    }
+
+    @Test func beginOwnedAttemptConfigurationOverridesJobVoiceCommandSnapshotWhenSupplied() async throws {
+        let database = try TemporaryJobDatabase()
+        let clock = FixedJobClock(now: Date(timeIntervalSince1970: 1_000))
+        let store = try TranscriptionJobStore(databaseURL: database.url, clock: clock)
+        let job = try await store.createProvisionalRecovery(
+            id: UUID(), source: .init(reference: "audio.wav"), capturedAt: clock.now,
+            voiceCommandsEnabled: true, commandKeywords: ["command"]
+        )
+        try await store.transition(job.id, from: .processing, to: .failed(.init(stage: .transcribing, message: "offline")))
+        try await store.transition(job.id, from: .failed, to: .queued)
+        let owner = UUID()
+        _ = try await store.claimQueuedJob(job.id, kind: .recovery, owner: owner, leaseDuration: 30)
+
+        let attempt = try await store.beginOwnedAttempt(
+            jobID: job.id, owner: owner,
+            configuration: .init(voiceCommandsEnabled: false, commandKeywords: ["override"])
+        )
+
+        #expect(attempt.configuration.voiceCommandsEnabled == false)
+        #expect(attempt.configuration.commandKeywords == ["override"])
+    }
+
     @Test func queueRecoveryRetryAtomicallyPersistsConfigurationAndQueues() async throws {
         let fixture = try await failedFixture()
         let configuration = AttemptConfiguration(language: "pt", speechModel: "small", template: "email")

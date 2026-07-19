@@ -453,6 +453,8 @@ private final class RemoveFailingFileSystem: JournalFileSystem, @unchecked Senda
         }
         try base.remove(url)
     }
+    func removeEmptyDirectory(_ url: URL) throws { try base.removeEmptyDirectory(url) }
+    func removeRegularFile(_ url: URL) throws { try base.removeRegularFile(url) }
     func exists(_ url: URL) -> Bool { base.exists(url) }
 }
 
@@ -480,6 +482,8 @@ private final class OneShotWriteFailingFileSystem: JournalFileSystem, @unchecked
     func contents(_ url: URL) throws -> [URL] { try base.contents(url) }
     func read(_ url: URL) throws -> Data { try base.read(url) }
     func remove(_ url: URL) throws { try base.remove(url) }
+    func removeEmptyDirectory(_ url: URL) throws { try base.removeEmptyDirectory(url) }
+    func removeRegularFile(_ url: URL) throws { try base.removeRegularFile(url) }
     func exists(_ url: URL) -> Bool { base.exists(url) }
 }
 
@@ -522,6 +526,8 @@ private final class LifecycleSyncFileSystem: JournalFileSystem, @unchecked Senda
     func contents(_ url: URL) throws -> [URL] { try base.contents(url) }
     func read(_ url: URL) throws -> Data { try base.read(url) }
     func remove(_ url: URL) throws { try base.remove(url) }
+    func removeEmptyDirectory(_ url: URL) throws { try base.removeEmptyDirectory(url) }
+    func removeRegularFile(_ url: URL) throws { try base.removeRegularFile(url) }
     func exists(_ url: URL) -> Bool { base.exists(url) }
 }
 
@@ -554,6 +560,8 @@ private final class BlockingWriteFileSystem: JournalFileSystem, @unchecked Senda
     func contents(_ url: URL) throws -> [URL] { try base.contents(url) }
     func read(_ url: URL) throws -> Data { try base.read(url) }
     func remove(_ url: URL) throws { try base.remove(url) }
+    func removeEmptyDirectory(_ url: URL) throws { try base.removeEmptyDirectory(url) }
+    func removeRegularFile(_ url: URL) throws { try base.removeRegularFile(url) }
     func exists(_ url: URL) -> Bool { base.exists(url) }
 }
 
@@ -600,6 +608,8 @@ private final class BoundaryFailingFileSystem: JournalFileSystem, @unchecked Sen
     func contents(_ url: URL) throws -> [URL] { try base.contents(url) }
     func read(_ url: URL) throws -> Data { try base.read(url) }
     func remove(_ url: URL) throws { try base.remove(url) }
+    func removeEmptyDirectory(_ url: URL) throws { try base.removeEmptyDirectory(url) }
+    func removeRegularFile(_ url: URL) throws { try base.removeRegularFile(url) }
     func exists(_ url: URL) -> Bool { base.exists(url) }
 
     private func shouldFail(_ candidate: SegmentCommitBoundary) -> Bool {

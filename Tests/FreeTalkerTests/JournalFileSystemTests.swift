@@ -41,6 +41,60 @@ import Testing
         }
         #expect(fileSystem.events == boundary.expectedEvents)
     }
+
+    @Test("removeEmptyDirectory uses non-recursive rmdir semantics: ENOTEMPTY on non-empty content, never deletes it (Codex round-10 minor 1)")
+    func removeEmptyDirectoryNeverRecursesIntoUnexpectedContent() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("journal-fs-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let target = root.appendingPathComponent("orphan", isDirectory: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        let survivor = target.appendingPathComponent("unexpected-content.txt")
+        try Data("do not delete me".utf8).write(to: survivor)
+
+        let fileSystem = LocalJournalFileSystem()
+        // Unlike the old empty-check-then-`remove(_:)` race, this must fail atomically instead of
+        // recursively deleting `survivor` — there is no separate check-then-act window at all.
+        #expect(throws: JournalPersistenceError.remove(path: target.path, code: ENOTEMPTY)) {
+            try fileSystem.removeEmptyDirectory(target)
+        }
+        #expect(FileManager.default.fileExists(atPath: survivor.path))
+
+        // An actually-empty directory is removed normally.
+        try FileManager.default.removeItem(at: survivor)
+        try fileSystem.removeEmptyDirectory(target)
+        #expect(!FileManager.default.fileExists(atPath: target.path))
+    }
+
+    @Test("removeRegularFile uses non-recursive unlink semantics: fails on a directory instead of recursing into it (Codex round-10 minor 2)")
+    func removeRegularFileNeverRecursesIntoADirectory() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("journal-fs-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        // Simulates the TOCTOU outcome: something replaced the expected regular file with a
+        // directory (containing other content) between an `lstat` check and the removal call.
+        let swapped = root.appendingPathComponent("marker", isDirectory: true)
+        try FileManager.default.createDirectory(at: swapped, withIntermediateDirectories: true)
+        let survivor = swapped.appendingPathComponent("unexpected-content.txt")
+        try Data("do not delete me".utf8).write(to: survivor)
+
+        let fileSystem = LocalJournalFileSystem()
+        // Darwin's `unlink(2)` reports a directory target as `EPERM`, not `EISDIR` (Linux's code) —
+        // the exact code doesn't matter here so much as the outcome: `unlink` NEVER recurses into a
+        // directory's contents, unlike `FileManager.removeItem`'s `remove(_:)`.
+        #expect(throws: JournalPersistenceError.remove(path: swapped.path, code: EPERM)) {
+            try fileSystem.removeRegularFile(swapped)
+        }
+        #expect(FileManager.default.fileExists(atPath: survivor.path))
+
+        // An actual regular file is removed normally.
+        let regular = root.appendingPathComponent("regular.txt")
+        try Data("bye".utf8).write(to: regular)
+        try fileSystem.removeRegularFile(regular)
+        #expect(!FileManager.default.fileExists(atPath: regular.path))
+    }
 }
 
 enum FileSystemEvent: Equatable, Sendable {
@@ -133,6 +187,11 @@ private final class RecordingJournalFileSystem: JournalFileSystem, @unchecked Se
     func contents(_ url: URL) throws -> [URL] { [] }
     func read(_ url: URL) throws -> Data { Data() }
     func remove(_ url: URL) throws {}
+    // This double models no real filesystem state (every read/contents call is a stub) — there is
+    // nothing behind it a non-recursive implementation could meaningfully protect, unlike the
+    // production `LocalJournalFileSystem` or wrappers around it.
+    func removeEmptyDirectory(_ url: URL) throws {}
+    func removeRegularFile(_ url: URL) throws {}
     func exists(_ url: URL) -> Bool { false }
 
     private func record(_ event: FileSystemEvent, at boundary: CommitBoundary) throws {

@@ -16,6 +16,24 @@ private struct SilentSegmentOwnershipError: LocalizedError {
     var errorDescription: String? { reason }
 }
 
+/// Durable stop/finalization intent for the voice command snapshot (Codex round-2 finding 1) —
+/// written into the session directory BEFORE `CaptureLedgerStoring.recordVoiceCommandSnapshot` is
+/// attempted in `CaptureJournalService.finish`. Journal segments are committed to the ledger
+/// continuously during capture, independent of Stop, so a `.capturing` session can have committed
+/// segments on disk even though `finish` never got past the snapshot write (e.g. a transient
+/// SQLite failure). Without this marker, `RecoveryReconciler`'s committed-segments promotion path
+/// cannot tell that state apart from a genuine mid-capture crash (where nil/nil current-settings
+/// fallback is correct) and would silently reuse current settings instead of the policy the user
+/// actually stopped with. Reconciliation hydrates the session from this marker before promoting.
+struct VoiceCommandFinalizationIntent: Codable, Sendable, Equatable {
+    let enabled: Bool
+    let keywords: [String]
+
+    static func markerURL(in directory: URL) -> URL {
+        directory.appendingPathComponent(".capture-voice-command-intent.json")
+    }
+}
+
 struct CaptureJournalService: Sendable {
     let fileSystem: any JournalFileSystem
     let ledger: any CaptureLedgerStoring
@@ -174,7 +192,41 @@ struct CaptureJournalService: Sendable {
         )
     }
 
-    func finish(_ active: ActiveCaptureJournal) async throws -> StagedCapture {
+    /// `voiceCommands`, when supplied, is persisted BEFORE `active.writer.finish()` below —
+    /// i.e. before the canonical WAV is fsynced and renamed into its durable, recoverable form —
+    /// closing the crash window where audio is durable but the snapshot wasn't (PLAN.md PR A,
+    /// item 1b). Reconciliation only ever observes a `.capturing` session with a durable canonical
+    /// file (`RecoveryReconciler.reconcileKnownSession`'s `importCanonical` path) AFTER this write
+    /// has landed, so a recreated job always inherits the stop-time policy. `nil` (the default)
+    /// skips the write entirely, leaving the session's snapshot columns NULL — used by callers
+    /// that don't have a live `AppSettings` snapshot to offer (e.g. tests exercising unrelated
+    /// behavior).
+    ///
+    /// The `VoiceCommandFinalizationIntent` marker is written durably to the session directory
+    /// even earlier than the ledger write above — closing the narrower crash window where the
+    /// ledger write itself fails (Codex round-2 finding 1). Journal segments are committed
+    /// continuously during capture, so a failed ledger write here still leaves committed segments
+    /// on disk for a `.capturing` session with null snapshot columns; the marker lets
+    /// `RecoveryReconciler` recover the exact stop-time policy instead of silently falling back to
+    /// current settings.
+    func finish(
+        _ active: ActiveCaptureJournal,
+        voiceCommands: VoiceCommandSnapshot? = nil
+    ) async throws -> StagedCapture {
+        if let voiceCommands {
+            try DurableArtifactWriter(fileSystem: fileSystem).commit(
+                try JSONEncoder().encode(VoiceCommandFinalizationIntent(
+                    enabled: voiceCommands.enabled, keywords: voiceCommands.keywords
+                )),
+                temporary: active.session.directory.appendingPathComponent(
+                    ".capture-voice-command-intent.\(UUID().uuidString).tmp"
+                ),
+                destination: VoiceCommandFinalizationIntent.markerURL(in: active.session.directory)
+            )
+            try await ledger.recordVoiceCommandSnapshot(
+                id: active.session.id, enabled: voiceCommands.enabled, keywords: voiceCommands.keywords
+            )
+        }
         let staged = try await active.writer.finish()
         guard let contentHash = active.writer.finishedContentHash() else {
             throw CaptureJournalError.failed("canonical audio hash is unavailable")

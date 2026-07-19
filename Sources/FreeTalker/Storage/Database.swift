@@ -50,7 +50,8 @@ final class Database {
             requested_output_language TEXT NOT NULL DEFAULT 'same',
             capture_id TEXT,
             bundle_id TEXT,
-            duration_secs REAL
+            duration_secs REAL,
+            voice_commands_active INTEGER
         );
         """)
         try exec("""
@@ -108,8 +109,8 @@ final class Database {
     func insertDictation(_ request: DictationInsertRequest, captureID: UUID?) throws -> Dictation {
         let sql = """
         INSERT INTO dictations
-            (ts, language, requested_output_language, template, transcript, refined, engine, source_id, capture_id, bundle_id, duration_secs)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (ts, language, requested_output_language, template, transcript, refined, engine, source_id, capture_id, bundle_id, duration_secs, voice_commands_active)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(capture_id) WHERE capture_id IS NOT NULL DO NOTHING;
         """
         let stmt = try prepare(sql)
@@ -140,6 +141,11 @@ final class Database {
             sqlite3_bind_double(stmt, 11, durationSecs)
         } else {
             sqlite3_bind_null(stmt, 11)
+        }
+        if let voiceCommandsActive = request.voiceCommandsActive {
+            sqlite3_bind_int(stmt, 12, voiceCommandsActive ? 1 : 0)
+        } else {
+            sqlite3_bind_null(stmt, 12)
         }
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.sqlFailed(lastError())
@@ -254,9 +260,9 @@ final class Database {
     /// The single source-of-truth column list, in the exact order `readAll` reads positionally.
     /// Every dictation SELECT interpolates this so the projection and the reader can never drift.
     private static let dictationColumns =
-        "id, ts, language, requested_output_language, template, transcript, refined, engine, source_id, capture_id, bundle_id, duration_secs"
+        "id, ts, language, requested_output_language, template, transcript, refined, engine, source_id, capture_id, bundle_id, duration_secs, voice_commands_active"
     private static let dictationColumnsPrefixedD =
-        "d.id, d.ts, d.language, d.requested_output_language, d.template, d.transcript, d.refined, d.engine, d.source_id, d.capture_id, d.bundle_id, d.duration_secs"
+        "d.id, d.ts, d.language, d.requested_output_language, d.template, d.transcript, d.refined, d.engine, d.source_id, d.capture_id, d.bundle_id, d.duration_secs, d.voice_commands_active"
 
     /// All dictations, reverse-chronological. `id DESC` breaks ties when two rows share a `ts`
     /// (e.g. inserted within the same clock tick) — id is the monotonic tiebreaker.
@@ -356,6 +362,7 @@ final class Database {
             let captureID = optionalColumnText(stmt, 9).flatMap(UUID.init(uuidString:))
             let bundleID = optionalColumnText(stmt, 10)
             let durationSecs: Double? = sqlite3_column_type(stmt, 11) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 11)
+            let voiceCommandsActive: Bool? = sqlite3_column_type(stmt, 12) == SQLITE_NULL ? nil : sqlite3_column_int(stmt, 12) == 1
             results.append(Dictation(
                 id: id,
                 timestamp: Date(timeIntervalSince1970: ts),
@@ -368,7 +375,8 @@ final class Database {
                 sourceID: sourceID,
                 captureID: captureID,
                 bundleID: bundleID,
-                durationSecs: durationSecs
+                durationSecs: durationSecs,
+                voiceCommandsActive: voiceCommandsActive
             ))
             stepResult = sqlite3_step(stmt)
         }

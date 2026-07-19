@@ -90,17 +90,25 @@ actor TranscriptionJobStore {
         try createProvisionalRecovery(id: UUID(), source: source, capturedAt: capturedAt)
     }
 
+    /// `voiceCommandsEnabled`/`commandKeywords` inherit the ORIGINATING capture session's durable
+    /// snapshot (PLAN.md PR A, item 1b) — callers that have a `CaptureSession` (the normal
+    /// `registerJournalCapture` path and reconciliation-recreated jobs, `RecoveryReconciler`)
+    /// pass its `voiceCommandsEnabled`/`commandKeywords` through; callers without a session
+    /// (legacy provisional captures predating the durable journal) pass `nil`/`nil`, which later
+    /// falls back to current settings at retry time.
     func createProvisionalRecovery(
         id: UUID,
         source: JobSource,
-        capturedAt: Date
+        capturedAt: Date,
+        voiceCommandsEnabled: Bool? = nil,
+        commandKeywords: [String]? = nil
     ) throws -> TranscriptionJob {
         if let existing = try recoveryJob(sourceReference: source.reference) { return existing }
         let statement = try prepare("""
         INSERT INTO transcription_jobs
             (id, kind, source_reference, source_bookmark, state, progress, created_at, updated_at,
-             started_at, failure_stage)
-        VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?);
+             started_at, failure_stage, voice_commands_enabled, command_keywords)
+        VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?);
         """)
         defer { sqlite3_finalize(statement) }
         bind(id.uuidString, to: 1, in: statement)
@@ -112,11 +120,14 @@ actor TranscriptionJobStore {
         sqlite3_bind_double(statement, 7, capturedAt.timeIntervalSince1970)
         sqlite3_bind_double(statement, 8, capturedAt.timeIntervalSince1970)
         bind(JobStage.preparing.rawValue, to: 9, in: statement)
+        bind(voiceCommandsEnabled, to: 10, in: statement)
+        bind(commandKeywords?.joined(separator: ","), to: 11, in: statement)
         try stepDone(statement)
         return TranscriptionJob(
             id: id, kind: .recovery, source: source, state: .processing(stage: .preparing), progress: 0,
             createdAt: capturedAt, updatedAt: capturedAt, startedAt: capturedAt, completedAt: nil,
-            expiresAt: nil, result: nil, needsSourceCleanup: false, sourceCleanupError: nil
+            expiresAt: nil, result: nil, needsSourceCleanup: false, sourceCleanupError: nil,
+            voiceCommandsEnabled: voiceCommandsEnabled, commandKeywords: commandKeywords
         )
     }
 
@@ -281,13 +292,15 @@ actor TranscriptionJobStore {
         return claims
     }
 
+    private static let jobColumns = """
+        id, kind, source_reference, source_bookmark, state, progress,
+        created_at, updated_at, started_at, completed_at, expires_at,
+        failure_stage, failure_message, result, needs_source_cleanup, source_cleanup_error,
+        voice_commands_enabled, command_keywords
+        """
+
     func job(id: UUID) throws -> TranscriptionJob? {
-        let statement = try prepare("""
-        SELECT id, kind, source_reference, source_bookmark, state, progress,
-               created_at, updated_at, started_at, completed_at, expires_at,
-               failure_stage, failure_message, result, needs_source_cleanup, source_cleanup_error
-        FROM transcription_jobs WHERE id = ?;
-        """)
+        let statement = try prepare("SELECT \(Self.jobColumns) FROM transcription_jobs WHERE id = ?;")
         defer { sqlite3_finalize(statement) }
         bind(id.uuidString, to: 1, in: statement)
         switch sqlite3_step(statement) {
@@ -300,20 +313,10 @@ actor TranscriptionJobStore {
     func jobs(kind: JobKind? = nil) throws -> [TranscriptionJob] {
         let statement: OpaquePointer
         if let kind {
-            statement = try prepare("""
-            SELECT id, kind, source_reference, source_bookmark, state, progress,
-                   created_at, updated_at, started_at, completed_at, expires_at,
-                   failure_stage, failure_message, result, needs_source_cleanup, source_cleanup_error
-            FROM transcription_jobs WHERE kind = ? ORDER BY created_at, id;
-            """)
+            statement = try prepare("SELECT \(Self.jobColumns) FROM transcription_jobs WHERE kind = ? ORDER BY created_at, id;")
             bind(kind.rawValue, to: 1, in: statement)
         } else {
-            statement = try prepare("""
-            SELECT id, kind, source_reference, source_bookmark, state, progress,
-                   created_at, updated_at, started_at, completed_at, expires_at,
-                   failure_stage, failure_message, result, needs_source_cleanup, source_cleanup_error
-            FROM transcription_jobs ORDER BY created_at, id;
-            """)
+            statement = try prepare("SELECT \(Self.jobColumns) FROM transcription_jobs ORDER BY created_at, id;")
         }
         defer { sqlite3_finalize(statement) }
         var values: [TranscriptionJob] = []
@@ -355,14 +358,23 @@ actor TranscriptionJobStore {
         }
     }
 
+    /// `configuration.voiceCommandsEnabled`/`commandKeywords`, when the caller leaves them `nil`,
+    /// COALESCE against the JOB's own durable snapshot columns in the same INSERT — so a manual
+    /// retry (`JobLibraryStore.retry`, which never sets these) and a fresh automatic attempt
+    /// (`RecoveryRetryPipeline.execute`, which always passes `configuration: nil` ->
+    /// `AttemptConfiguration()`) both inherit the job's snapshot without an extra round trip. See
+    /// PLAN.md PR A, item 1b: "retry uses the snapshot if present, else falls back to current
+    /// settings" — the second half of that fallback (job snapshot ALSO absent) happens later, at
+    /// `AppCoordinator.processRecoveredDictation`, against current `AppSettings`.
     func beginAttempt(jobID: UUID, configuration: AttemptConfiguration) throws -> JobAttempt {
         let startedAt = clock.now
         let statement = try prepare("""
         INSERT INTO job_attempts
-            (job_id, attempt_number, started_at, language, speech_model, template)
+            (job_id, attempt_number, started_at, language, speech_model, template,
+             voice_commands_enabled, command_keywords)
         SELECT ?,
                COALESCE((SELECT MAX(attempt_number) FROM job_attempts WHERE job_id = ?), 0) + 1,
-               ?, ?, ?, ?
+               ?, ?, ?, ?, COALESCE(?, voice_commands_enabled), COALESCE(?, command_keywords)
         FROM transcription_jobs
         WHERE id = ? AND purge_claimed_at IS NULL;
         """)
@@ -373,7 +385,9 @@ actor TranscriptionJobStore {
         bind(configuration.language, to: 4, in: statement)
         bind(configuration.speechModel, to: 5, in: statement)
         bind(configuration.template, to: 6, in: statement)
-        bind(jobID.uuidString, to: 7, in: statement)
+        bind(configuration.voiceCommandsEnabled, to: 7, in: statement)
+        bind(configuration.commandKeywords?.joined(separator: ","), to: 8, in: statement)
+        bind(jobID.uuidString, to: 9, in: statement)
         try stepDone(statement)
         guard sqlite3_changes(handle) == 1 else {
             guard try job(id: jobID) != nil else { throw JobStoreError.jobNotFound }
@@ -391,10 +405,11 @@ actor TranscriptionJobStore {
             let startedAt = clock.now
             let insert = try prepare("""
             INSERT INTO job_attempts
-                (job_id, attempt_number, started_at, language, speech_model, template)
+                (job_id, attempt_number, started_at, language, speech_model, template,
+                 voice_commands_enabled, command_keywords)
             SELECT ?,
                    COALESCE((SELECT MAX(attempt_number) FROM job_attempts WHERE job_id = ?), 0) + 1,
-                   ?, ?, ?, ?
+                   ?, ?, ?, ?, COALESCE(?, voice_commands_enabled), COALESCE(?, command_keywords)
             FROM transcription_jobs
             WHERE id = ? AND kind = 'recovery' AND state = 'failed'
               AND purge_claimed_at IS NULL
@@ -410,7 +425,9 @@ actor TranscriptionJobStore {
             bind(configuration.language, to: 4, in: insert)
             bind(configuration.speechModel, to: 5, in: insert)
             bind(configuration.template, to: 6, in: insert)
-            bind(jobID.uuidString, to: 7, in: insert)
+            bind(configuration.voiceCommandsEnabled, to: 7, in: insert)
+            bind(configuration.commandKeywords?.joined(separator: ","), to: 8, in: insert)
+            bind(jobID.uuidString, to: 9, in: insert)
             try stepDone(insert)
             guard sqlite3_changes(handle) == 1 else {
                 guard try job(id: jobID) != nil else { throw JobStoreError.jobNotFound }
@@ -439,12 +456,14 @@ actor TranscriptionJobStore {
         }
     }
 
+    private static let attemptColumns = """
+        id, job_id, attempt_number, started_at, completed_at,
+        language, speech_model, template, result, failure_stage, failure_message,
+        voice_commands_enabled, command_keywords
+        """
+
     private func attempt(id: Int64) throws -> JobAttempt? {
-        let statement = try prepare("""
-        SELECT id, job_id, attempt_number, started_at, completed_at,
-               language, speech_model, template, result, failure_stage, failure_message
-        FROM job_attempts WHERE id = ?;
-        """)
+        let statement = try prepare("SELECT \(Self.attemptColumns) FROM job_attempts WHERE id = ?;")
         defer { sqlite3_finalize(statement) }
         sqlite3_bind_int64(statement, 1, id)
         switch sqlite3_step(statement) {
@@ -472,8 +491,7 @@ actor TranscriptionJobStore {
 
     func latestUnfinishedAttempt(jobID: UUID) throws -> JobAttempt? {
         let statement = try prepare("""
-        SELECT id, job_id, attempt_number, started_at, completed_at,
-               language, speech_model, template, result, failure_stage, failure_message
+        SELECT \(Self.attemptColumns)
         FROM job_attempts
         WHERE job_id = ? AND completed_at IS NULL
         ORDER BY attempt_number DESC LIMIT 1;
@@ -593,9 +611,7 @@ actor TranscriptionJobStore {
 
     func jobsNeedingSourceCleanup() throws -> [TranscriptionJob] {
         let statement = try prepare("""
-        SELECT id, kind, source_reference, source_bookmark, state, progress,
-               created_at, updated_at, started_at, completed_at, expires_at,
-               failure_stage, failure_message, result, needs_source_cleanup, source_cleanup_error
+        SELECT \(Self.jobColumns)
         FROM transcription_jobs
         WHERE kind = 'recovery' AND state = 'ready' AND needs_source_cleanup = 1
         ORDER BY updated_at, id;
@@ -612,11 +628,7 @@ actor TranscriptionJobStore {
     }
 
     func attempts(jobID: UUID) throws -> [JobAttempt] {
-        let statement = try prepare("""
-        SELECT id, job_id, attempt_number, started_at, completed_at,
-               language, speech_model, template, result, failure_stage, failure_message
-        FROM job_attempts WHERE job_id = ? ORDER BY attempt_number;
-        """)
+        let statement = try prepare("SELECT \(Self.attemptColumns) FROM job_attempts WHERE job_id = ? ORDER BY attempt_number;")
         defer { sqlite3_finalize(statement) }
         bind(jobID.uuidString, to: 1, in: statement)
         var values: [JobAttempt] = []
@@ -721,7 +733,9 @@ actor TranscriptionJobStore {
             startedAt: date(statement, 8), completedAt: date(statement, 9),
             expiresAt: date(statement, 10), result: optionalText(statement, 13),
             needsSourceCleanup: sqlite3_column_int(statement, 14) == 1,
-            sourceCleanupError: optionalText(statement, 15)
+            sourceCleanupError: optionalText(statement, 15),
+            voiceCommandsEnabled: optionalBool(statement, 16),
+            commandKeywords: optionalText(statement, 17).map { $0.split(separator: ",").map(String.init) }
         )
     }
 
@@ -746,7 +760,9 @@ actor TranscriptionJobStore {
             number: Int(sqlite3_column_int(statement, 2)),
             configuration: AttemptConfiguration(
                 language: optionalText(statement, 5), speechModel: optionalText(statement, 6),
-                template: optionalText(statement, 7)
+                template: optionalText(statement, 7),
+                voiceCommandsEnabled: optionalBool(statement, 11),
+                commandKeywords: optionalText(statement, 12).map { $0.split(separator: ",").map(String.init) }
             ),
             startedAt: date(statement, 3)!, completedAt: date(statement, 4), result: result
         )
@@ -789,6 +805,11 @@ actor TranscriptionJobStore {
         }
     }
 
+    private func bind(_ value: Bool?, to index: Int32, in statement: OpaquePointer) {
+        guard let value else { sqlite3_bind_null(statement, index); return }
+        sqlite3_bind_int(statement, index, value ? 1 : 0)
+    }
+
     private func text(_ statement: OpaquePointer, _ index: Int32) -> String {
         String(cString: sqlite3_column_text(statement, index))
     }
@@ -796,6 +817,11 @@ actor TranscriptionJobStore {
     private func optionalText(_ statement: OpaquePointer, _ index: Int32) -> String? {
         guard sqlite3_column_type(statement, index) != SQLITE_NULL else { return nil }
         return text(statement, index)
+    }
+
+    private func optionalBool(_ statement: OpaquePointer, _ index: Int32) -> Bool? {
+        guard sqlite3_column_type(statement, index) != SQLITE_NULL else { return nil }
+        return sqlite3_column_int(statement, index) == 1
     }
 
     private func optionalData(_ statement: OpaquePointer, _ index: Int32) -> Data? {

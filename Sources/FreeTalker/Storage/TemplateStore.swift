@@ -38,6 +38,41 @@ final class TemplateStore: ObservableObject {
     private static let promptEngineerMigrationKey = "TemplateStore.migrations.promptEngineer.v1"
     private static let promptEngineerMigrationVersion = 1
 
+    /// PLAN.md PR A, item 5 — version-bumped migration key (mirrors `promptEngineerMigrationKey`
+    /// above) gating `Template.migratingSpokenCommandRules`, run once per install.
+    private static let spokenCommandRulesMigrationKey = "TemplateStore.migrations.spokenCommandRules.v1"
+    private static let spokenCommandRulesMigrationVersion = 1
+    private static let legacyCommandRuleWarningKey = "TemplateStore.spokenCommandRules.unrecognizedTemplateIDs"
+    /// Codex round-7 finding 9 — see `importTemplates(_:)`. A precommit landing zone for warning
+    /// IDs discovered mid-import: written before `mutateAndSave`, promoted into
+    /// `legacyCommandRuleWarningKey` only after the save lands, and reconciled against the loaded
+    /// `templates.json` at every `init` so a hard kill anywhere in that sequence self-corrects
+    /// instead of leaving a permanent false warning.
+    private static let pendingLegacyCommandRuleWarningKey = "TemplateStore.spokenCommandRules.pendingUnrecognizedTemplateIDs"
+
+    /// Built-in-ID templates flagged during the spoken-command-rules migration as containing an
+    /// unrecognized variant of the legacy section (PLAN.md PR A, item 5) — surfaced as a one-time
+    /// warning in Settings ("legacy rules still active despite the toggle being off"). Persisted
+    /// so the warning survives relaunch until explicitly dismissed via
+    /// `dismissLegacyCommandRuleWarning()`.
+    @Published private(set) var unrecognizedLegacyCommandRuleTemplateIDs: [String]
+
+    func dismissLegacyCommandRuleWarning() {
+        unrecognizedLegacyCommandRuleTemplateIDs = []
+        defaults.set([String](), forKey: Self.legacyCommandRuleWarningKey)
+    }
+
+    /// Merges newly-discovered unrecognized-legacy-variant built-in IDs into the persisted,
+    /// one-time Settings warning set. Shared by `init` (local migration) and `importTemplates`
+    /// (PLAN.md PR A, item 5 — restoring a pre-feature backup can reintroduce the legacy section
+    /// under a built-in ID; that must surface the same warning as the local migration does).
+    private func recordUnrecognizedLegacyCommandRuleIDs(_ newIDs: [String]) {
+        guard !newIDs.isEmpty else { return }
+        let merged = Array(Set(unrecognizedLegacyCommandRuleTemplateIDs + newIDs)).sorted()
+        unrecognizedLegacyCommandRuleTemplateIDs = merged
+        defaults.set(merged, forKey: Self.legacyCommandRuleWarningKey)
+    }
+
     /// Complete old→new ID map covering EVERY template `importTemplates` was asked to import:
     /// appended-with-fresh-ID → new ID, appended-keeping-ID → same ID, and skipped-as-duplicate
     /// → the matching EXISTING template's ID. Callers (e.g. Backup Bundle restore) use this to
@@ -51,6 +86,7 @@ final class TemplateStore: ObservableObject {
     @Published private(set) var templates: [Template]
 
     private let fileURL: URL
+    private let defaults: UserDefaults
 
     private convenience init() {
         let dir = FreeTalkerPaths.applicationSupport
@@ -66,6 +102,8 @@ final class TemplateStore: ObservableObject {
 
     init(fileURL: URL, defaults: UserDefaults) {
         self.fileURL = fileURL
+        self.defaults = defaults
+        unrecognizedLegacyCommandRuleTemplateIDs = defaults.stringArray(forKey: Self.legacyCommandRuleWarningKey) ?? []
 
         let loadedTemplates: [Template]
         let didSeed: Bool
@@ -95,8 +133,37 @@ final class TemplateStore: ObservableObject {
                 migrationReady = false
             }
         }
+        let spokenCommandMigrationComplete = defaults.integer(forKey: Self.spokenCommandRulesMigrationKey)
+            >= Self.spokenCommandRulesMigrationVersion
+        let spokenCommandMigrationNeeded = !spokenCommandMigrationComplete
+        var newlyUnrecognizedIDs: [String] = []
+        if spokenCommandMigrationNeeded {
+            let (migrated, _, unrecognizedIDs) = Template.migratingSpokenCommandRules(renamed)
+            renamed = migrated
+            newlyUnrecognizedIDs = unrecognizedIDs
+        }
         templates = renamed
+
+        // Codex round-7 finding 9: reconcile any warning IDs left pending by a prior
+        // `importTemplates(_:)` call that was interrupted between precommitting them and
+        // promoting them into `legacyCommandRuleWarningKey`. Only promote an ID whose loaded
+        // template ACTUALLY still carries the unrecognized variant — if the matching
+        // `mutateAndSave` never landed (or landed differently), the loaded content won't match
+        // and the stale pending entry is silently dropped, never surfaced as a false warning.
+        if let pendingIDs = defaults.stringArray(forKey: Self.pendingLegacyCommandRuleWarningKey),
+           !pendingIDs.isEmpty {
+            let stillUnrecognized = pendingIDs.filter { id in
+                guard let template = templates.first(where: { $0.id == id }) else { return false }
+                return Template.containsUnrecognizedLegacyCommandRuleVariant(template.prompt)
+            }
+            if !stillUnrecognized.isEmpty {
+                recordUnrecognizedLegacyCommandRuleIDs(stillUnrecognized)
+            }
+            defaults.removeObject(forKey: Self.pendingLegacyCommandRuleWarningKey)
+        }
+
         let needsSave = migrationNeeded || didSeed || changed || renameChanged || addedPromptEngineer
+            || spokenCommandMigrationNeeded
         if needsSave {
             // ponytail: init can't throw here without changing every call site (this predates
             // throwing save()); a failed initial-seed write just means it retries on next
@@ -105,6 +172,21 @@ final class TemplateStore: ObservableObject {
                 try save()
                 if migrationNeeded && migrationReady {
                     defaults.set(Self.promptEngineerMigrationVersion, forKey: Self.promptEngineerMigrationKey)
+                }
+                // Marker (and the unrecognized-template warning it gates) is only persisted once
+                // `save()` has actually landed the stripped text on disk — mirrors promptEngineer's
+                // migrationReady gate above. A failed save leaves the marker unset so init retries
+                // the whole migration (strip + re-scan for unrecognized variants) on next launch,
+                // instead of silently stranding legacy text with the marker claiming "done".
+                if spokenCommandMigrationNeeded {
+                    // Codex round-7 finding 10: warning IDs must be durable BEFORE the completion
+                    // marker, not after — the previous order left a kill window where the marker
+                    // landed (so the migration never reruns) but the matching warning was lost
+                    // forever. This order's own kill window (warning lands, marker doesn't) is
+                    // safe: the whole migration is a cheap, idempotent re-strip + re-scan that
+                    // simply reruns and completes properly on the next launch.
+                    recordUnrecognizedLegacyCommandRuleIDs(newlyUnrecognizedIDs)
+                    defaults.set(Self.spokenCommandRulesMigrationVersion, forKey: Self.spokenCommandRulesMigrationKey)
                 }
             } catch {
                 // A failed migration save leaves its marker unset, so initialization retries it
@@ -203,6 +285,18 @@ final class TemplateStore: ObservableObject {
     /// Used directly by Backup Bundle restore, which validates+bounds-checks the array before
     /// this ever runs (PLAN.md F1.4/F1.5), so this method itself does no bounds checking.
     func importTemplates(_ incoming: [Template]) throws -> ImportResult {
+        // Reconcile recognized historical built-in IDs BEFORE dedup/remapping (PLAN.md PR A, item
+        // 5 / finding 3): a pre-feature backup can carry a built-in-ID prompt still ending in the
+        // legacy spoken-command suffix. Left unstripped, that prompt no longer matches the
+        // library's current (migrated) built-in text, so dedupe treats it as new content and
+        // remaps it onto a fresh UUID id — silently reactivating the legacy command rules (which
+        // apply regardless of the toggle) under a template that's no longer recognized as a
+        // built-in. Stripping first lets a pristine legacy built-in dedupe cleanly against the
+        // current one, exactly like the local migration does; unrecognized variants are left
+        // intact and flagged via the same one-time Settings warning.
+        let (reconciled, _, unrecognizedIDs) = Template.migratingSpokenCommandRules(incoming)
+        let unrecognizedIDSet = Set(unrecognizedIDs)
+
         var existingIDs = Set(templates.map(\.id))
         // `templates` can itself already contain two entries with the same (name, prompt) —
         // e.g. clicking "+" twice creates two "New Template"/empty-prompt rows — so
@@ -213,8 +307,9 @@ final class TemplateStore: ObservableObject {
         var existingIDByDedupeKey = Dictionary(templates.map { (Self.dedupeKey($0), $0.id) }, uniquingKeysWith: { first, _ in first })
         var idMap: [String: String] = [:]
         var toImport: [Template] = []
+        var importedUnrecognizedIDs: [String] = []
 
-        for var template in incoming {
+        for var template in reconciled {
             let key = Self.dedupeKey(template)
             if let existingID = existingIDByDedupeKey[key] {
                 // Skipped as a duplicate of existing content — map its old id (if it had one) to
@@ -231,6 +326,15 @@ final class TemplateStore: ObservableObject {
             existingIDs.insert(template.id)
             existingIDByDedupeKey[key] = template.id
             if !originalID.isEmpty { idMap[originalID] = template.id }
+            // Codex round-8 finding 4: append the FINAL `template.id` (post-remap), not
+            // `originalID` — a colliding unrecognized-variant built-in gets remapped to a fresh
+            // UUID just above, so the pending/committed warning key must reference the id the
+            // content actually lands under in `templates`/`templates.json`. Keying on
+            // `originalID` here left both the pending-key reconciliation at `init` (which looks up
+            // `templates.first(where: { $0.id == id })`) and any direct lookup unable to find the
+            // remapped entry — silently dropping the warning while the remapped legacy-rule
+            // template survived un-warned.
+            if unrecognizedIDSet.contains(originalID) { importedUnrecognizedIDs.append(template.id) }
             toImport.append(template)
         }
 
@@ -240,8 +344,24 @@ final class TemplateStore: ObservableObject {
         }
 
         let (renamed, _) = Self.renamingReservedNameCollisions(toImport)
+        // Codex round-7 finding 9: round-6's fix (precommit the warning to the COMMITTED key,
+        // roll back on catch) still has a crash window an ordinary `catch` can't close — a hard
+        // kill between the precommit and `mutateAndSave` landing left a permanent false warning
+        // with no matching import, since nothing ever revisited it. Precommitting to a separate
+        // PENDING key instead, and only promoting it into the committed key once `mutateAndSave`
+        // actually lands, means a hard kill anywhere in this sequence leaves at most a stale
+        // pending entry — reconciled against the loaded templates.json the next time the store
+        // is initialized (see `init`), never surfaced as a warning unless the corresponding
+        // template content is actually on disk.
+        if !importedUnrecognizedIDs.isEmpty {
+            defaults.set(importedUnrecognizedIDs, forKey: Self.pendingLegacyCommandRuleWarningKey)
+        }
         try mutateAndSave { templates in
             templates.append(contentsOf: renamed)
+        }
+        if !importedUnrecognizedIDs.isEmpty {
+            recordUnrecognizedLegacyCommandRuleIDs(importedUnrecognizedIDs)
+            defaults.removeObject(forKey: Self.pendingLegacyCommandRuleWarningKey)
         }
         return ImportResult(idMap: idMap, importedCount: renamed.count, skippedCount: skippedCount)
     }

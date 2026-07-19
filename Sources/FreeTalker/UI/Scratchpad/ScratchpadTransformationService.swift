@@ -119,7 +119,10 @@ struct ScratchpadTransformationService: ScratchpadTransforming {
                 transcript: text,
                 template: template,
                 appName: nil,
-                languagePolicy: action.languagePolicy
+                languagePolicy: action.languagePolicy,
+                // PLAN.md PR A, item 2: Scratchpad transformation actions (improve/expand/
+                // condense/custom/translate) are hard-disabled, always — never from a snapshot.
+                voiceCommandPolicy: .disabled
             ),
             snapshot
         )

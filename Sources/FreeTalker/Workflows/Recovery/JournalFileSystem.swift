@@ -11,6 +11,16 @@ protocol JournalFileSystem: Sendable {
     func contents(_ url: URL) throws -> [URL]
     func read(_ url: URL) throws -> Data
     func remove(_ url: URL) throws
+    /// Codex round-10 minor 1/2: non-recursive `rmdir(2)` semantics — atomically fails with
+    /// `ENOTEMPTY` (never silently deletes) if the directory gained content between a caller's
+    /// emptiness check and this call, instead of `remove(_:)`'s recursive delete racing that check.
+    func removeEmptyDirectory(_ url: URL) throws
+    /// Codex round-10 minor 1/2: non-recursive `unlink(2)` semantics — never follows a symlink
+    /// planted at `url`'s final path component and always fails (never recurses) if `url` is a
+    /// directory by the time this runs, unlike `remove(_:)`'s `FileManager.removeItem`, which
+    /// recursively deletes a directory's entire contents if one was swapped in after a caller's
+    /// own type check.
+    func removeRegularFile(_ url: URL) throws
     func exists(_ url: URL) -> Bool
 }
 
@@ -142,6 +152,18 @@ struct LocalJournalFileSystem: JournalFileSystem {
             try FileManager.default.removeItem(at: url)
         } catch {
             throw JournalPersistenceError.remove(path: url.path, code: Self.code(for: error))
+        }
+    }
+
+    func removeEmptyDirectory(_ url: URL) throws {
+        guard Darwin.rmdir(url.path) == 0 else {
+            throw JournalPersistenceError.remove(path: url.path, code: errno)
+        }
+    }
+
+    func removeRegularFile(_ url: URL) throws {
+        guard Darwin.unlink(url.path) == 0 else {
+            throw JournalPersistenceError.remove(path: url.path, code: errno)
         }
     }
 

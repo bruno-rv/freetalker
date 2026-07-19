@@ -303,7 +303,8 @@ struct CaptureAdmissionTests {
         )
         let snapshot = AppCoordinator.captureStopSettingsSnapshot(
             oneShotLanguage: "pt", selectedOutput: .french,
-            defaultOutput: .german, cloudSnapshot: stopCloud
+            defaultOutput: .german, cloudSnapshot: stopCloud,
+            voiceCommands: VoiceCommandSnapshot(enabled: true, keywords: ["command"])
         )
 
         let laterCloud = CloudLLMSettingsSnapshot(
@@ -312,11 +313,13 @@ struct CaptureAdmissionTests {
         )
         _ = AppCoordinator.captureStopSettingsSnapshot(
             oneShotLanguage: nil, selectedOutput: nil,
-            defaultOutput: .spanish, cloudSnapshot: laterCloud
+            defaultOutput: .spanish, cloudSnapshot: laterCloud,
+            voiceCommands: VoiceCommandSnapshot(enabled: false, keywords: [])
         )
 
         #expect(snapshot.oneShotLanguage == "pt")
         #expect(snapshot.outputLanguage == .french)
+        #expect(snapshot.voiceCommands == VoiceCommandSnapshot(enabled: true, keywords: ["command"]))
         #expect(snapshot.cloudSnapshot == stopCloud)
     }
 
@@ -463,6 +466,11 @@ private struct AdmissionFileSystem: JournalFileSystem {
     func contents(_ url: URL) throws -> [URL] { [] }
     func read(_ url: URL) throws -> Data { Data() }
     func remove(_ url: URL) throws { events.append(.removeArtifacts) }
+    // This double models no real filesystem state (every read/contents call is a stub) — there
+    // is nothing behind it a non-recursive implementation could meaningfully protect, and the
+    // admission flow under test here never calls either method.
+    func removeEmptyDirectory(_ url: URL) throws {}
+    func removeRegularFile(_ url: URL) throws {}
     func exists(_ url: URL) -> Bool { captureExists }
 }
 
@@ -553,5 +561,7 @@ private final class FailFirstTwoParentSyncFileSystem: JournalFileSystem, @unchec
     func contents(_ url: URL) throws -> [URL] { try local.contents(url) }
     func read(_ url: URL) throws -> Data { try local.read(url) }
     func remove(_ url: URL) throws { try local.remove(url) }
+    func removeEmptyDirectory(_ url: URL) throws { try local.removeEmptyDirectory(url) }
+    func removeRegularFile(_ url: URL) throws { try local.removeRegularFile(url) }
     func exists(_ url: URL) -> Bool { local.exists(url) }
 }

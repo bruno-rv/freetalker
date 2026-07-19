@@ -129,6 +129,54 @@ import Testing
         #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('dictations') WHERE name = 'bundle_id' AND type = 'TEXT';") == 1)
         #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('dictations') WHERE name = 'duration_secs' AND type = 'REAL';") == 1)
         #expect(try db.integer("SELECT bundle_id IS NULL AND duration_secs IS NULL FROM dictations WHERE id = 7;") == 1)
+        // The "normal" migration ordering (Codex round-4 finding 1): `dictations` already exists
+        // when the ledger reaches v13, so the idempotent `ALTER TABLE ... ADD COLUMN` adds it.
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('dictations') WHERE name = 'voice_commands_active' AND type = 'INTEGER';") == 1)
+        // Codex round-5 finding 8: the v13 `ALTER TABLE ... ADD COLUMN` has no DEFAULT clause, so
+        // it must leave this pre-existing (v11) row's new column NULL, never backfill it.
+        #expect(try db.integer("SELECT voice_commands_active IS NULL FROM dictations WHERE id = 7;") == 1)
+        #expect(try db.schema() == schema)
+        #expect(try db.migrationVersions() == Array(1...DatabaseMigrator.latestVersion))
+    }
+
+    /// Codex round-5 finding 8: the library-side test above covers `dictations.voice_commands_active`
+    /// — this covers the jobs-database side of the same v13 migration (`capture_sessions`,
+    /// `transcription_jobs`, `job_attempts`), proving a populated PRE-v13 row in each table stays
+    /// NULL for the new `voice_commands_enabled`/`command_keywords` columns rather than being
+    /// backfilled to some non-NULL default.
+    @Test func versionThirteenJobsUpgradeLeavesPopulatedRowsNullForVoiceCommandColumns() throws {
+        let db = try TemporaryDatabase()
+        try DatabaseMigrator.migrate(db.handle, role: .jobs)
+        // Simulate a genuinely PRE-v13 schema by dropping the columns the v13 migration adds,
+        // then re-running only that step — mirrors the drop+recreate trick the library-side test
+        // above uses for `dictations`, just via DROP COLUMN since these tables have foreign-key
+        // dependents that make a full drop+recreate impractical.
+        try db.execute("""
+        ALTER TABLE transcription_jobs DROP COLUMN voice_commands_enabled;
+        ALTER TABLE transcription_jobs DROP COLUMN command_keywords;
+        ALTER TABLE job_attempts DROP COLUMN voice_commands_enabled;
+        ALTER TABLE job_attempts DROP COLUMN command_keywords;
+        ALTER TABLE capture_sessions DROP COLUMN voice_commands_enabled;
+        ALTER TABLE capture_sessions DROP COLUMN command_keywords;
+        DELETE FROM schema_migrations WHERE version >= 13;
+        INSERT INTO transcription_jobs
+            (id, kind, source_reference, state, created_at, updated_at)
+        VALUES ('kept-job', 'recovery', '/kept.wav', 'failed', 100, 101);
+        INSERT INTO job_attempts (job_id, attempt_number, started_at)
+        VALUES ('kept-job', 1, 100);
+        INSERT INTO capture_sessions
+            (id, state, directory, captured_at, sample_rate, channel_count, destination, asset_kind)
+        VALUES ('kept-capture', 'staged', '/dir', 100, 16000, 1, 'external', 'audio');
+        """)
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('transcription_jobs') WHERE name = 'voice_commands_enabled';") == 0)
+
+        try DatabaseMigrator.migrate(db.handle, role: .jobs)
+        let schema = try db.schema()
+        try DatabaseMigrator.migrate(db.handle, role: .jobs)
+
+        #expect(try db.integer("SELECT voice_commands_enabled IS NULL AND command_keywords IS NULL FROM transcription_jobs WHERE id = 'kept-job';") == 1)
+        #expect(try db.integer("SELECT voice_commands_enabled IS NULL AND command_keywords IS NULL FROM job_attempts WHERE job_id = 'kept-job';") == 1)
+        #expect(try db.integer("SELECT voice_commands_enabled IS NULL AND command_keywords IS NULL FROM capture_sessions WHERE id = 'kept-capture';") == 1)
         #expect(try db.schema() == schema)
         #expect(try db.migrationVersions() == Array(1...DatabaseMigrator.latestVersion))
     }
@@ -307,16 +355,26 @@ import Testing
             let shared = try TemporaryDatabase(path: url.path)
             try DatabaseMigrator.migrate(shared.handle, role: .library)
             #expect(try shared.migrationVersions() == Array(1...DatabaseMigrator.latestVersion))
+            // The ledger ordering this test exercises (Codex round-4 finding 1): the migrator
+            // reaches v13 before `createSchema()` has ever created `dictations`, so v13 is a no-op
+            // here — the baseline `CREATE TABLE dictations` (below, via `Database(path:)`) must
+            // declare the column itself, or a ledger already at v13 permanently skips the ALTER.
+            #expect(try shared.integer("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'dictations';") == 0)
         }
 
         let library = try Database(path: url)
+        // `insertDictation` binds `voice_commands_active` unconditionally (Database.swift); if the
+        // baseline `CREATE TABLE dictations` omitted the column (the poisoned-ledger bug), this
+        // insert throws `DatabaseError.sqlFailed` instead of silently succeeding.
         let id = try library.insertDictation(.init(
             timestamp: Date(), sourceLanguage: SourceLanguage("en"),
             requestedOutputLanguage: .spanish, template: "Clean",
-            transcript: "hello", refined: "hello", engine: "local"
+            transcript: "hello", refined: "hello", engine: "local",
+            voiceCommandsActive: true
         ))
         try library.upsertTranslation(parentID: id, target: .spanish, text: "hola")
         #expect(try library.translationVariants(parentID: id).map(\.text) == ["hola"])
+        #expect(try library.dictation(id: id)?.voiceCommandsActive == true)
     }
 
     @Test func versionTenFailureRollsBackLibrarySchemaAndLedger() throws {

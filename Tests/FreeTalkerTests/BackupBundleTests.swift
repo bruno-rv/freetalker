@@ -477,6 +477,10 @@ struct BackupBundleTests {
         settingsA.dictationLanguages = ["en", "pt", "es"]
         settingsA.microphoneDeviceUID = "some-uid"
         settingsA.vocabularyText = "Kubernetes\nPostgres"
+        // Non-default values (PR A, item 1) so this actually exercises the export/restore/
+        // normalize path rather than round-tripping the already-matching defaults.
+        settingsA.voiceCommandsEnabled = true
+        settingsA.commandKeywords = ["comando", "hey"]
 
         let data = try await BackupBundle.export(settings: settingsA, templateStore: envA.templateStore, snippetStore: envA.snippetStore)
 
