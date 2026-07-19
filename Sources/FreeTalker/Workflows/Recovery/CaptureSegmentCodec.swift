@@ -139,7 +139,11 @@ struct CaptureSegmentCodec: Sendable {
         digest.map { String(format: "%02x", $0) }.joined()
     }
 
-    private func decode(_ data: Data, path: String) throws -> [Float] {
+    // Codex round-13 minor: no longer `private` — `RecoveryReconciler.clearUnledgeredOrphanSegments`
+    // needs to decode and hash a candidate segment from a single `Data` snapshot (read once, not
+    // re-read from disk between the two), the same Data-based entry point `validatedData`/`assemble`
+    // already use internally.
+    func decode(_ data: Data, path: String) throws -> [Float] {
         guard data.count >= Self.headerSize,
               data.ascii(at: 0, count: 4) == "RIFF",
               data.ascii(at: 8, count: 4) == "WAVE",

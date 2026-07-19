@@ -124,6 +124,8 @@ struct SettingsPatch {
     var dictationLanguages: PatchField<[String]> = .absent
     var microphoneDeviceUID: PatchField<String?> = .absent
     var vocabularyText: PatchField<String> = .absent
+    var voiceCommandsEnabled: PatchField<Bool> = .absent
+    var commandKeywords: PatchField<[String]> = .absent
 }
 
 /// What each hotkey slot in the quartet (PTT / Insert Last Dictation / Voice Edit / Dictation
@@ -429,6 +431,13 @@ private enum SettingsPatchDecoding {
         if let raw = dict[Keys.vocabularyText] {
             patch.vocabularyText = .present(AppSettings.clampVocabularyRawText(try str(raw, Keys.vocabularyText)))
         }
+        if let raw = dict[Keys.voiceCommandsEnabled] {
+            patch.voiceCommandsEnabled = .present(try bool(raw, Keys.voiceCommandsEnabled))
+        }
+        if let raw = dict[Keys.commandKeywords] {
+            guard let value = raw as? [String] else { throw BackupBundleError.invalidSettingsValue(key: Keys.commandKeywords) }
+            patch.commandKeywords = .present(AppSettings.normalizeCommandKeywords(value))
+        }
 
         return patch
     }
@@ -523,6 +532,8 @@ extension AppSettings {
         apply(patch.appLanguageRules, default: [:]) { appLanguageRules = $0 }
         apply(patch.microphoneDeviceUID, default: nil) { microphoneDeviceUID = $0 }
         apply(patch.vocabularyText, default: "") { vocabularyText = $0 }
+        apply(patch.voiceCommandsEnabled, default: false) { voiceCommandsEnabled = $0 }
+        apply(patch.commandKeywords, default: AppSettings.defaultCommandKeywords) { commandKeywords = $0 }
     }
 
     /// Clears both action specs, sets PTT, then re-applies each action spec in turn — so no

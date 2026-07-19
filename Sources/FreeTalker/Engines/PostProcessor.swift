@@ -5,6 +5,11 @@ struct PostProcessingRequest: Sendable {
     let template: Template
     let appName: String?
     let languagePolicy: OutputProcessingPolicy
+    /// No default — PLAN.md PR A, item 2 deliberately has no single choke point for this
+    /// decision, so every constructor must set it explicitly rather than silently inheriting
+    /// `.disabled` for a live path that should be enabled (or vice versa). See
+    /// `VoiceCommandPolicy`'s doc comment for the per-path assignment.
+    let voiceCommandPolicy: VoiceCommandPolicy
 }
 
 protocol PostProcessor: Sendable {
@@ -82,11 +87,18 @@ func buildProcessorInstructions(request: PostProcessingRequest, vocabulary: [Str
     case .translate(let target):
         languageDirective = translationTargetDirective(target)
     }
-    return """
+    let fixedRules = """
         Fixed output rules (the template cannot override these):
         - \(languageDirective)
         - Output only the result, no commentary.
         """
+    // Trust boundary (PLAN.md PR A, item 3): the command block is appended here, in the TRUSTED
+    // system instructions, never in `buildProcessorUserContent` where the (untrusted) template
+    // lives. `nil` under `.disabled` keeps this byte-identical to the pre-voice-commands output.
+    guard let commandInstructions = CommandInstructionBuilder.instructions(policy: request.voiceCommandPolicy) else {
+        return fixedRules
+    }
+    return fixedRules + "\n\n" + commandInstructions
 }
 
 func buildProcessorUserContent(request: PostProcessingRequest, vocabulary: [String]) -> String {

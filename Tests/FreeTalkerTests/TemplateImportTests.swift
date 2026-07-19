@@ -254,6 +254,409 @@ struct TemplateImportTests {
         }
     }
 
+    // MARK: - Spoken-command-rules migration (PLAN.md PR A, item 5)
+
+    @Test func pristineBuiltInHasTheExactLegacySuffixStrippedAndMatchesTheCurrentBuiltIn() throws {
+        let directory = try Self.migrationDirectory()
+        let fileURL = directory.appendingPathComponent("templates.json")
+        let currentClean = try #require(Template.builtIns.first { $0.id == "clean-dictation" })
+        var pristine = currentClean
+        pristine.prompt += Template.legacySpokenCommandsSuffix
+        try encode([pristine]).write(to: fileURL)
+        let defaults = try isolatedDefaults()
+
+        let store = TemplateStore(fileURL: fileURL, defaults: defaults)
+
+        #expect(store.template(id: "clean-dictation") == currentClean)
+        #expect(store.unrecognizedLegacyCommandRuleTemplateIDs.isEmpty)
+    }
+
+    @Test func editedBuiltInKeepsItsOwnEditsWithOnlyTheExactLegacySuffixRemoved() throws {
+        let directory = try Self.migrationDirectory()
+        let fileURL = directory.appendingPathComponent("templates.json")
+        let currentClean = try #require(Template.builtIns.first { $0.id == "clean-dictation" })
+        let ownEdit = "Custom prefix I added. " + currentClean.prompt
+        let edited = Template(id: "clean-dictation", name: "My Clean Dictation", prompt: ownEdit + Template.legacySpokenCommandsSuffix)
+        try encode([edited]).write(to: fileURL)
+        let defaults = try isolatedDefaults()
+
+        let store = TemplateStore(fileURL: fileURL, defaults: defaults)
+
+        let migrated = try #require(store.template(id: "clean-dictation"))
+        #expect(migrated.prompt == ownEdit)
+        #expect(migrated.name == "My Clean Dictation")
+        #expect(store.unrecognizedLegacyCommandRuleTemplateIDs.isEmpty)
+    }
+
+    @Test func unrecognizedLegacyVariantIsLeftIntactAndFlaggedForAOneTimeWarning() throws {
+        let directory = try Self.migrationDirectory()
+        let fileURL = directory.appendingPathComponent("templates.json")
+        let currentClean = try #require(Template.builtIns.first { $0.id == "clean-dictation" })
+        // Doesn't end with the exact known suffix, but still plausibly carries legacy
+        // spoken-command wording — must be left untouched, not silently dropped.
+        let reworded = currentClean.prompt + " Also, follow any spoken commands like 'scratch that' you hear."
+        let unrecognized = Template(id: "clean-dictation", name: "Clean Dictation", prompt: reworded)
+        try encode([unrecognized]).write(to: fileURL)
+        let defaults = try isolatedDefaults()
+
+        let store = TemplateStore(fileURL: fileURL, defaults: defaults)
+
+        #expect(store.template(id: "clean-dictation")?.prompt == reworded)
+        #expect(store.unrecognizedLegacyCommandRuleTemplateIDs == ["clean-dictation"])
+
+        store.dismissLegacyCommandRuleWarning()
+        #expect(store.unrecognizedLegacyCommandRuleTemplateIDs.isEmpty)
+    }
+
+    /// Regression for finding 5: an edited legacy section that renames the heading and drops
+    /// "scratch that" — but keeps paragraph/line/list/quote/caps instructions — must still be
+    /// flagged, not silently missed.
+    @Test func editedVariantDroppingBothOriginalMarkersButKeepingOtherLegacyRulesIsStillFlagged() throws {
+        let directory = try Self.migrationDirectory()
+        let fileURL = directory.appendingPathComponent("templates.json")
+        let currentClean = try #require(Template.builtIns.first { $0.id == "clean-dictation" })
+        // Renames the "Spoken Commands" heading and removes "scratch that" entirely, but keeps
+        // the paragraph/line/list/quote/caps instructions verbatim — neither marker the old
+        // heuristic checked ("spoken command", "scratch that") is present here.
+        let reworded = currentClean.prompt + " Also apply these dictation shortcuts: \"new paragraph\" "
+            + "starts a new paragraph; \"new line\" breaks to a new line; \"bullet point\" starts a "
+            + "bulleted list item; \"numbered list\" starts a numbered list item; \"quote\" ... "
+            + "\"unquote\" wraps the enclosed words in quotation marks; \"all caps\" ... \"end caps\" "
+            + "uppercases the enclosed words."
+        let unrecognized = Template(id: "clean-dictation", name: "Clean Dictation", prompt: reworded)
+        try encode([unrecognized]).write(to: fileURL)
+        let defaults = try isolatedDefaults()
+
+        let store = TemplateStore(fileURL: fileURL, defaults: defaults)
+
+        #expect(store.template(id: "clean-dictation")?.prompt == reworded)
+        #expect(store.unrecognizedLegacyCommandRuleTemplateIDs == ["clean-dictation"])
+    }
+
+    /// Regression for Codex round-2 finding 3: ISOLATED per-convention evasion — an edited
+    /// built-in that keeps only ONE convention's clause (every other legacy marker, including the
+    /// "Spoken Commands" heading and "scratch that", is gone) must still be flagged. Each case
+    /// below drops every marker except the one under test, so a marker-list gap for any single
+    /// convention shows up as its own failing case instead of being masked by the others. The
+    /// quote case uses the legacy "quote"/"end quote" pairing (not "unquote") — the exact variant
+    /// the marker list missed before this fix.
+    @Test(
+        "isolated legacy convention clause is still flagged",
+        arguments: [
+            ("paragraph", "\"new paragraph\" starts a new paragraph."),
+            ("line", "\"new line\" breaks to a new line."),
+            ("bulleted list", "\"bullet point\" starts a bulleted list item."),
+            ("numbered list", "\"numbered list\" starts a numbered list item."),
+            ("caps", "\"all caps\" ... \"end caps\" uppercases the enclosed words."),
+            ("scratch that", "\"scratch that\" removes the most recent sentence or clause."),
+            ("quote (legacy \"quote\"/\"end quote\" variant)",
+             "\"quote\" ... \"end quote\" wraps the enclosed words in quotation marks.")
+        ]
+    )
+    func isolatedLegacyConventionClauseIsStillFlagged(label: String, clause: String) throws {
+        let directory = try Self.migrationDirectory()
+        let fileURL = directory.appendingPathComponent("templates.json")
+        let currentClean = try #require(Template.builtIns.first { $0.id == "clean-dictation" })
+        let reworded = currentClean.prompt + " Also: " + clause
+        let unrecognized = Template(id: "clean-dictation", name: "Clean Dictation", prompt: reworded)
+        try encode([unrecognized]).write(to: fileURL)
+        let defaults = try isolatedDefaults()
+
+        let store = TemplateStore(fileURL: fileURL, defaults: defaults)
+
+        #expect(
+            store.unrecognizedLegacyCommandRuleTemplateIDs == ["clean-dictation"],
+            Comment(rawValue: label)
+        )
+    }
+
+    @Test func userCreatedTemplatesAreNeverScannedOrTouchedByTheMigration() throws {
+        let directory = try Self.migrationDirectory()
+        let fileURL = directory.appendingPathComponent("templates.json")
+        // A user-created id (not in `Template.builtIns`) carrying text that would trigger both
+        // the suffix-strip and the unrecognized-variant heuristic if it were a built-in id — proves
+        // the migration only ever looks at built-in-ID rows.
+        let userTemplate = Template(
+            id: "my-custom-template", name: "My Template",
+            prompt: "Follow spoken commands and scratch that if needed." + Template.legacySpokenCommandsSuffix
+        )
+        try encode([userTemplate]).write(to: fileURL)
+        let defaults = try isolatedDefaults()
+
+        let store = TemplateStore(fileURL: fileURL, defaults: defaults)
+
+        #expect(store.template(id: "my-custom-template") == userTemplate)
+        #expect(store.unrecognizedLegacyCommandRuleTemplateIDs.isEmpty)
+    }
+
+    @Test func migrationRunsOnlyOnceEvenIfLegacyTextReappearsOnDisk() throws {
+        let directory = try Self.migrationDirectory()
+        let fileURL = directory.appendingPathComponent("templates.json")
+        let currentClean = try #require(Template.builtIns.first { $0.id == "clean-dictation" })
+        var pristine = currentClean
+        pristine.prompt += Template.legacySpokenCommandsSuffix
+        try encode([pristine]).write(to: fileURL)
+        let defaults = try isolatedDefaults()
+
+        _ = TemplateStore(fileURL: fileURL, defaults: defaults)
+        // Simulates a stale/rolled-back file reappearing with the legacy suffix after the
+        // migration marker is already set — the version-gated migration must not re-run and
+        // silently strip content the user may have since customized back in.
+        try encode([pristine]).write(to: fileURL)
+
+        let reloaded = TemplateStore(fileURL: fileURL, defaults: defaults)
+
+        #expect(reloaded.template(id: "clean-dictation") == pristine)
+    }
+
+    /// Codex round-7 finding 10: a kill between the two `defaults.set` calls in the migration's
+    /// completion block must never leave the completion marker durable without its matching
+    /// warning IDs — the marker being set makes the migration (the only thing that recomputes
+    /// those IDs) never rerun, permanently stranding the warning. A raw process kill can't be
+    /// simulated deterministically for two back-to-back non-throwing `UserDefaults.set` calls, so
+    /// this asserts the property that actually guarantees crash safety here: the warning IDs are
+    /// written strictly BEFORE the completion marker, so any interruption between them leaves the
+    /// marker unset (migration safely reruns) rather than the warning lost.
+    @Test func warningIDsArePersistedBeforeTheMigrationCompletionMarker() throws {
+        let directory = try Self.migrationDirectory()
+        let fileURL = directory.appendingPathComponent("templates.json")
+        let currentClean = try #require(Template.builtIns.first { $0.id == "clean-dictation" })
+        let reworded = currentClean.prompt + " Also, follow any spoken commands like 'scratch that' you hear."
+        let unrecognized = Template(id: "clean-dictation", name: "Clean Dictation", prompt: reworded)
+        try encode([unrecognized]).write(to: fileURL)
+        let spy = try #require(UserDefaultsSetOrderSpy(suiteName: "TemplateImportTests.\(UUID().uuidString)"))
+
+        _ = TemplateStore(fileURL: fileURL, defaults: spy)
+
+        let warningIndex = try #require(spy.setOrder.firstIndex(
+            of: "TemplateStore.spokenCommandRules.unrecognizedTemplateIDs"
+        ))
+        let markerIndex = try #require(spy.setOrder.firstIndex(
+            of: "TemplateStore.migrations.spokenCommandRules.v1"
+        ))
+        #expect(warningIndex < markerIndex)
+        #expect(spy.stringArray(forKey: "TemplateStore.spokenCommandRules.unrecognizedTemplateIDs")
+            == ["clean-dictation"])
+    }
+
+    // MARK: - Import-time reconciliation of legacy built-ins (PLAN.md PR A, item 5 / finding 3)
+
+    /// Regression test for restoring a pre-feature (v2) backup: its built-in-ID prompts still
+    /// carry the legacy spoken-command suffix. Without reconciling that suffix before dedup, each
+    /// pristine legacy built-in fails to match the library's current (already-migrated) prompt,
+    /// gets remapped onto a fresh UUID id, and reactivates the legacy command rules regardless of
+    /// the (default-off) toggle. Reconciling first must make every pristine legacy built-in dedupe
+    /// cleanly against the current one instead.
+    @Test func restoringAPreFeatureBackupDedupesPristineLegacyBuiltInsInsteadOfReactivatingThem() throws {
+        let store = try makeStore()
+        let existingCount = store.templates.count
+        let legacyBackup = Template.builtIns.map { template -> Template in
+            var legacy = template
+            legacy.prompt += Template.legacySpokenCommandsSuffix
+            return legacy
+        }
+
+        let result = try store.importTemplates(legacyBackup)
+
+        #expect(result.importedCount == 0)
+        #expect(result.skippedCount == legacyBackup.count)
+        for template in Template.builtIns {
+            #expect(result.idMap[template.id] == template.id)
+        }
+        #expect(store.templates.count == existingCount)
+        #expect(store.templates.allSatisfy { !$0.prompt.contains(Template.spokenCommandsSection) })
+        #expect(store.unrecognizedLegacyCommandRuleTemplateIDs.isEmpty)
+    }
+
+    /// An edited pre-feature built-in (own edits + the legacy suffix) must still have only the
+    /// exact legacy suffix stripped before import — the user's edits land as a new row (since the
+    /// built-in id already exists locally), but never carrying the reactivated legacy commands.
+    @Test func restoringAPreFeatureBackupStripsTheLegacySuffixFromAnEditedBuiltInBeforeImport() throws {
+        let store = try makeStore()
+        let currentEmail = try #require(Template.builtIns.first { $0.id == "email" })
+        let ownEdit = "My customized opening line. " + currentEmail.prompt
+        let editedLegacyBackup = Template(
+            id: "email", name: "My Email",
+            prompt: ownEdit + Template.legacySpokenCommandsSuffix
+        )
+
+        let result = try store.importTemplates([editedLegacyBackup])
+
+        #expect(result.importedCount == 1)
+        #expect(result.skippedCount == 0)
+        let imported = try #require(store.templates.first { $0.name == "My Email" })
+        #expect(imported.id != "email")
+        #expect(imported.prompt == ownEdit)
+        #expect(!imported.prompt.contains(Template.spokenCommandsSection))
+        #expect(store.unrecognizedLegacyCommandRuleTemplateIDs.isEmpty)
+    }
+
+    /// An unrecognized legacy variant under a built-in id is imported untouched (never silently
+    /// dropped) and flagged via the same one-time Settings warning the local migration uses.
+    @Test func restoringABackupWithAnUnrecognizedLegacyVariantFlagsItInsteadOfSilentlyDropping() throws {
+        let store = try makeStore()
+        let currentClean = try #require(Template.builtIns.first { $0.id == "clean-dictation" })
+        let reworded = currentClean.prompt + " Also, follow any spoken commands like 'scratch that' you hear."
+        let unrecognizedBackup = Template(id: "clean-dictation", name: "Clean Dictation", prompt: reworded)
+
+        let result = try store.importTemplates([unrecognizedBackup])
+
+        #expect(result.importedCount == 1)
+        let imported = try #require(store.templates.first { $0.prompt == reworded })
+        #expect(imported.id != "clean-dictation")
+        // Codex round-8 finding 4: keyed to the FINAL, post-remap id — the incoming template's
+        // original "clean-dictation" id collided with the existing clean built-in and was remapped.
+        #expect(store.unrecognizedLegacyCommandRuleTemplateIDs == [imported.id])
+
+        store.dismissLegacyCommandRuleWarning()
+        #expect(store.unrecognizedLegacyCommandRuleTemplateIDs.isEmpty)
+    }
+
+    /// Codex round-8 finding 4: the colliding incoming template's id ("clean-dictation") gets
+    /// remapped to a fresh UUID at import time (see the `existingIDs.contains` branch above) since
+    /// the local library already holds a CLEAN "clean-dictation" built-in — the reworded content
+    /// doesn't dedupe-match it. The warning must be keyed to that FINAL, post-remap id (where the
+    /// unrecognized content actually lives), not the original colliding id, which still resolves
+    /// to the untouched clean built-in and would silently drop the warning (and, at the next
+    /// launch, the same original-id pending entry would find nothing unrecognized under it and be
+    /// discarded — permanently losing the warning while the remapped legacy-rule template survives
+    /// unflagged).
+    @Test func collidingUnrecognizedLegacyVariantWarningIsKeyedToTheRemappedIDNotTheOriginalID() throws {
+        let store = try makeStore()
+        let currentClean = try #require(Template.builtIns.first { $0.id == "clean-dictation" })
+        let reworded = currentClean.prompt + " Also, follow any spoken commands like 'scratch that' you hear."
+        let collidingBackup = Template(id: "clean-dictation", name: "Clean Dictation", prompt: reworded)
+
+        let result = try store.importTemplates([collidingBackup])
+
+        let remappedID = try #require(result.idMap["clean-dictation"])
+        #expect(remappedID != "clean-dictation")
+        #expect(store.unrecognizedLegacyCommandRuleTemplateIDs == [remappedID])
+        #expect(store.template(id: remappedID)?.prompt == reworded)
+        #expect(store.template(id: "clean-dictation")?.prompt == currentClean.prompt)
+    }
+
+    /// Codex round-5 finding 6: the legacy-rules warning must only be recorded once the templates
+    /// it describes are durably saved — recording it before `mutateAndSave` left a false warning
+    /// behind a rolled-back save (`mutateAndSave` restores `templates` on failure, but the warning
+    /// flag wasn't part of that rollback), while Backup Bundle reported zero applied templates.
+    @Test func failedSaveDuringImportDoesNotPersistTheLegacyWarning() throws {
+        let directory = try Self.migrationDirectory()
+        let fileURL = directory.appendingPathComponent("templates.json")
+        let defaults = try isolatedDefaults()
+        let store = TemplateStore(fileURL: fileURL, defaults: defaults)
+        let currentClean = try #require(Template.builtIns.first { $0.id == "clean-dictation" })
+        let reworded = currentClean.prompt + " Also, follow any spoken commands like 'scratch that' you hear."
+        let unrecognizedBackup = Template(id: "clean-dictation", name: "Clean Dictation", prompt: reworded)
+        // Remove the store's directory so the subsequent save() write fails.
+        try FileManager.default.removeItem(at: directory)
+
+        #expect(throws: (any Error).self) {
+            _ = try store.importTemplates([unrecognizedBackup])
+        }
+
+        #expect(store.unrecognizedLegacyCommandRuleTemplateIDs.isEmpty)
+        #expect(!store.templates.contains { $0.name == "Clean Dictation" && $0.prompt == reworded })
+    }
+
+    /// Codex round-6 finding 5: the warning is now precommitted BEFORE the templates.json save
+    /// (closing the crash window between a durable save and a post-save warning write) and rolled
+    /// back on an ordinary save failure. This must roll back to the exact PRE-import snapshot —
+    /// not an empty array — so an already-legitimate warning from an earlier, successful import
+    /// survives a later import whose save fails.
+    @Test func failedSaveDuringImportRollsBackToThePriorWarningNotToEmpty() throws {
+        let directory = try Self.migrationDirectory()
+        let fileURL = directory.appendingPathComponent("templates.json")
+        let defaults = try isolatedDefaults()
+        let store = TemplateStore(fileURL: fileURL, defaults: defaults)
+        let currentClean = try #require(Template.builtIns.first { $0.id == "clean-dictation" })
+        let firstReworded = currentClean.prompt + " Also, follow any spoken commands like 'scratch that' you hear."
+        let firstResult = try store.importTemplates([
+            Template(id: "clean-dictation", name: "Clean Dictation", prompt: firstReworded)
+        ])
+        // Codex round-8 finding 4: keyed to the FINAL, post-remap id — "clean-dictation" collided
+        // with the existing clean built-in and was remapped to a fresh UUID.
+        let firstRemappedID = try #require(firstResult.idMap["clean-dictation"])
+        #expect(store.unrecognizedLegacyCommandRuleTemplateIDs == [firstRemappedID])
+
+        let currentRefined = try #require(Template.builtIns.first { $0.id == "refined-message" })
+        let secondReworded = currentRefined.prompt + " Also, follow any spoken commands like 'scratch that' you hear."
+        // Remove the store's directory so the second import's save() write fails.
+        try FileManager.default.removeItem(at: directory)
+
+        #expect(throws: (any Error).self) {
+            _ = try store.importTemplates([
+                Template(id: "refined-message", name: "Refined Message", prompt: secondReworded)
+            ])
+        }
+
+        #expect(store.unrecognizedLegacyCommandRuleTemplateIDs == [firstRemappedID])
+        #expect(defaults.stringArray(forKey: "TemplateStore.spokenCommandRules.unrecognizedTemplateIDs") == [firstRemappedID])
+    }
+
+    // MARK: - Pending-warning reconciliation at init (Codex round-7 finding 9)
+
+    /// Round-6's fix (precommit the warning, roll back via `catch`) still had a crash window an
+    /// ordinary `catch` can't close — a hard kill between the precommit and `mutateAndSave` landing
+    /// left a permanent false warning with no matching import. The new fix precommits to a SEPARATE
+    /// pending key and only promotes it once the save actually lands, reconciling the pending key
+    /// against the loaded `templates.json` on every subsequent `init`. Simulates that exact crash
+    /// directly: a pending entry with no matching unrecognized content on disk must be dropped, not
+    /// surfaced. The migration-completion marker is pre-set so the LOCAL migration (a separate
+    /// mechanism) can't independently produce the same result and mask a broken fix.
+    @Test func pendingWarningIsDroppedAtInitWhenTheMatchingImportNeverLanded() throws {
+        let directory = try Self.migrationDirectory()
+        let fileURL = directory.appendingPathComponent("templates.json")
+        try encode(Template.builtIns).write(to: fileURL)
+        let defaults = try isolatedDefaults()
+        defaults.set(1, forKey: "TemplateStore.migrations.spokenCommandRules.v1")
+        defaults.set(
+            ["clean-dictation"],
+            forKey: "TemplateStore.spokenCommandRules.pendingUnrecognizedTemplateIDs"
+        )
+
+        let store = TemplateStore(fileURL: fileURL, defaults: defaults)
+
+        #expect(store.unrecognizedLegacyCommandRuleTemplateIDs.isEmpty)
+        #expect(defaults.stringArray(
+            forKey: "TemplateStore.spokenCommandRules.pendingUnrecognizedTemplateIDs"
+        ) == nil)
+    }
+
+    /// The opposite crash window: `mutateAndSave` DID land (the unrecognized content is durably on
+    /// disk) but the process died before promoting the pending warning into the committed key — the
+    /// warning must still surface, recovered from the loaded template content itself, never lost.
+    @Test func pendingWarningIsPromotedAtInitWhenTheMatchingImportDidLand() throws {
+        let directory = try Self.migrationDirectory()
+        let fileURL = directory.appendingPathComponent("templates.json")
+        let currentClean = try #require(Template.builtIns.first { $0.id == "clean-dictation" })
+        let reworded = currentClean.prompt + " Also, follow any spoken commands like 'scratch that' you hear."
+        var seeded = Template.builtIns
+        let index = try #require(seeded.firstIndex { $0.id == "clean-dictation" })
+        seeded[index].prompt = reworded
+        try encode(seeded).write(to: fileURL)
+        let defaults = try isolatedDefaults()
+        defaults.set(1, forKey: "TemplateStore.migrations.spokenCommandRules.v1")
+        defaults.set(
+            ["clean-dictation"],
+            forKey: "TemplateStore.spokenCommandRules.pendingUnrecognizedTemplateIDs"
+        )
+
+        let store = TemplateStore(fileURL: fileURL, defaults: defaults)
+
+        #expect(store.unrecognizedLegacyCommandRuleTemplateIDs == ["clean-dictation"])
+        #expect(defaults.stringArray(
+            forKey: "TemplateStore.spokenCommandRules.pendingUnrecognizedTemplateIDs"
+        ) == nil)
+    }
+
+    private static func migrationDirectory() throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("template-command-migration-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory
+    }
+
     private func makeStore() throws -> TemplateStore {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("template-import-\(UUID().uuidString)", isDirectory: true)
@@ -272,5 +675,18 @@ struct TemplateImportTests {
 
     private func encode(_ template: Template) throws -> Data {
         try JSONEncoder().encode(template)
+    }
+}
+
+/// Records the order of every `UserDefaults.set(_:forKey:)` call while still durably persisting
+/// through the real `UserDefaults` superclass — used to assert write ORDERING (the actual property
+/// that makes a two-step durable-write sequence crash-safe) without needing to simulate a raw
+/// process kill between two non-throwing calls (Codex round-7 finding 10).
+private final class UserDefaultsSetOrderSpy: UserDefaults {
+    private(set) var setOrder: [String] = []
+
+    override func set(_ value: Any?, forKey defaultName: String) {
+        setOrder.append(defaultName)
+        super.set(value, forKey: defaultName)
     }
 }

@@ -52,6 +52,28 @@ import Testing
         #expect(await processor.callCount == 1)
     }
 
+    /// Codex round-5 finding 8: proves a persisted attempt's durable voice-command snapshot
+    /// (`AttemptConfiguration.voiceCommandsEnabled`/`commandKeywords` — the job row written by
+    /// `TranscriptionJobStore.beginAttempt`/`queueRecoveryRetry`) reaches the REAL
+    /// `PostProcessingRequest` the active processor receives on retry, not just that some policy
+    /// value is computed and discarded upstream.
+    @MainActor @Test func persistedAttemptVoiceCommandSnapshotReachesTheRealPostProcessingRequest() async throws {
+        let transcriber = RecoveryLocalTranscriberProbe()
+        let processor = RecoveryPostProcessorSpy(output: "polished text")
+
+        let dictation = try await AppCoordinator.shared.processRecoveredDictation(
+            samples: [0.1],
+            configuration: .init(voiceCommandsEnabled: true, commandKeywords: ["ordem"]),
+            captureID: UUID(),
+            transcriber: transcriber,
+            processor: processor,
+            record: { _ in }
+        )
+
+        #expect(await processor.lastRequest?.voiceCommandPolicy == .enabled(keywords: ["ordem"]))
+        #expect(dictation.voiceCommandsActive == true)
+    }
+
     @MainActor @Test func retryFallsBackToRawTranscriptWhenPostProcessingFails() async throws {
         let transcriber = RecoveryLocalTranscriberProbe()
         let processor = RecoveryPostProcessorSpy(error: RetryTestError.database)
@@ -480,12 +502,17 @@ private actor RecoveryPostProcessorSpy: PostProcessor {
     private let output: String?
     private let error: Error?
     private(set) var callCount = 0
+    // Codex round-5 finding 8: captures the REAL request the processor received, so a test can
+    // assert a persisted attempt's voice-command snapshot actually reaches it, not just that some
+    // policy value was computed somewhere upstream.
+    private(set) var lastRequest: PostProcessingRequest?
 
     init(output: String) { self.output = output; error = nil }
     init(error: Error) { output = nil; self.error = error }
 
     func process(_ request: PostProcessingRequest) async throws -> String {
         callCount += 1
+        lastRequest = request
         if let error { throw error }
         return output ?? ""
     }

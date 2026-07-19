@@ -13,6 +13,10 @@ struct RecoveryDictation: Sendable, Equatable {
     /// report keep compiling unchanged. See P2 finding: recovered rows persisted with NULL
     /// duration even when it was recoverable.
     var duration: Double? = nil
+    /// Whether the `VoiceCommandPolicy` was `.enabled` for this retry's post-processing pass
+    /// (PLAN.md PR A, item 1b) — `var`+default for the same "existing call sites keep compiling"
+    /// reason as `duration` above.
+    var voiceCommandsActive: Bool? = nil
 }
 
 protocol RecoveryRetryStoring: Sendable {

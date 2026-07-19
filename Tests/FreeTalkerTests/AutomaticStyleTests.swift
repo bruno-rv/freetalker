@@ -106,7 +106,7 @@ import Testing
         let prompt = buildLocalProcessorUserContent(
             request: .init(
                 transcript: "text", template: Template.builtIns[0], appName: "Mail",
-                languagePolicy: .preserveSource
+                languagePolicy: .preserveSource, voiceCommandPolicy: .disabled
             ),
             vocabulary: [],
             context: context
@@ -124,7 +124,7 @@ import Testing
         let prompt = buildLocalProcessorUserContent(
             request: .init(
                 transcript: "text", template: Template.builtIns[0], appName: nil,
-                languagePolicy: .preserveSource
+                languagePolicy: .preserveSource, voiceCommandPolicy: .disabled
             ),
             vocabulary: [],
             context: context

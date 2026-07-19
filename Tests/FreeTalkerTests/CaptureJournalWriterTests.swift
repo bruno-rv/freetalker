@@ -108,6 +108,77 @@ import Testing
         #expect(await ledger.session(id: request.id) == nil)
     }
 
+    @Test("finish persists the voice-command snapshot onto the session (PLAN.md PR A, item 1b)")
+    func serviceFinishRecordsVoiceCommandSnapshot() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("capture-voice-commands-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let ledger = MemoryCaptureLedger()
+        let service = CaptureJournalService(fileSystem: LocalJournalFileSystem(), ledger: ledger)
+        let request = captureRequest(directory: root)
+        let active = try await service.prepare(request)
+        #expect(active.writer.enqueue([0, 1]) == .accepted)
+
+        let staged = try await service.finish(
+            active, voiceCommands: VoiceCommandSnapshot(enabled: true, keywords: ["command", "comando"])
+        )
+
+        #expect(staged.sampleCount == 2)
+        let stored = try #require(await ledger.session(id: request.id))
+        #expect(stored.state == .staged)
+        #expect(stored.voiceCommandsEnabled == true)
+        #expect(stored.commandKeywords == ["command", "comando"])
+    }
+
+    @Test("finish without a voice-command snapshot leaves the session's snapshot columns nil (legacy path)")
+    func serviceFinishWithoutVoiceCommandsLeavesSnapshotNil() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("capture-voice-commands-absent-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let ledger = MemoryCaptureLedger()
+        let service = CaptureJournalService(fileSystem: LocalJournalFileSystem(), ledger: ledger)
+        let request = captureRequest(directory: root)
+        let active = try await service.prepare(request)
+        #expect(active.writer.enqueue([0, 1]) == .accepted)
+
+        _ = try await service.finish(active)
+
+        let stored = try #require(await ledger.session(id: request.id))
+        #expect(stored.voiceCommandsEnabled == nil)
+        #expect(stored.commandKeywords == nil)
+    }
+
+    @Test("a failed snapshot write never lets canonical audio become durable (PLAN.md PR A, item 1b / finding 1: crash window ordering)")
+    func serviceFinishNeverCommitsCanonicalAudioIfVoiceCommandSnapshotFails() async throws {
+        // Regression test for the ordering bug: with the snapshot recorded AFTER
+        // `active.writer.finish()`, a crash (simulated here as the snapshot write throwing)
+        // between the two would still leave a durable canonical WAV on disk with no snapshot
+        // attached — exactly what a reconciliation-recreated job would silently inherit as
+        // `nil`. Recording the snapshot FIRST means a failure there must prevent the canonical
+        // commit from ever running, so this state can never arise.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("capture-voice-commands-crash-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let ledger = MemoryCaptureLedger()
+        let service = CaptureJournalService(fileSystem: LocalJournalFileSystem(), ledger: ledger)
+        let request = captureRequest(directory: root)
+        let active = try await service.prepare(request)
+        #expect(active.writer.enqueue([0, 1]) == .accepted)
+
+        await ledger.failVoiceCommandSnapshot(with: TestLedgerError.injected)
+        await #expect(throws: TestLedgerError.injected) {
+            _ = try await service.finish(
+                active, voiceCommands: VoiceCommandSnapshot(enabled: true, keywords: ["command"])
+            )
+        }
+
+        let canonical = root.appendingPathComponent("\(request.id.uuidString).wav")
+        #expect(!FileManager.default.fileExists(atPath: canonical.path))
+        let stored = try #require(await ledger.session(id: request.id))
+        #expect(stored.state == .capturing)
+        #expect(stored.voiceCommandsEnabled == nil)
+    }
+
     @Test("eight thousand frames commit one segment")
     func segmentBoundary() async throws {
         let fixture = try await JournalWriterFixture(segmentFrames: 8_000)
@@ -286,6 +357,7 @@ actor MemoryCaptureLedger: CaptureLedgerStoring {
     var segments: [UUID: [CaptureSegment]] = [:]
     var recordError: Error?
     var damageTransitionError: Error?
+    var voiceCommandSnapshotError: Error?
 
     func createCapture(_ request: CaptureStartRequest) throws -> CaptureSession {
         if let existing = sessions[request.id] { return existing }
@@ -320,13 +392,20 @@ actor MemoryCaptureLedger: CaptureLedgerStoring {
         guard let old = sessions[id], old.state == from || old.state == to else {
             throw TestLedgerError.conflict
         }
-        sessions[id] = CaptureSession(
+        // Mirrors the real store's `transition()` UPDATE, which never touches
+        // `voice_commands_enabled`/`command_keywords` — those columns only change via
+        // `recordVoiceCommandSnapshot`, so a transition must carry the prior values forward
+        // rather than defaulting them back to nil.
+        var updated = CaptureSession(
             id: old.id, state: to, directory: old.directory, capturedAt: old.capturedAt,
             sampleRate: old.sampleRate, channelCount: old.channelCount,
             inputDeviceUID: old.inputDeviceUID, destination: old.destination,
             recoveryJobID: recoveryJobID, libraryDictationID: libraryDictationID,
             assetKind: assetKind, failureMessage: failureMessage, contentHash: contentHash
         )
+        updated.voiceCommandsEnabled = old.voiceCommandsEnabled
+        updated.commandKeywords = old.commandKeywords
+        sessions[id] = updated
     }
 
     func session(id: UUID) -> CaptureSession? { sessions[id] }
@@ -343,6 +422,15 @@ actor MemoryCaptureLedger: CaptureLedgerStoring {
         segments[id] = nil
     }
 
+    func recordVoiceCommandSnapshot(id: UUID, enabled: Bool, keywords: [String]) async throws {
+        if let voiceCommandSnapshotError { throw voiceCommandSnapshotError }
+        guard let old = sessions[id] else { throw TestLedgerError.conflict }
+        var updated = old
+        updated.voiceCommandsEnabled = enabled
+        updated.commandKeywords = keywords
+        sessions[id] = updated
+    }
+
     func replaceSegments(_ replacement: [CaptureSegment], captureID: UUID) {
         segments[captureID] = replacement
     }
@@ -350,9 +438,10 @@ actor MemoryCaptureLedger: CaptureLedgerStoring {
     func failRecords(with error: Error) { recordError = error }
     func allowRecords() { recordError = nil }
     func failDamageTransitions(with error: Error) { damageTransitionError = error }
+    func failVoiceCommandSnapshot(with error: Error) { voiceCommandSnapshotError = error }
 }
 
-enum TestLedgerError: Error { case conflict, injected }
+enum TestLedgerError: Error, Equatable { case conflict, injected }
 
 private actor AsyncTestGate {
     private var paused = false
@@ -416,5 +505,7 @@ private final class StreamingProbeFileSystem: JournalFileSystem, @unchecked Send
     func contents(_ url: URL) throws -> [URL] { try base.contents(url) }
     func read(_ url: URL) throws -> Data { try base.read(url) }
     func remove(_ url: URL) throws { try base.remove(url) }
+    func removeEmptyDirectory(_ url: URL) throws { try base.removeEmptyDirectory(url) }
+    func removeRegularFile(_ url: URL) throws { try base.removeRegularFile(url) }
     func exists(_ url: URL) -> Bool { base.exists(url) }
 }

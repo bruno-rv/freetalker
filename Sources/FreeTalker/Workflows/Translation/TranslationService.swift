@@ -50,7 +50,10 @@ struct TranslationService: Translating {
             transcript: source,
             template: template,
             appName: nil,
-            languagePolicy: policy
+            languagePolicy: policy,
+            // PLAN.md PR A, item 2: the translation pipeline is hard-disabled, always — never
+            // from a snapshot.
+            voiceCommandPolicy: .disabled
         )
         let output = try await cloudProcess(request, snapshot, apiKey)
             .trimmingCharacters(in: .whitespacesAndNewlines)

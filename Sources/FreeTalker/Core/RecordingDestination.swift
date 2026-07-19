@@ -24,6 +24,13 @@ struct RecordingProcessingContext: Equatable, Sendable {
     let outputLanguage: OutputLanguage
     let template: Template
     let cloudSnapshot: CloudLLMSettingsSnapshot?
+    /// The stop-time `VoiceCommandPolicy` for this dictation (PLAN.md PR A, item 2) — from the
+    /// `VoiceCommandSnapshot` captured at `AppCoordinator.makeStopRequest`, enabled per toggle.
+    /// Defaults to `.disabled` for the same reason `candidateLanguages` below defaults to `[]`:
+    /// existing/test call sites that don't exercise voice commands keep compiling; every real
+    /// production call site (`stopAndTranscribeToScratchpad`, `processDictation`'s convenience
+    /// initializer) passes the actual snapshot-derived policy.
+    var voiceCommandPolicy: VoiceCommandPolicy = .disabled
     /// The Dictation Language Set this dictation's local WhisperKit request is constrained to —
     /// the Recording-start snapshot (`AppCoordinator.recordingLanguageSnapshot`), not
     /// necessarily the live configured set. Defaults to `[]` so existing/test call sites that
@@ -44,6 +51,7 @@ struct RecordingProcessingContext: Equatable, Sendable {
         Self(
             destination: destination, spokenLanguage: spokenLanguage,
             outputLanguage: outputLanguage, template: template, cloudSnapshot: nil,
+            voiceCommandPolicy: voiceCommandPolicy,
             candidateLanguages: candidateLanguages
         )
     }

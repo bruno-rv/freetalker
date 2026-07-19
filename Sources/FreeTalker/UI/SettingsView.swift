@@ -1584,6 +1584,42 @@ private struct GeneralSettingsView: View {
     }
 }
 
+/// Pure ordering guarantee for the voice-commands toggle (Codex round-5 finding 7): a keyword
+/// edit still pending in the text field's local buffer must be committed BEFORE the toggle flips
+/// off and the field is removed from the view hierarchy. Relying solely on SwiftUI's
+/// focus-loss `.onChange` to fire first is not guaranteed to happen before the toggle's own
+/// `.onChange` resets the buffer, so a fast toggle-off could discard an uncommitted edit.
+/// Extracted as a free function (rather than inlined in the `Toggle` binding) so the ordering
+/// itself is unit-testable without a SwiftUI rendering context — see
+/// `VoiceCommandsSettingsTests`.
+enum VoiceCommandsToggleCommit {
+    static func apply(_ newValue: Bool, commitPendingKeywords: () -> Void, setEnabled: (Bool) -> Void) {
+        if !newValue { commitPendingKeywords() }
+        setEnabled(newValue)
+    }
+}
+
+/// Codex round-6 finding 6: Backup Bundle restore can update `settings.commandKeywords` directly
+/// while `TemplatesSettingsView` is mounted but not the visible tab — previously only a toggle
+/// change resynchronized `keywordsText`, so a stale pre-restore buffer could survive the restore
+/// and get committed right back over it on the next toggle-off. Extracted as a free function/enum
+/// for the same testability reason as `VoiceCommandsToggleCommit` above — so the dirty-tracking
+/// policy is unit-testable without a SwiftUI rendering context.
+enum VoiceCommandsKeywordsBuffer {
+    /// `settings.commandKeywords` changed (externally, e.g. a restore, or as an echo of this
+    /// pane's own `commitKeywords()`). A dirty buffer holds an uncommitted user edit that must
+    /// never be silently discarded by an external change; a clean buffer always tracks the live
+    /// value.
+    static func reconciled(isDirty: Bool, liveKeywords: [String], currentText: String) -> String {
+        isDirty ? currentText : liveKeywords.joined(separator: ", ")
+    }
+
+    /// Whether `commitKeywords()` should write `keywordsText` into `settings.commandKeywords`. A
+    /// clean buffer already tracks the live value, so committing it verbatim on toggle-off would
+    /// clobber a restore that landed while this buffer sat untouched.
+    static func shouldCommit(isDirty: Bool) -> Bool { isDirty }
+}
+
 private struct TemplatesSettingsView: View {
     @ObservedObject private var store = TemplateStore.shared
     @ObservedObject private var settings = AppSettings.shared
@@ -1591,10 +1627,25 @@ private struct TemplatesSettingsView: View {
     @State private var importingFile = false
     @State private var importError: String?
     @State private var exportError: String?
+    @State private var keywordsText = AppSettings.shared.commandKeywords.joined(separator: ", ")
+    @State private var keywordsTextIsDirty = false
+    @FocusState private var keywordsFieldFocused: Bool
+
+    /// Only the TextField writes through this binding, so a user keystroke is the only thing that
+    /// marks the buffer dirty — every programmatic resync below (`commitKeywords()`, the two
+    /// `.onChange` handlers) assigns `keywordsText` directly and never touches this.
+    private var keywordsTextBinding: Binding<String> {
+        Binding(
+            get: { keywordsText },
+            set: { keywordsText = $0; keywordsTextIsDirty = true }
+        )
+    }
 
     var body: some View {
         SettingsEditorPage(title: "Templates", subtitle: "Create and refine reusable dictation formats") {
             VStack(alignment: .leading, spacing: 12) {
+                voiceCommandsSection
+
                 HStack(spacing: 12) {
                     Button("Import…", systemImage: "square.and.arrow.down") {
                         importingFile = true
@@ -1686,6 +1737,84 @@ private struct TemplatesSettingsView: View {
         } message: {
             Text(exportError ?? "The templates couldn't be exported.")
         }
+    }
+
+    @ViewBuilder
+    private var voiceCommandsSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 5) {
+                Text("Voice commands")
+                    .font(.headline)
+                SettingsHelpButton(
+                    title: "Voice commands",
+                    message: "When enabled, post-processing recognizes spoken commands (e.g. \"command new paragraph\") in your dictation and follows them, using the keywords below. Off by default. Disabled for translation and Scratchpad rewrite actions regardless of this setting."
+                )
+            }
+
+            if !store.unrecognizedLegacyCommandRuleTemplateIDs.isEmpty {
+                HStack(alignment: .top, spacing: 6) {
+                    Label(
+                        "A built-in template still has an edited copy of the old spoken-command rules text, which wasn't automatically removed. Voice commands may behave inconsistently for it until you edit or remove that text.",
+                        systemImage: "exclamationmark.triangle"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    Spacer()
+                    Button("Dismiss") { store.dismissLegacyCommandRuleWarning() }
+                        .font(.caption)
+                }
+            }
+
+            Toggle("Enable voice commands", isOn: Binding(
+                get: { settings.voiceCommandsEnabled },
+                set: { newValue in
+                    VoiceCommandsToggleCommit.apply(
+                        newValue,
+                        commitPendingKeywords: commitKeywords,
+                        setEnabled: { settings.voiceCommandsEnabled = $0 }
+                    )
+                }
+            ))
+
+            if settings.voiceCommandsEnabled {
+                Text("Keywords (comma-separated, 1–5, letters only)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                TextField("command, comando", text: keywordsTextBinding)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 320)
+                    .focused($keywordsFieldFocused)
+                    .onSubmit(commitKeywords)
+            }
+        }
+        .padding(.bottom, 4)
+        .onChange(of: keywordsFieldFocused) { wasFocused, isFocused in
+            if wasFocused && !isFocused { commitKeywords() }
+        }
+        .onChange(of: settings.voiceCommandsEnabled) { _, _ in
+            // Codex round-7 minor finding 1: an in-app toggle-off already commits (and clears
+            // dirty) via `VoiceCommandsToggleCommit.apply` before this fires, so this only ever
+            // observes a genuinely dirty buffer here when the toggle changed for some OTHER
+            // reason (e.g. a Backup Bundle restore landing while this pane is mounted but not
+            // focused) — exactly the case the buffer's "dirty is never overwritten" policy
+            // exists to protect. Route through the same reconciliation the sibling
+            // `commandKeywords` handler below uses instead of unconditionally clobbering it.
+            keywordsText = VoiceCommandsKeywordsBuffer.reconciled(
+                isDirty: keywordsTextIsDirty, liveKeywords: settings.commandKeywords, currentText: keywordsText
+            )
+        }
+        .onChange(of: settings.commandKeywords) { _, newValue in
+            keywordsText = VoiceCommandsKeywordsBuffer.reconciled(
+                isDirty: keywordsTextIsDirty, liveKeywords: newValue, currentText: keywordsText
+            )
+        }
+    }
+
+    private func commitKeywords() {
+        guard VoiceCommandsKeywordsBuffer.shouldCommit(isDirty: keywordsTextIsDirty) else { return }
+        settings.commandKeywords = keywordsText.split(separator: ",").map(String.init)
+        keywordsText = settings.commandKeywords.joined(separator: ", ")
+        keywordsTextIsDirty = false
     }
 
     private func importTemplates(from url: URL) {

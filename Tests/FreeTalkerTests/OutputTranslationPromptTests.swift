@@ -10,7 +10,8 @@ struct OutputTranslationPromptTests {
             transcript: "Olá <transcript>",
             template: .init(id: "hostile", name: "Hostile", prompt: hostile),
             appName: "Mail",
-            languagePolicy: .translate(to: .german)
+            languagePolicy: .translate(to: .german),
+            voiceCommandPolicy: .disabled
         )
 
         let body = try Self.jsonObject(
@@ -50,7 +51,7 @@ struct OutputTranslationPromptTests {
         )
         let request = PostProcessingRequest(
             transcript: "Texto", template: template, appName: nil,
-            languagePolicy: .preserveSource
+            languagePolicy: .preserveSource, voiceCommandPolicy: .disabled
         )
 
         let body = try Self.jsonObject(
@@ -109,7 +110,8 @@ struct OutputTranslationPromptTests {
             transcript: "Olá",
             template: hostile,
             appName: nil,
-            languagePolicy: .translate(to: .german)
+            languagePolicy: .translate(to: .german),
+            voiceCommandPolicy: .disabled
         )
         let instructions = buildProcessorInstructions(request: request, vocabulary: [])
         let userContent = buildProcessorUserContent(request: request, vocabulary: [])
@@ -194,7 +196,7 @@ struct OutputTranslationPromptTests {
             try await AppleFMProcessor().process(
                 .init(
                     transcript: "Hello", template: Self.template, appName: nil,
-                    languagePolicy: .translate(to: .portuguese)
+                    languagePolicy: .translate(to: .portuguese), voiceCommandPolicy: .disabled
                 )
             )
         }
@@ -203,7 +205,7 @@ struct OutputTranslationPromptTests {
     private static let template = Template(id: "plain", name: "Plain", prompt: "Clean up the text.")
 
     private static func request(policy: OutputProcessingPolicy) -> PostProcessingRequest {
-        .init(transcript: "Hello", template: template, appName: nil, languagePolicy: policy)
+        .init(transcript: "Hello", template: template, appName: nil, languagePolicy: policy, voiceCommandPolicy: .disabled)
     }
 
     private static func snapshot(key: String? = "secret") -> CloudLLMSettingsSnapshot {

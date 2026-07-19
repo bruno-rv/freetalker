@@ -110,9 +110,218 @@ import Testing
             "remove:\(fixture.canonical.path)",
             "remove:\(fixture.segment.path)",
             "sync:\(fixture.sessionDirectory.path)",
+            // Codex round-5 finding 5: no marker exists in this fixture, so the marker-removal
+            // step is a no-op, but the now-empty per-capture directory is still removed and its
+            // parent (the recovery root) re-synced — additive cleanup after the unchanged steps
+            // above, before the job/ledger rows are deleted.
+            "remove:\(fixture.sessionDirectory.path)",
+            "sync:\(fixture.temp.url.path)",
             "delete-job:\(fixture.captureID.uuidString)",
             "delete-ledger:\(fixture.captureID.uuidString)"
         ])
+        #expect(try await fixture.store.job(id: fixture.captureID) == nil)
+        #expect(try await fixture.store.session(id: fixture.captureID) == nil)
+        #expect(!FileManager.default.fileExists(atPath: fixture.sessionDirectory.path))
+    }
+
+    @Test("cleanup removes the orphan voice-command intent marker and the now-empty capture directory before deleting the ledger row (Codex round-5 finding 5)")
+    func journalCompletionRemovesTheOrphanVoiceCommandMarkerAndNowEmptyDirectory() async throws {
+        let fixture = try await JournalCompletionFixture(writesVoiceCommandMarker: true)
+        let marker = VoiceCommandFinalizationIntent.markerURL(in: fixture.sessionDirectory)
+        #expect(FileManager.default.fileExists(atPath: marker.path))
+        let service = fixture.service(libraryID: fixture.libraryID)
+
+        try await service.completeJournalCapture(
+            fixture.capture, captureID: fixture.captureID
+        )
+
+        #expect(!FileManager.default.fileExists(atPath: marker.path))
+        #expect(!FileManager.default.fileExists(atPath: fixture.sessionDirectory.path))
+        #expect(try await fixture.store.job(id: fixture.captureID) == nil)
+        #expect(try await fixture.store.session(id: fixture.captureID) == nil)
+    }
+
+    @Test("cleanup refuses to delete a session directory outside <recoveryRoot>/<captureID> (Codex round-6 finding 1)")
+    func cleanupRefusesSessionDirectoryOutsideRecoveryRoot() async throws {
+        let temp = try TemporaryDirectory()
+        let recoveryRoot = temp.url.appendingPathComponent("recovery", isDirectory: true)
+        try FileManager.default.createDirectory(at: recoveryRoot, withIntermediateDirectories: true)
+        let outside = temp.url.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let sentinel = outside.appendingPathComponent("do-not-delete.txt")
+        try Data("keep".utf8).write(to: sentinel)
+        let marker = VoiceCommandFinalizationIntent.markerURL(in: outside)
+        try JSONEncoder().encode(VoiceCommandFinalizationIntent(enabled: true, keywords: ["comando"]))
+            .write(to: marker)
+
+        let captureID = UUID()
+        let store = try TranscriptionJobStore(
+            databaseURL: temp.url.appendingPathComponent("jobs.sqlite"), clock: SystemJobClock()
+        )
+        // A corrupted/migrated ledger row pointing outside `<recoveryRoot>/<captureID>` — cleanup
+        // must never trust `session.directory` blindly for deletion.
+        _ = try await store.createCapture(.init(
+            id: captureID, directory: outside, capturedAt: Date(timeIntervalSince1970: 1),
+            sampleRate: 16_000, channelCount: 1, inputDeviceUID: nil, destination: "external"
+        ))
+        try await store.transition(
+            id: captureID, from: .capturing, to: .libraryCommitted,
+            recoveryJobID: nil, libraryDictationID: 42, assetKind: .audio,
+            failureMessage: nil, contentHash: nil
+        )
+
+        let service = RecoveryCaptureService(
+            directory: recoveryRoot, store: store, ledger: store,
+            libraryDictationID: { _ in 42 }
+        )
+
+        await #expect(throws: RecoveryFinalizationError.captureIdentityMismatch) {
+            try await service.resumeLibraryCommittedCapture(captureID: captureID)
+        }
+        #expect(FileManager.default.fileExists(atPath: sentinel.path))
+        #expect(FileManager.default.fileExists(atPath: marker.path))
+        #expect(try await store.session(id: captureID)?.state == .libraryCommitted)
+    }
+
+    @Test("cleanup keeps the ledger row when the capture directory still has unexpected contents after marker removal (Codex round-6 finding 4)")
+    func cleanupRetainsOwnershipWhenDirectoryHasUnexpectedContents() async throws {
+        let fixture = try await JournalCompletionFixture()
+        let stray = fixture.sessionDirectory.appendingPathComponent("unexpected.tmp")
+        try Data("stray".utf8).write(to: stray)
+        let service = fixture.service(libraryID: fixture.libraryID)
+
+        await #expect(throws: CaptureJournalError.self) {
+            try await service.completeJournalCapture(fixture.capture, captureID: fixture.captureID)
+        }
+
+        // The unexpected file (and therefore the directory itself) must survive — deleting the
+        // job/ledger rows anyway would strand it with nothing left to revisit it.
+        #expect(FileManager.default.fileExists(atPath: stray.path))
+        #expect(FileManager.default.fileExists(atPath: fixture.sessionDirectory.path))
+        #expect(try await fixture.store.session(id: fixture.captureID) != nil)
+        #expect(try await fixture.store.job(id: fixture.captureID) != nil)
+    }
+
+    @Test("cleanup durably removes recognized app-owned temporary residue before the emptiness check, instead of wedging on legitimate crash leftovers (Codex round-7 finding 4)")
+    func cleanupSweepsRecognizedTemporaryResidueBeforeEmptinessCheck() async throws {
+        let fixture = try await JournalCompletionFixture()
+        // Every temporary file this subsystem writes into a session directory
+        // (`DurableArtifactWriter.commit`'s `temporary:` argument — segment, canonical-audio,
+        // marker, and diagnostics writes) uses this exact `.<name>.<uuid>.tmp` naming. This
+        // simulates a crash between one such write and its rename — legitimate app-owned residue,
+        // not evidence of unexpected content, unlike `unexpected.tmp` in the round-6 finding-4 test
+        // above (no leading dot — genuinely unrecognized).
+        let residue = fixture.sessionDirectory.appendingPathComponent(
+            ".capture-voice-command-intent.\(UUID().uuidString).tmp"
+        )
+        try Data("partial write".utf8).write(to: residue)
+        let service = fixture.service(libraryID: fixture.libraryID)
+
+        try await service.completeJournalCapture(fixture.capture, captureID: fixture.captureID)
+
+        #expect(!FileManager.default.fileExists(atPath: residue.path))
+        #expect(!FileManager.default.fileExists(atPath: fixture.sessionDirectory.path))
+        #expect(try await fixture.store.job(id: fixture.captureID) == nil)
+        #expect(try await fixture.store.session(id: fixture.captureID) == nil)
+    }
+
+    @Test("cleanup rejects an unrecognized hidden .tmp file instead of sweeping it as app-owned residue (Codex round-8 finding 1)")
+    func cleanupRejectsUnrecognizedHiddenTemporaryFile() async throws {
+        let fixture = try await JournalCompletionFixture()
+        // Looks like the recognized `.<stem>.<uuid>.tmp` residue shape at a glance (leading dot,
+        // `.tmp` suffix) but has no embedded UUID and isn't one of this subsystem's known
+        // artifact stems — must NOT be swept as legitimate crash leftovers.
+        let evil = fixture.sessionDirectory.appendingPathComponent(".evil.tmp")
+        try Data("not app-owned".utf8).write(to: evil)
+        let service = fixture.service(libraryID: fixture.libraryID)
+
+        await #expect(throws: CaptureJournalError.self) {
+            try await service.completeJournalCapture(fixture.capture, captureID: fixture.captureID)
+        }
+
+        #expect(FileManager.default.fileExists(atPath: evil.path))
+        #expect(FileManager.default.fileExists(atPath: fixture.sessionDirectory.path))
+        #expect(try await fixture.store.session(id: fixture.captureID) != nil)
+        #expect(try await fixture.store.job(id: fixture.captureID) != nil)
+    }
+
+    @Test("cleanup refuses to remove a directory planted at the final intent-marker path (Codex round-9 finding 5)")
+    func cleanupRejectsDirectoryPlantedAtIntentMarkerPath() async throws {
+        let fixture = try await JournalCompletionFixture()
+        // The final marker-removal step previously checked only name and existence —
+        // `FileManager.removeItem` recursively deletes whatever is planted there, so a directory
+        // (with real content inside) would be destroyed instead of hitting the unexpected-content
+        // guard.
+        let marker = VoiceCommandFinalizationIntent.markerURL(in: fixture.sessionDirectory)
+        try FileManager.default.createDirectory(at: marker, withIntermediateDirectories: true)
+        let sentinel = marker.appendingPathComponent("do-not-delete.txt")
+        try Data("keep".utf8).write(to: sentinel)
+        let service = fixture.service(libraryID: fixture.libraryID)
+
+        await #expect(throws: CaptureJournalError.self) {
+            try await service.completeJournalCapture(fixture.capture, captureID: fixture.captureID)
+        }
+
+        #expect(FileManager.default.fileExists(atPath: sentinel.path))
+        #expect(try await fixture.store.session(id: fixture.captureID) != nil)
+        #expect(try await fixture.store.job(id: fixture.captureID) != nil)
+    }
+
+    @Test("cleanup accepts a lowercase-UUID nested session directory the reconciler can legitimately create (Codex round-7 finding 5)")
+    func cleanupAcceptsLowercaseUUIDDirectoryName() async throws {
+        let temp = try TemporaryDirectory()
+        let recoveryRoot = temp.url.appendingPathComponent("recovery", isDirectory: true)
+        try FileManager.default.createDirectory(at: recoveryRoot, withIntermediateDirectories: true)
+        let captureID = UUID()
+        // `RecoveryReconciler.directoryCaptureID` parses the leaf via the case-insensitive
+        // `UUID(uuidString:)` and persists whatever casing was actually on disk — a lowercase leaf
+        // is a legitimate directory name this subsystem itself creates, not evidence of corruption.
+        let sessionDirectory = recoveryRoot.appendingPathComponent(
+            captureID.uuidString.lowercased(), isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: sessionDirectory, withIntermediateDirectories: true)
+        let canonical = sessionDirectory.appendingPathComponent("\(captureID.uuidString).wav")
+        try Data([1]).write(to: canonical)
+        let store = try TranscriptionJobStore(
+            databaseURL: temp.url.appendingPathComponent("jobs.sqlite"), clock: SystemJobClock()
+        )
+        _ = try await store.createCapture(.init(
+            id: captureID, directory: sessionDirectory, capturedAt: Date(timeIntervalSince1970: 1),
+            sampleRate: 16_000, channelCount: 1, inputDeviceUID: nil, destination: "external"
+        ))
+        try await store.transition(
+            id: captureID, from: .capturing, to: .libraryCommitted,
+            recoveryJobID: nil, libraryDictationID: 42, assetKind: .audio,
+            failureMessage: nil, contentHash: nil
+        )
+        let service = RecoveryCaptureService(
+            directory: recoveryRoot, store: store, ledger: store,
+            libraryDictationID: { _ in 42 }
+        )
+
+        try await service.resumeLibraryCommittedCapture(captureID: captureID)
+
+        #expect(!FileManager.default.fileExists(atPath: sessionDirectory.path))
+        #expect(try await store.session(id: captureID) == nil)
+    }
+
+    @Test("cleanup fsyncs the recovery root even when a retry finds the child directory already removed (Codex round-7 minor finding 2)")
+    func cleanupFsyncsRecoveryRootOnRetryWhenChildAlreadyRemoved() async throws {
+        let fixture = try await JournalCompletionFixture()
+        // Simulates a prior pass that already durably removed the session directory (this exact
+        // method's own directory-removal step, on an earlier attempt) but crashed before its
+        // parent fsync landed — a retry must still fsync the recovery root before releasing
+        // ownership (the job/ledger deletes) below.
+        try FileManager.default.removeItem(at: fixture.sessionDirectory)
+        let spy = SynchronizeDirectorySpyFileSystem()
+        let service = RecoveryCaptureService(
+            directory: fixture.temp.url, store: fixture.store, ledger: fixture.store,
+            journalFileSystem: spy, libraryDictationID: { _ in fixture.libraryID }
+        )
+
+        try await service.completeJournalCapture(fixture.capture, captureID: fixture.captureID)
+
+        #expect(spy.synchronizedDirectories.contains(fixture.temp.url.standardizedFileURL.path))
         #expect(try await fixture.store.job(id: fixture.captureID) == nil)
         #expect(try await fixture.store.session(id: fixture.captureID) == nil)
     }
@@ -581,7 +790,7 @@ private enum RecoveryTestError: Error { case databaseFailure }
 private actor FailingRecoveryStore: RecoveryJobStoring {
     func job(id: UUID) throws -> TranscriptionJob? { throw RecoveryTestError.databaseFailure }
     func createProvisionalRecovery(source: JobSource, capturedAt: Date) throws -> TranscriptionJob { throw RecoveryTestError.databaseFailure }
-    func createProvisionalRecovery(id: UUID, source: JobSource, capturedAt: Date) throws -> TranscriptionJob { throw RecoveryTestError.databaseFailure }
+    func createProvisionalRecovery(id: UUID, source: JobSource, capturedAt: Date, voiceCommandsEnabled: Bool?, commandKeywords: [String]?) throws -> TranscriptionJob { throw RecoveryTestError.databaseFailure }
     func failProvisionalRecovery(id: UUID, failure: JobFailure) throws { throw RecoveryTestError.databaseFailure }
     func deleteProvisionalRecovery(id: UUID, expectedSourceReference: String) throws -> Bool { throw RecoveryTestError.databaseFailure }
     func deleteCommittedRecovery(id: UUID, expectedSourceReference: String) throws -> Bool { throw RecoveryTestError.databaseFailure }
@@ -627,6 +836,31 @@ private struct InjectedRecoveryFinalizationFailure: Error {
     let boundary: String
 }
 
+/// Records every `synchronizeDirectory` call while delegating to a real filesystem, so a test can
+/// assert a specific directory was durably fsynced without depending on that fsync's (unobservable
+/// from userspace) actual disk effect (Codex round-7 minor finding 2).
+private final class SynchronizeDirectorySpyFileSystem: JournalFileSystem, @unchecked Sendable {
+    private let base = LocalJournalFileSystem()
+    private let lock = NSLock()
+    private var storage: [String] = []
+    var synchronizedDirectories: [String] { lock.withLock { storage } }
+    func createDirectory(_ url: URL) throws { try base.createDirectory(url) }
+    func write(_ data: Data, to url: URL) throws { try base.write(data, to: url) }
+    func append(_ data: Data, to url: URL) throws { try base.append(data, to: url) }
+    func synchronizeFile(_ url: URL) throws { try base.synchronizeFile(url) }
+    func rename(_ source: URL, to destination: URL) throws { try base.rename(source, to: destination) }
+    func synchronizeDirectory(_ url: URL) throws {
+        try base.synchronizeDirectory(url)
+        lock.withLock { storage.append(url.standardizedFileURL.path) }
+    }
+    func contents(_ url: URL) throws -> [URL] { try base.contents(url) }
+    func read(_ url: URL) throws -> Data { try base.read(url) }
+    func remove(_ url: URL) throws { try base.remove(url) }
+    func removeEmptyDirectory(_ url: URL) throws { try base.removeEmptyDirectory(url) }
+    func removeRegularFile(_ url: URL) throws { try base.removeRegularFile(url) }
+    func exists(_ url: URL) -> Bool { base.exists(url) }
+}
+
 private struct RecordingRecoveryFileSystem: JournalFileSystem {
     let base = LocalJournalFileSystem()
     let events: LockedRecoveryEvents
@@ -647,6 +881,8 @@ private struct RecordingRecoveryFileSystem: JournalFileSystem {
         try base.remove(url)
         try events.record("remove:\(url.path)", boundary: boundary)
     }
+    func removeEmptyDirectory(_ url: URL) throws { try base.removeEmptyDirectory(url) }
+    func removeRegularFile(_ url: URL) throws { try base.removeRegularFile(url) }
     func exists(_ url: URL) -> Bool { base.exists(url) }
 }
 
@@ -663,7 +899,7 @@ private struct JournalCompletionFixture {
     let capture: ProvisionalRecoveryCapture
     let events: LockedRecoveryEvents
 
-    init(removeCanonical: Bool = false, failureEvent: String? = nil) async throws {
+    init(removeCanonical: Bool = false, writesVoiceCommandMarker: Bool = false, failureEvent: String? = nil) async throws {
         events = LockedRecoveryEvents(failureEvent: failureEvent)
         temp = try TemporaryDirectory()
         captureID = UUID()
@@ -673,6 +909,10 @@ private struct JournalCompletionFixture {
         segment = sessionDirectory.appendingPathComponent("segment-00000000.wav")
         try Data([1]).write(to: canonical)
         try Data([2]).write(to: segment)
+        if writesVoiceCommandMarker {
+            try JSONEncoder().encode(VoiceCommandFinalizationIntent(enabled: true, keywords: ["comando"]))
+                .write(to: VoiceCommandFinalizationIntent.markerURL(in: sessionDirectory))
+        }
         databaseURL = temp.url.appendingPathComponent("jobs.sqlite")
         library = try PersistentCaptureLibrary(
             url: temp.url.appendingPathComponent("library.sqlite")
@@ -757,7 +997,7 @@ private struct EventingRecoveryStore: RecoveryJobStoring {
     let events: LockedRecoveryEvents
     func job(id: UUID) async throws -> TranscriptionJob? { try await base.job(id: id) }
     func createProvisionalRecovery(source: JobSource, capturedAt: Date) async throws -> TranscriptionJob { try await base.createProvisionalRecovery(source: source, capturedAt: capturedAt) }
-    func createProvisionalRecovery(id: UUID, source: JobSource, capturedAt: Date) async throws -> TranscriptionJob { try await base.createProvisionalRecovery(id: id, source: source, capturedAt: capturedAt) }
+    func createProvisionalRecovery(id: UUID, source: JobSource, capturedAt: Date, voiceCommandsEnabled: Bool?, commandKeywords: [String]?) async throws -> TranscriptionJob { try await base.createProvisionalRecovery(id: id, source: source, capturedAt: capturedAt, voiceCommandsEnabled: voiceCommandsEnabled, commandKeywords: commandKeywords) }
     func failProvisionalRecovery(id: UUID, failure: JobFailure) async throws { try await base.failProvisionalRecovery(id: id, failure: failure) }
     func deleteProvisionalRecovery(id: UUID, expectedSourceReference: String) async throws -> Bool { try await base.deleteProvisionalRecovery(id: id, expectedSourceReference: expectedSourceReference) }
     func deleteCommittedRecovery(id: UUID, expectedSourceReference: String) async throws -> Bool {

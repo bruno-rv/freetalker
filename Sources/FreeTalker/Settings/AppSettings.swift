@@ -350,6 +350,63 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(automaticStyleEnabled, forKey: Keys.automaticStyleEnabled) }
     }
 
+    /// Voice command layer master switch (PLAN.md PR A, item 1). **Default OFF** — a default-ON
+    /// flip is explicitly out of scope for this PR (see PLAN.md "Key decisions") and requires its
+    /// own separately reviewed change with an evidence gate. When enabled, dictations may contain
+    /// a spoken keyword (see `commandKeywords`) followed by a free-form instruction the
+    /// post-processing LLM interprets — see `CommandInstructionBuilder`.
+    @Published var voiceCommandsEnabled: Bool {
+        didSet { defaults.set(voiceCommandsEnabled, forKey: Keys.voiceCommandsEnabled) }
+    }
+
+    /// Spoken keyword(s) that introduce a voice command (PLAN.md PR A, item 1). Validated/
+    /// normalized on every set: 1–5 entries, each 2–24 characters, letters only, lowercased,
+    /// deduped — see `normalizeCommandKeywords`. `CommandInstructionBuilder` re-sanitizes this
+    /// list independently at render time (defense in depth — see its doc comment), so this
+    /// setter's own validation is a UX/UserDefaults-hygiene concern, not the trust boundary.
+    @Published var commandKeywords: [String] {
+        didSet {
+            let normalized = Self.normalizeCommandKeywords(commandKeywords)
+            guard normalized == commandKeywords else {
+                commandKeywords = normalized
+                defaults.set(normalized, forKey: Keys.commandKeywords)
+                return
+            }
+            defaults.set(commandKeywords, forKey: Keys.commandKeywords)
+        }
+    }
+
+    /// Default spoken command keywords (English + Portuguese) — also the normalizer's fallback
+    /// when every candidate is invalid/duplicate/empty (never an empty set). See PLAN.md PR A,
+    /// item 1.
+    nonisolated static let defaultCommandKeywords = ["command", "comando"]
+
+    nonisolated static let commandKeywordMinCount = 1
+    nonisolated static let commandKeywordMaxCount = 5
+    nonisolated static let commandKeywordMinLength = 2
+    nonisolated static let commandKeywordMaxLength = 24
+
+    /// Trims, lowercases, dedupes, and bounds a candidate keyword list to
+    /// `commandKeywordMinCount...commandKeywordMaxCount` entries of
+    /// `commandKeywordMinLength...commandKeywordMaxLength` Unicode letters each (no digits,
+    /// punctuation, or whitespace within a term — a spoken keyword is a single word). Falls back
+    /// to `defaultCommandKeywords` when every candidate is invalid or the input is empty, so
+    /// `commandKeywords` is never empty (mirrors `normalizeDictationLanguages`'s never-empty
+    /// contract).
+    nonisolated static func normalizeCommandKeywords(_ raw: [String]) -> [String] {
+        var seen = Set<String>()
+        var kept: [String] = []
+        for candidate in raw {
+            guard kept.count < commandKeywordMaxCount else { break }
+            let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard trimmed.count >= commandKeywordMinLength, trimmed.count <= commandKeywordMaxLength,
+                  trimmed.unicodeScalars.allSatisfy({ CharacterSet.letters.contains($0) }) else { continue }
+            guard seen.insert(trimmed).inserted else { continue }
+            kept.append(trimmed)
+        }
+        return kept.isEmpty ? defaultCommandKeywords : kept
+    }
+
     @Published var handsFreeMaxMinutes: Int {
         didSet {
             let clamped = Self.clampHandsFreeMaxMinutes(handsFreeMaxMinutes)
@@ -777,6 +834,8 @@ final class AppSettings: ObservableObject {
         static let mediaImportRetention = "mediaImportRetention"
         static let localContextScope = "localContextScope"
         static let automaticStyleEnabled = "automaticStyleEnabled"
+        static let voiceCommandsEnabled = "voiceCommandsEnabled"
+        static let commandKeywords = "commandKeywords"
         static let handsFreeMaxMinutes = "handsFreeMaxMinutes"
         static let appRules = "appRules"
         static let languagePin = "languagePin"
@@ -907,6 +966,16 @@ final class AppSettings: ObservableObject {
         let storedLocalContextScope = defaults.string(forKey: Keys.localContextScope)
         localContextScope = storedLocalContextScope.flatMap(LocalContextScope.init(rawValue:)) ?? .off
         automaticStyleEnabled = defaults.bool(forKey: Keys.automaticStyleEnabled)
+        // Default OFF — plain `.bool(forKey:)` is correct here (unlike the `.object(forKey:) as?
+        // Bool` idiom used for default-ON flags above): an unset key and an explicit `false` both
+        // correctly resolve to `false`. See PLAN.md PR A, item 1.
+        voiceCommandsEnabled = defaults.bool(forKey: Keys.voiceCommandsEnabled)
+        let storedCommandKeywords = defaults.array(forKey: Keys.commandKeywords) as? [String] ?? Self.defaultCommandKeywords
+        let normalizedCommandKeywords = Self.normalizeCommandKeywords(storedCommandKeywords)
+        commandKeywords = normalizedCommandKeywords
+        if normalizedCommandKeywords != storedCommandKeywords {
+            defaults.set(normalizedCommandKeywords, forKey: Keys.commandKeywords)
+        }
         if let storedLocalContextScope, LocalContextScope(rawValue: storedLocalContextScope) == nil {
             defaults.set(LocalContextScope.off.rawValue, forKey: Keys.localContextScope)
         }
@@ -1052,6 +1121,22 @@ extension AppSettings {
     }
 }
 
+/// Stop-time snapshot of the voice command settings (PLAN.md PR A, item 1) — mirrors
+/// `CloudLLMSettingsSnapshot`'s role: captured synchronously on MainActor at Recording stop
+/// (`AppCoordinator.makeStopRequest`) so a later mutation of the live `AppSettings` singleton
+/// can never reach an in-flight request. Persisted durably on the capture session (item 1b) and
+/// copied into the provisional job / retry `AttemptConfiguration`.
+struct VoiceCommandSnapshot: Equatable, Sendable {
+    let enabled: Bool
+    let keywords: [String]
+}
+
+extension AppSettings {
+    var voiceCommandSnapshot: VoiceCommandSnapshot {
+        VoiceCommandSnapshot(enabled: voiceCommandsEnabled, keywords: commandKeywords)
+    }
+}
+
 extension AppSettings {
     /// Every `Keys` entry that's safe and meaningful to export, excluding `legacyHotKeyDeviceMask`
     /// and `hudPosition` — both read-only migration keys that current code only ever reads, never
@@ -1095,7 +1180,9 @@ extension AppSettings {
         Keys.appLanguageRules,
         Keys.dictationLanguages,
         Keys.microphoneDeviceUID,
-        Keys.vocabularyText
+        Keys.vocabularyText,
+        Keys.voiceCommandsEnabled,
+        Keys.commandKeywords
     ]
 
     /// Exports every non-secret setting to a human-readable JSON file. Reads only the
@@ -1176,6 +1263,8 @@ extension AppSettings {
         out[Keys.dictationLanguages] = dictationLanguages
         out[Keys.microphoneDeviceUID] = microphoneDeviceUID ?? NSNull()
         out[Keys.vocabularyText] = vocabularyText
+        out[Keys.voiceCommandsEnabled] = voiceCommandsEnabled
+        out[Keys.commandKeywords] = commandKeywords
         return out
     }
 }

@@ -70,17 +70,34 @@ struct TranscriptionJob: Sendable, Equatable {
     let result: String?
     let needsSourceCleanup: Bool
     let sourceCleanupError: String?
+    /// Durable voice command snapshot inherited from the capture session at provisional-job
+    /// creation (PLAN.md PR A, item 1b) — see `TranscriptionJobStore.createProvisionalRecovery`.
+    /// `nil` for a job created before this feature existed, or whose originating session never
+    /// staged with a snapshot; retry falls back to current settings in that case.
+    var voiceCommandsEnabled: Bool? = nil
+    var commandKeywords: [String]? = nil
 }
 
 struct AttemptConfiguration: Sendable, Equatable {
     let language: String?
     let speechModel: String?
     let template: String?
+    /// Copied from the job's own snapshot at attempt-begin time when the caller doesn't supply an
+    /// explicit override (PLAN.md PR A, item 1b) — see `TranscriptionJobStore.beginAttempt`/
+    /// `queueRecoveryRetry`. `nil` here means "job snapshot is also absent" (legacy), which
+    /// `AppCoordinator.processRecoveredDictation` resolves against current settings.
+    let voiceCommandsEnabled: Bool?
+    let commandKeywords: [String]?
 
-    init(language: String? = nil, speechModel: String? = nil, template: String? = nil) {
+    init(
+        language: String? = nil, speechModel: String? = nil, template: String? = nil,
+        voiceCommandsEnabled: Bool? = nil, commandKeywords: [String]? = nil
+    ) {
         self.language = language
         self.speechModel = speechModel
         self.template = template
+        self.voiceCommandsEnabled = voiceCommandsEnabled
+        self.commandKeywords = commandKeywords
     }
 }
 

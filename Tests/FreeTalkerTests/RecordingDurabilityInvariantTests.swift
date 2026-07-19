@@ -1105,6 +1105,8 @@ private final class PersistentFaultFileSystem: JournalFileSystem, @unchecked Sen
             try fire(.cancelDirectoryRemove)
         }
     }
+    func removeEmptyDirectory(_ url: URL) throws { try base.removeEmptyDirectory(url) }
+    func removeRegularFile(_ url: URL) throws { try base.removeRegularFile(url) }
     func exists(_ url: URL) -> Bool { base.exists(url) }
 }
 
@@ -1190,8 +1192,8 @@ private actor PersistentFaultJobStore: RecoveryJobStoring {
         try fire(.recoveryJobCreate)
         return job
     }
-    func createProvisionalRecovery(id: UUID, source: JobSource, capturedAt: Date) async throws -> TranscriptionJob {
-        let job = try await base.createProvisionalRecovery(id: id, source: source, capturedAt: capturedAt)
+    func createProvisionalRecovery(id: UUID, source: JobSource, capturedAt: Date, voiceCommandsEnabled: Bool?, commandKeywords: [String]?) async throws -> TranscriptionJob {
+        let job = try await base.createProvisionalRecovery(id: id, source: source, capturedAt: capturedAt, voiceCommandsEnabled: voiceCommandsEnabled, commandKeywords: commandKeywords)
         try fire(.recoveryJobCreate)
         return job
     }
