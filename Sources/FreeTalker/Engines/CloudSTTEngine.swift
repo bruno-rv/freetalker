@@ -33,8 +33,9 @@ final class CloudSTTEngine: ObservableObject, TranscriptionEngine, @unchecked Se
 
     /// `candidateLanguages` is ignored — the OpenAI-compatible `/audio/transcriptions` API only
     /// ever takes a single `forcedLanguage` (or provider auto-detect when nil); there's no
-    /// candidate-set concept to constrain it with. See PLAN.md F5.3.
-    func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String]) async throws -> TranscriptionOutput {
+    /// candidate-set concept to constrain it with. See PLAN.md F5.3. `vocabulary` is the caller's
+    /// snapshot — see `TranscriptionEngine.transcribe`'s doc comment; never re-read live here.
+    func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String], vocabulary: [String]) async throws -> TranscriptionOutput {
         let provider = await AppSettings.shared.cloudSTTProvider
         let baseURL = await AppSettings.shared.cloudSTTBaseURL
         let model = await AppSettings.shared.cloudSTTModel
@@ -50,7 +51,6 @@ final class CloudSTTEngine: ObservableObject, TranscriptionEngine, @unchecked Se
 
         let wavData = WAVEncoder.encode(samples: samples, sampleRate: 16_000)
         let boundary = "FreeTalker-\(UUID().uuidString)"
-        let vocabulary = await AppSettings.shared.vocabulary
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"

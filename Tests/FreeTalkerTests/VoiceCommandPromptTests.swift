@@ -13,7 +13,7 @@ struct VoiceCommandPromptTests {
         .init(
             transcript: "Hello, command new paragraph, world.",
             template: template, appName: nil,
-            languagePolicy: .preserveSource, voiceCommandPolicy: policy
+            languagePolicy: .preserveSource, voiceCommandPolicy: policy, vocabulary: []
         )
     }
 
@@ -288,7 +288,7 @@ private actor FixedTranscriptionSpy: TranscriptionEngine {
 
     init(output: TranscriptionOutput) { self.output = output }
 
-    func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String]) async throws -> TranscriptionOutput {
+    func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String], vocabulary: [String]) async throws -> TranscriptionOutput {
         output
     }
 }

@@ -351,6 +351,21 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, WhisperFile
 
     var isLoaded: Bool { modelController.state.isLoaded }
 
+    /// Synchronous, non-loading accessor for the currently loaded tokenizer's exact token-count
+    /// function (PLAN.md PR B, item 4's "tokenizer loaded → exact token count" path) — nil when no
+    /// model is loaded yet, in which case `VocabularyFitGate`/`EffectiveVocabulary` fall back to
+    /// the conservative byte bound. Mirrors the encode + special-token-filter `performTranscribe`
+    /// performs below byte-for-byte, since `VocabularyFitGate.serializedPrompt` is the one shared
+    /// serialization both this and the real biasing prompt use — an out-of-sync mirror would let
+    /// this gate approve a term the real prompt truncates differently. Wired into
+    /// `AppSettings.vocabularyTokenEncoder` by `AppCoordinator` at launch.
+    func currentVocabularyEncoder() -> ((String) -> Int)? {
+        guard let kit = modelController.state.capturedKit(), let tokenizer = kit.tokenizer else { return nil }
+        return { text in
+            tokenizer.encode(text: text).filter { $0 < tokenizer.specialTokens.specialTokenBegin }.count
+        }
+    }
+
     init(downloadCoordinator: SpeechModelDownloadCoordinator = .shared) {
         self.downloadCoordinator = downloadCoordinator
     }
@@ -401,13 +416,13 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, WhisperFile
         return pool.max { langProbs[$0, default: -.infinity] < langProbs[$1, default: -.infinity] } ?? pool[0]
     }
 
-    func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String], allowEarlyCancel: Bool) async throws -> TranscriptionOutput {
+    func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String], vocabulary: [String], allowEarlyCancel: Bool) async throws -> TranscriptionOutput {
         guard allowEarlyCancel else {
-            return try await gate.run { [self] in try await performTranscribe(samples: samples, forcedLanguage: forcedLanguage, candidateLanguages: candidateLanguages, cancelFlag: nil) }
+            return try await gate.run { [self] in try await performTranscribe(samples: samples, forcedLanguage: forcedLanguage, candidateLanguages: candidateLanguages, vocabulary: vocabulary, cancelFlag: nil) }
         }
         let cancelFlag = OSAllocatedUnfairLock(initialState: false)
         return try await withTaskCancellationHandler {
-            try await gate.run { [self] in try await performTranscribe(samples: samples, forcedLanguage: forcedLanguage, candidateLanguages: candidateLanguages, cancelFlag: cancelFlag) }
+            try await gate.run { [self] in try await performTranscribe(samples: samples, forcedLanguage: forcedLanguage, candidateLanguages: candidateLanguages, vocabulary: vocabulary, cancelFlag: cancelFlag) }
         } onCancel: {
             cancelFlag.withLock { $0 = true }
         }
@@ -415,14 +430,17 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, WhisperFile
 
     /// `TranscriptionEngine` conformance — the final-transcription entry point. Always
     /// `allowEarlyCancel: false`; see the overload above.
-    func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String]) async throws -> TranscriptionOutput {
-        try await transcribe(samples: samples, forcedLanguage: forcedLanguage, candidateLanguages: candidateLanguages, allowEarlyCancel: false)
+    func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String], vocabulary: [String]) async throws -> TranscriptionOutput {
+        try await transcribe(samples: samples, forcedLanguage: forcedLanguage, candidateLanguages: candidateLanguages, vocabulary: vocabulary, allowEarlyCancel: false)
     }
 
-    func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String], exactModel: String) async throws -> TranscriptionOutput {
+    /// Recovery retry only (`RecoveryLocalTranscribing`) — detached from any live Recording, so
+    /// there's no stop-time snapshot to reuse; `vocabulary` is whatever the caller considers
+    /// "current" at retry time (mirrors `candidateLanguages`' own doc comment above).
+    func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String], vocabulary: [String], exactModel: String) async throws -> TranscriptionOutput {
         try await gate.run {
             let kit = try await self.kitForFileTranscription(model: exactModel)
-            return try await self.performTranscribe(samples: samples, forcedLanguage: forcedLanguage, candidateLanguages: candidateLanguages, cancelFlag: nil, kitOverride: kit)
+            return try await self.performTranscribe(samples: samples, forcedLanguage: forcedLanguage, candidateLanguages: candidateLanguages, vocabulary: vocabulary, cancelFlag: nil, kitOverride: kit)
         }
     }
 
@@ -503,7 +521,7 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, WhisperFile
         }
     }
 
-    private func performTranscribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String], cancelFlag: OSAllocatedUnfairLock<Bool>?, kitOverride: WhisperKit? = nil) async throws -> TranscriptionOutput {
+    private func performTranscribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String], vocabulary: [String], cancelFlag: OSAllocatedUnfairLock<Bool>?, kitOverride: WhisperKit? = nil) async throws -> TranscriptionOutput {
         let kit: WhisperKit
         if let kitOverride { kit = kitOverride }
         else { kit = try await kitForTranscription() }
@@ -551,10 +569,15 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, WhisperFile
             // Bias decoding toward user-registered vocabulary (proper nouns/jargon) via
             // WhisperKit's `promptTokens`, following the same encode pattern as WhisperKit's own
             // CLI/server prompt handling (leading space, special tokens filtered out).
-            let vocabulary = await AppSettings.shared.vocabulary
+            // `VocabularyFitGate.serializedPrompt` is the single source of this exact
+            // serialization — the self-learning vocabulary fit-gate (PLAN.md PR B, item 4) mirrors
+            // it byte-for-byte to compute its conservative bound, so any change here must change
+            // there too. `vocabulary` is the caller's snapshot (see `TranscriptionEngine.transcribe`'s
+            // doc comment) — never re-read live here, so a stop-time snapshot and a later live
+            // preview tick can legitimately differ without this call ever privately re-deciding
+            // which one is "current". See Codex round 1 finding 4.
             if !vocabulary.isEmpty, let tokenizer = kit.tokenizer {
-                let promptText = " " + vocabulary.joined(separator: ", ")
-                options.promptTokens = tokenizer.encode(text: promptText)
+                options.promptTokens = tokenizer.encode(text: VocabularyFitGate.serializedPrompt(vocabulary))
                     .filter { $0 < tokenizer.specialTokens.specialTokenBegin }
             }
 

@@ -122,7 +122,10 @@ struct ScratchpadTransformationService: ScratchpadTransforming {
                 languagePolicy: action.languagePolicy,
                 // PLAN.md PR A, item 2: Scratchpad transformation actions (improve/expand/
                 // condense/custom/translate) are hard-disabled, always — never from a snapshot.
-                voiceCommandPolicy: .disabled
+                voiceCommandPolicy: .disabled,
+                // `snapshot` already carries the vocabulary CloudLLMProcessor should hint toward
+                // (PLAN.md PR B, item 2b) — same source as every other consumer.
+                vocabulary: snapshot.vocabulary
             ),
             snapshot
         )

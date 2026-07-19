@@ -264,7 +264,7 @@ private actor PipelineEngineSpy: TranscriptionEngine {
 
     init(output: TranscriptionOutput) { self.output = output }
 
-    func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String]) async throws -> TranscriptionOutput {
+    func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String], vocabulary: [String]) async throws -> TranscriptionOutput {
         forcedLanguages.append(forcedLanguage)
         return output
     }

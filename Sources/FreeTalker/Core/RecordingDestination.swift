@@ -38,6 +38,18 @@ struct RecordingProcessingContext: Equatable, Sendable {
     /// keep compiling; every real production call site passes the actual snapshot. See PLAN.md
     /// F5.3/F5.4.
     var candidateLanguages: [String] = []
+    /// The effective vocabulary (manual + approved self-learning terms), snapshotted ONCE at stop
+    /// time (`AppCoordinator.makeStopRequest`/`captureStopSettingsSnapshot`) and carried through
+    /// to every consumer of this dictation's processing — STT biasing (`engine.transcribe`) and
+    /// post-processing (`PostProcessingRequest.vocabulary`) alike — so the two can never disagree
+    /// about which vocabulary applied to this dictation, even though the actual work can run long
+    /// after a later `vocabularyText` edit or vocabulary decision changes what's "live". Mirrors
+    /// `candidateLanguages`'/`cloudSnapshot`'s own snapshot-threading pattern (PLAN.md PR A, item
+    /// 2 did the same for `voiceCommandPolicy`). Defaults to `[]` for the same
+    /// existing/test-call-site-compiles reasoning as `candidateLanguages`; every real production
+    /// call site passes the actual stop-time snapshot. See PLAN.md PR B, item 2d/4, Codex round 1
+    /// finding 4.
+    var vocabularySnapshot: [String] = []
 
     /// Re-validates `spokenLanguage` against `candidateLanguages` before it's handed to the
     /// engine as `forcedLanguage` — `resolveLanguage` already validates its inputs, so this is
@@ -52,7 +64,8 @@ struct RecordingProcessingContext: Equatable, Sendable {
             destination: destination, spokenLanguage: spokenLanguage,
             outputLanguage: outputLanguage, template: template, cloudSnapshot: nil,
             voiceCommandPolicy: voiceCommandPolicy,
-            candidateLanguages: candidateLanguages
+            candidateLanguages: candidateLanguages,
+            vocabularySnapshot: vocabularySnapshot
         )
     }
 }

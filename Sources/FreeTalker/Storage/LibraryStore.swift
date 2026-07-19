@@ -29,6 +29,14 @@ final class LibraryStore: ObservableObject, LibraryTranslationStoring {
     }
 
     @Published private(set) var dictations: [Dictation] = []
+
+    /// Fired once per successfully recorded dictation, from every insert path uniformly (both
+    /// `record` overloads below) — the self-learning vocabulary incremental mining hook
+    /// (PLAN.md PR B, item 3) hangs off this rather than `AppCoordinator` wiring each of its own
+    /// several `LibraryStore.shared.record(...)` call sites individually, so a new insert path
+    /// added later can never forget to mine. `LibraryStore` itself stays ignorant of `VocabStore`
+    /// (Storage/ layering) — `AppCoordinator` assigns this closure once both stores exist.
+    var onDictationRecorded: ((Dictation) -> Void)?
     @Published var searchText: String = "" {
         didSet { refresh() }
     }
@@ -99,8 +107,13 @@ final class LibraryStore: ObservableObject, LibraryTranslationStoring {
     /// Inserts a Dictation row. Throws (rather than silently swallowing) so callers can surface
     /// the failure — the transcript is already inserted/pasteboarded by this point, so a failure
     /// here only loses the Library row, not the user's words. See Round 1 Codex finding 10.
+    ///
+    /// `suppressMining`: `AppCoordinator.reprocess` sets this — a reprocess reruns post-processing
+    /// on an ALREADY-mined transcript/refined pair and inserts a second row for it, so firing
+    /// `onDictationRecorded` again would mine (and inflate the recurrence of) the same correction
+    /// a second time. See Codex finding (AppCoordinator.swift:3944).
     @discardableResult
-    func record(language: String, requestedOutputLanguage: OutputLanguage = .sameAsSpoken, template: String, transcript: String, refined: String, engine: String, sourceID: Int64? = nil, captureID: UUID? = nil, bundleID: String? = nil, durationSecs: Double? = nil, voiceCommandsActive: Bool? = nil) throws -> Int64 {
+    func record(language: String, requestedOutputLanguage: OutputLanguage = .sameAsSpoken, template: String, transcript: String, refined: String, engine: String, sourceID: Int64? = nil, captureID: UUID? = nil, bundleID: String? = nil, durationSecs: Double? = nil, voiceCommandsActive: Bool? = nil, suppressMining: Bool = false) throws -> Int64 {
         guard let db else { throw LibraryStoreError.databaseUnavailable }
         let stored = try db.insertDictation(.init(
             timestamp: Date(),
@@ -116,6 +129,9 @@ final class LibraryStore: ObservableObject, LibraryTranslationStoring {
             voiceCommandsActive: voiceCommandsActive
         ), captureID: captureID)
         refresh()
+        if !suppressMining {
+            onDictationRecorded?(stored)
+        }
         return stored.id
     }
 
@@ -136,12 +152,19 @@ final class LibraryStore: ObservableObject, LibraryTranslationStoring {
             voiceCommandsActive: dictation.voiceCommandsActive
         ), captureID: captureID)
         refresh()
+        onDictationRecorded?(stored)
         return stored
     }
 
     func dictations(captureID: UUID) throws -> [Dictation] {
         guard let db else { throw LibraryStoreError.databaseUnavailable }
         return try db.dictations(captureID: captureID)
+    }
+
+    /// See `Database.vocabMiningProjectionPage` — PLAN.md PR B, item 3.
+    func vocabMiningProjectionPage(afterID: Int64, limit: Int) throws -> [VocabMiningRow] {
+        guard let db else { throw LibraryStoreError.databaseUnavailable }
+        return try db.vocabMiningProjectionPage(afterID: afterID, limit: limit)
     }
 
     func translationVariants(parentID: Int64) throws -> [DictationTranslationVariant] {

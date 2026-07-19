@@ -25,6 +25,30 @@ import Testing
         #expect(first.id != second.id)
     }
 
+    /// `AppCoordinator.reprocess` sets `suppressMining: true` on this overload (the one it calls)
+    /// so a fresh post-processing pass over an ALREADY-mined transcript/refined pair doesn't mine
+    /// (and inflate the recurrence of) the same correction a second time. See Codex finding
+    /// (AppCoordinator.swift:3944).
+    @Test func suppressMiningSkipsTheOnDictationRecordedHook() throws {
+        let store = try LibraryStore.temporary()
+        var firedCount = 0
+        store.onDictationRecorded = { _ in firedCount += 1 }
+
+        try store.record(language: "en", template: "Clean", transcript: "hi joao", refined: "hi João", engine: "local", suppressMining: true)
+
+        #expect(firedCount == 0)
+    }
+
+    @Test func miningStillFiresByDefaultForNonReprocessedRows() throws {
+        let store = try LibraryStore.temporary()
+        var firedCount = 0
+        store.onDictationRecorded = { _ in firedCount += 1 }
+
+        try store.record(language: "en", template: "Clean", transcript: "hi joao", refined: "hi João", engine: "local")
+
+        #expect(firedCount == 1)
+    }
+
     private func sampleDictation(refined: String) -> Dictation {
         Dictation(
             id: 0, timestamp: Date(timeIntervalSince1970: 1_234),
