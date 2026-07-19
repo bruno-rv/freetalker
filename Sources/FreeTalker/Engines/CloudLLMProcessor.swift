@@ -96,7 +96,7 @@ struct CloudLLMProcessor: PostProcessor {
         // 60s default. Not the 10s `testConnection` timeout, which is deliberately short.
         request.timeoutInterval = 300
 
-        request.httpBody = try Self.anthropicRequestBody(model: model, request: processingRequest, vocabulary: snapshot.vocabulary)
+        request.httpBody = try Self.anthropicRequestBody(model: model, request: processingRequest, vocabulary: processingRequest.vocabulary)
 
         let (data, response) = try await URLSession.shared.data(for: request)
         try Self.checkStatus(response, provider: providerLabel)
@@ -119,7 +119,7 @@ struct CloudLLMProcessor: PostProcessor {
         // See callAnthropic: cold Ollama model loads commonly exceed the 60s default.
         request.timeoutInterval = 300
 
-        request.httpBody = try Self.openAICompatibleRequestBody(model: model, request: processingRequest, vocabulary: snapshot.vocabulary)
+        request.httpBody = try Self.openAICompatibleRequestBody(model: model, request: processingRequest, vocabulary: processingRequest.vocabulary)
 
         let (data, response) = try await URLSession.shared.data(for: request)
         try Self.checkStatus(response, provider: providerLabel)

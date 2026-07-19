@@ -181,6 +181,100 @@ import Testing
         #expect(try db.migrationVersions() == Array(1...DatabaseMigrator.latestVersion))
     }
 
+    /// PLAN.md PR B, item 2: `vocab_evidence`/`vocab_decisions` are library-only, created
+    /// unconditionally (no `dictations`-exists guard — see the migration's doc comment), and the
+    /// migration is idempotent (re-running produces no schema diff).
+    @Test func versionFourteenLibraryUpgradeAddsVocabTablesAndIsIdempotent() throws {
+        let db = try TemporaryDatabase()
+        try DatabaseMigrator.migrate(db.handle, role: .library)
+        let schema = try db.schema()
+        try DatabaseMigrator.migrate(db.handle, role: .library)
+
+        #expect(try db.tableNames().isSuperset(of: ["vocab_evidence", "vocab_decisions"]))
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('vocab_evidence') WHERE name = 'dictation_id' AND type = 'INTEGER';") == 1)
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('vocab_evidence') WHERE name = 'normalized_term' AND type = 'TEXT';") == 1)
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('vocab_evidence') WHERE name = 'surface_term' AND type = 'TEXT';") == 1)
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('vocab_evidence') WHERE name = 'first_seen' AND type = 'REAL';") == 1)
+        #expect(try db.integer("""
+        SELECT COUNT(*) FROM pragma_table_info('vocab_evidence')
+        WHERE name IN ('dictation_id', 'normalized_term') AND pk > 0;
+        """) == 2)
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_foreign_key_list('vocab_evidence') WHERE \"table\" = 'dictations' AND \"from\" = 'dictation_id' AND on_delete = 'CASCADE';") == 1)
+        #expect(try db.integer("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_vocab_evidence_normalized_term' AND tbl_name = 'vocab_evidence';") == 1)
+
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('vocab_decisions') WHERE name = 'normalized_term' AND pk = 1;") == 1)
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('vocab_decisions') WHERE name = 'status' AND \"notnull\" = 1;") == 1)
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('vocab_decisions') WHERE name = 'surface_term' AND \"notnull\" = 0;") == 1)
+        #expect(try db.integer("SELECT COUNT(*) FROM pragma_table_info('vocab_decisions') WHERE name = 'decided_at' AND type = 'REAL' AND \"notnull\" = 1;") == 1)
+
+        #expect(try db.schema() == schema)
+        #expect(try db.migrationVersions() == Array(1...DatabaseMigrator.latestVersion))
+    }
+
+    /// Jobs database never gets the vocab tables (they FK to `dictations`, a Library-only table) —
+    /// mirrors the role separation `migrateVoiceCommandSnapshotV13`/`migrateCaptureV11` already
+    /// establish for their own library-vs-jobs branches.
+    @Test func versionFourteenJobsUpgradeCreatesNoVocabTables() throws {
+        let db = try TemporaryDatabase()
+        try DatabaseMigrator.migrate(db.handle, role: .jobs)
+        #expect(try db.integer("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('vocab_evidence', 'vocab_decisions');") == 0)
+        #expect(try db.migrationVersions() == Array(1...DatabaseMigrator.latestVersion))
+    }
+
+    /// Deleting a dictation retracts its mined evidence (cascade) but a term's explicit
+    /// approve/dismiss decision is a separate, unrelated table — Delete All (which clears every
+    /// `dictations` row) must therefore leave `vocab_decisions` untouched. See PLAN.md PR B, item 2.
+    @Test func vocabEvidenceCascadesOnDictationDeleteWhileDecisionsSurvive() throws {
+        let db = try TemporaryDatabase()
+        try DatabaseMigrator.migrate(db.handle, role: .library)
+        // `dictations` isn't created by the migrator itself (only `Database.createSchema()` does,
+        // for a fresh install) — declare it here matching that baseline shape, same as the other
+        // library-role tests above (e.g. `versionElevenLibraryUpgrade...`).
+        try db.execute("""
+        CREATE TABLE dictations (
+          id INTEGER PRIMARY KEY, ts REAL NOT NULL, language TEXT NOT NULL,
+          template TEXT NOT NULL, transcript TEXT NOT NULL, refined TEXT NOT NULL,
+          engine TEXT NOT NULL, source_id INTEGER
+        );
+        INSERT INTO dictations (id, ts, language, template, transcript, refined, engine, source_id)
+        VALUES (7, 1, 'en', 'Clean', 'hello joao', 'hello João', 'local', NULL);
+        INSERT INTO vocab_evidence (dictation_id, normalized_term, surface_term, first_seen)
+        VALUES (7, 'joao', 'João', 1);
+        INSERT INTO vocab_decisions (normalized_term, status, surface_term, decided_at)
+        VALUES ('joao', 'approved', 'João', 1);
+        """)
+        try db.execute("PRAGMA foreign_keys = ON;")
+
+        try db.execute("DELETE FROM dictations WHERE id = 7;")
+
+        #expect(try db.integer("SELECT COUNT(*) FROM vocab_evidence;") == 0)
+        #expect(try db.integer("SELECT COUNT(*) FROM vocab_decisions;") == 1)
+        #expect(try db.string("SELECT status || '|' || surface_term FROM vocab_decisions WHERE normalized_term = 'joao';") == "approved|João")
+    }
+
+    @Test func vocabDecisionsCheckConstraintRejectsApprovedWithoutSurfaceTerm() throws {
+        let db = try TemporaryDatabase()
+        try DatabaseMigrator.migrate(db.handle, role: .library)
+
+        #expect(throws: DatabaseError.self) {
+            try db.execute("""
+            INSERT INTO vocab_decisions (normalized_term, status, surface_term, decided_at)
+            VALUES ('joao', 'approved', NULL, 1);
+            """)
+        }
+        #expect(throws: DatabaseError.self) {
+            try db.execute("""
+            INSERT INTO vocab_decisions (normalized_term, status, surface_term, decided_at)
+            VALUES ('joao', 'unknown-status', 'João', 1);
+            """)
+        }
+        try db.execute("""
+        INSERT INTO vocab_decisions (normalized_term, status, surface_term, decided_at)
+        VALUES ('joao', 'dismissed', NULL, 1);
+        """)
+        #expect(try db.integer("SELECT COUNT(*) FROM vocab_decisions;") == 1)
+    }
+
     @Test func deletingJobCascadesRecoveryAttempts() throws {
         let db = try TemporaryDatabase()
         try DatabaseMigrator.migrate(db.handle)

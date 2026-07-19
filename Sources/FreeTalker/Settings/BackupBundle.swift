@@ -16,6 +16,8 @@ enum BackupBundleError: LocalizedError, Equatable {
     case tooManySnippets(max: Int)
     case stringTooLong(field: String, maxBytes: Int)
     case tooManyRuleEntries(field: String, max: Int)
+    case invalidVocabDecisionsSection
+    case tooManyVocabDecisions(max: Int)
     /// A later stage (snippets/settings) failed after an earlier one (templates/snippets)
     /// already committed. `partial` reports exactly what was applied — no silent partial
     /// restore, no fake atomicity claim across UserDefaults + JSON + SQLite. See PLAN.md F1.5.
@@ -47,6 +49,10 @@ enum BackupBundleError: LocalizedError, Equatable {
             return "A \(field) in this backup exceeds the \(maxBytes)-byte limit."
         case .tooManyRuleEntries(let field, let max):
             return "This backup's \(field) has more than \(max) entries."
+        case .invalidVocabDecisionsSection:
+            return "The backup's vocabulary decisions section is invalid."
+        case .tooManyVocabDecisions(let max):
+            return "This backup has more than \(max) vocabulary decisions."
         case .stageFailed(let stage, let partial, let underlying):
             return "Restore stopped while applying \(stage): \(underlying). Already applied: \(partial.templatesImported) templates, \(partial.snippetsImported) snippets."
         }
@@ -59,6 +65,13 @@ struct BackupBundleImportResult: Equatable, Sendable {
     var templatesSkipped = 0
     var snippetsImported = 0
     var snippetsSkipped = 0
+    /// Approve/dismiss decisions applied because the incoming `decidedAt` was strictly newer than
+    /// whatever was already stored (or the term was brand new) — see `VocabStore.mergeDecisions`.
+    /// See PLAN.md PR B, item 2c.
+    var vocabDecisionsImported = 0
+    /// Incoming decisions skipped because the existing stored decision was already newer (or
+    /// equal) — the existing one wins, never a silent overwrite. See PLAN.md PR B, item 2c.
+    var vocabDecisionsSkipped = 0
     var settingsApplied = false
 }
 
@@ -75,6 +88,9 @@ enum BackupBundleBounds {
     static let maxRuleEntries = 200
     static let maxRuleKeyBytes = 500
     static let maxRuleValueBytes = 500
+    /// Generous relative to how many terms could ever be approved (each one already passed the
+    /// fit gate against a ~224-token budget) — bounds decode, not a realistic usage ceiling.
+    static let maxVocabDecisions = 2_000
 }
 
 /// Whether an exportable key was present in the decoded bundle at all, distinct from the typed
@@ -203,6 +219,38 @@ private func validateSnippets(_ snippets: [Snippet]) throws {
         }
         guard snippet.expansion.utf8.count <= BackupBundleBounds.maxSnippetExpansionBytes else {
             throw BackupBundleError.stringTooLong(field: "snippet expansion", maxBytes: BackupBundleBounds.maxSnippetExpansionBytes)
+        }
+    }
+}
+
+/// Bounds and shape-checks incoming vocab decisions BEFORE any write (PLAN.md PR B, item 2c) —
+/// same "validate-all-then-apply" discipline as `validateTemplates`/`validateSnippets`. The
+/// table's own `CHECK(status != 'approved' OR surface_term IS NOT NULL)` constraint is
+/// duplicated here so a malformed/hand-edited bundle rejects the WHOLE stage up front rather than
+/// failing mid-transaction inside `VocabStore.mergeDecisions`. Beyond emptiness/byte length, every
+/// restored surface/key must be the SAME shared NFC/control-character/50-byte validator
+/// (`AppSettings.validatedVocabularyTerm`) manual and approved terms use everywhere else — a
+/// control-containing or noncanonical term must never be committed and reported "imported" only
+/// to be silently dropped or re-encoded by `EffectiveVocabulary` later. For an approved decision,
+/// `normalizedTerm` must additionally equal the CANONICAL surface's own lowercased form — never
+/// independently trusted — so a hand-edited bundle can't name two different spellings under one
+/// key (production writes, `VocabStore.approve`/the miner, always produce exactly this
+/// relationship). See Codex round 1 finding 6.
+private func validateVocabDecisions(_ decisions: [VocabDecision]) throws {
+    guard decisions.count <= BackupBundleBounds.maxVocabDecisions else {
+        throw BackupBundleError.tooManyVocabDecisions(max: BackupBundleBounds.maxVocabDecisions)
+    }
+    for decision in decisions {
+        guard !decision.normalizedTerm.isEmpty else { throw BackupBundleError.invalidVocabDecisionsSection }
+        if decision.status == .approved {
+            guard let surfaceTerm = decision.surfaceTerm, !surfaceTerm.isEmpty,
+                  let canonicalSurface = AppSettings.validatedVocabularyTerm(surfaceTerm),
+                  decision.normalizedTerm == canonicalSurface.lowercased()
+            else { throw BackupBundleError.invalidVocabDecisionsSection }
+        } else {
+            guard let canonicalKey = AppSettings.validatedVocabularyTerm(decision.normalizedTerm),
+                  canonicalKey.lowercased() == decision.normalizedTerm
+            else { throw BackupBundleError.invalidVocabDecisionsSection }
         }
     }
 }
@@ -560,15 +608,20 @@ enum BackupBundle {
     static let fileName = "FreeTalker Backup.json"
 
     /// Every exportable key at its current normalized value (v2 completeness, PLAN.md F1.2),
-    /// every template, and every snippet — reading `TemplateStore.templates` and
-    /// `SnippetStore.snippets()` directly rather than touching Dictation History/Scratchpad
-    /// storage at all (out of scope, PLAN.md "Out of scope").
-    static func export(settings: AppSettings, templateStore: TemplateStore, snippetStore: SnippetStore) async throws -> Data {
+    /// every template, every snippet, and every self-learning-vocabulary decision — reading
+    /// `TemplateStore.templates`, `SnippetStore.snippets()`, and `VocabStore.decisions()` directly
+    /// rather than touching Dictation History/Scratchpad storage at all (out of scope, PLAN.md
+    /// "Out of scope"). `vocabStore` is optional — a `nil` (e.g. it failed to initialize this
+    /// session, see `AppCoordinator`) simply omits the `vocabDecisions` key rather than failing
+    /// the whole backup; `restore` treats an absent key as "nothing to merge", not an error.
+    /// Evidence (the transcript-derived recurrence data behind suggestions) is deliberately NOT
+    /// exported — see PLAN.md PR B, item 2c.
+    static func export(settings: AppSettings, templateStore: TemplateStore, snippetStore: SnippetStore, vocabStore: VocabStore? = nil) async throws -> Data {
         let settingsDict = settings.exportableSettingsSnapshot()
         let templatesJSON = try jsonArray(from: templateStore.templates)
         let snippets = try await snippetStore.snippets()
         let snippetsJSON = try jsonArray(from: snippets)
-        let payload: [String: Any] = [
+        var payload: [String: Any] = [
             "formatVersion": 2,
             "app": "FreeTalker",
             "exportedAt": ISO8601DateFormatter().string(from: Date()),
@@ -576,6 +629,16 @@ enum BackupBundle {
             "templates": templatesJSON,
             "snippets": snippetsJSON
         ]
+        if let vocabStore {
+            let decisions = try await vocabStore.decisions()
+            // Export enforces the SAME 2,000-decision bound and full shared-validator check
+            // `restore` requires (PLAN.md PR B, item 2c) — otherwise a store that somehow
+            // accumulated more decisions than the cap, or (defense in depth) a row that
+            // wouldn't itself pass the shared validator, would produce a bundle FreeTalker's own
+            // restore then unconditionally rejects. See Codex round 1 finding 8.
+            try validateVocabDecisions(decisions)
+            payload["vocabDecisions"] = try jsonArray(from: decisions)
+        }
         return try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
     }
 
@@ -586,7 +649,7 @@ enum BackupBundle {
     /// restore. v1 bundles (`formatVersion == 1`) are settings-only: templates/snippets stages
     /// are skipped and absent settings keys are left untouched rather than reset (F1.6).
     @discardableResult
-    static func restore(data: Data, settings: AppSettings, templateStore: TemplateStore, snippetStore: SnippetStore) async throws -> BackupBundleImportResult {
+    static func restore(data: Data, settings: AppSettings, templateStore: TemplateStore, snippetStore: SnippetStore, vocabStore: VocabStore? = nil) async throws -> BackupBundleImportResult {
         guard data.count <= BackupBundleBounds.maxFileBytes else {
             throw BackupBundleError.fileTooLarge(maxBytes: BackupBundleBounds.maxFileBytes)
         }
@@ -634,6 +697,17 @@ enum BackupBundle {
             try validateSnippets(snippets)
         }
 
+        // Vocab decisions (PLAN.md PR B, item 2c) are a NAMED, OPTIONAL stage — unlike
+        // templates/snippets above, an absent `vocabDecisions` key is not an error: it means
+        // either an older backup predating this feature, or one exported while `vocabStore`
+        // itself was unavailable (see `export`'s doc comment). Bounded/validated in full here,
+        // before any write, same as every other section.
+        var vocabDecisions: [VocabDecision] = []
+        if formatVersion == 2, let vocabDecisionsRaw = top["vocabDecisions"] {
+            vocabDecisions = try decodeArray(VocabDecision.self, vocabDecisionsRaw, error: .invalidVocabDecisionsSection)
+            try validateVocabDecisions(vocabDecisions)
+        }
+
         // The hotkey trio is validated as a WHOLE before any write — see F1.6 and
         // `validateHotKeyQuartet`'s doc comment for why a per-setter loop can't do this safely.
         try validateHotKeyQuartet(patch.hotKeyQuartetTargets(current: settings, resetAbsentToDefault: resetAbsentToDefault))
@@ -657,6 +731,28 @@ enum BackupBundle {
                 result.snippetsSkipped = snippetResult.skippedCount
             } catch {
                 throw BackupBundleError.stageFailed(stage: "snippets", partial: result, underlying: error.localizedDescription)
+            }
+        }
+
+        if !vocabDecisions.isEmpty {
+            // The bundle DOES carry decisions to apply — a `nil` destination `vocabStore` here
+            // must fail this named stage explicitly, never report a plain success that silently
+            // dropped every restored approve/dismiss decision (indistinguishable, before this
+            // fix, from "the bundle simply had none"). An EMPTY/absent `vocabDecisions` section
+            // still skips silently above — genuinely nothing to apply, not a failure. See Codex
+            // round 1 finding 7.
+            guard let vocabStore else {
+                throw BackupBundleError.stageFailed(
+                    stage: "vocabDecisions", partial: result,
+                    underlying: "Vocabulary suggestions storage isn't available."
+                )
+            }
+            do {
+                let mergeResult = try await vocabStore.mergeDecisions(vocabDecisions)
+                result.vocabDecisionsImported = mergeResult.merged
+                result.vocabDecisionsSkipped = mergeResult.skipped
+            } catch {
+                throw BackupBundleError.stageFailed(stage: "vocabDecisions", partial: result, underlying: error.localizedDescription)
             }
         }
 

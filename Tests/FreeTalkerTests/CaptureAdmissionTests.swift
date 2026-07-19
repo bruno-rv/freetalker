@@ -304,7 +304,8 @@ struct CaptureAdmissionTests {
         let snapshot = AppCoordinator.captureStopSettingsSnapshot(
             oneShotLanguage: "pt", selectedOutput: .french,
             defaultOutput: .german, cloudSnapshot: stopCloud,
-            voiceCommands: VoiceCommandSnapshot(enabled: true, keywords: ["command"])
+            voiceCommands: VoiceCommandSnapshot(enabled: true, keywords: ["command"]),
+            vocabularySnapshot: ["stop-term"]
         )
 
         let laterCloud = CloudLLMSettingsSnapshot(
@@ -314,13 +315,19 @@ struct CaptureAdmissionTests {
         _ = AppCoordinator.captureStopSettingsSnapshot(
             oneShotLanguage: nil, selectedOutput: nil,
             defaultOutput: .spanish, cloudSnapshot: laterCloud,
-            voiceCommands: VoiceCommandSnapshot(enabled: false, keywords: [])
+            voiceCommands: VoiceCommandSnapshot(enabled: false, keywords: []),
+            vocabularySnapshot: ["later-term"]
         )
 
         #expect(snapshot.oneShotLanguage == "pt")
         #expect(snapshot.outputLanguage == .french)
         #expect(snapshot.voiceCommands == VoiceCommandSnapshot(enabled: true, keywords: ["command"]))
         #expect(snapshot.cloudSnapshot == stopCloud)
+        // PLAN.md PR B, item 2d/4: the vocabulary snapshot is a stop-time value too — a later
+        // call (simulating a later stop, or a later live read) must never retroactively change
+        // the FIRST snapshot already handed to a prior dictation's processing. See Codex round 1
+        // finding 4.
+        #expect(snapshot.vocabularySnapshot == ["stop-term"])
     }
 
     @Test func delayedWriterFailureFromOldCaptureCannotAffectCurrentCapture() {

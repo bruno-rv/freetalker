@@ -52,6 +52,36 @@ import Testing
         #expect(await processor.callCount == 1)
     }
 
+    /// `processRecoveredDictation` used to read `AppSettings.shared.vocabulary` twice — once for
+    /// the transcriber, once for the post-processing request — with an `await` (the transcription
+    /// call) between them. `VocabularyMutatingTranscriberProbe` mutates the shared cache from
+    /// inside that gap, exactly where a concurrent decision or `refreshApprovedVocabularyCache`
+    /// could land mid-retry; both reads must still observe the SAME snapshot. See Codex finding
+    /// (AppCoordinator.swift:3769/3797).
+    @MainActor @Test func recoveryRetryUsesOneVocabularySnapshotForTranscriptionAndPostProcessing() async throws {
+        let originalVocabularyText = AppSettings.shared.vocabularyText
+        defer { AppSettings.shared.vocabularyText = originalVocabularyText }
+        AppSettings.shared.vocabularyText = "Alpha"
+
+        let transcriber = VocabularyMutatingTranscriberProbe {
+            AppSettings.shared.vocabularyText = "Alpha\nBeta"
+        }
+        let processor = RecoveryPostProcessorSpy(output: "polished text")
+
+        _ = try await AppCoordinator.shared.processRecoveredDictation(
+            samples: [0.1],
+            configuration: .init(),
+            captureID: UUID(),
+            transcriber: transcriber,
+            processor: processor,
+            record: { _ in }
+        )
+
+        let transcriberVocabulary = await transcriber.receivedVocabulary
+        let postProcessorVocabulary = try #require(await processor.lastRequest?.vocabulary)
+        #expect(transcriberVocabulary == postProcessorVocabulary)
+    }
+
     /// Codex round-5 finding 8: proves a persisted attempt's durable voice-command snapshot
     /// (`AttemptConfiguration.voiceCommandsEnabled`/`commandKeywords` — the job row written by
     /// `TranscriptionJobStore.beginAttempt`/`queueRecoveryRetry`) reaches the REAL
@@ -117,6 +147,7 @@ import Testing
         let output = try await RecoveryLocalProcessor(transcriber: local).process(
             samples: [0.1],
             configuration: .init(language: "pt", speechModel: "requested-small", template: "ignored"),
+            vocabulary: [],
             defaultModel: "global-large"
         )
         #expect(output.text == "local transcript")
@@ -487,8 +518,26 @@ import Testing
 
 private actor RecoveryLocalTranscriberProbe: RecoveryLocalTranscribing {
     private(set) var requests: [String] = []
-    func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String], exactModel: String) async throws -> TranscriptionOutput {
+    func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String], vocabulary: [String], exactModel: String) async throws -> TranscriptionOutput {
         requests.append("\(forcedLanguage ?? "auto")|\(exactModel)")
+        return .init(text: "local transcript", language: forcedLanguage ?? "en")
+    }
+}
+
+/// Captures the `vocabulary` it received, then runs `onTranscribe` (mutating
+/// `AppSettings.shared` mid-retry) BEFORE returning — see
+/// `recoveryRetryUsesOneVocabularySnapshotForTranscriptionAndPostProcessing`.
+private actor VocabularyMutatingTranscriberProbe: RecoveryLocalTranscribing {
+    private(set) var receivedVocabulary: [String] = []
+    private let onTranscribe: @MainActor @Sendable () -> Void
+
+    init(onTranscribe: @escaping @MainActor @Sendable () -> Void) {
+        self.onTranscribe = onTranscribe
+    }
+
+    func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String], vocabulary: [String], exactModel: String) async throws -> TranscriptionOutput {
+        receivedVocabulary = vocabulary
+        await onTranscribe()
         return .init(text: "local transcript", language: forcedLanguage ?? "en")
     }
 }

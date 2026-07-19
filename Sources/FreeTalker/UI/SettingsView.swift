@@ -303,6 +303,7 @@ private struct GeneralSettingsView: View {
     @ObservedObject private var coordinator = AppCoordinator.shared
     @ObservedObject private var speechModelStore = AppCoordinator.shared.speechModelStore
     @ObservedObject private var templateStore = TemplateStore.shared
+    @StateObject private var vocabularySuggestions = VocabularySuggestionsController()
     @State private var accessibilityTrusted = Permissions.isAccessibilityTrusted()
     @State private var microphoneAuthorized = Permissions.isMicrophoneAuthorized()
     @State private var inputMonitoringAuthorized = Permissions.isInputMonitoringAuthorized()
@@ -1013,7 +1014,7 @@ private struct GeneralSettingsView: View {
         guard panel.runModal() == .OK, let url = panel.url else { return }
         Task {
             do {
-                let data = try await BackupBundle.export(settings: settings, templateStore: templateStore, snippetStore: snippetStore)
+                let data = try await BackupBundle.export(settings: settings, templateStore: templateStore, snippetStore: snippetStore, vocabStore: coordinator.vocabStore)
                 try data.write(to: url, options: .atomic)
             } catch {
                 backupError = "Could not save backup: \(error.localizedDescription)"
@@ -1031,7 +1032,14 @@ private struct GeneralSettingsView: View {
             defer { if didAccess { url.stopAccessingSecurityScopedResource() } }
             do {
                 let data = try Data(contentsOf: url)
-                let result = try await BackupBundle.restore(data: data, settings: settings, templateStore: templateStore, snippetStore: snippetStore)
+                let result = try await BackupBundle.restore(data: data, settings: settings, templateStore: templateStore, snippetStore: snippetStore, vocabStore: coordinator.vocabStore)
+                // Restore may have merged fresh approve/dismiss decisions — republish the cache
+                // every other vocabulary consumer reads (PLAN.md PR B, item 2d), and refetch the
+                // buffered suggestions list so a term just approved/dismissed by the restore
+                // doesn't linger as a stale, still-actionable suggestion in this view. See Codex
+                // round 1 minor finding (`SettingsView.swift:1038`).
+                await coordinator.refreshApprovedVocabularyCache()
+                vocabularySuggestions.refreshSuggestions()
                 backupRestoreSummary = Self.summary(for: result)
             } catch {
                 backupError = error.localizedDescription
@@ -1042,6 +1050,7 @@ private struct GeneralSettingsView: View {
     private static func summary(for result: BackupBundleImportResult) -> String {
         "Templates: \(result.templatesImported) imported, \(result.templatesSkipped) skipped.\n"
             + "Snippets: \(result.snippetsImported) imported, \(result.snippetsSkipped) skipped.\n"
+            + "Vocabulary decisions: \(result.vocabDecisionsImported) merged, \(result.vocabDecisionsSkipped) skipped.\n"
             + "Settings: \(result.settingsApplied ? "restored" : "not restored")."
     }
 
@@ -1066,6 +1075,8 @@ private struct GeneralSettingsView: View {
             transcriptionEngineSection
             Divider()
             vocabularySection
+            Divider()
+            vocabularySuggestionsSection
         }
     }
 
@@ -1218,6 +1229,22 @@ private struct GeneralSettingsView: View {
 
     @ViewBuilder
     private var vocabularySection: some View {
+        // Computed ONCE per body evaluation — `settings.effectiveVocabulary` re-runs
+        // `EffectiveVocabulary.derive`, so reading it here and deriving both lists below from this
+        // ONE `Result` avoids invoking `derive` twice (once each for "active"/"displaced", as two
+        // separate computed properties used to). Naturally invalidated whenever `vocabularyText`/
+        // `approvedVocabularyCache` change, since those are `@Published` on `settings` and drive
+        // this view's re-render. See Codex finding (SettingsView.swift:1288).
+        //
+        // Renders the TRUE partition (PLAN.md PR B, item 2e) — `activeApproved`/`displaced` are
+        // `EffectiveVocabulary`'s own bookkeeping of which approved terms actually landed where,
+        // not "cache minus displaced" (which wrongly counted a term dropped by validation-failure
+        // or case-dedupe as active). See Codex finding (SettingsView.swift:1297).
+        let effective = settings.effectiveVocabulary
+        let activeApprovedSet = Set(effective.activeApproved)
+        let displacedSet = Set(effective.displaced)
+        let activeApprovedTerms = settings.approvedVocabularyCache.filter { activeApprovedSet.contains($0.surfaceTerm) }
+        let displacedApprovedTerms = settings.approvedVocabularyCache.filter { displacedSet.contains($0.surfaceTerm) }
         VStack(alignment: .leading, spacing: 8) {
             Text("Vocabulary")
                 .font(.headline)
@@ -1230,8 +1257,127 @@ private struct GeneralSettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.orange)
             }
+            if !activeApprovedTerms.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    // The required effective-vocabulary preview (PLAN.md PR B, item 2e / item 6):
+                    // the centrally derived ACTIVE approved terms — `settings.vocabulary`'s
+                    // approved-provenance subset, distinct from the manually typed text above and
+                    // from the INACTIVE/displaced terms below. See Codex round 1 minor finding
+                    // (`SettingsView.swift:1234`).
+                    Text("Approved terms currently active (from Vocabulary Suggestions below):")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    ForEach(activeApprovedTerms, id: \.normalizedTerm) { term in
+                        HStack {
+                            Text(term.surfaceTerm)
+                                .font(.caption)
+                            Spacer()
+                            Button("Dismiss") { vocabularySuggestions.dismiss(term.normalizedTerm) }
+                                .font(.caption)
+                        }
+                    }
+                }
+            }
+            if !displacedApprovedTerms.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("These approved terms don't currently fit alongside the text above and are INACTIVE — trim the list, or dismiss one to evict it permanently (PLAN.md PR B, item 2e: never silently treated as active).")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                    ForEach(displacedApprovedTerms, id: \.normalizedTerm) { term in
+                        HStack {
+                            Text(term.surfaceTerm)
+                                .font(.caption)
+                            Spacer()
+                            Button("Dismiss") { vocabularySuggestions.dismiss(term.normalizedTerm) }
+                                .font(.caption)
+                        }
+                    }
+                }
+            }
         }
         .padding(.vertical, 12)
+    }
+
+    /// PLAN.md PR B, item 6: ranked suggestions (recurrence desc, cap 25 — already enforced by
+    /// `VocabStore.suggestions`), approve/dismiss per term, and a cancellable "Scan library"
+    /// backfill with progress. Row shape mirrors the App Rules list (`appRulesSection`) — an
+    /// `HStack` + `Spacer` + trailing borderless icon `Button`s.
+    @ViewBuilder
+    private var vocabularySuggestionsSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Text(vocabularySuggestions.suggestions.isEmpty
+                     ? "Vocabulary Suggestions"
+                     : "Vocabulary Suggestions (\(vocabularySuggestions.suggestions.count))")
+                    .font(.headline)
+                Spacer()
+                if vocabularySuggestions.isScanning {
+                    if let progress = vocabularySuggestions.scanProgress, progress.total > 0 {
+                        ProgressView(value: Double(progress.scanned), total: Double(progress.total))
+                            .frame(width: 100)
+                    } else {
+                        ProgressView().controlSize(.small)
+                    }
+                    Button("Cancel") { vocabularySuggestions.cancelScan() }
+                        .font(.caption)
+                } else {
+                    Button("Scan library") { vocabularySuggestions.scanLibrary() }
+                        .font(.caption)
+                        .disabled(!vocabularySuggestions.isAvailable)
+                }
+            }
+            Text("Recurring proper nouns/jargon corrections found in your dictation history. Approve to add them to the vocabulary above; dismiss to stop suggesting a term.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if !vocabularySuggestions.isAvailable {
+                Text("Vocabulary suggestions storage isn't available.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            } else if vocabularySuggestions.suggestions.isEmpty {
+                Text("No suggestions yet.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(vocabularySuggestions.suggestions, id: \.normalizedTerm) { suggestion in
+                    HStack {
+                        Text(suggestion.surfaceTerm)
+                        Text("seen \(suggestion.recurrence) times")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button {
+                            vocabularySuggestions.approve(suggestion)
+                        } label: {
+                            Image(systemName: "checkmark.circle")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Approve")
+                        Button {
+                            vocabularySuggestions.dismiss(suggestion.normalizedTerm)
+                        } label: {
+                            Image(systemName: "xmark.circle")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Dismiss")
+                    }
+                }
+            }
+            if let errorMessage = vocabularySuggestions.errorMessage {
+                Text(errorMessage)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+            if let displacedWarning = vocabularySuggestions.displacedWarning {
+                Text(displacedWarning)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            Text("Delete All in the Library clears these suggestions' evidence but keeps every approved/dismissed decision you've already made.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 12)
+        .onAppear { vocabularySuggestions.refreshSuggestions() }
     }
 
     @ViewBuilder

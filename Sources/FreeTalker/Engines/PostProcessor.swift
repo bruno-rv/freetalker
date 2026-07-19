@@ -10,6 +10,13 @@ struct PostProcessingRequest: Sendable {
     /// `.disabled` for a live path that should be enabled (or vice versa). See
     /// `VoiceCommandPolicy`'s doc comment for the per-path assignment.
     let voiceCommandPolicy: VoiceCommandPolicy
+    /// The effective vocabulary to hint the processor toward — the caller's snapshot, never a
+    /// live `AppSettings.shared.vocabulary`/`CloudLLMSettingsSnapshot.vocabulary` read inside
+    /// `AppleFMProcessor`/`CloudLLMProcessor` themselves (PLAN.md PR B, item 2d/4: one snapshot,
+    /// threaded to every consumer, so STT biasing and this hint always agree for one dictation).
+    /// No default, same "every constructor sets it explicitly" reasoning as `voiceCommandPolicy`
+    /// above. See Codex round 1 finding 4.
+    let vocabulary: [String]
 }
 
 protocol PostProcessor: Sendable {

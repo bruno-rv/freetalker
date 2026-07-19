@@ -484,7 +484,7 @@ private enum CloseFailure: Error {
 private actor ScratchpadCancellationEngine: TranscriptionEngine {
     nonisolated let name = "Spy"
     nonisolated var statusText: String { "Ready" }
-    func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String]) async throws -> TranscriptionOutput {
+    func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String], vocabulary: [String]) async throws -> TranscriptionOutput {
         .init(text: "raw", language: "en")
     }
 }

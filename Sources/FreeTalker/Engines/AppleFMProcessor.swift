@@ -21,10 +21,9 @@ struct AppleFMProcessor: PostProcessor {
             throw FMError.unavailable
         }
 
-        let vocabulary = await AppSettings.shared.vocabulary
-        let instructions = buildProcessorInstructions(request: request, vocabulary: vocabulary)
+        let instructions = buildProcessorInstructions(request: request, vocabulary: request.vocabulary)
         let session = LanguageModelSession(instructions: instructions)
-        let response = try await session.respond(to: buildProcessorUserContent(request: request, vocabulary: vocabulary))
+        let response = try await session.respond(to: buildProcessorUserContent(request: request, vocabulary: request.vocabulary))
         return response.content
     }
 
@@ -41,11 +40,10 @@ struct AppleFMProcessor: PostProcessor {
             throw FMError.unavailable
         }
 
-        let vocabulary = await AppSettings.shared.vocabulary
-        let instructions = buildProcessorInstructions(request: request, vocabulary: vocabulary)
+        let instructions = buildProcessorInstructions(request: request, vocabulary: request.vocabulary)
         let content = buildLocalProcessorUserContent(
             request: request,
-            vocabulary: vocabulary,
+            vocabulary: request.vocabulary,
             context: context
         )
         let session = LanguageModelSession(instructions: instructions)

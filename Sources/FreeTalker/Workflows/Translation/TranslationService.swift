@@ -53,7 +53,12 @@ struct TranslationService: Translating {
             languagePolicy: policy,
             // PLAN.md PR A, item 2: the translation pipeline is hard-disabled, always — never
             // from a snapshot.
-            voiceCommandPolicy: .disabled
+            voiceCommandPolicy: .disabled,
+            // `snapshot` is already the stop-time `CloudLLMSettingsSnapshot` (PLAN.md PR B, item
+            // 2d) — its `vocabulary` was captured at the same synchronous stop-time read as
+            // `RecordingProcessingContext.vocabularySnapshot`, so this stays consistent with the
+            // rest of the dictation's processing without needing its own separate parameter.
+            vocabulary: snapshot.vocabulary
         )
         let output = try await cloudProcess(request, snapshot, apiKey)
             .trimmingCharacters(in: .whitespacesAndNewlines)

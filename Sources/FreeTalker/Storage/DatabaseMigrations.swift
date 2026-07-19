@@ -6,7 +6,7 @@ enum DatabaseRole: Sendable {
 }
 
 enum DatabaseMigrator {
-    static let latestVersion = 13
+    static let latestVersion = 14
 
     static func migrate(_ db: OpaquePointer, role: DatabaseRole = .jobs) throws {
         try execute(db, "BEGIN IMMEDIATE;")
@@ -32,6 +32,8 @@ enum DatabaseMigrator {
                     try migrateLibraryStatsV12(db, role: role)
                 } else if version == 13 {
                     try migrateVoiceCommandSnapshotV13(db, role: role)
+                } else if version == 14 {
+                    try migrateVocabV14(db, role: role)
                 } else {
                     try execute(db, migration)
                 }
@@ -240,8 +242,9 @@ enum DatabaseMigrator {
     private static let migration11 = ""
     private static let migration12 = ""
     private static let migration13 = ""
+    private static let migration14 = ""
 
-    private static let migrations = [migration1, migration2, migration3, migration4, migration5, migration6, migration7, migration8, migration9, migration10, migration11, migration12, migration13]
+    private static let migrations = [migration1, migration2, migration3, migration4, migration5, migration6, migration7, migration8, migration9, migration10, migration11, migration12, migration13, migration14]
 
     /// Adds the Usage Statistics columns to an existing Library `dictations` table. Runs only for
     /// the Library database (the jobs database has no `dictations`). Guarded by `columnExists` so a
@@ -294,6 +297,39 @@ enum DatabaseMigrator {
                 try execute(db, "ALTER TABLE dictations ADD COLUMN voice_commands_active INTEGER;")
             }
         }
+    }
+
+    /// Adds the self-learning vocabulary tables (PLAN.md PR B, item 2): `vocab_evidence` — one row
+    /// per (dictation, normalized term) recurrence, FK'd to `dictations` `ON DELETE CASCADE` so
+    /// deleting a dictation automatically retracts its evidence — and `vocab_decisions` — one row
+    /// per term ever explicitly approved or dismissed, independent of evidence, so Delete All
+    /// (which clears `dictations` and therefore all evidence via cascade) never touches a user's
+    /// approve/dismiss decisions. Library database only; unconditional (not guarded on `dictations`
+    /// already existing) because SQLite does not require a `FOREIGN KEY` target table to exist at
+    /// `CREATE TABLE` time — see the sibling V13 doc comment for why a `tableExists` guard here
+    /// would instead risk PERMANENTLY skipping table creation if this migration ever ran before
+    /// `dictations` existed (ledger already at v14, guard forever false on every later run).
+    private static func migrateVocabV14(_ db: OpaquePointer, role: DatabaseRole) throws {
+        guard role == .library else { return }
+        try execute(db, """
+        CREATE TABLE IF NOT EXISTS vocab_evidence (
+            dictation_id INTEGER NOT NULL,
+            normalized_term TEXT NOT NULL,
+            surface_term TEXT NOT NULL,
+            first_seen REAL NOT NULL,
+            PRIMARY KEY (dictation_id, normalized_term),
+            FOREIGN KEY (dictation_id) REFERENCES dictations(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_vocab_evidence_normalized_term
+            ON vocab_evidence(normalized_term, dictation_id);
+        CREATE TABLE IF NOT EXISTS vocab_decisions (
+            normalized_term TEXT PRIMARY KEY,
+            status TEXT NOT NULL CHECK(status IN ('approved', 'dismissed')),
+            surface_term TEXT,
+            decided_at REAL NOT NULL,
+            CHECK (status != 'approved' OR surface_term IS NOT NULL)
+        );
+        """)
     }
 
     private static func migrateCaptureV11(_ db: OpaquePointer, role: DatabaseRole) throws {

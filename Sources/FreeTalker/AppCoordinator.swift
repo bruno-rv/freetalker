@@ -52,6 +52,10 @@ final class AppCoordinator: ObservableObject {
         let outputLanguage: OutputLanguage
         let cloudSnapshot: CloudLLMSettingsSnapshot
         let voiceCommands: VoiceCommandSnapshot
+        /// PLAN.md PR B, item 2d/4: the ONE effective-vocabulary snapshot threaded to every STT +
+        /// post-processing consumer for this dictation — see `RecordingProcessingContext.
+        /// vocabularySnapshot`'s doc comment. Same synchronous stop-time read as `cloudSnapshot`.
+        let vocabularySnapshot: [String]
     }
 
     nonisolated static func captureStopSettingsSnapshot(
@@ -59,13 +63,15 @@ final class AppCoordinator: ObservableObject {
         selectedOutput: OutputLanguage?,
         defaultOutput: OutputLanguage,
         cloudSnapshot: CloudLLMSettingsSnapshot,
-        voiceCommands: VoiceCommandSnapshot
+        voiceCommands: VoiceCommandSnapshot,
+        vocabularySnapshot: [String]
     ) -> CaptureStopSettingsSnapshot {
         CaptureStopSettingsSnapshot(
             oneShotLanguage: oneShotLanguage,
             outputLanguage: selectedOutput ?? defaultOutput,
             cloudSnapshot: cloudSnapshot,
-            voiceCommands: voiceCommands
+            voiceCommands: voiceCommands,
+            vocabularySnapshot: vocabularySnapshot
         )
     }
 
@@ -208,6 +214,10 @@ final class AppCoordinator: ObservableObject {
     private(set) var pendingVoiceEditSelection: SelectionSnapshot?
     @Published private(set) var snippetStore: SnippetStore?
     @Published private(set) var snippetStoreInitializationError: String?
+    /// Self-learning vocabulary store (PLAN.md PR B, item 2) — its own connection to the Library
+    /// database, independent of `LibraryStore`'s. See `wireVocabularyMining`.
+    @Published private(set) var vocabStore: VocabStore?
+    @Published private(set) var vocabStoreInitializationError: String?
     private var voiceEditCoordinator: VoiceEditCoordinator?
     private var voiceEditWindow: NSWindow?
     private var voiceEditWindowDelegate: VoiceEditWindowDelegate?
@@ -244,6 +254,7 @@ final class AppCoordinator: ObservableObject {
         let outputLanguage: OutputLanguage
         let cloudSnapshot: CloudLLMSettingsSnapshot
         let voiceCommands: VoiceCommandSnapshot
+        let vocabularySnapshot: [String]
     }
     private var pendingStopRequest: PendingStopRequest?
     private struct PendingCaptureCleanup {
@@ -326,6 +337,19 @@ final class AppCoordinator: ObservableObject {
         if let recoveryStoreInitializationError {
             recoveryHealth = .unavailable(recoveryStoreInitializationError)
         }
+        // `VocabStore.init` does synchronous SQLite open + migration (PLAN.md PR B, item 2) — unlike
+        // `recoveryStore`/`snippetStore` above, this one is deferred off the synchronous launch path
+        // entirely, into the same `Task` that already exists to eagerly load the approved-terms
+        // cache (item 2d): constructing it there rather than here means `private init()` returns
+        // before that I/O runs, instead of the app launch sequence blocking on it. See Codex finding
+        // (VocabStore.swift:81).
+        Task(priority: .userInitiated) { await self.setUpVocabularyStore() }
+        // PLAN.md PR B, item 4: once a model/tokenizer is loaded, every vocabulary read (Settings
+        // preview, approval fit-gate, transcription biasing) should use the exact token count
+        // instead of the conservative byte bound — see `WhisperKitEngine.currentVocabularyEncoder`
+        // and `EffectiveVocabulary`'s doc comment. `[weak whisperEngine]` matters here: `whisperEngine`
+        // is owned by this `AppCoordinator`, not the other way around.
+        AppSettings.shared.vocabularyTokenEncoder = { [weak whisperEngine] in whisperEngine?.currentVocabularyEncoder() }
         whisperEngine.setEventReceiver(modelStore)
         modelStore.onAutomaticSelection = { [weak whisperEngine] target in
             guard let whisperEngine else { return }
@@ -677,7 +701,7 @@ final class AppCoordinator: ObservableObject {
             do {
                 // Voice Edit is deliberately pinned to the on-device engine even when normal
                 // dictation is configured for cloud STT.
-                let transcription = try await whisperEngine.transcribe(samples: samples, forcedLanguage: nil, candidateLanguages: recordingLanguageSnapshot)
+                let transcription = try await whisperEngine.transcribe(samples: samples, forcedLanguage: nil, candidateLanguages: recordingLanguageSnapshot, vocabulary: AppSettings.shared.vocabulary)
                 let instruction = transcription.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !instruction.isEmpty else {
                     hud.flash("No voice instruction recognized")
@@ -1938,7 +1962,8 @@ final class AppCoordinator: ObservableObject {
             selectedOutput: recordingOutputSelection.current,
             defaultOutput: AppSettings.shared.defaultOutputLanguage,
             cloudSnapshot: AppSettings.shared.cloudLLMSnapshot,
-            voiceCommands: AppSettings.shared.voiceCommandSnapshot
+            voiceCommands: AppSettings.shared.voiceCommandSnapshot,
+            vocabularySnapshot: AppSettings.shared.vocabulary
         )
         return PendingStopRequest(
             destination: destination, snapshot: snapshot,
@@ -1946,7 +1971,8 @@ final class AppCoordinator: ObservableObject {
             oneShotLanguage: settings.oneShotLanguage,
             outputLanguage: settings.outputLanguage,
             cloudSnapshot: settings.cloudSnapshot,
-            voiceCommands: settings.voiceCommands
+            voiceCommands: settings.voiceCommands,
+            vocabularySnapshot: settings.vocabularySnapshot
         )
     }
 
@@ -2105,6 +2131,7 @@ final class AppCoordinator: ObservableObject {
         let capturedOutputLanguage = stopRequest.outputLanguage
         let capturedCloudSnapshot = stopRequest.cloudSnapshot
         let capturedVoiceCommands = stopRequest.voiceCommands
+        let capturedVocabularySnapshot = stopRequest.vocabularySnapshot
         defer {
             oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .clear)
             recordingOutputSelection.resolveTerminal()
@@ -2118,6 +2145,7 @@ final class AppCoordinator: ObservableObject {
                 token: token, forcedLanguage: capturedOneShotLanguage,
                 outputLanguage: capturedOutputLanguage, cloudSnapshot: capturedCloudSnapshot,
                 voiceCommands: capturedVoiceCommands,
+                vocabularySnapshot: capturedVocabularySnapshot,
                 skipPostProcessing: stopRequest.skipPostProcessing,
                 stoppedCapture: stoppedCapture
             )
@@ -2260,6 +2288,7 @@ final class AppCoordinator: ObservableObject {
                     outputLanguage: capturedOutputLanguage,
                     cloudSnapshot: capturedCloudSnapshot,
                     voiceCommands: capturedVoiceCommands,
+                    vocabularySnapshot: capturedVocabularySnapshot,
                     skipPostProcessing: stopRequest.skipPostProcessing,
                     processor: processor,
                     localContext: Self.localContextForProcessor(
@@ -2626,7 +2655,10 @@ final class AppCoordinator: ObservableObject {
         // cancelled/early-stopped attempt throws and lands here as `try?`. Errors are otherwise
         // non-fatal — the unchanged final pipeline still owns the real result; just let the next
         // tick retry.
-        guard let result = try? await whisperEngine.transcribe(samples: window, forcedLanguage: nil, candidateLanguages: recordingLanguageSnapshot, allowEarlyCancel: true) else { return }
+        // Preview has no "stop time" yet — it always wants whatever is live right now, unlike the
+        // final pipeline below (which threads a stop-time snapshot; see
+        // `RecordingProcessingContext.vocabularySnapshot`).
+        guard let result = try? await whisperEngine.transcribe(samples: window, forcedLanguage: nil, candidateLanguages: recordingLanguageSnapshot, vocabulary: AppSettings.shared.vocabulary, allowEarlyCancel: true) else { return }
 
         guard Self.shouldAcceptLivePreviewResult(isRecording: isRecording, resultGeneration: generation, currentGeneration: livePreviewGeneration) else { return }
 
@@ -2760,7 +2792,7 @@ final class AppCoordinator: ObservableObject {
         return Template.containsUnrecognizedLegacyCommandRuleVariant(template.prompt) ? nil : false
     }
 
-    private func runPipeline(samples: [Float], engine: any TranscriptionEngine, engineName: String, template: Template, appName: String?, target: InsertionTarget?, forcedLanguage: String?, candidateLanguages: [String], outputLanguage: OutputLanguage, cloudSnapshot: CloudLLMSettingsSnapshot, voiceCommands: VoiceCommandSnapshot, skipPostProcessing: Bool, processor: (any PostProcessor)? = nil, localContext: LocalProcessingContext? = nil, recovery: ForegroundRecovery, bundleID: String?, durationSecs: Double?, hudGeneration: UUID) async {
+    private func runPipeline(samples: [Float], engine: any TranscriptionEngine, engineName: String, template: Template, appName: String?, target: InsertionTarget?, forcedLanguage: String?, candidateLanguages: [String], outputLanguage: OutputLanguage, cloudSnapshot: CloudLLMSettingsSnapshot, voiceCommands: VoiceCommandSnapshot, vocabularySnapshot: [String], skipPostProcessing: Bool, processor: (any PostProcessor)? = nil, localContext: LocalProcessingContext? = nil, recovery: ForegroundRecovery, bundleID: String?, durationSecs: Double?, hudGeneration: UUID) async {
         defer {
             isProcessing = false
             recordingHUDDidReachTerminalState(generation: hudGeneration)
@@ -2774,7 +2806,7 @@ final class AppCoordinator: ObservableObject {
                     candidateLanguages: candidateLanguages,
                     skipPostProcessing: skipPostProcessing, outputLanguage: outputLanguage,
                     cloudSnapshot: cloudSnapshot.eligibility.isEligible ? cloudSnapshot : nil,
-                    voiceCommands: voiceCommands,
+                    voiceCommands: voiceCommands, vocabularySnapshot: vocabularySnapshot,
                     processor: processor, localContext: localContext,
                     record: { result in
                         try LibraryStore.shared.record(
@@ -2859,6 +2891,7 @@ final class AppCoordinator: ObservableObject {
         outputLanguage: OutputLanguage,
         cloudSnapshot: CloudLLMSettingsSnapshot,
         voiceCommands: VoiceCommandSnapshot,
+        vocabularySnapshot: [String],
         skipPostProcessing: Bool,
         stoppedCapture: (samples: [Float], peak: Float, rms: Float, staged: StagedCapture?)?
     ) {
@@ -2901,7 +2934,8 @@ final class AppCoordinator: ObservableObject {
             outputLanguage: outputLanguage, template: template,
             cloudSnapshot: cloudSnapshot.eligibility.isEligible ? cloudSnapshot : nil,
             voiceCommandPolicy: voiceCommands.enabled ? .enabled(keywords: voiceCommands.keywords) : .disabled,
-            candidateLanguages: recordingLanguageSnapshot
+            candidateLanguages: recordingLanguageSnapshot,
+            vocabularySnapshot: vocabularySnapshot
         )
         let processor = outputLanguage == .sameAsSpoken ? resolveActiveProcessor() : nil
 
@@ -3098,6 +3132,8 @@ final class AppCoordinator: ObservableObject {
         // above: existing/test call sites that don't exercise voice commands keep compiling;
         // `runPipeline` (the real production caller) passes the actual stop-time snapshot.
         voiceCommands: VoiceCommandSnapshot = VoiceCommandSnapshot(enabled: false, keywords: []),
+        // Default matches `candidateLanguages`'s own reasoning above. See PLAN.md PR B, item 2d.
+        vocabularySnapshot: [String] = [],
         processor: (any PostProcessor)? = nil,
         translator: any Translating = TranslationService(),
         localContext: LocalProcessingContext? = nil,
@@ -3120,7 +3156,8 @@ final class AppCoordinator: ObservableObject {
             template: template,
             cloudSnapshot: cloudSnapshot,
             voiceCommandPolicy: voiceCommands.enabled ? .enabled(keywords: voiceCommands.keywords) : .disabled,
-            candidateLanguages: candidateLanguages
+            candidateLanguages: candidateLanguages,
+            vocabularySnapshot: vocabularySnapshot
         )
         return try await processDictation(
             samples: samples, engine: engine, engineName: engineName, context: context,
@@ -3233,7 +3270,7 @@ final class AppCoordinator: ObservableObject {
         translator: any Translating,
         localContext: LocalProcessingContext?
     ) async throws -> DictationProcessingResult {
-        let transcription = try await engine.transcribe(samples: samples, forcedLanguage: context.transcriptionLanguage, candidateLanguages: context.candidateLanguages)
+        let transcription = try await engine.transcribe(samples: samples, forcedLanguage: context.transcriptionLanguage, candidateLanguages: context.candidateLanguages, vocabulary: context.vocabularySnapshot)
         guard !transcription.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw PipelineError.emptyTranscript
         }
@@ -3252,7 +3289,8 @@ final class AppCoordinator: ObservableObject {
                 template: context.template,
                 cloudSnapshot: context.cloudSnapshot,
                 voiceCommandPolicy: context.voiceCommandPolicy,
-                candidateLanguages: context.candidateLanguages
+                candidateLanguages: context.candidateLanguages,
+                vocabularySnapshot: context.vocabularySnapshot
             )
             guard let snapshot = context.cloudSnapshot, snapshot.eligibility.isEligible else {
                 throw OutputTranslationFailure(
@@ -3285,10 +3323,11 @@ final class AppCoordinator: ObservableObject {
                 template: context.template,
                 appName: appName,
                 languagePolicy: .preserveSource,
-                // PLAN.md PR A, item 2: live dictation (external paste, scratchpad recording,
-                // notchpad — all funnel through this one `transcribeAndRefine`) uses the
-                // stop-time snapshot carried on `context`.
-                voiceCommandPolicy: context.voiceCommandPolicy
+                // PLAN.md PR A, item 2 / PR B, item 2d: live dictation (external paste, scratchpad
+                // recording, notchpad — all funnel through this one `transcribeAndRefine`) uses
+                // the stop-time snapshot carried on `context` for both.
+                voiceCommandPolicy: context.voiceCommandPolicy,
+                vocabulary: context.vocabularySnapshot
             )
             if case .enabled = request.voiceCommandPolicy {
                 Self.logger.notice("post-processing request: voice command policy enabled")
@@ -3316,7 +3355,7 @@ final class AppCoordinator: ObservableObject {
         )
     }
 
-    private static let applicationSupportDirectory = FreeTalkerPaths.applicationSupport
+    private nonisolated static let applicationSupportDirectory = FreeTalkerPaths.applicationSupport
 
     private static var recoveryDirectory: URL {
         FreeTalkerPaths.recoveryDirectory
@@ -3339,6 +3378,108 @@ final class AppCoordinator: ObservableObject {
         try FreeTalkerPaths.requireValidConfiguration()
         try FileManager.default.createDirectory(at: applicationSupportDirectory, withIntermediateDirectories: true)
         return try SnippetStore(databaseURL: FreeTalkerPaths.snippetsDatabase)
+    }
+
+    private nonisolated static func makeVocabStore() throws -> VocabStore {
+        try FreeTalkerPaths.requireValidConfiguration()
+        try FileManager.default.createDirectory(at: applicationSupportDirectory, withIntermediateDirectories: true)
+        return try VocabStore(databaseURL: FreeTalkerPaths.libraryDatabase)
+    }
+
+    /// Constructs `vocabStore` (PLAN.md PR B, item 2) and wires it up — deferred here, off
+    /// `private init()`'s synchronous launch path (see the `Task` that calls this), rather than
+    /// opened+migrated inline like `recoveryStore`/`snippetStore` above. A construction failure
+    /// degrades gracefully (mining/approval simply stays unavailable), same contract as those.
+    private func setUpVocabularyStore() async {
+        do {
+            // `makeVocabStore` is `nonisolated` and run via `Task.detached` so the blocking SQLite
+            // open+migration happens off the main actor — only the assignment below (and
+            // everything after it) hops back to `@MainActor`. See Codex finding
+            // (AppCoordinator.swift:346).
+            vocabStore = try await Task.detached(priority: .userInitiated) {
+                try Self.makeVocabStore()
+            }.value
+            vocabStoreInitializationError = nil
+        } catch {
+            vocabStore = nil
+            vocabStoreInitializationError = Self.snippetStoreErrorMessage(error)
+            return
+        }
+        wireVocabularyMining()
+        // `.userInitiated`, not the default priority, to shrink the cold-boot window between
+        // `vocabStore` existing and this eager load actually landing. See Codex round 1 finding 3.
+        await refreshApprovedVocabularyCache()
+    }
+
+    /// Wires the self-learning vocabulary store into the Library insert path — every
+    /// `LibraryStore.record(...)` call now also mines the just-recorded row (PLAN.md PR B, item
+    /// 3's incremental hook). Called once `vocabStore` exists (see `setUpVocabularyStore`).
+    private func wireVocabularyMining() {
+        guard let vocabStore else { return }
+        LibraryStore.shared.onDictationRecorded = { dictation in
+            Task {
+                let row = VocabMiningRow(
+                    id: dictation.id, transcript: dictation.transcript, refined: dictation.refined,
+                    requestedOutputLanguage: dictation.requestedOutputLanguage, template: dictation.templateName,
+                    voiceCommandsActive: dictation.voiceCommandsActive
+                )
+                try? await VocabularyScanService.mineRow(row, into: vocabStore)
+            }
+        }
+    }
+
+    /// Monotonic generation counter guarding `refreshApprovedVocabularyCache` against a stale slow
+    /// read clobbering a newer one — same idiom as `VocabularySuggestionsController.generation`.
+    /// See Codex finding (AppCoordinator.swift:3416).
+    private var vocabularyCacheGeneration = 0
+
+    /// Republishes `AppSettings.approvedVocabularyCache` from `vocabStore` — the ONE place this
+    /// happens, called at startup (above) and after every approve/dismiss decision or Backup
+    /// Bundle restore of vocab decisions. See PLAN.md PR B, item 2d. A transient read failure
+    /// (e.g. `SQLITE_BUSY`) leaves the existing cache untouched rather than replacing committed
+    /// approvals with an empty array — see `resolveApprovedVocabularyCache`'s doc comment. See
+    /// Codex round 1 finding 3.
+    func refreshApprovedVocabularyCache() async {
+        guard let vocabStore else { return }
+        vocabularyCacheGeneration += 1
+        let requestGeneration = vocabularyCacheGeneration
+        let freshRead = try? await vocabStore.approvedTerms()
+        guard let resolved = Self.vocabularyCacheApplyDecision(
+            requestGeneration: requestGeneration,
+            currentGeneration: vocabularyCacheGeneration,
+            current: AppSettings.shared.approvedVocabularyCache,
+            freshRead: freshRead
+        ) else { return }
+        AppSettings.shared.applyApprovedVocabularyCache(resolved)
+    }
+
+    /// Pure generation guard behind `refreshApprovedVocabularyCache`: nil means "this read is
+    /// stale — a newer refresh already started (or finished) since this one began — apply
+    /// nothing," so a slow read that began before a faster later one can never overwrite it.
+    /// Extracted (mirroring `resolveApprovedVocabularyCache`) so it's directly testable without
+    /// racing real async I/O.
+    nonisolated static func vocabularyCacheApplyDecision(
+        requestGeneration: Int,
+        currentGeneration: Int,
+        current: [ApprovedVocabularyTerm],
+        freshRead: [ApprovedVocabularyTerm]?
+    ) -> [ApprovedVocabularyTerm]? {
+        guard requestGeneration == currentGeneration else { return nil }
+        return resolveApprovedVocabularyCache(current: current, freshRead: freshRead)
+    }
+
+    /// Pure merge decision behind `refreshApprovedVocabularyCache`: a successful read always wins
+    /// (even an empty one — the user really did dismiss/evict every approved term), but a FAILED
+    /// read (`freshRead == nil`) must preserve `current` rather than fall back to `[]` — every
+    /// stop-time snapshot reader treats an empty `approvedVocabularyCache` as "no approved terms
+    /// exist," not "unknown," so silently replacing committed approvals with `[]` on a transient
+    /// `SQLITE_BUSY`/read error would make them vanish from every subsequent STT/post-processing
+    /// snapshot until the next successful refresh. See Codex round 1 finding 3.
+    nonisolated static func resolveApprovedVocabularyCache(
+        current: [ApprovedVocabularyTerm],
+        freshRead: [ApprovedVocabularyTerm]?
+    ) -> [ApprovedVocabularyTerm] {
+        freshRead ?? current
     }
 
     private static func snippetStoreErrorMessage(_ error: Error) -> String {
@@ -3668,10 +3809,17 @@ final class AppCoordinator: ObservableObject {
         let template = TemplateStore.shared.templates.first {
             $0.id == configuration.template || $0.name == configuration.template
         } ?? TemplateStore.shared.template(id: AppSettings.shared.activeTemplateID) ?? Template.builtIns[0]
+        // ONE read of the effective vocabulary for this whole retry — both the transcriber and the
+        // post-processing request below must observe the exact same snapshot. Two independent live
+        // `AppSettings.shared.vocabulary` reads (as this used to be) could disagree if the approved-
+        // terms cache republishes (a concurrent decision, or `refreshApprovedVocabularyCache`)
+        // between them, mid-retry. See Codex finding (AppCoordinator.swift:3769/3797).
+        let vocabularySnapshot = AppSettings.shared.vocabulary
         let transcription = try await RecoveryLocalProcessor(transcriber: transcriber ?? whisperEngine).process(
             samples: samples,
             configuration: configuration,
             candidateLanguages: AppSettings.shared.dictationLanguages,
+            vocabulary: vocabularySnapshot,
             defaultModel: AppSettings.shared.whisperModel
         )
         // Retry must apply the same post-processing (active processor + template) the live path
@@ -3695,7 +3843,13 @@ final class AppCoordinator: ObservableObject {
             template: template,
             appName: nil,
             languagePolicy: .preserveSource,
-            voiceCommandPolicy: voiceCommandPolicy
+            voiceCommandPolicy: voiceCommandPolicy,
+            // Recovery retry uses CURRENT settings (see `process(...)`'s `vocabulary:` argument
+            // just above, and this function's own doc comment) — there's no stop-time snapshot
+            // to reuse for a retry that can run long after, even across relaunches. Reuses the
+            // SAME `vocabularySnapshot` the transcriber above already saw — see that `let`'s doc
+            // comment.
+            vocabulary: vocabularySnapshot
         )
         if case .enabled = request.voiceCommandPolicy {
             Self.logger.notice("post-processing request: voice command policy enabled (recovery retry)")
@@ -3819,7 +3973,10 @@ final class AppCoordinator: ObservableObject {
                     template: template,
                     appName: nil,
                     languagePolicy: .preserveSource,
-                    voiceCommandPolicy: voiceCommandPolicy
+                    voiceCommandPolicy: voiceCommandPolicy,
+                    // Same "CURRENT settings, no stop-time snapshot" reasoning as
+                    // `voiceCommandPolicy` just above.
+                    vocabulary: AppSettings.shared.vocabulary
                 )
             )
             let trimmed = processed.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3855,7 +4012,12 @@ final class AppCoordinator: ObservableObject {
                     policyEnabled: { guard case .enabled = voiceCommandPolicy else { return false }; return true }(),
                     ranCommandEligiblePass: true,
                     template: template
-                )
+                ),
+                // `dictation.transcript`/`refined` already ran through mining once, at the
+                // original capture — reprocessing it must not mine it again (would double-count
+                // the same correction's recurrence). See Codex finding
+                // (AppCoordinator.swift:3944), `LibraryStore.record`'s doc comment.
+                suppressMining: true
             )
         } catch {
             hud.flash("Library save failed")

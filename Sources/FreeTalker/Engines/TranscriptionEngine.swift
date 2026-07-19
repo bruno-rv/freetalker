@@ -15,5 +15,12 @@ protocol TranscriptionEngine: Sendable {
     /// taken at Recording start. Local WhisperKit only — it constrains the engine's own
     /// auto-detect argmax when `forcedLanguage` is nil. Cloud engines ignore this parameter
     /// entirely; their API only ever takes a single `forcedLanguage`. See PLAN.md F5.3.
-    func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String]) async throws -> TranscriptionOutput
+    /// `vocabulary`: the effective vocabulary (manual + approved self-learning terms) to bias
+    /// decoding toward — the CALLER's snapshot, never re-read live inside the engine. PLAN.md PR
+    /// B, item 2d/4: the live pipeline threads `RecordingProcessingContext.vocabularySnapshot`
+    /// (captured once, at stop time) through here so STT biasing and post-processing's vocabulary
+    /// hint always agree on the exact same list for one dictation, even though the actual network/
+    /// on-device call can run long after the settings that produced the snapshot might have
+    /// changed. See Codex round 1 finding 4.
+    func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String], vocabulary: [String]) async throws -> TranscriptionOutput
 }

@@ -1,6 +1,16 @@
 import CSQLite
 import Foundation
 
+/// One page row of `Database.vocabMiningProjectionPage` — see that method's doc comment.
+struct VocabMiningRow: Sendable {
+    let id: Int64
+    let transcript: String
+    let refined: String
+    let requestedOutputLanguage: OutputLanguage
+    let template: String
+    let voiceCommandsActive: Bool?
+}
+
 enum DatabaseError: Error, Equatable {
     case openFailed(String)
     case sqlFailed(String)
@@ -418,6 +428,35 @@ final class Database {
                 durationSecs: sqlite3_column_type(stmt, 5) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 5),
                 refined: columnText(stmt, 6),
                 transcript: columnText(stmt, 7)
+            ))
+            result = sqlite3_step(stmt)
+        }
+        guard Self.classifyStep(result) == .done else { throw DatabaseError.sqlFailed(lastError()) }
+        return rows
+    }
+
+    /// Keyset-paginated projection for the self-learning vocabulary miner (PLAN.md PR B, item 3):
+    /// just `id`, `transcript`, `refined`, and the columns `VocabularyMiner.isEligible` needs — no
+    /// full `Dictation` allocation, no `allDictations()` full load. Keyset (`id > afterID`), not
+    /// `LIMIT`/`OFFSET`, so a concurrent insert/delete during a scan can't skip or repeat rows.
+    func vocabMiningProjectionPage(afterID: Int64, limit: Int) throws -> [VocabMiningRow] {
+        let stmt = try prepare("""
+        SELECT id, transcript, refined, requested_output_language, template, voice_commands_active
+        FROM dictations WHERE id > ? ORDER BY id LIMIT ?;
+        """)
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, afterID)
+        sqlite3_bind_int(stmt, 2, Int32(limit))
+        var rows: [VocabMiningRow] = []
+        var result = sqlite3_step(stmt)
+        while Self.classifyStep(result) == .row {
+            rows.append(VocabMiningRow(
+                id: sqlite3_column_int64(stmt, 0),
+                transcript: columnText(stmt, 1),
+                refined: columnText(stmt, 2),
+                requestedOutputLanguage: OutputLanguage.persisted(rawValue: columnText(stmt, 3)),
+                template: columnText(stmt, 4),
+                voiceCommandsActive: sqlite3_column_type(stmt, 5) == SQLITE_NULL ? nil : sqlite3_column_int(stmt, 5) == 1
             ))
             result = sqlite3_step(stmt)
         }

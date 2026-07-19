@@ -605,11 +605,53 @@ final class AppSettings: ObservableObject {
         }
     }
 
-    /// Normalized vocabulary derived from `vocabularyText` — see `boundedVocabulary`. This is
-    /// what STT bias and the post-processor prompt actually consume — see
-    /// WhisperKitEngine/CloudSTTEngine/PostProcessor.swift. Consumers must not re-clamp; the
-    /// bound is enforced once, here.
-    var vocabulary: [String] { Self.boundedVocabulary(vocabularyText).kept }
+    /// Eagerly-loaded, immutable snapshot of every approved self-learning-vocabulary term
+    /// (PLAN.md PR B, item 2d) — populated at startup and republished after every decision/
+    /// restore by whatever drives `VocabStore` (see `AppCoordinator`). Oldest-`decidedAt`-first,
+    /// matching `EffectiveVocabulary`'s append order. Reading this is pure in-memory access, no
+    /// SQLite — what makes `vocabulary` below safe to call from synchronous stop-time snapshot
+    /// paths.
+    @Published private(set) var approvedVocabularyCache: [ApprovedVocabularyTerm] = []
+
+    /// Republishes `approvedVocabularyCache` — the ONE place `VocabStore`-driven code (see
+    /// `AppCoordinator`) pushes a fresh snapshot after startup load, an approve/dismiss decision,
+    /// or a Backup Bundle restore. See PLAN.md PR B, item 2d.
+    func applyApprovedVocabularyCache(_ terms: [ApprovedVocabularyTerm]) {
+        approvedVocabularyCache = terms
+    }
+
+    /// Set once at launch by `AppCoordinator` (composition root) to
+    /// `WhisperKitEngine.currentVocabularyEncoder` — synchronously returns the exact token-count
+    /// encoder for the currently loaded WhisperKit tokenizer, or nil while no model/tokenizer is
+    /// loaded yet (in which case `effectiveVocabulary` falls back to the conservative byte
+    /// bound). Never triggers a model load itself. See PLAN.md PR B, item 4 and
+    /// `EffectiveVocabulary`'s doc comment.
+    var vocabularyTokenEncoder: (() -> ((String) -> Int)?)?
+
+    /// The ONE derivation feeding every consumer (PLAN.md PR B, item 2b) — user-entered terms
+    /// (`boundedVocabulary(vocabularyText).kept`) first, then `approvedVocabularyCache` filtered
+    /// through the fit gate, using the exact tokenizer-backed bound when one is loaded
+    /// (`vocabularyTokenEncoder`) and the conservative byte bound otherwise. Not `private`: Settings
+    /// reads this directly (once per body evaluation) to render the true active/displaced
+    /// partition instead of reconstructing it from `vocabulary`/`displacedApprovedVocabularyTerms`
+    /// separately. See `EffectiveVocabulary`'s doc comment.
+    var effectiveVocabulary: EffectiveVocabulary.Result {
+        EffectiveVocabulary.derive(
+            userTerms: Self.boundedVocabulary(vocabularyText).kept,
+            approvedTerms: approvedVocabularyCache.map(\.surfaceTerm),
+            encode: vocabularyTokenEncoder?()
+        )
+    }
+
+    /// What STT bias and the post-processor prompt actually consume — see
+    /// WhisperKitEngine/CloudSTTEngine/PostProcessor.swift/AppleFMProcessor.swift. Consumers must
+    /// not re-clamp; the bound is enforced once, in `boundedVocabulary`/`VocabularyFitGate`.
+    var vocabulary: [String] { effectiveVocabulary.active }
+
+    /// Approved terms currently excluded from `vocabulary` because they don't fit alongside the
+    /// current `vocabularyText` — Settings surfaces these as needing an explicit eviction
+    /// decision. See PLAN.md PR B, item 2e.
+    var displacedApprovedVocabularyTerms: [String] { effectiveVocabulary.displaced }
 
     /// (kept, total) when bounding actually dropped/truncated terms, nil otherwise — drives the
     /// Settings UI footer warning (SettingsView.swift, Vocabulary section).
@@ -624,8 +666,10 @@ final class AppSettings: ObservableObject {
     /// independent of the term bounds below, this keeps `vocabularyText` itself from growing
     /// unboundedly. See Round 2 Codex finding 1, Round 4 Codex finding.
     nonisolated static let maxVocabularyRawTextLength = 20_000
-    /// Max terms kept after bounding. WhisperKit's prompt window is ~224 tokens; this and
-    /// `maxVocabularyCharacterBudget` keep the injected vocabulary well under provider limits
+    /// Max terms kept after bounding. WhisperKit's actual retained prompt window is
+    /// `VocabularyFitGate.tokenBudget` (~111 tokens — see that type's doc comment for the exact
+    /// derivation); this and `maxVocabularyCharacterBudget` keep the injected vocabulary well
+    /// under provider limits
     /// (WhisperKit promptTokens, cloud STT multipart `prompt`, LLM system instructions).
     nonisolated static let maxVocabularyTerms = 100
     /// Max total UTF-8 bytes across kept terms (as joined by ", "). UTF-8 bytes, not grapheme
@@ -674,6 +718,19 @@ final class AppSettings: ObservableObject {
     /// bounding kicks in — see Round 2 Codex finding 1. `total` is therefore exact for input
     /// that fits under the cap, and a cheap upper-bound (non-empty-line) count once it doesn't;
     /// either way `kept.count < total` still reliably signals truncation for the UI.
+    /// Shared per-term validator (PLAN.md PR B, item 2b — "one shared term validator... applies
+    /// identically to manual and approved terms"): NFC-normalizes `raw` and rejects it outright
+    /// (returns nil) if it contains control characters or its normalized UTF-8 byte length exceeds
+    /// `maxVocabularyTermLength`. Used by `boundedVocabulary` below for manually-typed terms, and
+    /// by `EffectiveVocabulary.derive` for approved self-learning-vocabulary terms — one validator,
+    /// one truth, no separate/looser cap for mined terms.
+    nonisolated static func validatedVocabularyTerm(_ raw: String) -> String? {
+        let normalized = raw.precomposedStringWithCanonicalMapping
+        guard !normalized.unicodeScalars.contains(where: { $0.properties.generalCategory == .control }) else { return nil }
+        guard normalized.utf8.count <= maxVocabularyTermLength else { return nil }
+        return normalized
+    }
+
     nonisolated static func boundedVocabulary(_ raw: String) -> (kept: [String], total: Int) {
         var seenLowercased = Set<String>()
         var kept: [String] = []
@@ -690,13 +747,11 @@ final class AppSettings: ObservableObject {
                 continue
             }
 
-            let normalized = trimmed.precomposedStringWithCanonicalMapping
-            guard !normalized.unicodeScalars.contains(where: { $0.properties.generalCategory == .control }) else { continue }
-            let byteLength = normalized.utf8.count
-            guard byteLength <= maxVocabularyTermLength else { continue }
+            guard let normalized = validatedVocabularyTerm(trimmed) else { continue }
             guard seenLowercased.insert(normalized.lowercased()).inserted else { continue }
 
             total += 1
+            let byteLength = normalized.utf8.count
             let increment = kept.isEmpty ? byteLength : byteLength + 2 // ", " separator
             if kept.count < maxVocabularyTerms && byteBudget + increment <= maxVocabularyCharacterBudget {
                 kept.append(normalized)
