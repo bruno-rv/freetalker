@@ -38,6 +38,11 @@ final class TemplateStore: ObservableObject {
     private static let promptEngineerMigrationKey = "TemplateStore.migrations.promptEngineer.v1"
     private static let promptEngineerMigrationVersion = 1
 
+    /// Mirrors `promptEngineerMigrationKey` above, for the three model-specific Prompt Engineer
+    /// built-ins (`Template.modelPromptEngineerIDs`) added in the same release.
+    private static let modelPromptEngineersMigrationKey = "TemplateStore.migrations.modelPromptEngineers.v1"
+    private static let modelPromptEngineersMigrationVersion = 1
+
     /// PLAN.md PR A, item 5 — version-bumped migration key (mirrors `promptEngineerMigrationKey`
     /// above) gating `Template.migratingSpokenCommandRules`, run once per install.
     private static let spokenCommandRulesMigrationKey = "TemplateStore.migrations.spokenCommandRules.v1"
@@ -133,6 +138,23 @@ final class TemplateStore: ObservableObject {
                 migrationReady = false
             }
         }
+
+        let modelPromptEngineersMigrationComplete = defaults.integer(forKey: Self.modelPromptEngineersMigrationKey)
+            >= Self.modelPromptEngineersMigrationVersion
+        let modelPromptEngineersMigrationNeeded = !modelPromptEngineersMigrationComplete
+        var modelPromptEngineersMigrationReady = true
+        if modelPromptEngineersMigrationNeeded && !loadedTemplates.isEmpty {
+            let existingIDs = Set(renamed.map(\.id))
+            let missingIDs = Template.modelPromptEngineerIDs.filter { !existingIDs.contains($0) }
+            for id in missingIDs {
+                guard let template = Template.builtIns.first(where: { $0.id == id }) else {
+                    modelPromptEngineersMigrationReady = false
+                    continue
+                }
+                renamed.append(template)
+            }
+        }
+
         let spokenCommandMigrationComplete = defaults.integer(forKey: Self.spokenCommandRulesMigrationKey)
             >= Self.spokenCommandRulesMigrationVersion
         let spokenCommandMigrationNeeded = !spokenCommandMigrationComplete
@@ -163,7 +185,7 @@ final class TemplateStore: ObservableObject {
         }
 
         let needsSave = migrationNeeded || didSeed || changed || renameChanged || addedPromptEngineer
-            || spokenCommandMigrationNeeded
+            || spokenCommandMigrationNeeded || modelPromptEngineersMigrationNeeded
         if needsSave {
             // ponytail: init can't throw here without changing every call site (this predates
             // throwing save()); a failed initial-seed write just means it retries on next
@@ -172,6 +194,12 @@ final class TemplateStore: ObservableObject {
                 try save()
                 if migrationNeeded && migrationReady {
                     defaults.set(Self.promptEngineerMigrationVersion, forKey: Self.promptEngineerMigrationKey)
+                }
+                if modelPromptEngineersMigrationNeeded && modelPromptEngineersMigrationReady {
+                    defaults.set(
+                        Self.modelPromptEngineersMigrationVersion,
+                        forKey: Self.modelPromptEngineersMigrationKey
+                    )
                 }
                 // Marker (and the unrecognized-template warning it gates) is only persisted once
                 // `save()` has actually landed the stripped text on disk — mirrors promptEngineer's
