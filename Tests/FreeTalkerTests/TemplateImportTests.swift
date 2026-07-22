@@ -158,12 +158,19 @@ struct TemplateImportTests {
         let defaults = try isolatedDefaults()
         let store = TemplateStore(fileURL: fileURL, defaults: defaults)
 
-        #expect(store.templates.count == prePromptTemplates.count + 1)
-        #expect(Set(store.templates.map(\.id)) == Set(["clean-dictation", "email", "custom", "prompt-engineer"]))
+        // A pre-existing library also predates the three model-specific Prompt Engineer
+        // built-ins, so their own migration appends those alongside `prompt-engineer`.
+        #expect(store.templates.count == prePromptTemplates.count + 1 + Template.modelPromptEngineerIDs.count)
+        #expect(Set(store.templates.map(\.id)) == Set(
+            ["clean-dictation", "email", "custom", "prompt-engineer"] + Template.modelPromptEngineerIDs
+        ))
         #expect(store.template(id: "clean-dictation")?.prompt == Template.builtIns.first { $0.id == "clean-dictation" }?.prompt)
         #expect(store.template(id: "email") == customizedEmail)
         #expect(store.template(id: "custom") == custom)
         #expect(store.template(id: "prompt-engineer") == Template.builtIns.first { $0.id == "prompt-engineer" })
+        for id in Template.modelPromptEngineerIDs {
+            #expect(store.template(id: id) == Template.builtIns.first { $0.id == id })
+        }
         #expect(store.template(id: "refined-prompt") == nil)
 
         try store.delete(id: "prompt-engineer")
@@ -182,12 +189,82 @@ struct TemplateImportTests {
         let defaults = try isolatedDefaults()
 
         let store = TemplateStore(fileURL: fileURL, defaults: defaults)
-        #expect(store.templates == [customized])
+        // The customized `prompt-engineer` is preserved verbatim; the library still lacks the
+        // three model-specific Prompt Engineer built-ins, so their own migration appends those.
+        #expect(store.template(id: "prompt-engineer") == customized)
+        #expect(store.templates.count == 1 + Template.modelPromptEngineerIDs.count)
+        for id in Template.modelPromptEngineerIDs {
+            #expect(store.template(id: id) == Template.builtIns.first { $0.id == id })
+        }
 
         try store.delete(id: "prompt-engineer")
+        for id in Template.modelPromptEngineerIDs {
+            try store.delete(id: id)
+        }
         let reloaded = TemplateStore(fileURL: fileURL, defaults: defaults)
         #expect(reloaded.template(id: "prompt-engineer") == nil)
         #expect(reloaded.templates.isEmpty)
+    }
+
+    @Test func seedsModelPromptEngineersAsBuiltIns() throws {
+        let store = try makeStore()
+
+        for id in Template.modelPromptEngineerIDs {
+            #expect(Template.builtIns.contains { $0.id == id })
+            #expect(store.templates.contains { $0.id == id })
+        }
+        #expect(store.templates.contains { $0.id == "prompt-engineer-fable-5" && $0.name == "Prompt Engineer (Fable 5)" })
+        #expect(store.templates.contains { $0.id == "prompt-engineer-opus-4-8" && $0.name == "Prompt Engineer (Opus 4.8)" })
+        #expect(store.templates.contains { $0.id == "prompt-engineer-sonnet-5" && $0.name == "Prompt Engineer (Sonnet 5)" })
+    }
+
+    @Test func migratesModelPromptEngineersIntoAnExistingLibraryOnlyOnce() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("template-migration-model-pe-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let fileURL = directory.appendingPathComponent("templates.json")
+        let cleanDictation = try #require(Template.builtIns.first { $0.id == "clean-dictation" })
+        // Includes `prompt-engineer` already, so only the model-specific migration fires here —
+        // its own migration is covered separately above.
+        let promptEngineer = try #require(Template.builtIns.first { $0.id == "prompt-engineer" })
+        let custom = Template(id: "custom", name: "My Template", prompt: "My prompt")
+        let preTemplates = [cleanDictation, promptEngineer, custom]
+        try encode(preTemplates).write(to: fileURL)
+
+        let defaults = try isolatedDefaults()
+        let store = TemplateStore(fileURL: fileURL, defaults: defaults)
+
+        #expect(store.templates.count == preTemplates.count + Template.modelPromptEngineerIDs.count)
+        for id in Template.modelPromptEngineerIDs {
+            #expect(store.template(id: id) == Template.builtIns.first { $0.id == id })
+        }
+
+        // Deleting one and reloading must NOT re-add it.
+        try store.delete(id: "prompt-engineer-fable-5")
+        let reloaded = TemplateStore(fileURL: fileURL, defaults: defaults)
+        #expect(reloaded.template(id: "prompt-engineer-fable-5") == nil)
+        #expect(reloaded.templates == store.templates.filter { $0.id != "prompt-engineer-fable-5" })
+    }
+
+    @Test func preservesAnExistingCustomizedModelPromptEngineerAndDoesNotOverwriteIt() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("template-migration-model-pe-custom-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let fileURL = directory.appendingPathComponent("templates.json")
+        let cleanDictation = try #require(Template.builtIns.first { $0.id == "clean-dictation" })
+        let promptEngineer = try #require(Template.builtIns.first { $0.id == "prompt-engineer" })
+        let customizedSonnet = Template(
+            id: "prompt-engineer-sonnet-5", name: "Prompt Engineer (Sonnet 5)", prompt: "My custom sonnet prompt"
+        )
+        try encode([cleanDictation, promptEngineer, customizedSonnet]).write(to: fileURL)
+        let defaults = try isolatedDefaults()
+
+        let store = TemplateStore(fileURL: fileURL, defaults: defaults)
+
+        #expect(store.template(id: "prompt-engineer-sonnet-5") == customizedSonnet)
+        // The two IDs still missing get appended, the customized one is left untouched.
+        #expect(store.template(id: "prompt-engineer-fable-5") == Template.builtIns.first { $0.id == "prompt-engineer-fable-5" })
+        #expect(store.template(id: "prompt-engineer-opus-4-8") == Template.builtIns.first { $0.id == "prompt-engineer-opus-4-8" })
     }
 
     @Test func preservesAValidEmptyLibraryInsteadOfReseedingBuiltIns() throws {
