@@ -598,13 +598,15 @@ final class HUDController {
             controllerVisible: controllerVisible,
             surfaceStyle: surfaceStyle
         )
-        guard shouldShow, let geometry = lastResolvedGeometry else {
+        guard shouldShow, let geometry = lastResolvedGeometry, let panel else {
             connectorPanel?.orderOut(nil)
             connectorPanel = nil
             return
         }
 
-        let frame = geometry.connectorFrame
+        // Connector tracks the interactive panel's current width/x so wide recording rows
+        // stay fused to the notch strip instead of leaving a gap on either side.
+        let frame = geometry.connectorFrame(panelFrame: panel.frame)
         let connector: NSPanel
         if let existing = connectorPanel {
             connector = existing
@@ -989,9 +991,23 @@ struct HUDView: View {
                 ))
                 .background(.regularMaterial, in: Capsule())
         case .notch:
-            // No drag; rounded rect fused under the notch strip rather than free-floating capsule.
+            // No drag. Opaque black, square top / rounded bottom so the panel reads as one
+            // continuous shape hanging from the camera housing (fused with the connector strip
+            // above it) rather than a detached floating pill. Force dark scheme so text/controls
+            // stay legible against the opaque black — .regularMaterial (translucent, follows
+            // system appearance) is what made the old panel read as a separate floating pill.
             content
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .colorScheme(.dark)
+                .background(
+                    UnevenRoundedRectangle(
+                        topLeadingRadius: 0,
+                        bottomLeadingRadius: 14,
+                        bottomTrailingRadius: 14,
+                        topTrailingRadius: 0,
+                        style: .continuous
+                    )
+                    .fill(Color.black)
+                )
         }
     }
 

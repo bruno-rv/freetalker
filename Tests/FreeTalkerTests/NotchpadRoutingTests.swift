@@ -120,9 +120,19 @@ struct NotchpadRoutingTests {
         let originY = geometry.contentOriginY(panelHeight: panelHeight)
         #expect(originY + panelHeight == geometry.contentMaxY)
         #expect(originY + panelHeight <= geometry.screenFrame.maxY - geometry.safeAreaTop)
-        #expect(geometry.connectorFrame.minY == geometry.contentMaxY)
-        #expect(geometry.connectorFrame.height == geometry.safeAreaTop)
-        #expect(geometry.connectorFrame.width == geometry.notchFrame.width)
+
+        let panelWidth: CGFloat = 460
+        let panelFrame = CGRect(
+            x: geometry.notchFrame.midX - panelWidth / 2,
+            y: originY,
+            width: panelWidth,
+            height: panelHeight
+        )
+        let connector = geometry.connectorFrame(panelFrame: panelFrame)
+        #expect(connector.minY == geometry.contentMaxY)
+        #expect(connector.height == geometry.safeAreaTop)
+        #expect(connector.width == panelFrame.width)
+        #expect(connector.minX == panelFrame.minX)
     }
 
     // MARK: Lifetime decisions with synthetic modes

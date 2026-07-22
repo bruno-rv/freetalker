@@ -267,15 +267,26 @@ struct NotchGeometryTests {
         #expect(panelFrame.maxY <= macBookFrame.maxY - safeAreaTop)
     }
 
-    @Test func connectorMatchesNotchWidthInSafeAreaStrip() throws {
+    @Test func connectorMatchesPanelWidthAndSitsFlushInSafeAreaStrip() throws {
         let geometry = try #require(NotchGeometryResolver.resolve(screens: [validBuiltin()]))
-        let connector = geometry.connectorFrame
+        let panelHeight: CGFloat = 44
+        // Wide recording row (~460pt), centered under the notch.
+        let panelFrame = CGRect(
+            x: geometry.notchFrame.midX - 230,
+            y: geometry.contentOriginY(panelHeight: panelHeight),
+            width: 460,
+            height: panelHeight
+        )
+        let connector = geometry.connectorFrame(panelFrame: panelFrame)
 
-        #expect(connector.width == geometry.notchFrame.width)
-        #expect(connector.minX == geometry.notchFrame.minX)
+        #expect(connector.width == panelFrame.width)
+        #expect(connector.minX == panelFrame.minX)
         #expect(connector.height == safeAreaTop)
         #expect(connector.minY == geometry.contentMaxY)
         #expect(connector.maxY == macBookFrame.maxY)
+        #expect(connector.maxY == geometry.screenFrame.maxY)
+        // Flush fusion: connector's bottom edge sits exactly at the panel's top edge, no gap.
+        #expect(connector.minY == panelFrame.maxY)
     }
 
     // MARK: - No width fallback

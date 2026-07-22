@@ -20,12 +20,14 @@ struct NotchGeometry: Equatable, Sendable {
         contentMaxY - panelHeight
     }
 
-    /// Noninteractive connector strip under the camera housing (notch-width, safe-area height).
-    var connectorFrame: CGRect {
+    /// Noninteractive connector strip that spans the interactive panel's width, sitting flush
+    /// in the menu-bar safe-area strip directly above it — fuses the panel to the notch housing
+    /// instead of leaving a notch-width sliver that's invisible against the black camera housing.
+    func connectorFrame(panelFrame: CGRect) -> CGRect {
         CGRect(
-            x: notchFrame.minX,
+            x: panelFrame.minX,
             y: contentMaxY,
-            width: notchFrame.width,
+            width: panelFrame.width,
             height: safeAreaTop
         )
     }
