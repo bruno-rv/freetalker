@@ -161,6 +161,38 @@ struct FloatingPanelGeometryTests {
         #expect(saved == NormalizedWindowPosition(displayID: "main", x: 0.25, y: 0))
     }
 
+    @Test func bottomEdgeLauncherSitsAtTheTrueScreenBottomOverTheDock() {
+        let screenFrame = CGRect(x: 0, y: 0, width: 1_440, height: 982)
+        let visibleFrame = CGRect(x: 0, y: 89, width: 1_440, height: 893)
+        let display = DisplayFrame(id: "main", visibleFrame: visibleFrame, frame: screenFrame)
+        let panelSize = CGSize(width: 32, height: 32)
+
+        let launcher = FloatingPanelGeometry.launcherFrame(
+            edge: .bottom,
+            position: 0.5,
+            panelSize: panelSize,
+            visibleFrame: visibleFrame,
+            frame: screenFrame
+        )
+
+        #expect(launcher.minY == screenFrame.minY)
+
+        // Regression: normalize -> restore -> clamp must not snap the launcher back above the
+        // Dock once the position is persisted and re-derived on the next render.
+        let saved = FloatingPanelGeometry.normalizedOrigin(
+            frame: launcher, display: display, edge: .bottom
+        )
+        let restored = FloatingPanelGeometry.restoredOrigin(
+            saved: saved,
+            displays: [display],
+            fallback: display,
+            panelSize: panelSize,
+            edge: .bottom
+        )
+
+        #expect(restored.y == screenFrame.minY)
+    }
+
     @Test func restoredOriginKeepsPanelsInsideTheUsableFrame() {
         let display = DisplayFrame(id: "main", visibleFrame: screen)
         let origin = FloatingPanelGeometry.restoredOrigin(

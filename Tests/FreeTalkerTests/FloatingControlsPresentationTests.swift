@@ -44,7 +44,7 @@ import Testing
         #expect(panel.styleMask.contains(.nonactivatingPanel))
         #expect(panel.canBecomeKey == false)
         #expect(panel.canBecomeMain == false)
-        #expect(panel.level == .floating)
+        #expect(panel.level == .statusBar)
         #expect(panel.collectionBehavior.contains(.canJoinAllSpaces))
         #expect(panel.collectionBehavior.contains(.fullScreenAuxiliary))
     }

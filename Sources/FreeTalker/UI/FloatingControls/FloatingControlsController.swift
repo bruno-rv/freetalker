@@ -232,7 +232,10 @@ final class FloatingControlsController {
             backing: .buffered,
             defer: false
         )
-        panel.level = .floating
+        // `.floating` (3) renders below the Dock (level 20), so a `.bottom`-edge launcher would be
+        // hidden behind it. `.statusBar` (25) renders above the Dock while still staying below
+        // system-critical surfaces like the screen saver.
+        panel.level = .statusBar
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
@@ -346,7 +349,8 @@ final class FloatingControlsController {
             saved: resolvedPosition,
             displays: displays,
             fallback: fallback,
-            panelSize: size
+            panelSize: size,
+            edge: settings.edgeLauncherEdge
         )
         panel.setFrameOrigin(panelDragState.originForRender(
             liveOrigin: panel.frame.origin,
@@ -367,14 +371,17 @@ final class FloatingControlsController {
     private func persistPanelPosition(placementContext: FloatingPanelPlacementContext) {
         guard let panel, let screen = panel.screen ?? NSScreen.main else { return }
         let display = Self.displayFrame(screen, in: placementContext)
+        let edge = settings.edgeLauncherEdge
         panel.setFrameOrigin(FloatingPanelGeometry.clampedOrigin(
             panel.frame.origin,
             panelSize: panel.frame.size,
-            visibleFrame: display.visibleFrame
+            visibleFrame: display.visibleFrame,
+            frame: edge == .bottom ? display.frame : nil
         ))
         settings.launcherPanelPosition = FloatingPanelGeometry.normalizedOrigin(
             frame: panel.frame,
-            display: display
+            display: display,
+            edge: edge
         )
     }
 
@@ -384,7 +391,7 @@ final class FloatingControlsController {
     ) -> DisplayFrame {
         let id = FloatingPanelPlacementPolicy.displayID(for: screen)
         return placementContext.display(id: id)
-            ?? DisplayFrame(id: id, visibleFrame: screen.visibleFrame)
+            ?? DisplayFrame(id: id, visibleFrame: screen.visibleFrame, frame: screen.frame)
     }
 }
 

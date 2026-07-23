@@ -3,6 +3,16 @@ import AppKit
 struct DisplayFrame: Equatable, Sendable {
     let id: String
     let visibleFrame: CGRect
+    /// The screen's true frame (`NSScreen.frame`), including the Dock/menu-bar insets that
+    /// `visibleFrame` excludes. Defaults to `visibleFrame` when not supplied, so existing call
+    /// sites that only know the visible frame keep their prior behavior.
+    let frame: CGRect
+
+    init(id: String, visibleFrame: CGRect, frame: CGRect? = nil) {
+        self.id = id
+        self.visibleFrame = visibleFrame
+        self.frame = frame ?? visibleFrame
+    }
 }
 
 struct FloatingPanelWindowSnapshot: Equatable, Sendable {
@@ -165,7 +175,8 @@ enum FloatingPanelPlacementPolicy {
                     visibleFrame: screen.visibleFrame,
                     targetDisplayBounds: targetDisplayBounds,
                     snapshot: snapshot
-                )
+                ),
+                frame: screen.frame
             )
         })
     }
@@ -211,9 +222,14 @@ enum FloatingPanelGeometry {
         edge: LauncherEdge,
         position: Double,
         panelSize: CGSize,
-        visibleFrame: CGRect
+        visibleFrame: CGRect,
+        frame: CGRect? = nil
     ) -> CGRect {
         let position = clampedUnit(position)
+        // `.bottom` sits on the true screen edge (over the Dock); every other edge stays within
+        // the visible frame, matching prior behavior.
+        let trueFrame = frame ?? visibleFrame
+        let minimumY = edge == .bottom ? trueFrame.minY : visibleFrame.minY
         let horizontalTravel = max(0, visibleFrame.width - panelSize.width)
         let verticalTravel = max(0, visibleFrame.height - panelSize.height)
         let origin: CGPoint
@@ -237,16 +253,16 @@ enum FloatingPanelGeometry {
         case .bottom:
             origin = CGPoint(
                 x: visibleFrame.minX + horizontalTravel * position,
-                y: visibleFrame.minY
+                y: minimumY
             )
         }
 
         let maximumX = max(visibleFrame.minX, visibleFrame.maxX - panelSize.width)
-        let maximumY = max(visibleFrame.minY, visibleFrame.maxY - panelSize.height)
+        let maximumY = max(minimumY, visibleFrame.maxY - panelSize.height)
         return CGRect(
             origin: CGPoint(
                 x: min(max(origin.x, visibleFrame.minX), maximumX),
-                y: min(max(origin.y, visibleFrame.minY), maximumY)
+                y: min(max(origin.y, minimumY), maximumY)
             ),
             size: panelSize
         )
@@ -254,10 +270,14 @@ enum FloatingPanelGeometry {
 
     static func normalizedOrigin(
         frame: CGRect,
-        display: DisplayFrame
+        display: DisplayFrame,
+        edge: LauncherEdge? = nil
     ) -> NormalizedWindowPosition {
+        // `.bottom` is anchored to the true screen frame (over the Dock); every other edge (or
+        // no edge context, e.g. the HUD panels) normalizes against the visible frame as before.
+        let verticalReference = edge == .bottom ? display.frame : display.visibleFrame
         let horizontalTravel = display.visibleFrame.width - frame.width
-        let verticalTravel = display.visibleFrame.height - frame.height
+        let verticalTravel = verticalReference.height - frame.height
         return NormalizedWindowPosition(
             displayID: display.id,
             x: normalizedCoordinate(
@@ -265,7 +285,7 @@ enum FloatingPanelGeometry {
                 travel: horizontalTravel
             ),
             y: normalizedCoordinate(
-                frame.minY - display.visibleFrame.minY,
+                frame.minY - verticalReference.minY,
                 travel: verticalTravel
             )
         )
@@ -282,9 +302,11 @@ enum FloatingPanelGeometry {
                 edge: edge,
                 position: position,
                 panelSize: panelSize,
-                visibleFrame: display.visibleFrame
+                visibleFrame: display.visibleFrame,
+                frame: display.frame
             ),
-            display: display
+            display: display,
+            edge: edge
         )
     }
 
@@ -292,30 +314,39 @@ enum FloatingPanelGeometry {
         saved: NormalizedWindowPosition?,
         displays: [DisplayFrame],
         fallback: DisplayFrame,
-        panelSize: CGSize
+        panelSize: CGSize,
+        edge: LauncherEdge? = nil
     ) -> CGPoint {
         guard let saved else {
             return clampedOrigin(
                 fallback.visibleFrame.origin,
                 panelSize: panelSize,
-                visibleFrame: fallback.visibleFrame
+                visibleFrame: fallback.visibleFrame,
+                frame: edge == .bottom ? fallback.frame : nil
             )
         }
 
         let display = displays.first { $0.id == saved.displayID } ?? fallback
+        let verticalReference = edge == .bottom ? display.frame : display.visibleFrame
         let origin = CGPoint(
             x: display.visibleFrame.minX
                 + max(0, display.visibleFrame.width - panelSize.width) * clampedUnit(saved.x),
-            y: display.visibleFrame.minY
-                + max(0, display.visibleFrame.height - panelSize.height) * clampedUnit(saved.y)
+            y: verticalReference.minY
+                + max(0, verticalReference.height - panelSize.height) * clampedUnit(saved.y)
         )
-        return clampedOrigin(origin, panelSize: panelSize, visibleFrame: display.visibleFrame)
+        return clampedOrigin(
+            origin,
+            panelSize: panelSize,
+            visibleFrame: display.visibleFrame,
+            frame: edge == .bottom ? display.frame : nil
+        )
     }
 
     static func clampedOrigin(
         _ origin: CGPoint,
         panelSize: CGSize,
         visibleFrame: CGRect,
+        frame: CGRect? = nil,
         minimumVisible: CGSize = CGSize(width: 48, height: 32)
     ) -> CGPoint {
         let horizontalBounds: (minimum: CGFloat, maximum: CGFloat)
@@ -328,13 +359,16 @@ enum FloatingPanelGeometry {
                 visibleFrame.maxX - visibleWidth
             )
         }
+        // `frame`, when supplied, is the true screen frame — passing it allows the lower bound to
+        // reach the physical bottom edge (over the Dock) instead of stopping at `visibleFrame`.
+        let verticalMinimum = (frame ?? visibleFrame).minY
         let verticalBounds: (minimum: CGFloat, maximum: CGFloat)
         if panelSize.height <= visibleFrame.height {
-            verticalBounds = (visibleFrame.minY, visibleFrame.maxY - panelSize.height)
+            verticalBounds = (verticalMinimum, visibleFrame.maxY - panelSize.height)
         } else {
             let visibleHeight = min(panelSize.height, minimumVisible.height)
             verticalBounds = (
-                visibleFrame.minY - panelSize.height + visibleHeight,
+                verticalMinimum - panelSize.height + visibleHeight,
                 visibleFrame.maxY - visibleHeight
             )
         }
