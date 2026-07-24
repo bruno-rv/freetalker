@@ -364,6 +364,21 @@ enum Insertion {
         return text
     }
 
+    /// One fresh caret+baseline snapshot, taken immediately before a BATCH (non-streaming) paste
+    /// — the Correction Loop counterpart of what `LiveInsertionSession.receivePartial` captures
+    /// on its first post, reusing the exact same two primitives (`streamingWriteCaret`,
+    /// `streamingBaselineValue`) rather than a parallel implementation. `nil` (AX untrusted,
+    /// drifted, secure, or an active selection) means Correction Loop simply won't offer a
+    /// correction for this insertion — it never blocks or alters the paste itself, which runs
+    /// through its own, separate (non-strict) drift check in `insert(_:target:strict:)`. See
+    /// `RecentInsertion`.
+    @MainActor
+    static func captureCorrectionAnchor(target: InsertionTarget) -> (anchor: Int, baseline: String)? {
+        guard let anchor = streamingWriteCaret(target: target, expectedCaret: nil) else { return nil }
+        guard let baseline = streamingBaselineValue(target: target) else { return nil }
+        return (anchor, baseline)
+    }
+
     /// One AX attribute read, classified into whether the value was affirmatively present, is
     /// legitimately absent (the attribute doesn't apply to this element — `.noValue`/
     /// `.attributeUnsupported`), or is unreadable for any other reason (Codex finding 1: a

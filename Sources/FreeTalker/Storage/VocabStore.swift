@@ -2,12 +2,26 @@ import CSQLite
 import Foundation
 import os
 
+/// Where a piece of vocabulary evidence came from (Correction Loop,
+/// BRAINSTORM_CORRECTION_LOOP.md "Record corrections as vocabulary evidence"): `.mined` is
+/// `VocabularyMiner`'s own transcript-vs-refined diffing; `.userSupplied` is a deliberate
+/// correction (hotkey panel, spoken correction, or a confirmed observed edit) — stronger
+/// evidence, approved immediately rather than waiting for `VocabStore.minimumRecurrence`. The
+/// raw string matches the `vocab_evidence.source` column exactly (see `DatabaseMigrator.
+/// migrateVocabEvidenceSourceV15`).
+enum VocabEvidenceSource: String, Equatable, Sendable {
+    case mined
+    case userSupplied = "user"
+}
+
 /// One evidence sighting: a dictation whose refined output contained an anchored local
 /// substitution correction of `normalizedTerm`, spelled `surfaceTerm` in that dictation. See
-/// `VocabularyMiner`.
+/// `VocabularyMiner`. `source` defaults to `.mined` — the miner's own call site never needs to
+/// name it explicitly; Correction Loop's call sites always pass `.userSupplied`.
 struct VocabEvidenceCandidate: Equatable, Sendable {
     let normalizedTerm: String
     let surfaceTerm: String
+    var source: VocabEvidenceSource = .mined
 }
 
 /// A term recurring in evidence with no explicit decision yet — what Settings shows in the
@@ -122,12 +136,13 @@ actor VocabStore {
                 for candidate in bounded {
                     try execute(
                         """
-                        INSERT INTO vocab_evidence (dictation_id, normalized_term, surface_term, first_seen)
-                        VALUES (?, ?, ?, ?)
+                        INSERT INTO vocab_evidence (dictation_id, normalized_term, surface_term, first_seen, source)
+                        VALUES (?, ?, ?, ?, ?)
                         ON CONFLICT(dictation_id, normalized_term) DO NOTHING;
                         """,
                         bindings: [.int64(dictationID), .text(candidate.normalizedTerm),
-                                   .text(candidate.surfaceTerm), .double(now.timeIntervalSince1970)]
+                                   .text(candidate.surfaceTerm), .double(now.timeIntervalSince1970),
+                                   .text(candidate.source.rawValue)]
                     )
                 }
             }
@@ -178,6 +193,25 @@ actor VocabStore {
                 recurrence: Int(sqlite3_column_int64(statement, 2)),
                 mostRecentSeenAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 3))
             ))
+            result = sqlite3_step(statement)
+        }
+        guard result == SQLITE_DONE else { throw sqlError() }
+        return results
+    }
+
+    /// Every evidence source recorded for `normalizedTerm`, most-recent-`first_seen`-first — the
+    /// observable half of "corrections must be marked as user-supplied... distinguishable from
+    /// mined evidence" (BRAINSTORM_CORRECTION_LOOP.md, "Record corrections as vocabulary
+    /// evidence"). Not consulted by `suggestions()`/`approve()`/`CorrectionRecorder` — those only
+    /// need evidence to EXIST, not where it came from — this is a diagnostic/testable read.
+    func evidenceSources(normalizedTerm: String) throws -> [VocabEvidenceSource] {
+        let statement = try prepare("SELECT source FROM vocab_evidence WHERE normalized_term = ? ORDER BY first_seen DESC;")
+        defer { sqlite3_finalize(statement) }
+        bind([.text(normalizedTerm)], to: statement)
+        var results: [VocabEvidenceSource] = []
+        var result = sqlite3_step(statement)
+        while result == SQLITE_ROW {
+            if let source = VocabEvidenceSource(rawValue: text(statement, 0)) { results.append(source) }
             result = sqlite3_step(statement)
         }
         guard result == SQLITE_DONE else { throw sqlError() }
@@ -305,6 +339,30 @@ actor VocabStore {
         }
         guard result == SQLITE_DONE else { throw sqlError() }
         return results
+    }
+
+    /// The explicit decision for one term, or nil if none exists yet — Correction Loop's
+    /// immediate-approval path (`CorrectionRecorder`) uses this to distinguish "no decision yet"
+    /// (approve right away) from "already approved" (no-op) from "previously dismissed" (must not
+    /// silently return — see BRAINSTORM_CORRECTION_LOOP.md item 10), without pulling every
+    /// decision in the store the way `decisions()` (Backup Bundle export) does.
+    func decision(normalizedTerm: String) throws -> VocabDecision? {
+        let statement = try prepare("SELECT normalized_term, status, surface_term, decided_at FROM vocab_decisions WHERE normalized_term = ?;")
+        defer { sqlite3_finalize(statement) }
+        bind([.text(normalizedTerm)], to: statement)
+        let result = sqlite3_step(statement)
+        guard result == SQLITE_ROW else {
+            guard result == SQLITE_DONE else { throw sqlError() }
+            return nil
+        }
+        guard let status = VocabDecisionStatus(rawValue: text(statement, 1)) else {
+            throw DatabaseError.sqlFailed("Invalid vocab_decisions.status in Library database")
+        }
+        return VocabDecision(
+            normalizedTerm: text(statement, 0), status: status,
+            surfaceTerm: optionalText(statement, 2),
+            decidedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 3))
+        )
     }
 
     /// Approved terms only, oldest-`decidedAt`-first — the exact order `EffectiveVocabulary`

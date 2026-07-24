@@ -6,7 +6,7 @@ enum DatabaseRole: Sendable {
 }
 
 enum DatabaseMigrator {
-    static let latestVersion = 14
+    static let latestVersion = 15
 
     static func migrate(_ db: OpaquePointer, role: DatabaseRole = .jobs) throws {
         try execute(db, "BEGIN IMMEDIATE;")
@@ -34,6 +34,8 @@ enum DatabaseMigrator {
                     try migrateVoiceCommandSnapshotV13(db, role: role)
                 } else if version == 14 {
                     try migrateVocabV14(db, role: role)
+                } else if version == 15 {
+                    try migrateVocabEvidenceSourceV15(db, role: role)
                 } else {
                     try execute(db, migration)
                 }
@@ -243,8 +245,9 @@ enum DatabaseMigrator {
     private static let migration12 = ""
     private static let migration13 = ""
     private static let migration14 = ""
+    private static let migration15 = ""
 
-    private static let migrations = [migration1, migration2, migration3, migration4, migration5, migration6, migration7, migration8, migration9, migration10, migration11, migration12, migration13, migration14]
+    private static let migrations = [migration1, migration2, migration3, migration4, migration5, migration6, migration7, migration8, migration9, migration10, migration11, migration12, migration13, migration14, migration15]
 
     /// Adds the Usage Statistics columns to an existing Library `dictations` table. Runs only for
     /// the Library database (the jobs database has no `dictations`). Guarded by `columnExists` so a
@@ -330,6 +333,22 @@ enum DatabaseMigrator {
             CHECK (status != 'approved' OR surface_term IS NOT NULL)
         );
         """)
+    }
+
+    /// Adds `vocab_evidence.source` (Correction Loop, BRAINSTORM_CORRECTION_LOOP.md "Record
+    /// corrections as vocabulary evidence"): distinguishes a USER-SUPPLIED correction (hotkey
+    /// panel, spoken correction, or an observed edit) from ordinary MINED evidence
+    /// (`VocabularyMiner`) — user corrections are stronger evidence and are approved immediately
+    /// rather than waiting for `VocabStore.minimumRecurrence`. `DEFAULT 'mined'` classifies every
+    /// pre-existing row correctly (all evidence before this migration came from the miner) without
+    /// a backfill pass. Library database only, same as V14; guarded by `columnExists` for the same
+    /// idempotence reasons `migrateLibraryStatsV12` documents.
+    private static func migrateVocabEvidenceSourceV15(_ db: OpaquePointer, role: DatabaseRole) throws {
+        guard role == .library else { return }
+        guard try tableExists("vocab_evidence", db: db) else { return }
+        if try !columnExists("source", in: "vocab_evidence", db: db) {
+            try execute(db, "ALTER TABLE vocab_evidence ADD COLUMN source TEXT NOT NULL DEFAULT 'mined';")
+        }
     }
 
     private static func migrateCaptureV11(_ db: OpaquePointer, role: DatabaseRole) throws {
