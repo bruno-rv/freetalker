@@ -225,6 +225,17 @@ final class AppCoordinator: ObservableObject {
     /// session, if any (Codex finding 8) — `nil` whenever `liveInsertionSession` is `nil`, and
     /// torn down (`finish()`) at exactly the same points, by `cancelLiveStreaming()`.
     private var liveAudioFanOut: LiveAudioFanOut?
+    /// The `Task` running `startLiveStreaming`'s prepare/start/setPartialCallback sequence for the
+    /// CURRENT capture, if any (Codex finding 5) — without tracking and cancelling this, a
+    /// suspended sequence from a cancelled capture could resume after teardown and reinstall its
+    /// own (stale) callback on the shared engine.
+    private var liveStreamSetupTask: Task<Void, Never>?
+    /// The most recently spawned `streamingEngine.reset()` teardown `Task` (Codex finding 5) — a
+    /// fire-and-forget reset, if left untracked, can run after the NEXT capture has already
+    /// called `prepare`/`start`/`setPartialCallback` on the same shared engine and wipe its
+    /// callback/decoder state out from under it. `startLiveStreaming` awaits this before touching
+    /// the engine, so a prior capture's teardown always completes before the next one reuses it.
+    private var engineTeardownTask: Task<Void, Never>?
     private let appleFMProcessor = AppleFMProcessor()
     private let localContextProvider: any LocalContextProvider = AccessibilityLocalContextProvider()
     private let screenshotService: any ActiveWindowScreenshotCapturing = ActiveWindowScreenshotService()
@@ -1548,14 +1559,30 @@ final class AppCoordinator: ObservableObject {
                 // `cancelLiveStreaming()` (called on every terminal transition) can `finish()`
                 // it, which is what stops a late chunk from this Recording reaching a later
                 // one's `streamingEngine` state.
+                //
+                // Codex finding 6: the queue is created here (before capture starts, so
+                // `audioCapture.start`'s `liveSampleConsumer` has somewhere to enqueue into
+                // immediately), but draining begins only in `startLiveStreaming`, once
+                // `streamingEngine.start()` and `setPartialCallback` have both succeeded — never
+                // here. Enqueued samples just sit in the bounded queue until then, so nothing is
+                // lost, and none of them can land in whatever state the SHARED manager was in
+                // before `start()`'s `reset()` discards it.
                 let fanOut = LiveAudioFanOut()
                 liveAudioFanOut = fanOut
-                fanOut.start { [weak self] samples in
-                    await self?.streamingEngine.append(samples: samples)
-                }
+                // Codex finding 8: this overflow notification fires from a queue callback that
+                // can outlive the capture that created it — bind it to THIS exact fan-out
+                // instance and generation, not to "whatever `liveInsertionSession` is current
+                // when it happens to run", so a late overflow from a prior capture can never
+                // freeze a later one's session.
+                let generation = recordingGeneration
                 liveSampleConsumer = { [weak fanOut, weak self] samples in
-                    fanOut?.enqueue(samples) {
-                        Task { @MainActor in self?.liveInsertionSession?.freeze() }
+                    guard let fanOut else { return }
+                    fanOut.enqueue(samples) {
+                        Task { @MainActor in
+                            guard let self, self.liveAudioFanOut === fanOut,
+                                  self.recordingGeneration == generation else { return }
+                            self.liveInsertionSession?.freeze()
+                        }
                     }
                 }
             }
@@ -1599,6 +1626,10 @@ final class AppCoordinator: ObservableObject {
                 let message = Self.captureStartFailureMessage(
                     errorDescription: error.localizedDescription
                 )
+                // Codex finding 7: `audioCapture.start` threw AFTER the fan-out above was already
+                // created and stored on `self` — without this, nothing ever `finish()`es or nils
+                // it, stranding it (and its consumer task) past this capture's cleanup.
+                cancelLiveStreaming()
                 _ = reduceCaptureAdmission(.cancelRequested)
                 Task {
                     let destination = recordingDestination ?? .external
@@ -2771,25 +2802,57 @@ final class AppCoordinator: ObservableObject {
         livePreviewTask = nil
     }
 
+    /// Whether `self` still owns `session` at exactly `generation` (Codex finding 5) — re-checked
+    /// after EVERY suspension point in `startLiveStreaming`'s setup sequence, since a cancelled
+    /// capture's suspended `prepare`/`start`/`setPartialCallback` chain must never resume and act
+    /// on the shared engine once ownership has moved on (a later capture, or nothing at all).
+    private func ownsLiveSession(_ session: LiveInsertionSession, generation: Int) -> Bool {
+        recordingGeneration == generation && liveInsertionSession === session
+    }
+
     /// Starts the live typing lane for the Recording that just began — `target` already passed
-    /// every `shouldStreamLive` gate condition in `prepareLiveStreamingCandidate`. `prepare`/
-    /// `start`/registering the partial callback all run off the synchronous capture-start path:
-    /// audio already flows into `streamingEngine.append` (wired in `completeCaptureAdmission`)
-    /// the moment the tap starts, and `append` itself no-ops until the engine reports ready — so a
-    /// few buffers recorded before the (already-downloaded) model finishes loading into memory are
-    /// simply not streamed, never dropped from the durable recording or the batch fallback.
+    /// every `shouldStreamLive` gate condition in `prepareLiveStreamingCandidate`.
+    ///
+    /// Codex finding 5: this whole sequence — awaiting the PRIOR capture's teardown, then
+    /// `prepare`/`start`/`setPartialCallback` — runs as one tracked, cancellable `Task` stored in
+    /// `liveStreamSetupTask`, with an ownership re-check after every suspension point. Without
+    /// that, cancelling capture A does not stop A's suspended setup from resuming later and
+    /// reinstalling A's callback on the shared engine, and A's fire-and-forget `reset()` (from
+    /// `cancelLiveStreaming`) could otherwise run after B has already configured the engine and
+    /// wipe B's callback/decoder out from under it — `engineTeardownTask` is awaited here before
+    /// touching the engine at all, so a prior capture's teardown always finishes first.
+    ///
+    /// Codex finding 6: audio only starts DRAINING into the engine (`liveAudioFanOut?.start`)
+    /// once `prepare`, `start`, AND `setPartialCallback` have all succeeded — never before. Buffers
+    /// enqueued by `completeCaptureAdmission`'s `liveSampleConsumer` before that just sit in the
+    /// bounded queue; draining them earlier risked the first ones landing in whatever state the
+    /// SHARED manager was in before `start()`'s `reset()` discards it.
     private func startLiveStreaming(target: InsertionTarget) {
         let generation = recordingGeneration
         let session = LiveInsertionSession(target: target, generation: generation)
         liveInsertionSession = session
+        // Codex finding 9: marks the streaming model "in use" for the exact window `prepare()`
+        // may be suspended loading it into memory — Settings' Delete guards on this so deletion
+        // can no longer unload/remove the model files out from under a suspended `prepare()`,
+        // whose stale resume would then set `isReady = true` again despite the files being gone.
+        streamingModelStore.markCaptureActive(true)
         let engine = streamingEngine
-        Task { [weak self] in
+        let priorTeardown = engineTeardownTask
+        liveStreamSetupTask = Task { [weak self] in
+            await priorTeardown?.value
+            guard let self, !Task.isCancelled, self.ownsLiveSession(session, generation: generation) else { return }
             do {
                 try await engine.prepare(progress: nil)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, self.ownsLiveSession(session, generation: generation) else { return }
+            do {
                 try await engine.start()
             } catch {
                 return
             }
+            guard !Task.isCancelled, self.ownsLiveSession(session, generation: generation) else { return }
             await engine.setPartialCallback { [weak self] confirmed in
                 Task { @MainActor in
                     guard let self, self.recordingGeneration == generation,
@@ -2797,7 +2860,24 @@ final class AppCoordinator: ObservableObject {
                     session.receivePartial(confirmed)
                 }
             }
+            guard !Task.isCancelled, self.ownsLiveSession(session, generation: generation),
+                  let fanOut = self.liveAudioFanOut else { return }
+            // Codex finding 5 (session token): only THIS fan-out instance's own drained samples
+            // ever reach `streamingEngine.append` — a stale consumer from a torn-down capture
+            // fails the identity check and drops its samples instead of feeding them into
+            // whatever capture currently owns the shared engine.
+            fanOut.start { [weak self, weak fanOut] samples in
+                guard let self, let fanOut else { return }
+                guard await self.isCurrentFanOut(fanOut) else { return }
+                await self.streamingEngine.append(samples: samples)
+            }
         }
+    }
+
+    /// Codex finding 5 (session token for `append`): true only while `fanOut` is still THE fan-out
+    /// this coordinator currently owns.
+    private func isCurrentFanOut(_ fanOut: LiveAudioFanOut) -> Bool {
+        liveAudioFanOut === fanOut
     }
 
     /// Tears an in-progress live session down without inserting anything: backspaces whatever's
@@ -2808,14 +2888,20 @@ final class AppCoordinator: ObservableObject {
     /// a Recording without going through `runPipeline`'s insert closure (Codex finding 7) — a
     /// session left dangling there could otherwise be finalized by a LATER Recording, backspacing
     /// at the new focus using the old target. Safe even when nothing is streaming
-    /// (`liveInsertionSession` nil); every call site calls this unconditionally.
+    /// (`liveInsertionSession` nil); every call site calls this unconditionally. Also cancels a
+    /// still-suspended `startLiveStreaming` setup sequence (Codex finding 5), and tracks its own
+    /// `reset()` teardown so the NEXT capture's `startLiveStreaming` can await it before reusing
+    /// the shared engine.
     private func cancelLiveStreaming() {
+        liveStreamSetupTask?.cancel()
+        liveStreamSetupTask = nil
         liveAudioFanOut?.finish()
         liveAudioFanOut = nil
+        streamingModelStore.markCaptureActive(false)
         guard let session = liveInsertionSession else { return }
         liveInsertionSession = nil
         _ = session.finalize(action: .cancel, refinedText: "", rawText: "")
-        Task { [engine = streamingEngine] in await engine.reset() }
+        engineTeardownTask = Task { [engine = streamingEngine] in await engine.reset() }
     }
 
     /// Pure ownership check (Codex finding 7): a live session may only ever be finalized by the
@@ -2844,10 +2930,13 @@ final class AppCoordinator: ObservableObject {
         }
         return { [weak self] text, _ in
             guard let self else { return false }
+            self.liveStreamSetupTask?.cancel()
+            self.liveStreamSetupTask = nil
             self.liveInsertionSession = nil
             self.liveAudioFanOut?.finish()
             self.liveAudioFanOut = nil
-            Task { [engine = self.streamingEngine] in await engine.reset() }
+            self.streamingModelStore.markCaptureActive(false)
+            self.engineTeardownTask = Task { [engine = self.streamingEngine] in await engine.reset() }
             switch session.finalize(action: .done, refinedText: text, rawText: text) {
             case .insert(let finalText):
                 return Insertion.insert(finalText, target: session.target).posted
