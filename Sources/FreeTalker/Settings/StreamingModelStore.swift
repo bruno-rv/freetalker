@@ -50,13 +50,33 @@ final class StreamingModelStore: ObservableObject {
         return SpeechModelStore.Inspection(downloaded: true, sizeBytes: SpeechModelStore.recursiveSize(of: directory))
     }
 
-    func refresh() async {
+    /// Pure decision (Codex finding 6) of whether `refresh` should proceed to write `phase`/
+    /// `sizeBytes`, factored out so it's directly unit-testable without touching the file system
+    /// or the real FluidAudio engine — same style as `Insertion.classifyPreflightFailure`/
+    /// `shouldSynthesizePaste`. `refresh` consults this TWICE — before AND after the detached
+    /// inspection — answering the same way both times: an ordinary (non-`force`) refresh must
+    /// never write over a transitional phase, whether that phase was already set when `refresh`
+    /// was called, or was set by a NEW operation that started while this refresh's detached
+    /// inspection was still in flight.
+    nonisolated static func shouldApplyRefresh(phase: SpeechModelStore.Phase, force: Bool) -> Bool {
+        guard !force else { return true }
         switch phase {
-        case .downloading, .busy: return
-        case .notDownloaded, .downloaded, .failed: break
+        case .downloading, .busy: return false
+        case .notDownloaded, .downloaded, .failed: return true
         }
+    }
+
+    /// `force`, when true, is the operation-owned call `download()`/`delete()` make at the end of
+    /// their own state transition (Codex finding 6): those callers just left `.downloading`/
+    /// `.busy` themselves and need the inspection-based refresh to actually run rather than
+    /// bouncing off the transitional-phase guard, which would otherwise leave the UI stuck on
+    /// "Downloading…"/"Loading…" forever (successful download, and both delete outcomes, never
+    /// left those phases before calling this).
+    func refresh(force: Bool = false) async {
+        guard Self.shouldApplyRefresh(phase: phase, force: force) else { return }
         let directory = modelDirectory
         let inspection = await Task.detached { Self.inspect(directory) }.value
+        guard Self.shouldApplyRefresh(phase: phase, force: force) else { return }
         phase = inspection.downloaded ? .downloaded : .notDownloaded
         sizeBytes = inspection.sizeBytes
     }
@@ -75,7 +95,7 @@ final class StreamingModelStore: ObservableObject {
             phase = .failed(error.localizedDescription)
             return
         }
-        await refresh()
+        await refresh(force: true)
     }
 
     func delete() async throws {
@@ -93,9 +113,9 @@ final class StreamingModelStore: ObservableObject {
         let directory = modelDirectory
         do {
             try await Task.detached { try FileManager.default.removeItem(at: directory) }.value
-            await refresh()
+            await refresh(force: true)
         } catch {
-            await refresh()
+            await refresh(force: true)
             throw error
         }
     }
