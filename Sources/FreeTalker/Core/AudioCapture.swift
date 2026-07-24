@@ -743,20 +743,24 @@ final class AudioCapture: @unchecked Sendable {
         if signalDecision != .continueRecording {
             signalHandler?(signalDecision)
         }
+        // Durable journal write happens BEFORE the optional live fan-out (Codex finding 8) — the
+        // fan-out must never be able to delay or gate the write that Recovery depends on.
+        if let consumer {
+            let result = consumer(convertedSamples)
+            if Self.consumerFailureAction(for: result) == .escalate {
+                let shouldReport = samplesLock.withLock {
+                    guard !didReportConsumerFailure else { return false }
+                    didReportConsumerFailure = true
+                    return true
+                }
+                if shouldReport, let failureHandler {
+                    Task { failureHandler(result) }
+                }
+            }
+        }
         // Fire-and-forget, purely additive fan-out — never gates or affects `samples`/the durable
-        // `sampleConsumer` write below, which stay exactly as they are without Streaming ASR.
+        // `sampleConsumer` write above, which stay exactly as they are without Streaming ASR.
         liveConsumer?(convertedSamples)
-        guard let consumer else { return }
-        let result = consumer(convertedSamples)
-        guard Self.consumerFailureAction(for: result) == .escalate else { return }
-        let shouldReport = samplesLock.withLock {
-            guard !didReportConsumerFailure else { return false }
-            didReportConsumerFailure = true
-            return true
-        }
-        if shouldReport, let failureHandler {
-            Task { failureHandler(result) }
-        }
     }
 
     private func recordConversionFailure(generation: UUID) {
