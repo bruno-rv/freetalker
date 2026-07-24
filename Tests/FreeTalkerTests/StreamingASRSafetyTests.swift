@@ -51,7 +51,7 @@ import Testing
     @Test func finalizeDecisionBackspacesOnlyWhenVerified() {
         let (shouldBackspace, shouldFreeze, outcome) = LiveInsertionSession.finalizeDecision(
             action: .done, refinedText: "refined", rawText: "raw",
-            isFrozen: false, ledgerCount: 5, verified: true
+            isFrozen: false, ledgerCount: 5, verified: true, emptyLedgerInsertSafe: true
         )
         #expect(shouldBackspace)
         #expect(!shouldFreeze)
@@ -64,7 +64,7 @@ import Testing
         // instead goes to the clipboard with a HUD hint.
         let (shouldBackspace, shouldFreeze, outcome) = LiveInsertionSession.finalizeDecision(
             action: .done, refinedText: "refined", rawText: "raw",
-            isFrozen: false, ledgerCount: 5, verified: false
+            isFrozen: false, ledgerCount: 5, verified: false, emptyLedgerInsertSafe: true
         )
         #expect(!shouldBackspace)
         #expect(shouldFreeze)
@@ -77,7 +77,7 @@ import Testing
         // (no backspace) AND never touch the clipboard (there is no refined text to offer).
         let (shouldBackspace, shouldFreeze, outcome) = LiveInsertionSession.finalizeDecision(
             action: .cancel, refinedText: "", rawText: "",
-            isFrozen: false, ledgerCount: 5, verified: false
+            isFrozen: false, ledgerCount: 5, verified: false, emptyLedgerInsertSafe: true
         )
         #expect(!shouldBackspace)
         #expect(shouldFreeze)
@@ -87,7 +87,7 @@ import Testing
     @Test func finalizeDecisionCancelOnVerifiedMatchBackspacesAndInsertsNothing() {
         let (shouldBackspace, shouldFreeze, outcome) = LiveInsertionSession.finalizeDecision(
             action: .cancel, refinedText: "", rawText: "",
-            isFrozen: false, ledgerCount: 5, verified: true
+            isFrozen: false, ledgerCount: 5, verified: true, emptyLedgerInsertSafe: true
         )
         #expect(shouldBackspace)
         #expect(!shouldFreeze)
@@ -99,22 +99,149 @@ import Testing
         // regardless of what `verified` says — the target may be a different window/app entirely.
         let (shouldBackspace, shouldFreeze, outcome) = LiveInsertionSession.finalizeDecision(
             action: .done, refinedText: "refined", rawText: "raw",
-            isFrozen: true, ledgerCount: 5, verified: true
+            isFrozen: true, ledgerCount: 5, verified: true, emptyLedgerInsertSafe: true
         )
         #expect(!shouldBackspace)
         #expect(!shouldFreeze)
         #expect(outcome == .clipboardOnly("refined"))
     }
 
-    @Test func finalizeDecisionEmptyLedgerNeedsNoVerification() {
-        // Nothing was ever typed: no destructive action, and `verified` is irrelevant.
+    @Test func finalizeDecisionEmptyLedgerNeedsNoBackspaceVerificationButStillNeedsTheFreshInsertCheck() {
+        // Nothing was ever typed: no destructive backspace, so `verified` is irrelevant — but
+        // (Codex round 3 finding 1) `.insert` is still gated on the caller's fresh
+        // collapsed-selection/secure/identity check.
         let (shouldBackspace, shouldFreeze, outcome) = LiveInsertionSession.finalizeDecision(
             action: .done, refinedText: "refined", rawText: "raw",
-            isFrozen: false, ledgerCount: 0, verified: false
+            isFrozen: false, ledgerCount: 0, verified: false, emptyLedgerInsertSafe: true
         )
         #expect(!shouldBackspace)
         #expect(!shouldFreeze)
         #expect(outcome == .insert("refined"))
+    }
+
+    @Test func finalizeDecisionEmptyLedgerFallsBackToClipboardWhenTheFreshInsertCheckFails() {
+        // Codex round 3 finding 1: an empty ledger previously took the `.insert` branch
+        // unconditionally — no destructive backspace, but `.insert` still performs the session's
+        // only OTHER consequential action (an ordinary pasteboard paste) with none of the
+        // streaming security checks. When the caller's fresh check fails (a selection is present,
+        // the target drifted, or the field turned secure), this must fall back to clipboard-only,
+        // same as an unverified non-empty ledger — and never backspace (there's nothing to).
+        let (shouldBackspace, shouldFreeze, outcome) = LiveInsertionSession.finalizeDecision(
+            action: .done, refinedText: "refined", rawText: "raw",
+            isFrozen: false, ledgerCount: 0, verified: false, emptyLedgerInsertSafe: false
+        )
+        #expect(!shouldBackspace)
+        #expect(!shouldFreeze)
+        #expect(outcome == .clipboardOnly("refined"))
+    }
+
+    @Test func finalizeDecisionEmptyLedgerCancelIgnoresTheFreshInsertCheck() {
+        // Cancel with nothing typed has nothing to insert regardless of the fresh check's result.
+        let (shouldBackspace, shouldFreeze, outcome) = LiveInsertionSession.finalizeDecision(
+            action: .cancel, refinedText: "", rawText: "",
+            isFrozen: false, ledgerCount: 0, verified: false, emptyLedgerInsertSafe: false
+        )
+        #expect(!shouldBackspace)
+        #expect(!shouldFreeze)
+        #expect(outcome == .none)
+    }
+
+    // MARK: - Round 3 finding 1: `finalize()` performs the fresh empty-ledger check itself
+
+    @MainActor
+    @Test func finalizeWithEmptyLedgerRequiresAFreshCollapsedCaretCheckBeforeInserting() {
+        // Nothing was ever typed (`receivePartial` never called, ledger stays empty) — `finalize`
+        // must still call `writeSnapshotCaret` with `expectedCaret: nil` (a fresh
+        // collapsed-selection/secure/identity read) before accepting `.insert`.
+        var writeSnapshotCaretCalls: [Int?] = []
+        let target = InsertionTarget(bundleID: "com.test.app", pid: 1, focusedElement: nil, window: nil)
+        let session = LiveInsertionSession(
+            target: target,
+            generation: 1,
+            writeSnapshotCaret: { _, expectedCaret in
+                writeSnapshotCaretCalls.append(expectedCaret)
+                return 0
+            },
+            readBaselineValue: { _ in "" },
+            verifyBeforeDelete: { _, _, _, _ in false }
+        )
+        let outcome = session.finalize(action: .done, refinedText: "refined", rawText: "refined")
+        #expect(writeSnapshotCaretCalls == [nil])
+        #expect(outcome == .insert("refined"))
+    }
+
+    @MainActor
+    @Test func finalizeWithEmptyLedgerFallsBackToClipboardWhenTheFreshCheckFails() {
+        // The fresh check finds a real selection, a drifted target, or a now-secure field — the
+        // empty-ledger `.insert` must never be taken; the refined text goes to the clipboard
+        // instead. This is the exact scenario Codex round 3 finding 1 found unguarded: the user
+        // selected pre-existing text before stopping, or the field turned secure mid-Recording,
+        // and the OLD code pasted straight over it with no check at all.
+        let target = InsertionTarget(bundleID: "com.test.app", pid: 1, focusedElement: nil, window: nil)
+        let session = LiveInsertionSession(
+            target: target,
+            generation: 1,
+            writeSnapshotCaret: { _, _ in nil },
+            readBaselineValue: { _ in "" },
+            verifyBeforeDelete: { _, _, _, _ in false }
+        )
+        let outcome = session.finalize(action: .done, refinedText: "refined", rawText: "refined")
+        #expect(outcome == .clipboardOnly("refined"))
+    }
+
+    @MainActor
+    @Test func finalizeWithEmptyLedgerOnCancelNeverConsultsTheFreshCheck() {
+        // Cancel with nothing typed has nothing to insert either way — must stay `.none` without
+        // even performing the (unnecessary) fresh AX read.
+        var writeSnapshotCaretCalled = false
+        let target = InsertionTarget(bundleID: "com.test.app", pid: 1, focusedElement: nil, window: nil)
+        let session = LiveInsertionSession(
+            target: target,
+            generation: 1,
+            writeSnapshotCaret: { _, _ in
+                writeSnapshotCaretCalled = true
+                return nil
+            },
+            readBaselineValue: { _ in "" },
+            verifyBeforeDelete: { _, _, _, _ in false }
+        )
+        let outcome = session.finalize(action: .cancel, refinedText: "", rawText: "")
+        #expect(!writeSnapshotCaretCalled)
+        #expect(outcome == .none)
+    }
+
+    // MARK: - Round 3 finding 2: the anchor authenticates provenance, not just location
+
+    @Test func documentMatchesBaselinePlusLedgerAcceptsAnExactReconstruction() {
+        let baseline = Array("Dear Sir, . Best regards".utf16)
+        let ledger = Array("hello".utf16)
+        let anchor = "Dear Sir, ".utf16.count
+        let current = Array("Dear Sir, hello. Best regards".utf16)
+        #expect(Insertion.documentMatchesBaselinePlusLedger(current: current, baseline: baseline, ledger: ledger, anchor: anchor))
+    }
+
+    @Test func documentMatchesBaselinePlusLedgerRefusesPreExistingTextThatOnlyMatchesByLocation() {
+        // Codex round 3 finding 2: the field already contains "hello" at offset 0 (the baseline).
+        // This session's own synthesized "hello" at offset 0 is silently swallowed by the
+        // app/IME — the real document never changes — and the user later parks the caret at
+        // offset 5, right after that pre-existing "hello". The OLD check (trailing text before
+        // the caret) would have accepted this: "hello" sits right before a caret at 5. The
+        // reconstruction check correctly refuses: baseline ("hello") with the ledger ("hello")
+        // spliced in at anchor 0 is "hellohello", which does not match what's actually on screen
+        // ("hello").
+        let baseline = Array("hello".utf16)
+        let ledger = Array("hello".utf16)
+        let current = Array("hello".utf16)
+        #expect(!Insertion.documentMatchesBaselinePlusLedger(current: current, baseline: baseline, ledger: ledger, anchor: 0))
+    }
+
+    @Test func documentMatchesBaselinePlusLedgerRefusesAnOutOfBoundsAnchor() {
+        // A caret-anchor arithmetic impossibility (should be unreachable in practice) fails
+        // closed rather than trapping on the array slice.
+        let baseline = Array("hi".utf16)
+        let ledger = Array("x".utf16)
+        #expect(!Insertion.documentMatchesBaselinePlusLedger(current: baseline, baseline: baseline, ledger: ledger, anchor: 99))
+        #expect(!Insertion.documentMatchesBaselinePlusLedger(current: baseline, baseline: baseline, ledger: ledger, anchor: -1))
     }
 
     // MARK: - Finding 7: capture-generation ownership
@@ -162,7 +289,7 @@ import Testing
             target: target,
             generation: 1,
             writeSnapshotCaret: { _, _ in nil },
-            verifyBeforeDelete: { _, _, _ in false }
+            verifyBeforeDelete: { _, _, _, _ in false }
         )
         session.receivePartial("hello")
         #expect(session.ledger.isEmpty)
@@ -185,7 +312,7 @@ import Testing
                 observedExpectedCaret = expectedCaret
                 return nil // still unsafe/unreadable in this test — no real CGEvent posted
             },
-            verifyBeforeDelete: { _, _, _ in false }
+            verifyBeforeDelete: { _, _, _, _ in false }
         )
         session.receivePartial("hi")
         #expect(wasCalled)
@@ -222,5 +349,31 @@ import Testing
         // than delivered against the new session's state.
         #expect(FluidAudioStreamingEngine.shouldProcessRawPartial(capturedEpoch: 1, currentEpoch: 1))
         #expect(!FluidAudioStreamingEngine.shouldProcessRawPartial(capturedEpoch: 1, currentEpoch: 2))
+    }
+
+    // MARK: - Round 3 finding 6: the model store leaves its transitional phase before refresh
+
+    @Test func shouldApplyRefreshLeavesTransitionalPhasesAloneWithoutForce() {
+        // An ordinary (ambient) refresh — e.g. `SettingsView`'s `.onAppear` — must never write
+        // over `.downloading`/`.busy`: a stale refresh that was already in flight when a NEW
+        // download/delete operation grabbed the model must not clobber that operation's phase.
+        #expect(!StreamingModelStore.shouldApplyRefresh(phase: .downloading(0.5), force: false))
+        #expect(!StreamingModelStore.shouldApplyRefresh(phase: .busy(reloadTarget: "parakeet-eou-160ms"), force: false))
+    }
+
+    @Test func shouldApplyRefreshProceedsOnOrdinaryNonTransitionalPhases() {
+        #expect(StreamingModelStore.shouldApplyRefresh(phase: .notDownloaded, force: false))
+        #expect(StreamingModelStore.shouldApplyRefresh(phase: .downloaded, force: false))
+        #expect(StreamingModelStore.shouldApplyRefresh(phase: .failed("boom"), force: false))
+    }
+
+    @Test func shouldApplyRefreshForcedByTheOwningOperationLeavesTheTransitionalPhase() {
+        // Codex round 3 finding 6: `download()`/`delete()` never left `.downloading`/`.busy`
+        // before calling their own closing `refresh()` — the ordinary transitional-phase guard
+        // bounced it every time, leaving the UI stuck on "Downloading…"/"Loading…" forever. The
+        // operation-owned `force: true` refresh must actually proceed past its own phase.
+        #expect(StreamingModelStore.shouldApplyRefresh(phase: .downloading(1.0), force: true))
+        #expect(StreamingModelStore.shouldApplyRefresh(phase: .busy(reloadTarget: "parakeet-eou-160ms"), force: true))
+        #expect(StreamingModelStore.shouldApplyRefresh(phase: .downloaded, force: true))
     }
 }
