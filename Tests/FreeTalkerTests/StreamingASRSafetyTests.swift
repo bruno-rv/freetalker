@@ -123,4 +123,104 @@ import Testing
         #expect(AppCoordinator.sessionBelongsToCapture(sessionGeneration: 3, currentGeneration: 3))
         #expect(!AppCoordinator.sessionBelongsToCapture(sessionGeneration: 3, currentGeneration: 4))
     }
+
+    // MARK: - Round 2 finding 1: tri-state secure-field check fails closed on doubt
+
+    @Test func secureCheckResultRefusesOnUnreadableSubrole() {
+        // A password field returning `.cannotComplete` (unreadable) while its protected-content
+        // read still succeeds must be treated as unsafe, not "not secure" — the old `Bool`
+        // collapse silently turned any AX error into `false` (fail OPEN); this must fail closed.
+        #expect(Insertion.secureCheckResult(subrole: .unreadable, protectedContent: .value(false)) == .unreadable)
+    }
+
+    @Test func secureCheckResultRefusesOnUnreadableProtectedContent() {
+        #expect(Insertion.secureCheckResult(subrole: .absent, protectedContent: .unreadable) == .unreadable)
+    }
+
+    @Test func secureCheckResultAffirmativeNotSecureRequiresBothReadsToResolve() {
+        // A legitimately absent subrole (the control doesn't expose one at all — most ordinary
+        // text fields) contributes "not secure via subrole", not doubt — otherwise streaming
+        // could never start on any plain text field.
+        #expect(Insertion.secureCheckResult(subrole: .absent, protectedContent: .value(false)) == .notSecure)
+        #expect(Insertion.secureCheckResult(subrole: .value("AXTextField"), protectedContent: .value(false)) == .notSecure)
+    }
+
+    @Test func secureCheckResultDetectsAffirmativelySecureFields() {
+        #expect(Insertion.secureCheckResult(subrole: .value("AXSecureTextField"), protectedContent: .value(false)) == .secure)
+        #expect(Insertion.secureCheckResult(subrole: .absent, protectedContent: .value(true)) == .secure)
+    }
+
+    // MARK: - Round 2 finding 2: per-partial collapsed-selection + caret requirement
+
+    @MainActor
+    @Test func receivePartialFreezesWithoutTypingWhenSelectionOrCaretCheckFails() {
+        // `writeSnapshotCaret` returning nil simulates the fresh read finding a non-collapsed
+        // selection (or a drifted/unsafe target) — must freeze WITHOUT ever reaching the real
+        // CGEvent-posting `typeText`, so nothing is typed over whatever the user just selected.
+        let target = InsertionTarget(bundleID: "com.test.app", pid: 1, focusedElement: nil, window: nil)
+        let session = LiveInsertionSession(
+            target: target,
+            generation: 1,
+            writeSnapshotCaret: { _, _ in nil },
+            verifyBeforeDelete: { _, _, _ in false }
+        )
+        session.receivePartial("hello")
+        #expect(session.ledger.isEmpty)
+        #expect(session.isFrozen)
+    }
+
+    @MainActor
+    @Test func receivePartialChecksSelectionEvenOnTheVeryFirstPostWithAnEmptyLedger() {
+        // The first partial has no caret anchor yet (ledger empty) — the fresh-read check must
+        // still run (with `expectedCaret == nil`, since there's no anchor yet) rather than being
+        // skipped entirely just because nothing has been typed yet.
+        var wasCalled = false
+        var observedExpectedCaret: Int? = -1 // sentinel distinguishable from the expected nil
+        let target = InsertionTarget(bundleID: "com.test.app", pid: 1, focusedElement: nil, window: nil)
+        let session = LiveInsertionSession(
+            target: target,
+            generation: 1,
+            writeSnapshotCaret: { _, expectedCaret in
+                wasCalled = true
+                observedExpectedCaret = expectedCaret
+                return nil // still unsafe/unreadable in this test — no real CGEvent posted
+            },
+            verifyBeforeDelete: { _, _, _ in false }
+        )
+        session.receivePartial("hi")
+        #expect(wasCalled)
+        #expect(observedExpectedCaret == nil)
+        #expect(session.isFrozen)
+    }
+
+    // MARK: - Round 2 finding 3: caret-anchor mismatch refuses to delete
+
+    @Test func verificationOutcomeFailsClosedWhenLedgerNonEmptyButNoAnchorExists() {
+        // Invariant violation (the anchor is always set alongside the ledger's first growth) —
+        // never trust an unverifiable state.
+        #expect(!LiveInsertionSession.verificationOutcome(ledgerIsEmpty: false, hasCaretAnchor: false, readbackMatches: true))
+    }
+
+    @Test func verificationOutcomeRequiresTheCaretReadbackToMatchWhenAnchorExists() {
+        // Codex finding 3: content matching alone is not enough — the caller's `readbackMatches`
+        // already folds in the absolute caret-anchor check (not just "some matching text sits
+        // before wherever the caret currently is"), and a mismatch there must refuse deletion.
+        #expect(LiveInsertionSession.verificationOutcome(ledgerIsEmpty: false, hasCaretAnchor: true, readbackMatches: true))
+        #expect(!LiveInsertionSession.verificationOutcome(ledgerIsEmpty: false, hasCaretAnchor: true, readbackMatches: false))
+    }
+
+    @Test func verificationOutcomeEmptyLedgerNeedsNoAnchorOrReadback() {
+        #expect(LiveInsertionSession.verificationOutcome(ledgerIsEmpty: true, hasCaretAnchor: false, readbackMatches: false))
+    }
+
+    // MARK: - Round 2 finding 4: stale epoch rejection
+
+    @Test func shouldProcessRawPartialRejectsAnEpochFromABeforeSessionThatHasSinceMovedOn() {
+        // A raw partial's handoff `Task` captures the epoch live at `setPartialCallback`
+        // registration time; if `start`/`reset`/`unload` bumped the epoch by the time that Task
+        // actually runs (a later session took over the shared engine), it must be dropped rather
+        // than delivered against the new session's state.
+        #expect(FluidAudioStreamingEngine.shouldProcessRawPartial(capturedEpoch: 1, currentEpoch: 1))
+        #expect(!FluidAudioStreamingEngine.shouldProcessRawPartial(capturedEpoch: 1, currentEpoch: 2))
+    }
 }
