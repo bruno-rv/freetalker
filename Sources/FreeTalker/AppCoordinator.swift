@@ -199,12 +199,28 @@ final class AppCoordinator: ObservableObject {
     /// `RecordingLanguageSnapshot`'s doc comment and `captureRecordingLanguageSnapshot`.
     private var recordingPinSnapshot: String = AppSettings.shared.languagePin
     private var recordingAppLanguageRulesSnapshot: [String: String] = AppSettings.shared.appLanguageRules
+    /// Streaming ASR (BRAINSTORM_STREAMING_ASR.md): the insertion target to start a
+    /// `LiveInsertionSession` against, decided synchronously in `beginCapture` (same moment the
+    /// language/pin/app-rule snapshots above are taken) and consumed once, in
+    /// `completeCaptureAdmission`, when audio capture actually starts. `nil` means this Recording
+    /// doesn't stream — every gate condition in `shouldStreamLive` must hold for it to be set.
+    private var pendingLiveStreamTarget: InsertionTarget?
     @Published private(set) var recordingOutputSelection = RecordingOutputSelection()
 
     let speechModelDownloadCoordinator: SpeechModelDownloadCoordinator
     let speechModelStore: SpeechModelStore
     let whisperEngine: WhisperKitEngine
     let cloudSTTEngine = CloudSTTEngine()
+    /// Streaming ASR (BRAINSTORM_STREAMING_ASR.md): model download/delete state, mirroring
+    /// `speechModelStore` above.
+    let streamingModelStore = StreamingModelStore()
+    /// The live streaming engine, shared across Recordings — `streamingModelStore` and this hold
+    /// the SAME underlying `FluidAudioStreamingEngine` so a model downloaded once stays loaded.
+    private var streamingEngine: any StreamingTranscriptionEngine { streamingModelStore.engine }
+    /// Live typing session for the current Recording, if Streaming ASR is active for it — nil
+    /// whenever streaming isn't gated on (see `shouldStreamLive`), for the whole duration of every
+    /// Recording that doesn't opt in. Torn down at every terminal transition (stop/cancel).
+    private var liveInsertionSession: LiveInsertionSession?
     private let appleFMProcessor = AppleFMProcessor()
     private let localContextProvider: any LocalContextProvider = AccessibilityLocalContextProvider()
     private let screenshotService: any ActiveWindowScreenshotCapturing = ActiveWindowScreenshotService()
@@ -1289,6 +1305,10 @@ final class AppCoordinator: ObservableObject {
     private func handlePanelOneShotLanguage(_ code: String) {
         guard recordingState != .idle else { return }
         oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .panelLanguageTap(code))
+        // A one-shot language change overrides the app-rule/pin resolution a live session's gate
+        // was decided against at Recording start — rather than migrate it, fall back to batch
+        // (BRAINSTORM_STREAMING_ASR.md decision #2).
+        cancelLiveStreaming()
         updateRecordingPanel()
     }
 
@@ -1359,6 +1379,14 @@ final class AppCoordinator: ObservableObject {
         recordingLanguageSnapshot = languageSnapshot.candidateLanguages
         recordingPinSnapshot = languageSnapshot.pin
         recordingAppLanguageRulesSnapshot = languageSnapshot.appLanguageRules
+        // Streaming ASR gate, decided now (key-down) rather than at stop: a live typing session
+        // has to start while the user is still speaking. `oneShot: nil` because `oneShotLanguage`
+        // is always nil at this point (cleared just above) — this is therefore an app-rule/pin
+        // resolution, the same approximation of stop-time `resolveLanguage` every other
+        // capture-start snapshot in this function already makes. If the user taps a one-shot
+        // language on the panel mid-recording, `handlePanelOneShotLanguage` tears the live session
+        // down (silent fallback to batch) rather than trying to migrate it.
+        pendingLiveStreamTarget = prepareLiveStreamingCandidate(languageSnapshot: languageSnapshot)
         let micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
         Self.logger.log("key down: micAuthorizationStatus=\(micStatus.rawValue, privacy: .public)")
         // Guard unconditionally rather than proceeding to record silence — a denied/stale TCC
@@ -1501,8 +1529,21 @@ final class AppCoordinator: ObservableObject {
         let action = reduceCaptureAdmission(.prepared(captureID: active.session.id))
         switch action {
         case .cancel:
+            pendingLiveStreamTarget = nil
             Task { await cleanCancelledAdmission(active, service: service) }
         case .start, .startAndStop:
+            let liveStreamTarget = pendingLiveStreamTarget
+            pendingLiveStreamTarget = nil
+            // `.startAndStop` (an already-finished tap) never starts a live session below, so its
+            // tap must not feed the engine either — an unstarted/stale engine has no session to
+            // deliver partials to.
+            var liveSampleConsumer: (@Sendable ([Float]) -> Void)?
+            if liveStreamTarget != nil, case .start = action {
+                liveSampleConsumer = { [weak self] samples in
+                    guard let self else { return }
+                    Task { await self.streamingEngine.append(samples: samples) }
+                }
+            }
             do {
                 try audioCapture.start(
                     deviceUID: AppSettings.shared.microphoneDeviceUID,
@@ -1522,10 +1563,16 @@ final class AppCoordinator: ObservableObject {
                                 decision, captureID: active.session.id
                             )
                         }
-                    }
+                    },
+                    liveSampleConsumer: liveSampleConsumer
                 )
                 activeCaptureJournal = active
                 startLivePreviewIfNeeded()
+                // Only `.start` (not `.startAndStop`, an already-finished tap) bothers spinning up
+                // the live lane — it would just be torn down again immediately.
+                if case .start = action, let liveStreamTarget {
+                    startLiveStreaming(target: liveStreamTarget)
+                }
                 if case .startAndStop = action {
                     let pending = pendingStopRequest
                     pendingStopRequest = nil
@@ -2044,6 +2091,10 @@ final class AppCoordinator: ObservableObject {
                         guard captureAdmission.state == .finalizing(
                             captureID: active.session.id
                         ) else { return }
+                        // A live session was already typing during this Recording — silence
+                        // detection means the pipeline never reaches `runPipeline`'s insert
+                        // closure below, so the ledger must be torn down here instead.
+                        cancelLiveStreaming()
                         _ = reduceCaptureAdmission(.finalizationFinished(
                             captureID: active.session.id
                         ))
@@ -2100,6 +2151,9 @@ final class AppCoordinator: ObservableObject {
                     _ = reduceCaptureAdmission(.failureHandled(
                         captureID: active.session.id
                     ))
+                    // Journal finalization failed — same reasoning as the silent-capture branch
+                    // above: `runPipeline` never runs, so tear the live session down here.
+                    cancelLiveStreaming()
                     journalFinalizationTask = nil
                     activeCaptureJournal = nil
                     captureOwner = .none
@@ -2177,6 +2231,7 @@ final class AppCoordinator: ObservableObject {
         if let issue = Self.capturedAudioIssue(sampleCount: samples.count, peak: peak, rms: rms) {
             lastError = issue
             hud.flash(issue)
+            cancelLiveStreaming()
             recordingHUDDidEndEarly(.externalDeadAudio)
             return
         }
@@ -2239,6 +2294,7 @@ final class AppCoordinator: ObservableObject {
         guard let recoveryStore else {
             lastError = "Could not save recording for processing"
             hud.flash("Recording could not be saved — transcription not started")
+            cancelLiveStreaming()
             isProcessing = false
             recordingHUDDidReachTerminalState(generation: hudGeneration)
             return
@@ -2246,6 +2302,7 @@ final class AppCoordinator: ObservableObject {
         guard let staged = stoppedCapture?.staged else {
             lastError = "Durable recording ownership is unavailable"
             hud.flash("Recording saved for recovery — processing not started")
+            cancelLiveStreaming()
             isProcessing = false
             recordingHUDDidReachTerminalState(generation: hudGeneration)
             return
@@ -2346,6 +2403,7 @@ final class AppCoordinator: ObservableObject {
     }
 
     private func cancelRecording() {
+        cancelLiveStreaming()
         if case .preparing = captureAdmission.state {
             _ = reduceCaptureAdmission(.cancelRequested)
             pendingStopRequest = nil
@@ -2488,6 +2546,64 @@ final class AppCoordinator: ObservableObject {
         )
     }
 
+    /// Streaming ASR gate (BRAINSTORM_STREAMING_ASR.md edge cases): every condition must hold —
+    /// the toggle is on, the model is already downloaded (never blocks capture start on a
+    /// download), the local WhisperKit engine is selected (never Cloud STT), the resolved
+    /// language is explicit (`Auto` → nil → no live insertion, today's HUD preview) *and* in
+    /// `StreamingASRLanguageSupport`, the focused field isn't secure, and there's a real
+    /// insertion target to type into.
+    nonisolated static func shouldStreamLive(
+        streamingEnabled: Bool,
+        streamingModelDownloaded: Bool,
+        sttEngine: STTEngineKind,
+        forcedLanguage: String?,
+        isSecureField: Bool,
+        hasInsertionTarget: Bool
+    ) -> Bool {
+        guard streamingEnabled, streamingModelDownloaded, sttEngine == .whisperKit,
+              !isSecureField, hasInsertionTarget else { return false }
+        guard let forcedLanguage else { return false }
+        return StreamingASRLanguageSupport.supportedLanguages.contains(forcedLanguage)
+    }
+
+    /// Synchronous, key-down-time evaluation of `shouldStreamLive` against the frontmost app —
+    /// mirrors how every other capture-start snapshot in `beginCapture` reads live AppKit/AX
+    /// state once, up front. Returns the `InsertionTarget` to hand `LiveInsertionSession` when
+    /// every gate condition holds, else nil.
+    private func prepareLiveStreamingCandidate(languageSnapshot: RecordingLanguageSnapshot) -> InsertionTarget? {
+        let streamingEnabled = AppSettings.shared.streamingASREnabled
+        let streamingModelDownloaded = streamingModelStore.phase == .downloaded
+        let sttEngine = AppSettings.shared.sttEngine
+        guard streamingEnabled, streamingModelDownloaded, sttEngine == .whisperKit else { return nil }
+        let app = NSWorkspace.shared.frontmostApplication
+        guard let target = Insertion.snapshotTarget(app: app) else { return nil }
+        let forcedLanguage = Self.resolveLanguage(
+            oneShot: nil,
+            bundleID: app?.bundleIdentifier,
+            appLanguageRules: languageSnapshot.appLanguageRules,
+            pin: languageSnapshot.pin,
+            candidateSet: languageSnapshot.candidateLanguages
+        )
+        // Deny-by-default: only an affirmative "not secure" from a trusted AX query allows
+        // streaming. An untrusted AX session or an unreadable focused field can't confirm safety,
+        // so both are treated as secure (Streaming ASR edge case: never in secure fields).
+        let isSecureField: Bool
+        if let app, Permissions.isAccessibilityTrusted() {
+            isSecureField = AccessibilityContext().focusedField(pid: app.processIdentifier)?.isSecure ?? true
+        } else {
+            isSecureField = true
+        }
+        guard Self.shouldStreamLive(
+            streamingEnabled: streamingEnabled,
+            streamingModelDownloaded: streamingModelDownloaded,
+            sttEngine: sttEngine,
+            forcedLanguage: forcedLanguage,
+            isSecureField: isSecureField,
+            hasInsertionTarget: true
+        ) else { return nil }
+        return target
+    }
+
     /// `candidateSet`: the Dictation Language Set the oneShot/rule/pin value is validated
     /// against — the set snapshotted at Recording start (`recordingLanguageSnapshot`), NOT
     /// necessarily the live `AppSettings.shared.dictationLanguages` at the moment this runs. The
@@ -2627,6 +2743,75 @@ final class AppCoordinator: ObservableObject {
     private func stopLivePreview() {
         livePreviewTask?.cancel()
         livePreviewTask = nil
+    }
+
+    /// Starts the live typing lane for the Recording that just began — `target` already passed
+    /// every `shouldStreamLive` gate condition in `prepareLiveStreamingCandidate`. `prepare`/
+    /// `start`/registering the partial callback all run off the synchronous capture-start path:
+    /// audio already flows into `streamingEngine.append` (wired in `completeCaptureAdmission`)
+    /// the moment the tap starts, and `append` itself no-ops until the engine reports ready — so a
+    /// few buffers recorded before the (already-downloaded) model finishes loading into memory are
+    /// simply not streamed, never dropped from the durable recording or the batch fallback.
+    private func startLiveStreaming(target: InsertionTarget) {
+        let session = LiveInsertionSession(target: target)
+        liveInsertionSession = session
+        let engine = streamingEngine
+        let generation = recordingGeneration
+        Task { [weak self] in
+            do {
+                try await engine.prepare(progress: nil)
+                try await engine.start()
+            } catch {
+                return
+            }
+            await engine.setPartialCallback { [weak self] confirmed in
+                Task { @MainActor in
+                    guard let self, self.recordingGeneration == generation,
+                          self.liveInsertionSession === session else { return }
+                    session.receivePartial(confirmed)
+                }
+            }
+        }
+    }
+
+    /// Tears an in-progress live session down without inserting anything: backspaces whatever's
+    /// been typed so far and resets the engine. Used both by Cancel (Esc) and by a mid-recording
+    /// language change (the panel's one-shot language tap) — silent fallback to batch rather than
+    /// trying to migrate an in-progress live session to a newly-resolved language. Safe even when
+    /// nothing is streaming (`liveInsertionSession` nil); every call site calls this
+    /// unconditionally.
+    private func cancelLiveStreaming() {
+        guard let session = liveInsertionSession else { return }
+        liveInsertionSession = nil
+        _ = session.finalize(action: .cancel, refinedText: "", rawText: "")
+        Task { [engine = streamingEngine] in await engine.reset() }
+    }
+
+    /// Builds the `insert` closure `runPipeline` hands `processDictation` when a live session is
+    /// active for this Recording — the SAME choke point (`processDictation`'s injectable `insert`
+    /// parameter) the batch path's default `{ Insertion.insert($0, target: $1).posted }` uses, so
+    /// there is exactly one place either path posts text. By the time this runs, `skipPostProcessing`
+    /// has already resolved `result.refined` to raw-or-refined text upstream (Feature 3's Raw
+    /// button), so `finalize(action: .done, …)` with that single string for both parameters is
+    /// correct for both Done and Raw. `target` is intentionally ignored — the live session already
+    /// carries its own (identical) snapshotted target from Recording start. Returns nil (batch's
+    /// default) when nothing is streaming.
+    private func liveStreamingInsertClosure() -> ((String, InsertionTarget?) -> Bool)? {
+        guard let session = liveInsertionSession else { return nil }
+        return { [weak self] text, _ in
+            guard let self else { return false }
+            self.liveInsertionSession = nil
+            Task { [engine = self.streamingEngine] in await engine.reset() }
+            switch session.finalize(action: .done, refinedText: text, rawText: text) {
+            case .insert(let finalText):
+                return Insertion.insert(finalText, target: session.target).posted
+            case .clipboardOnly:
+                self.hud.flash("Live dictation moved to the clipboard — the target app changed or the text was long")
+                return false
+            case .none:
+                return true
+            }
+        }
     }
 
     private func runLivePreviewTick(generation: Int) async {
@@ -2798,6 +2983,11 @@ final class AppCoordinator: ObservableObject {
             recordingHUDDidReachTerminalState(generation: hudGeneration)
         }
 
+        // Streaming ASR: captured before the pipeline runs, not read live inside the closure —
+        // `liveInsertionSession` is nilled by the closure itself the moment it fires, and the
+        // pipeline's `insert` closure only ever runs once per stop.
+        let liveInsert = liveStreamingInsertClosure()
+
         await Self.runExternalPipelineTask(
             operation: {
                 try await processDictation(
@@ -2808,6 +2998,7 @@ final class AppCoordinator: ObservableObject {
                     cloudSnapshot: cloudSnapshot.eligibility.isEligible ? cloudSnapshot : nil,
                     voiceCommands: voiceCommands, vocabularySnapshot: vocabularySnapshot,
                     processor: processor, localContext: localContext,
+                    insert: liveInsert ?? { Insertion.insert($0, target: $1).posted },
                     record: { result in
                         try LibraryStore.shared.record(
                             language: result.sourceLanguage.rawValue,
