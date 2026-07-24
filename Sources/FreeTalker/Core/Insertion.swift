@@ -220,6 +220,30 @@ enum Insertion {
         }
     }
 
+    /// Whether a synthetic keystroke should still land at `target` right now — the same drift
+    /// check `insert(_:target:strict:)` performs at paste time (bundle id + pid + best-effort
+    /// focused element/window comparison), reused as-is rather than duplicated. `LiveInsertionSession`
+    /// calls this before typing each live partial so a mid-recording focus change (Streaming ASR
+    /// edge case: focus drift) freezes typing immediately instead of only being caught at stop.
+    /// Always `strict` — a live-typing session always has a real snapshotted target (it only
+    /// exists because one was captured at Recording start), so there is no permissive "nothing to
+    /// contradict" case to fall back to here.
+    static func targetStillFocused(_ target: InsertionTarget) -> Bool {
+        let currentApp = NSWorkspace.shared.frontmostApplication
+        let currentElement = currentApp.flatMap(focusedElement(for:))
+        let currentWindow = currentElement.flatMap(windowElement(for:))
+        let pidMatch = target.pid == currentApp?.processIdentifier
+        let elementComparison = compareElements(snapshot: target, currentElement: currentElement, currentWindow: currentWindow)
+        return shouldSynthesizePaste(
+            hasTarget: true,
+            snapshotBundleID: target.bundleID,
+            currentBundleID: currentApp?.bundleIdentifier,
+            pidMatch: pidMatch,
+            elementComparison: elementComparison,
+            strict: true
+        )
+    }
+
     /// Compares the snapshotted focused element/window against what's focused right now.
     /// Prefers the element comparison (finer-grained); falls back to the window only when no
     /// element was snapshotted. Both nil at snapshot time (AX-opaque app) → `.unavailable`.

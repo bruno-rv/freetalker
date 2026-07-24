@@ -191,6 +191,11 @@ final class AudioCapture: @unchecked Sendable {
     private var isCapturing = false
     private var conversionFailureCount = 0
     private var sampleConsumer: (@Sendable ([Float]) -> CaptureJournalWriter.EnqueueResult)?
+    /// Optional live-tap fan-out (Streaming ASR): receives each converted buffer's samples
+    /// alongside `sampleConsumer`, purely additively — `samples` accumulation and
+    /// `sampleConsumer`'s durable-journal write are completely untouched by this. A throwing/slow
+    /// consumer here must never affect capture, so it's fire-and-forget from `consume`.
+    private var liveSampleConsumer: (@Sendable ([Float]) -> Void)?
     private var onConsumerFailure: (@Sendable (CaptureJournalWriter.EnqueueResult) -> Void)?
     private var didReportConsumerFailure = false
     private var signalWatchdog = MicrophoneSignalWatchdog()
@@ -273,7 +278,8 @@ final class AudioCapture: @unchecked Sendable {
         captureID: UUID? = nil,
         sampleConsumer: (@Sendable ([Float]) -> CaptureJournalWriter.EnqueueResult)? = nil,
         onConsumerFailure: (@Sendable (CaptureJournalWriter.EnqueueResult) -> Void)? = nil,
-        onSignalDecision: (@Sendable (MicrophoneSignalWatchdog.Decision) -> Void)? = nil
+        onSignalDecision: (@Sendable (MicrophoneSignalWatchdog.Decision) -> Void)? = nil,
+        liveSampleConsumer: (@Sendable ([Float]) -> Void)? = nil
     ) throws {
         samplesLock.lock()
         samples.removeAll()
@@ -281,6 +287,7 @@ final class AudioCapture: @unchecked Sendable {
         self.sampleConsumer = sampleConsumer
         self.onConsumerFailure = onConsumerFailure
         self.onSignalDecision = onSignalDecision
+        self.liveSampleConsumer = liveSampleConsumer
         signalWatchdog = MicrophoneSignalWatchdog(captureID: captureID)
         activeDeviceUID = deviceUID
         activeNoiseSuppression = noiseSuppression
@@ -728,6 +735,7 @@ final class AudioCapture: @unchecked Sendable {
         samplesLock.lock()
         samples.append(contentsOf: convertedSamples)
         let consumer = sampleConsumer
+        let liveConsumer = liveSampleConsumer
         let failureHandler = onConsumerFailure
         let signalDecision = signalWatchdog.observe(samples: convertedSamples)
         let signalHandler = onSignalDecision
@@ -735,6 +743,9 @@ final class AudioCapture: @unchecked Sendable {
         if signalDecision != .continueRecording {
             signalHandler?(signalDecision)
         }
+        // Fire-and-forget, purely additive fan-out — never gates or affects `samples`/the durable
+        // `sampleConsumer` write below, which stay exactly as they are without Streaming ASR.
+        liveConsumer?(convertedSamples)
         guard let consumer else { return }
         let result = consumer(convertedSamples)
         guard Self.consumerFailureAction(for: result) == .escalate else { return }
