@@ -261,7 +261,7 @@ enum Insertion {
     /// start). Identity reuses the exact same drift check `insert(_:target:strict:)` performs at
     /// paste time (bundle id + pid + best-effort focused element/window comparison, always
     /// `strict`) rather than a second, divergent implementation. `nil` (unsafe) covers: AX
-    /// untrusted, identity drifted, no focused element, or the focused element is secure.
+    /// untrusted, identity drifted, no focused element, or the focused element is secure/unreadable.
     @MainActor
     static func streamingSafeElement(target: InsertionTarget) -> AXUIElement? {
         guard Permissions.isAccessibilityTrusted() else { return nil }
@@ -282,17 +282,42 @@ enum Insertion {
         return currentElement
     }
 
+    /// One fresh read combining `streamingSafeElement` (identity/security) with a collapsed-
+    /// selection and caret-position check, used immediately before EVERY unicode post
+    /// (`LiveInsertionSession.receivePartial`) — not just once at Recording start (Codex finding
+    /// 2). `expectedCaret`, when non-nil, must equal the CURRENT caret exactly: the anchor
+    /// position this session's own first post observed, plus everything typed since (Codex
+    /// finding 3 — a readback that only checks text content before *wherever* the caret happens
+    /// to be right now can be fooled by an identical run of text elsewhere in the same field; an
+    /// absolute caret match closes that gap). `nil` `expectedCaret` is the first-ever post for
+    /// this session (ledger still empty) — there is no prior anchor to compare against yet, but
+    /// the selection must still be collapsed. Returns the observed caret (to become the anchor on
+    /// the caller's first successful post) or nil if anything is unsafe/unreadable/mismatched.
+    @MainActor
+    static func streamingWriteCaret(target: InsertionTarget, expectedCaret: Int?) -> Int? {
+        guard let element = streamingSafeElement(target: target) else { return nil }
+        guard let range = selectedRange(of: element), range.length == 0 else { return nil }
+        if let expectedCaret, range.location != expectedCaret { return nil }
+        return range.location
+    }
+
     /// Whether the AX-reported text immediately before the caret in `element` exactly matches
-    /// `expectedTrailingText` (Codex finding 3: `CGEvent.post` returning `true` only proves an
-    /// event was queued, never that the target actually consumed it unmodified — an app, IME, or
-    /// autocomplete could transform or swallow it, silently over-counting the ledger). UTF-16
+    /// `expectedTrailingText`, AND the caret sits exactly at `expectedCaret` (Codex finding 3:
+    /// `CGEvent.post` returning `true` only proves an event was queued, never that the target
+    /// actually consumed it unmodified — an app, IME, or autocomplete could transform or swallow
+    /// it, silently over-counting the ledger; and a content-only check can be satisfied by an
+    /// unrelated, identical run of text sitting wherever the caret happens to be NOW rather than
+    /// where this session's own typing left it). `expectedCaret` is the session's caret anchor
+    /// (captured before its first post) plus everything typed since — an absolute, session-
+    /// specific position, not just "immediately before wherever the caret currently is". UTF-16
     /// offsets throughout (AX's native indexing, matching `NSString`) since grapheme clusters
     /// don't map 1:1 to UTF-16 code units. Requires a collapsed caret (no active selection) — a
     /// real selection at this instant means something else changed the field since the session
     /// last typed into it.
-    static func readbackMatches(element: AXUIElement, expectedTrailingText: String) -> Bool {
+    static func readbackMatches(element: AXUIElement, expectedTrailingText: String, expectedCaret: Int) -> Bool {
         guard !expectedTrailingText.isEmpty else { return true }
         guard let range = selectedRange(of: element), range.length == 0 else { return false }
+        guard range.location == expectedCaret else { return false }
         var valueRef: AnyObject?
         guard AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &valueRef) == .success,
               let text = valueRef as? String else { return false }
@@ -303,15 +328,99 @@ enum Insertion {
         return Array(textUTF16[(caret - expectedUTF16.count)..<caret]) == expectedUTF16
     }
 
-    /// Subrole (not role — see the note above) + protected content, read from one element.
+    /// One AX attribute read, classified into whether the value was affirmatively present, is
+    /// legitimately absent (the attribute doesn't apply to this element — `.noValue`/
+    /// `.attributeUnsupported`), or is unreadable for any other reason (Codex finding 1: a
+    /// password field that momentarily returns `.cannotComplete` while its selection is still
+    /// readable must NOT be treated the same as a plain control that has no subrole at all).
+    /// `nonisolated` and generic over the decoded type so it's directly unit-testable without a
+    /// live AX session — see `secureCheckResult` below and `StreamingASRSafetyTests`.
+    enum AttributeReadOutcome<Value: Equatable>: Equatable {
+        case value(Value)
+        case absent
+        case unreadable
+    }
+
+    /// Tri-state result of the secure-field check (Codex finding 1): only `.notSecure` is an
+    /// AFFIRMATIVE "safe to stream" answer. `.secure` and `.unreadable` are both treated as unsafe
+    /// by every caller — the whole point of this type is to make "doubt" and "confirmed secure"
+    /// impossible to conflate at the call site the way the old `Bool` did.
+    enum SecureCheckResult: Equatable {
+        case notSecure
+        case secure
+        case unreadable
+    }
+
+    /// Pure classification (Codex finding 1), factored out of `isSecureForStreaming` so the
+    /// fail-closed-on-doubt behavior is directly unit-testable without a live AX session — same
+    /// style as `classifyPreflightFailure`/`shouldSynthesizePaste` above. A subrole/protected-
+    /// content read that legitimately doesn't apply to this element (`.absent`) contributes
+    /// "not secure via that attribute" (a control with no subrole at all cannot be a secure text
+    /// field via subrole); any other unreadable read (`.unreadable` — AX error, type mismatch)
+    /// fails the whole check closed to `.unreadable` regardless of what the other attribute says.
+    nonisolated static func secureCheckResult(
+        subrole: AttributeReadOutcome<String>,
+        protectedContent: AttributeReadOutcome<Bool>
+    ) -> SecureCheckResult {
+        let subroleSecure: Bool
+        switch subrole {
+        case .value(let value): subroleSecure = value == "AXSecureTextField"
+        case .absent: subroleSecure = false
+        case .unreadable: return .unreadable
+        }
+        let protected: Bool
+        switch protectedContent {
+        case .value(let value): protected = value
+        case .absent: protected = false
+        case .unreadable: return .unreadable
+        }
+        return (subroleSecure || protected) ? .secure : .notSecure
+    }
+
+    /// Subrole (not role — see the note above) + protected content, read from one element, then
+    /// classified tri-state (Codex finding 1: DEFERRED-FINDINGS.md's F4 entry claims
+    /// `streamingStartGate`/`streamingSafeElement` "fail closed when unreadable" — this is what
+    /// makes that claim actually true, rather than the previous `Bool` collapse that silently
+    /// turned every AX error into "not secure").
     private static func isSecureForStreaming(_ element: AXUIElement) -> Bool {
         var subroleRef: AnyObject?
-        let subroleResult = AXUIElementCopyAttributeValue(element, kAXSubroleAttribute as CFString, &subroleRef)
-        let subrole = subroleResult == .success ? subroleRef as? String : nil
+        let subroleError = AXUIElementCopyAttributeValue(element, kAXSubroleAttribute as CFString, &subroleRef)
+        let subroleOutcome: AttributeReadOutcome<String>
+        switch subroleError {
+        case .success:
+            if let subrole = subroleRef as? String {
+                subroleOutcome = .value(subrole)
+            } else {
+                subroleOutcome = .unreadable
+            }
+        case .noValue, .attributeUnsupported:
+            subroleOutcome = .absent
+        default:
+            subroleOutcome = .unreadable
+        }
+
         var protectedRef: AnyObject?
-        let protectedResult = AXUIElementCopyAttributeValue(element, "AXProtectedContent" as CFString, &protectedRef)
-        let protected = protectedResult == .success && ((protectedRef as? Bool) == true || (protectedRef as? NSNumber)?.boolValue == true)
-        return subrole == "AXSecureTextField" || protected
+        let protectedError = AXUIElementCopyAttributeValue(element, "AXProtectedContent" as CFString, &protectedRef)
+        let protectedOutcome: AttributeReadOutcome<Bool>
+        switch protectedError {
+        case .success:
+            if let boolValue = protectedRef as? Bool {
+                protectedOutcome = .value(boolValue)
+            } else if let number = protectedRef as? NSNumber {
+                protectedOutcome = .value(number.boolValue)
+            } else {
+                protectedOutcome = .unreadable
+            }
+        case .noValue, .attributeUnsupported:
+            protectedOutcome = .absent
+        default:
+            protectedOutcome = .unreadable
+        }
+
+        switch secureCheckResult(subrole: subroleOutcome, protectedContent: protectedOutcome) {
+        case .notSecure: return false
+        case .secure, .unreadable: return true
+        }
     }
 
     private static func selectedRange(of element: AXUIElement) -> CFRange? {

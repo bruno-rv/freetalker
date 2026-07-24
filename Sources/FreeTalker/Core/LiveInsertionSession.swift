@@ -44,22 +44,35 @@ final class LiveInsertionSession {
     /// (Codex finding 7): a session may only ever be finalized by the capture that created it —
     /// see `AppCoordinator.sessionBelongsToCapture`.
     let generation: Int
+    /// The caret position observed immediately before this session's FIRST unicode post — nil
+    /// until then (Codex finding 3). Every later post/deletion requires the CURRENT caret to sit
+    /// exactly at `caretAnchor + <UTF-16 length of ledger>`, an absolute, session-specific
+    /// position — not just "some matching text sits before wherever the caret currently is",
+    /// which a same-field, different-occurrence selection could satisfy.
+    private(set) var caretAnchor: Int?
 
-    private let isSafeToType: (InsertionTarget) -> Bool
-    private let verifyBeforeDelete: (InsertionTarget, String) -> Bool
+    /// Fresh identity/security/collapsed-selection/caret read, done immediately before EVERY
+    /// unicode post (Codex finding 2). `expectedCaret` is `caretAnchor + ledger UTF-16 length`,
+    /// or nil for this session's very first post (no anchor yet, but the selection must still be
+    /// collapsed). Returns the observed caret (which becomes `caretAnchor` on the first success)
+    /// or nil if anything is unsafe/drifted/mismatched.
+    private let writeSnapshotCaret: (InsertionTarget, Int?) -> Int?
+    private let verifyBeforeDelete: (InsertionTarget, String, Int) -> Bool
 
     init(
         target: InsertionTarget,
         generation: Int,
-        isSafeToType: @escaping (InsertionTarget) -> Bool = { Insertion.streamingSafeElement(target: $0) != nil },
-        verifyBeforeDelete: @escaping (InsertionTarget, String) -> Bool = { target, ledgerText in
+        writeSnapshotCaret: @escaping (InsertionTarget, Int?) -> Int? = { target, expectedCaret in
+            Insertion.streamingWriteCaret(target: target, expectedCaret: expectedCaret)
+        },
+        verifyBeforeDelete: @escaping (InsertionTarget, String, Int) -> Bool = { target, ledgerText, expectedCaret in
             guard let element = Insertion.streamingSafeElement(target: target) else { return false }
-            return Insertion.readbackMatches(element: element, expectedTrailingText: ledgerText)
+            return Insertion.readbackMatches(element: element, expectedTrailingText: ledgerText, expectedCaret: expectedCaret)
         }
     ) {
         self.target = target
         self.generation = generation
-        self.isSafeToType = isSafeToType
+        self.writeSnapshotCaret = writeSnapshotCaret
         self.verifyBeforeDelete = verifyBeforeDelete
     }
 
@@ -77,20 +90,27 @@ final class LiveInsertionSession {
     /// Types only the new suffix beyond what's already on the ledger. A no-op once frozen.
     func receivePartial(_ confirmedText: String) {
         guard !isFrozen else { return }
-        guard isSafeToType(target) else {
-            isFrozen = true
-            return
-        }
         let confirmed = Array(confirmedText)
         // Defensive append-only guard, mirroring `StreamingAppendOnly`: if the incoming text
         // doesn't extend exactly what's already on the ledger, don't type anything — never
         // rewrite characters already on screen.
         guard confirmed.count > ledger.count, Array(confirmed.prefix(ledger.count)) == ledger else { return }
         let delta = String(confirmed[ledger.count...])
+        // Codex findings 2, 3: ONE fresh read, immediately before this post — identity, security,
+        // a COLLAPSED selection, and (once there is an anchor) the caret sitting exactly where
+        // this session's own typing left it. A selection created after Recording start (the user
+        // selected an existing word in the same field) fails this and freezes instead of
+        // overwriting it. The very first post still runs this with `expectedCaret == nil`.
+        let expectedCaret = caretAnchor.map { $0 + Self.utf16Count(of: ledger) }
+        guard let caret = writeSnapshotCaret(target, expectedCaret) else {
+            isFrozen = true
+            return
+        }
         guard Self.typeText(delta) else {
             isFrozen = true
             return
         }
+        if caretAnchor == nil { caretAnchor = caret }
         ledger.append(contentsOf: delta)
     }
 
@@ -105,7 +125,17 @@ final class LiveInsertionSession {
     /// between this read and the synthesized backspace/type keystrokes themselves; that window
     /// can't be closed further without a delivery-confirmation API this platform doesn't expose.
     func finalize(action: FinalizeAction, refinedText: String, rawText: String) -> Outcome {
-        let verified = ledger.isEmpty || verifyBeforeDelete(target, String(ledger))
+        // Codex finding 3: verification requires the CURRENT caret to sit exactly at
+        // `caretAnchor + ledger UTF-16 length`, not just matching text somewhere before wherever
+        // the caret happens to be right now. Only actually reads back (AX + CGEvent-adjacent)
+        // when the ledger is non-empty and an anchor exists — `verificationOutcome` below is the
+        // pure decision core of what happens with that readback result.
+        let readbackMatches = ledger.isEmpty ? true : caretAnchor.map {
+            verifyBeforeDelete(target, String(ledger), $0 + Self.utf16Count(of: ledger))
+        } ?? false
+        let verified = Self.verificationOutcome(
+            ledgerIsEmpty: ledger.isEmpty, hasCaretAnchor: caretAnchor != nil, readbackMatches: readbackMatches
+        )
         let (shouldBackspace, shouldFreeze, outcome) = Self.finalizeDecision(
             action: action, refinedText: refinedText, rawText: rawText,
             isFrozen: isFrozen, ledgerCount: ledger.count, verified: verified
@@ -114,6 +144,18 @@ final class LiveInsertionSession {
         if shouldBackspace { backspaceLedger() }
         if case .clipboardOnly(let text) = outcome { Self.putOnClipboard(text) }
         return outcome
+    }
+
+    /// Pure decision core of `finalize`'s verification step (Codex finding 3), factored out so
+    /// the caret-anchor invariant is directly unit-testable without a live AX session. A
+    /// non-empty ledger with no anchor set is an invariant violation (the anchor is always
+    /// captured on the first successful post, before the ledger ever grows past zero) and fails
+    /// closed rather than trusting an unverifiable state — same fail-closed-on-doubt shape as
+    /// `Insertion.secureCheckResult`.
+    nonisolated static func verificationOutcome(ledgerIsEmpty: Bool, hasCaretAnchor: Bool, readbackMatches: Bool) -> Bool {
+        guard !ledgerIsEmpty else { return true }
+        guard hasCaretAnchor else { return false }
+        return readbackMatches
     }
 
     /// Pure decision core of `finalize` (Codex findings 1, 2, 3, 5) — every branch is a value
@@ -153,6 +195,12 @@ final class LiveInsertionSession {
         }
         if action == .cancel { return (true, false, .none) }
         return (true, false, outputText.isEmpty ? .none : .insert(outputText))
+    }
+
+    /// UTF-16 length of the ledger (Codex finding 3's caret-anchor arithmetic) — AX's native
+    /// indexing, matching `NSString`, since grapheme clusters don't map 1:1 to UTF-16 code units.
+    nonisolated private static func utf16Count(of characters: [Character]) -> Int {
+        String(characters).utf16.count
     }
 
     private func backspaceLedger() {
