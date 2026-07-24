@@ -220,28 +220,109 @@ enum Insertion {
         }
     }
 
-    /// Whether a synthetic keystroke should still land at `target` right now — the same drift
-    /// check `insert(_:target:strict:)` performs at paste time (bundle id + pid + best-effort
-    /// focused element/window comparison), reused as-is rather than duplicated. `LiveInsertionSession`
-    /// calls this before typing each live partial so a mid-recording focus change (Streaming ASR
-    /// edge case: focus drift) freezes typing immediately instead of only being caught at stop.
-    /// Always `strict` — a live-typing session always has a real snapshotted target (it only
-    /// exists because one was captured at Recording start), so there is no permissive "nothing to
-    /// contradict" case to fall back to here.
-    static func targetStillFocused(_ target: InsertionTarget) -> Bool {
+    // MARK: - Streaming ASR live-typing safety (Codex findings 1, 2, 3, 4, 5)
+    //
+    // These are new, streaming-specific checks — not a rewrite of the pre-existing
+    // `AccessibilityContext`/`SystemAccessibilityNodeAdapter.isSecure`, which compares
+    // `kAXRoleAttribute` against `"AXSecureTextField"` (that's a SUBROLE, not a role, so it never
+    // actually fires for a password field exposing role `AXTextField` + secure subrole). That
+    // helper is unchanged here — it's identical to `main` and still used elsewhere for read-only
+    // context capture — but live typing is a new, more dangerous consumer, so it gets its own
+    // correct check rather than inheriting the bug. See DEFERRED-FINDINGS.md.
+
+    /// Result of `streamingStartGate`: whether streaming may begin at all for a Recording.
+    struct StreamingStartGate {
+        let hasCollapsedSelection: Bool
+        let isSecure: Bool
+    }
+
+    /// Snapshot used ONCE, at Recording start, to decide whether live streaming may begin at all
+    /// (Codex findings 1, 4): the focused field must have a collapsed (empty) selection — typing
+    /// over a real selection would silently destroy it with no way to restore it on Cancel — and
+    /// must not be secure (subrole + protected content). Both read from the SAME element. `nil`
+    /// (AX untrusted, no focused element, or an unreadable selection range) fails closed to "not
+    /// safe to stream" — an unreadable selection can't be proven collapsed.
+    @MainActor
+    static func streamingStartGate(pid: pid_t) -> StreamingStartGate? {
+        guard Permissions.isAccessibilityTrusted() else { return nil }
+        let appElement = AXUIElementCreateApplication(pid)
+        var focusedRef: AnyObject?
+        guard AXUIElementCopyAttributeValue(appElement, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success,
+              let focusedRef else { return nil }
+        let element = focusedRef as! AXUIElement // swiftlint:disable:this force_cast
+        guard let range = selectedRange(of: element) else { return nil }
+        return StreamingStartGate(hasCollapsedSelection: range.length == 0, isSecure: isSecureForStreaming(element))
+    }
+
+    /// One fresh AX read of `target`'s focused element, used immediately before every act that
+    /// touches the target app during a live-streaming Recording — typing a partial, or
+    /// backspacing/pasting at finalize (Codex finding 5: identity and security must be derived
+    /// from the same read and re-checked immediately before every write, not once at Recording
+    /// start). Identity reuses the exact same drift check `insert(_:target:strict:)` performs at
+    /// paste time (bundle id + pid + best-effort focused element/window comparison, always
+    /// `strict`) rather than a second, divergent implementation. `nil` (unsafe) covers: AX
+    /// untrusted, identity drifted, no focused element, or the focused element is secure.
+    @MainActor
+    static func streamingSafeElement(target: InsertionTarget) -> AXUIElement? {
+        guard Permissions.isAccessibilityTrusted() else { return nil }
         let currentApp = NSWorkspace.shared.frontmostApplication
         let currentElement = currentApp.flatMap(focusedElement(for:))
         let currentWindow = currentElement.flatMap(windowElement(for:))
         let pidMatch = target.pid == currentApp?.processIdentifier
         let elementComparison = compareElements(snapshot: target, currentElement: currentElement, currentWindow: currentWindow)
-        return shouldSynthesizePaste(
+        guard shouldSynthesizePaste(
             hasTarget: true,
             snapshotBundleID: target.bundleID,
             currentBundleID: currentApp?.bundleIdentifier,
             pidMatch: pidMatch,
             elementComparison: elementComparison,
             strict: true
-        )
+        ), let currentElement else { return nil }
+        guard !isSecureForStreaming(currentElement) else { return nil }
+        return currentElement
+    }
+
+    /// Whether the AX-reported text immediately before the caret in `element` exactly matches
+    /// `expectedTrailingText` (Codex finding 3: `CGEvent.post` returning `true` only proves an
+    /// event was queued, never that the target actually consumed it unmodified — an app, IME, or
+    /// autocomplete could transform or swallow it, silently over-counting the ledger). UTF-16
+    /// offsets throughout (AX's native indexing, matching `NSString`) since grapheme clusters
+    /// don't map 1:1 to UTF-16 code units. Requires a collapsed caret (no active selection) — a
+    /// real selection at this instant means something else changed the field since the session
+    /// last typed into it.
+    static func readbackMatches(element: AXUIElement, expectedTrailingText: String) -> Bool {
+        guard !expectedTrailingText.isEmpty else { return true }
+        guard let range = selectedRange(of: element), range.length == 0 else { return false }
+        var valueRef: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &valueRef) == .success,
+              let text = valueRef as? String else { return false }
+        let expectedUTF16 = Array(expectedTrailingText.utf16)
+        let textUTF16 = Array(text.utf16)
+        let caret = range.location
+        guard caret >= expectedUTF16.count, textUTF16.count >= caret else { return false }
+        return Array(textUTF16[(caret - expectedUTF16.count)..<caret]) == expectedUTF16
+    }
+
+    /// Subrole (not role — see the note above) + protected content, read from one element.
+    private static func isSecureForStreaming(_ element: AXUIElement) -> Bool {
+        var subroleRef: AnyObject?
+        let subroleResult = AXUIElementCopyAttributeValue(element, kAXSubroleAttribute as CFString, &subroleRef)
+        let subrole = subroleResult == .success ? subroleRef as? String : nil
+        var protectedRef: AnyObject?
+        let protectedResult = AXUIElementCopyAttributeValue(element, "AXProtectedContent" as CFString, &protectedRef)
+        let protected = protectedResult == .success && ((protectedRef as? Bool) == true || (protectedRef as? NSNumber)?.boolValue == true)
+        return subrole == "AXSecureTextField" || protected
+    }
+
+    private static func selectedRange(of element: AXUIElement) -> CFRange? {
+        var rangeRef: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeRef) == .success,
+              let rangeRef, CFGetTypeID(rangeRef) == AXValueGetTypeID() else { return nil }
+        let axValue = unsafeDowncast(rangeRef, to: AXValue.self)
+        guard AXValueGetType(axValue) == .cfRange else { return nil }
+        var range = CFRange()
+        guard AXValueGetValue(axValue, .cfRange, &range) else { return nil }
+        return range
     }
 
     /// Compares the snapshotted focused element/window against what's focused right now.
