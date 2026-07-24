@@ -99,6 +99,18 @@ actor FluidAudioStreamingEngine: StreamingTranscriptionEngine {
     private(set) var isReady = false
     private var lastConfirmed = ""
     private var externalCallback: (@Sendable (String) -> Void)?
+    /// Bumped on `start`, `reset`, and `unload` (Codex finding 4). The manager's own partial
+    /// callback fires from FluidAudio's internal actor, and `setPartialCallback`'s handoff below
+    /// spawns an unstructured `Task` per raw partial to hop back onto this actor — so a `Task`
+    /// spawned while session A's handoff was still registered can still be pending when session B
+    /// calls `reset()`/`unload()` and installs its OWN callback via `setPartialCallback`. That
+    /// stale Task would otherwise run `handleRawPartial` against B's now-empty `lastConfirmed` and
+    /// invoke B's `externalCallback` with A's leftover partial. `AppCoordinator`'s own generation
+    /// guard (in the callback it hands to `setPartialCallback`) can't catch this — B's own
+    /// callback is the one that ends up invoked, at B's generation. Each handoff closure captures
+    /// the epoch live at the moment it's registered; `handleRawPartial` rejects anything whose
+    /// captured epoch no longer matches.
+    private var epoch = 0
 
     init(modelsDirectory: URL = FreeTalkerPaths.fluidAudioModels) {
         self.manager = StreamingEouAsrManager(chunkSize: .ms160)
@@ -115,6 +127,7 @@ actor FluidAudioStreamingEngine: StreamingTranscriptionEngine {
 
     func start() async throws {
         guard isReady else { throw StreamingEngineError.notReady }
+        epoch += 1
         lastConfirmed = ""
         await manager.reset()
     }
@@ -132,9 +145,10 @@ actor FluidAudioStreamingEngine: StreamingTranscriptionEngine {
 
     func setPartialCallback(_ callback: @escaping @Sendable (String) -> Void) async {
         externalCallback = callback
+        let capturedEpoch = epoch
         let handoff: @Sendable (String) -> Void = { [weak self] raw in
             guard let self else { return }
-            Task { await self.handleRawPartial(raw) }
+            Task { await self.handleRawPartial(raw, capturedEpoch: capturedEpoch) }
         }
         await manager.setPartialTranscriptCallback(handoff)
     }
@@ -150,6 +164,7 @@ actor FluidAudioStreamingEngine: StreamingTranscriptionEngine {
     /// `LiveInsertionSession` (and its captured `InsertionTarget` AX elements) the last Recording
     /// created, alive until the NEXT Recording overwrites it via `setPartialCallback`.
     func reset() async {
+        epoch += 1
         lastConfirmed = ""
         externalCallback = nil
         await manager.setPartialTranscriptCallback { _ in }
@@ -157,13 +172,21 @@ actor FluidAudioStreamingEngine: StreamingTranscriptionEngine {
     }
 
     func unload() async {
+        epoch += 1
         await manager.cleanup()
         isReady = false
         lastConfirmed = ""
         externalCallback = nil
     }
 
-    private func handleRawPartial(_ raw: String) {
+    /// Pure epoch comparison (Codex finding 4), factored out so it's directly unit-testable
+    /// without a live FluidAudio manager — same style as `StreamingAppendOnly.appendOnly`.
+    nonisolated static func shouldProcessRawPartial(capturedEpoch: Int, currentEpoch: Int) -> Bool {
+        capturedEpoch == currentEpoch
+    }
+
+    private func handleRawPartial(_ raw: String, capturedEpoch: Int) {
+        guard Self.shouldProcessRawPartial(capturedEpoch: capturedEpoch, currentEpoch: epoch) else { return }
         let confirmed = StreamingAppendOnly.appendOnly(previous: lastConfirmed, incoming: raw)
         guard confirmed != lastConfirmed else { return }
         lastConfirmed = confirmed
