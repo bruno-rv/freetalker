@@ -1,5 +1,57 @@
 # Deferred Findings (Codex adversarial review)
 
+## Streaming ASR (round 9, final) — F14, F15
+
+Both LOW severity, both deliberately not fixed before merge — the affected paths (the streaming
+model reservation and the Settings model-status refresh) are narrow, self-correcting, and
+orthogonal to the safety-critical typing/backspace path, so fixing them here would be scope creep
+onto polish rather than closing a real hazard. Each gets a dedicated follow-up PR.
+
+### F14 — LOW — streaming model reservation is Boolean, not generation-owned, so it can be cleared while a newer capture still holds it
+
+**Where:** `Sources/FreeTalker/AppCoordinator.swift:2845` (`startLiveStreaming` sets
+`streamingModelStore.markCaptureActive(true)`) and `:2926` (`cancelLiveStreaming`'s
+`engineTeardownTask` eventually calls `streamingModelStore.markCaptureActive(false)`).
+
+**Why real, and why LOW:** `StreamingModelStore.captureActive` is a plain `Bool` — it records only
+"some capture currently wants the model reserved," not which capture. If capture A starts
+streaming, is cancelled, and its `engineTeardownTask` teardown is still in flight when capture B
+starts and calls `markCaptureActive(true)`, then A's teardown later completes and unconditionally
+calls `markCaptureActive(false)` — clearing the reservation while B is still actively using the
+model. Settings' Delete button reads `captureActive` as its sole guard (`StreamingModelStore.swift`,
+`canDelete`), so a Delete tapped in that window is no longer blocked and could remove the model
+files out from under capture B. This is narrow (requires cancelling one live-streaming Recording
+and starting another before the first's async teardown finishes, then tapping Delete in that exact
+window) and doesn't touch the safety-critical parts of streaming: the batch transcription path and
+the final backspace/insert verification in `LiveInsertionSession.finalize` are both unaffected —
+worst case here is a mid-capture model deletion for capture B, not silently-wrong typed text.
+
+**Suggested fix (follow-up PR):** Replace the Boolean with a generation/token-owned reservation —
+e.g. `StreamingModelStore` tracks the owning generation (or a count of outstanding reservations)
+instead of a single flag, and `markCaptureActive(false)` only clears the reservation it itself
+holds rather than unconditionally clearing whatever is currently set.
+
+### F15 — LOW — an ambient `StreamingModelStore.refresh()` can apply a stale filesystem snapshot after an intervening download or delete
+
+**Where:** `Sources/FreeTalker/Settings/StreamingModelStore.swift:75` (`refresh(force:)`).
+
+**Why real, and why LOW:** `refresh()` reads `shouldApplyRefresh` once before its detached
+filesystem inspection and once after, to avoid clobbering a transitional (`.downloading`/`.busy`)
+phase — but nothing ties a given refresh's result to the operation that was current when it
+started. Two overlapping refreshes (for example, an `.onAppear`-triggered refresh racing a
+user-initiated download's own `force: true` refresh at completion) can interleave so the
+earlier-started, later-finishing inspection writes its (now stale) `phase`/`sizeBytes` last,
+briefly showing Settings a model as not-downloaded right after a completed download, or as
+downloaded right after a completed delete. The next refresh (the periodic `.onAppear` in
+`streamingASRSection`, or any subsequent user action) re-inspects the filesystem and repairs it,
+so this is a transient UI-only staleness, not a lost download, a leaked file, or anything the
+capture-active reservation (F14) or the typing/backspace safety checks depend on.
+
+**Suggested fix (follow-up PR):** Give each `refresh()` call an operation generation (incremented
+per `download()`/`delete()`/manual refresh) and discard a refresh's inspection result if the
+generation has moved on by the time the detached inspection returns, instead of only guarding on
+phase.
+
 ## Streaming ASR (round 8) — F4, F9
 
 ### F4 — `AccessibilityContext`/`SystemAccessibilityNodeAdapter.isSecure` checks the wrong AX attribute
