@@ -301,31 +301,67 @@ enum Insertion {
         return range.location
     }
 
-    /// Whether the AX-reported text immediately before the caret in `element` exactly matches
-    /// `expectedTrailingText`, AND the caret sits exactly at `expectedCaret` (Codex finding 3:
-    /// `CGEvent.post` returning `true` only proves an event was queued, never that the target
-    /// actually consumed it unmodified — an app, IME, or autocomplete could transform or swallow
-    /// it, silently over-counting the ledger; and a content-only check can be satisfied by an
-    /// unrelated, identical run of text sitting wherever the caret happens to be NOW rather than
-    /// where this session's own typing left it). `expectedCaret` is the session's caret anchor
-    /// (captured before its first post) plus everything typed since — an absolute, session-
-    /// specific position, not just "immediately before wherever the caret currently is". UTF-16
-    /// offsets throughout (AX's native indexing, matching `NSString`) since grapheme clusters
-    /// don't map 1:1 to UTF-16 code units. Requires a collapsed caret (no active selection) — a
-    /// real selection at this instant means something else changed the field since the session
-    /// last typed into it.
-    static func readbackMatches(element: AXUIElement, expectedTrailingText: String, expectedCaret: Int) -> Bool {
+    /// Whether the current document is EXACTLY `baseline` with `expectedTrailingText` (the
+    /// ledger) spliced in at the anchor, AND the caret sits exactly at `expectedCaret` (Codex
+    /// finding 3, and finding 2 — see `baseline` below). `expectedCaret` is the session's caret
+    /// anchor (captured before its first post) plus everything typed since — an absolute,
+    /// session-specific position, not just "immediately before wherever the caret currently is".
+    /// UTF-16 offsets throughout (AX's native indexing, matching `NSString`) since grapheme
+    /// clusters don't map 1:1 to UTF-16 code units. Requires a collapsed caret (no active
+    /// selection) — a real selection at this instant means something else changed the field since
+    /// the session last typed into it.
+    ///
+    /// `baseline` (Codex finding 2) is the field's full value snapshotted alongside this session's
+    /// FIRST caret read, before any typing — checking only "does text matching the ledger sit
+    /// immediately before a caret that's in the right place" authenticates LOCATION, not
+    /// PROVENANCE: pre-existing document text that happens to equal the ledger's content, sitting
+    /// at the same offset the user's caret later lands on for any unrelated reason, satisfies that
+    /// just as well as this session's own delivered insertion — e.g. the field already contains
+    /// "hello" at offset 0, this session's synthesized "hello" at offset 0 is silently swallowed by
+    /// the app/IME, and the user later parks the caret at offset 5. Requiring the ENTIRE current
+    /// document to equal `baseline` with the ledger spliced in at the anchor — not just the
+    /// substring immediately before the caret — proves nothing besides this session's own typing
+    /// changed the field since `baseline` was captured.
+    static func readbackMatches(element: AXUIElement, expectedTrailingText: String, expectedCaret: Int, baseline: String) -> Bool {
         guard !expectedTrailingText.isEmpty else { return true }
         guard let range = selectedRange(of: element), range.length == 0 else { return false }
         guard range.location == expectedCaret else { return false }
         var valueRef: AnyObject?
         guard AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &valueRef) == .success,
               let text = valueRef as? String else { return false }
-        let expectedUTF16 = Array(expectedTrailingText.utf16)
-        let textUTF16 = Array(text.utf16)
-        let caret = range.location
-        guard caret >= expectedUTF16.count, textUTF16.count >= caret else { return false }
-        return Array(textUTF16[(caret - expectedUTF16.count)..<caret]) == expectedUTF16
+        let anchor = expectedCaret - expectedTrailingText.utf16.count
+        return documentMatchesBaselinePlusLedger(
+            current: Array(text.utf16), baseline: Array(baseline.utf16),
+            ledger: Array(expectedTrailingText.utf16), anchor: anchor
+        )
+    }
+
+    /// Pure reconstruction check (Codex finding 2), factored out of `readbackMatches` so the
+    /// provenance invariant is directly unit-testable without a live AX session — same style as
+    /// `classifyPreflightFailure`/`shouldSynthesizePaste` above. `current`/`baseline`/`ledger` are
+    /// all UTF-16 code units (AX's native indexing); `anchor` is the position in `baseline` where
+    /// the ledger was inserted. `anchor` out of `baseline`'s bounds (a caret-anchor arithmetic
+    /// impossibility) fails closed.
+    nonisolated static func documentMatchesBaselinePlusLedger(
+        current: [UInt16], baseline: [UInt16], ledger: [UInt16], anchor: Int
+    ) -> Bool {
+        guard anchor >= 0, anchor <= baseline.count else { return false }
+        let expected = Array(baseline[0..<anchor]) + ledger + Array(baseline[anchor...])
+        return current == expected
+    }
+
+    /// One fresh read of `target`'s focused element's full current text (Codex finding 2), meant
+    /// to be captured once, immediately alongside this session's first caret read (before any
+    /// typing) — see `readbackMatches`'s `baseline` parameter. `nil` (AX untrusted, drifted, or
+    /// unreadable) fails the caller closed: without a baseline, no later delete can ever be proven
+    /// to be this session's own text rather than content that happened to already be there.
+    @MainActor
+    static func streamingBaselineValue(target: InsertionTarget) -> String? {
+        guard let element = streamingSafeElement(target: target) else { return nil }
+        var valueRef: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &valueRef) == .success,
+              let text = valueRef as? String else { return nil }
+        return text
     }
 
     /// One AX attribute read, classified into whether the value was affirmatively present, is

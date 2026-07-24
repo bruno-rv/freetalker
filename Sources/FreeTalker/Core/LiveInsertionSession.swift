@@ -50,6 +50,12 @@ final class LiveInsertionSession {
     /// position — not just "some matching text sits before wherever the caret currently is",
     /// which a same-field, different-occurrence selection could satisfy.
     private(set) var caretAnchor: Int?
+    /// The field's full value, snapshotted once, immediately after the first caret read succeeds
+    /// (Codex finding 2) — before any typing. `readbackMatches`/`verifyBeforeDelete` use this to
+    /// authenticate PROVENANCE (the current document is exactly this baseline with the ledger
+    /// spliced in at the anchor), not just location (matching text sitting wherever the caret
+    /// happens to be now, which pre-existing document text can satisfy just as well).
+    private(set) var baselineValue: String?
 
     /// Fresh identity/security/collapsed-selection/caret read, done immediately before EVERY
     /// unicode post (Codex finding 2). `expectedCaret` is `caretAnchor + ledger UTF-16 length`,
@@ -57,7 +63,11 @@ final class LiveInsertionSession {
     /// collapsed). Returns the observed caret (which becomes `caretAnchor` on the first success)
     /// or nil if anything is unsafe/drifted/mismatched.
     private let writeSnapshotCaret: (InsertionTarget, Int?) -> Int?
-    private let verifyBeforeDelete: (InsertionTarget, String, Int) -> Bool
+    /// One fresh read of the field's full current value, called once, immediately after the first
+    /// successful `writeSnapshotCaret` (Codex finding 2) — becomes `baselineValue`. `nil` fails
+    /// the session closed (frozen) since no later delete could ever be proven safe without it.
+    private let readBaselineValue: (InsertionTarget) -> String?
+    private let verifyBeforeDelete: (InsertionTarget, String, Int, String) -> Bool
 
     init(
         target: InsertionTarget,
@@ -65,14 +75,18 @@ final class LiveInsertionSession {
         writeSnapshotCaret: @escaping (InsertionTarget, Int?) -> Int? = { target, expectedCaret in
             Insertion.streamingWriteCaret(target: target, expectedCaret: expectedCaret)
         },
-        verifyBeforeDelete: @escaping (InsertionTarget, String, Int) -> Bool = { target, ledgerText, expectedCaret in
+        readBaselineValue: @escaping (InsertionTarget) -> String? = { target in
+            Insertion.streamingBaselineValue(target: target)
+        },
+        verifyBeforeDelete: @escaping (InsertionTarget, String, Int, String) -> Bool = { target, ledgerText, expectedCaret, baseline in
             guard let element = Insertion.streamingSafeElement(target: target) else { return false }
-            return Insertion.readbackMatches(element: element, expectedTrailingText: ledgerText, expectedCaret: expectedCaret)
+            return Insertion.readbackMatches(element: element, expectedTrailingText: ledgerText, expectedCaret: expectedCaret, baseline: baseline)
         }
     ) {
         self.target = target
         self.generation = generation
         self.writeSnapshotCaret = writeSnapshotCaret
+        self.readBaselineValue = readBaselineValue
         self.verifyBeforeDelete = verifyBeforeDelete
     }
 
@@ -106,11 +120,22 @@ final class LiveInsertionSession {
             isFrozen = true
             return
         }
+        let isFirstPost = caretAnchor == nil
+        if isFirstPost {
+            // Codex finding 2: captured HERE, immediately after the first caret read confirms a
+            // collapsed selection at this exact position — before any typing, so it can never
+            // include this session's own text.
+            guard let baseline = readBaselineValue(target) else {
+                isFrozen = true
+                return
+            }
+            baselineValue = baseline
+        }
         guard Self.typeText(delta) else {
             isFrozen = true
             return
         }
-        if caretAnchor == nil { caretAnchor = caret }
+        if isFirstPost { caretAnchor = caret }
         ledger.append(contentsOf: delta)
     }
 
@@ -127,18 +152,39 @@ final class LiveInsertionSession {
     func finalize(action: FinalizeAction, refinedText: String, rawText: String) -> Outcome {
         // Codex finding 3: verification requires the CURRENT caret to sit exactly at
         // `caretAnchor + ledger UTF-16 length`, not just matching text somewhere before wherever
-        // the caret happens to be right now. Only actually reads back (AX + CGEvent-adjacent)
-        // when the ledger is non-empty and an anchor exists — `verificationOutcome` below is the
-        // pure decision core of what happens with that readback result.
-        let readbackMatches = ledger.isEmpty ? true : caretAnchor.map {
-            verifyBeforeDelete(target, String(ledger), $0 + Self.utf16Count(of: ledger))
-        } ?? false
+        // the caret happens to be right now. Codex finding 2: `verifyBeforeDelete` also requires
+        // `baselineValue` — a non-empty ledger with no anchor OR no baseline is an invariant
+        // violation (both are always captured together, on the first successful post) and fails
+        // closed. Only actually reads back (AX + CGEvent-adjacent) when the ledger is non-empty —
+        // `verificationOutcome` below is the pure decision core of what happens with that readback
+        // result.
+        let readbackMatches: Bool
+        if ledger.isEmpty {
+            readbackMatches = true
+        } else if let anchor = caretAnchor, let baseline = baselineValue {
+            readbackMatches = verifyBeforeDelete(target, String(ledger), anchor + Self.utf16Count(of: ledger), baseline)
+        } else {
+            readbackMatches = false
+        }
         let verified = Self.verificationOutcome(
             ledgerIsEmpty: ledger.isEmpty, hasCaretAnchor: caretAnchor != nil, readbackMatches: readbackMatches
         )
+        // Codex finding 1: an empty ledger means nothing was ever typed, so there's nothing to
+        // backspace — but `.insert` is still this session's only OTHER consequential action (an
+        // ordinary pasteboard paste at whatever currently has focus), and none of the streaming
+        // security checks above ever ran for it (they're all gated on a non-empty ledger). One
+        // fresh collapsed-selection/secure/identity read, immediately before accepting that
+        // branch, closes both concrete failures Codex found: a selection the user made after
+        // Recording started would otherwise be silently replaced by the paste, and a field that
+        // turned secure since Recording start would otherwise receive the refined text via the
+        // ordinary (non-streaming) paste path, which never checks for that. Skipped for Cancel —
+        // an empty ledger on Cancel never inserts anything regardless, so there's nothing this
+        // read could gate.
+        let emptyLedgerInsertSafe = (ledger.isEmpty && action != .cancel) ? (writeSnapshotCaret(target, nil) != nil) : true
         let (shouldBackspace, shouldFreeze, outcome) = Self.finalizeDecision(
             action: action, refinedText: refinedText, rawText: rawText,
-            isFrozen: isFrozen, ledgerCount: ledger.count, verified: verified
+            isFrozen: isFrozen, ledgerCount: ledger.count, verified: verified,
+            emptyLedgerInsertSafe: emptyLedgerInsertSafe
         )
         if shouldFreeze { isFrozen = true }
         if shouldBackspace { backspaceLedger() }
@@ -162,14 +208,17 @@ final class LiveInsertionSession {
     /// computation with no CGEvent/AX side effects, so it's directly unit-testable (mirrors
     /// `Insertion.classifyPreflightFailure`'s split of decision from effect). `verified` is the
     /// caller's already-computed readback+identity+security check — trivially true when
-    /// `ledgerCount == 0` (nothing to verify, nothing to delete).
+    /// `ledgerCount == 0` (nothing to verify, nothing to delete). `emptyLedgerInsertSafe` is the
+    /// caller's already-computed fresh collapsed-selection/secure/identity check (Codex finding
+    /// 1) — only consulted when `ledgerCount == 0`; irrelevant otherwise.
     nonisolated static func finalizeDecision(
         action: FinalizeAction,
         refinedText: String,
         rawText: String,
         isFrozen: Bool,
         ledgerCount: Int,
-        verified: Bool
+        verified: Bool,
+        emptyLedgerInsertSafe: Bool
     ) -> (shouldBackspace: Bool, shouldFreeze: Bool, outcome: Outcome) {
         let outputText = action == .raw ? rawText : refinedText
         func leaveUntouched() -> Outcome {
@@ -183,8 +232,12 @@ final class LiveInsertionSession {
             return (false, false, leaveUntouched())
         }
         guard ledgerCount > 0 else {
-            // Nothing was ever typed — no destructive action, nothing to verify.
+            // Nothing was ever typed — no backspace needed. But `.insert` (Done/Raw) is still this
+            // session's only OTHER consequential action and gets none of the checks above for
+            // free (Codex finding 1) — require the caller's fresh check to have passed, else fall
+            // back to clipboard-only same as an unverified non-empty ledger.
             if action == .cancel { return (false, false, .none) }
+            guard emptyLedgerInsertSafe else { return (false, false, leaveUntouched()) }
             return (false, false, outputText.isEmpty ? .none : .insert(outputText))
         }
         guard verified else {
