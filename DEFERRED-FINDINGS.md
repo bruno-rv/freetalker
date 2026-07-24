@@ -1,3 +1,58 @@
+# Deferred Findings (Codex adversarial review)
+
+## Streaming ASR (round 8) — F4, F9
+
+### F4 — `AccessibilityContext`/`SystemAccessibilityNodeAdapter.isSecure` checks the wrong AX attribute
+
+**Where:** `Sources/FreeTalker/Core/AccessibilityContext.swift:144-154` (`SystemAccessibilityNodeAdapter.isSecure`).
+
+```swift
+func isSecure(_ node: AXUIElement) -> Bool {
+    let role = stringAttribute(kAXRoleAttribute, from: node)
+    ...
+    return Self.isSecure(role: role, protected: protected)
+}
+
+nonisolated static func isSecure(role: String?, protected: Bool) -> Bool {
+    role == "AXSecureTextField" || protected
+}
+```
+
+**Why real, and why not fixed here:** `"AXSecureTextField"` is a SUBROLE value
+(`kAXSubroleAttribute`), not a role value (`kAXRoleAttribute`) — a password field typically
+exposes role `AXTextField` with subrole `AXSecureTextField`, so this comparison is always false
+for that shape and the helper silently reports "not secure." This code is byte-for-byte identical
+to `main` (HEAD) — the Streaming ASR PR does not touch it — so fixing it here would be scope creep
+onto a pre-existing bug in a helper several other read-only subsystems (local context capture,
+selection access) also depend on, not a regression this PR introduced.
+
+Streaming ASR does NOT use this helper: `Insertion.streamingStartGate`/`Insertion.streamingSafeElement`
+(`Sources/FreeTalker/Core/Insertion.swift`) implement a correct, streaming-specific check —
+`kAXSubroleAttribute` compared against `"AXSecureTextField"`, plus `AXProtectedContent`, both
+failing closed when unreadable — because live typing is a new, more dangerous consumer than this
+helper's existing read-only callers.
+
+**Suggested fix (follow-up PR):** Change `SystemAccessibilityNodeAdapter.isSecure` to read
+`kAXSubroleAttribute` instead of `kAXRoleAttribute`, and add its own `AXProtectedContent` check
+(currently only `isSecure` on the concrete adapter reads it, `isSecure(role:protected:)`'s `role`
+parameter should become `subrole`). Once fixed, `Insertion.streamingStartGate`/`streamingSafeElement`
+could delegate to it instead of duplicating the check.
+
+### F9 — Crash mid-Recording strands live-typed text with no ledger to reconcile it (accepted residual)
+
+**Where:** `Sources/FreeTalker/Core/LiveInsertionSession.swift` (`ledger` property).
+
+Not a bug to fix: if FreeTalker crashes while a live-streaming Recording is typing partials into
+the target app, those characters remain in the user's document, and the in-memory
+`LiveInsertionSession.ledger` that would know how many characters to backspace is gone on
+relaunch. The ledger is deliberately NOT persisted to disk, and there is deliberately no
+auto-backspace-on-relaunch recovery path — reconciling a possibly-stale on-disk ledger against
+whatever the document looks like after restart (the user may have kept typing, undone something,
+or closed the app) is far more dangerous than leaving the correct-at-the-time partial text as-is.
+See the `// ponytail:` comment at the `ledger` declaration.
+
+---
+
 # Deferred Findings (Codex adversarial review, round 7)
 
 These findings from round 7 describe real flaws, but the flawed code is **byte-for-byte identical
