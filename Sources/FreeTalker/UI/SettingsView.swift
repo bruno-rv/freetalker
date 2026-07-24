@@ -302,6 +302,7 @@ private struct GeneralSettingsView: View {
     @ObservedObject private var settings = AppSettings.shared
     @ObservedObject private var coordinator = AppCoordinator.shared
     @ObservedObject private var speechModelStore = AppCoordinator.shared.speechModelStore
+    @ObservedObject private var streamingModelStore = AppCoordinator.shared.streamingModelStore
     @ObservedObject private var templateStore = TemplateStore.shared
     @StateObject private var vocabularySuggestions = VocabularySuggestionsController()
     @State private var accessibilityTrusted = Permissions.isAccessibilityTrusted()
@@ -1116,6 +1117,7 @@ private struct GeneralSettingsView: View {
                     Task { await speechModelStore.refresh() }
                     speechModelStore.refreshRemoteSupportOnce()
                 }
+                streamingASRSection
             }
             HStack {
                 Toggle("Live preview while recording", isOn: $settings.livePreviewEnabled)
@@ -1526,6 +1528,60 @@ private struct GeneralSettingsView: View {
         }
         .help(entry.quickTip)
         .accessibilityHint(entry.quickTip)
+    }
+
+    /// Streaming ASR (BRAINSTORM_STREAMING_ASR.md): toggle + single-model download row, styled
+    /// like `speechModelRow` above but simpler — there's one model, not a variant picker, so no
+    /// radio/select affordance.
+    @ViewBuilder
+    private var streamingASRSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 5) {
+                Toggle("Type as you speak (Streaming ASR)", isOn: $settings.streamingASREnabled)
+                SettingsHelpButton(
+                    title: "Type as you speak",
+                    message: "Types confirmed words into the focused field while you're still speaking, then replaces them with the refined text when you stop. Off by default. English only, on-device only (never with Cloud STT), and only when the spoken language is resolved explicitly (not \"Auto\") and the field isn't secure."
+                )
+            }
+            if settings.streamingASREnabled {
+                streamingModelRow
+            }
+        }
+        .padding(.top, 4)
+        .onAppear { Task { await streamingModelStore.refresh() } }
+    }
+
+    @ViewBuilder
+    private var streamingModelRow: some View {
+        HStack(alignment: .center, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Parakeet EOU 120M (160ms)")
+                Text(streamingModelStatusText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            switch streamingModelStore.phase {
+            case .notDownloaded, .failed:
+                Button("Download") { Task { await streamingModelStore.download() } }
+            case .downloaded:
+                Button("Delete") { Task { try? await streamingModelStore.delete() } }
+            case .downloading(let progress):
+                ProgressView(value: progress).frame(width: 72)
+            case .busy:
+                ProgressView().controlSize(.small)
+            }
+        }
+    }
+
+    private var streamingModelStatusText: String {
+        switch streamingModelStore.phase {
+        case .notDownloaded: "Not downloaded"
+        case .downloading(let progress): "Downloading \(Int(progress * 100))%"
+        case .downloaded: "Downloaded"
+        case .failed(let hint): "Failed — \(hint)"
+        case .busy: "Loading…"
+        }
     }
 
     private static func enumerateRunningApps() -> [NSRunningApplication] {
