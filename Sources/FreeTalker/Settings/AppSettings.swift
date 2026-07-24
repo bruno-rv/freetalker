@@ -359,6 +359,17 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(voiceCommandsEnabled, forKey: Keys.voiceCommandsEnabled) }
     }
 
+    /// Streaming ASR master switch (BRAINSTORM_STREAMING_ASR.md): types confirmed partial
+    /// transcripts live into the focused field while the user is still speaking, for explicit
+    /// supported-language Recordings (see `StreamingASRLanguageSupport`). **Default OFF** for the
+    /// first release — same reasoning as `voiceCommandsEnabled` above: no fallback-log evidence
+    /// gate exists yet for a default-ON flip. When off, or when any gate condition isn't met
+    /// (unsupported/Auto language, Cloud STT, secure field, focus drift), Recording behaves
+    /// exactly as it does today — the live lane is purely additive.
+    @Published var streamingASREnabled: Bool {
+        didSet { defaults.set(streamingASREnabled, forKey: Keys.streamingASREnabled) }
+    }
+
     /// Spoken keyword(s) that introduce a voice command (PLAN.md PR A, item 1). Validated/
     /// normalized on every set: 1–5 entries, each 2–24 characters, letters only, lowercased,
     /// deduped — see `normalizeCommandKeywords`. `CommandInstructionBuilder` re-sanitizes this
@@ -890,6 +901,7 @@ final class AppSettings: ObservableObject {
         static let localContextScope = "localContextScope"
         static let automaticStyleEnabled = "automaticStyleEnabled"
         static let voiceCommandsEnabled = "voiceCommandsEnabled"
+        static let streamingASREnabled = "streamingASREnabled"
         static let commandKeywords = "commandKeywords"
         static let handsFreeMaxMinutes = "handsFreeMaxMinutes"
         static let appRules = "appRules"
@@ -1025,6 +1037,7 @@ final class AppSettings: ObservableObject {
         // Bool` idiom used for default-ON flags above): an unset key and an explicit `false` both
         // correctly resolve to `false`. See PLAN.md PR A, item 1.
         voiceCommandsEnabled = defaults.bool(forKey: Keys.voiceCommandsEnabled)
+        streamingASREnabled = defaults.bool(forKey: Keys.streamingASREnabled)
         let storedCommandKeywords = defaults.array(forKey: Keys.commandKeywords) as? [String] ?? Self.defaultCommandKeywords
         let normalizedCommandKeywords = Self.normalizeCommandKeywords(storedCommandKeywords)
         commandKeywords = normalizedCommandKeywords
@@ -1237,7 +1250,8 @@ extension AppSettings {
         Keys.microphoneDeviceUID,
         Keys.vocabularyText,
         Keys.voiceCommandsEnabled,
-        Keys.commandKeywords
+        Keys.commandKeywords,
+        Keys.streamingASREnabled
     ]
 
     /// Exports every non-secret setting to a human-readable JSON file. Reads only the
@@ -1320,6 +1334,7 @@ extension AppSettings {
         out[Keys.vocabularyText] = vocabularyText
         out[Keys.voiceCommandsEnabled] = voiceCommandsEnabled
         out[Keys.commandKeywords] = commandKeywords
+        out[Keys.streamingASREnabled] = streamingASREnabled
         return out
     }
 }

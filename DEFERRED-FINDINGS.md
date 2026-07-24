@@ -1,3 +1,110 @@
+# Deferred Findings (Codex adversarial review)
+
+## Streaming ASR (round 9, final) — F14, F15
+
+Both LOW severity, both deliberately not fixed before merge — the affected paths (the streaming
+model reservation and the Settings model-status refresh) are narrow, self-correcting, and
+orthogonal to the safety-critical typing/backspace path, so fixing them here would be scope creep
+onto polish rather than closing a real hazard. Each gets a dedicated follow-up PR.
+
+### F14 — LOW — streaming model reservation is Boolean, not generation-owned, so it can be cleared while a newer capture still holds it
+
+**Where:** `Sources/FreeTalker/AppCoordinator.swift:2845` (`startLiveStreaming` sets
+`streamingModelStore.markCaptureActive(true)`) and `:2926` (`cancelLiveStreaming`'s
+`engineTeardownTask` eventually calls `streamingModelStore.markCaptureActive(false)`).
+
+**Why real, and why LOW:** `StreamingModelStore.captureActive` is a plain `Bool` — it records only
+"some capture currently wants the model reserved," not which capture. If capture A starts
+streaming, is cancelled, and its `engineTeardownTask` teardown is still in flight when capture B
+starts and calls `markCaptureActive(true)`, then A's teardown later completes and unconditionally
+calls `markCaptureActive(false)` — clearing the reservation while B is still actively using the
+model. Settings' Delete button reads `captureActive` as its sole guard (`StreamingModelStore.swift`,
+`canDelete`), so a Delete tapped in that window is no longer blocked and could remove the model
+files out from under capture B. This is narrow (requires cancelling one live-streaming Recording
+and starting another before the first's async teardown finishes, then tapping Delete in that exact
+window) and doesn't touch the safety-critical parts of streaming: the batch transcription path and
+the final backspace/insert verification in `LiveInsertionSession.finalize` are both unaffected —
+worst case here is a mid-capture model deletion for capture B, not silently-wrong typed text.
+
+**Suggested fix (follow-up PR):** Replace the Boolean with a generation/token-owned reservation —
+e.g. `StreamingModelStore` tracks the owning generation (or a count of outstanding reservations)
+instead of a single flag, and `markCaptureActive(false)` only clears the reservation it itself
+holds rather than unconditionally clearing whatever is currently set.
+
+### F15 — LOW — an ambient `StreamingModelStore.refresh()` can apply a stale filesystem snapshot after an intervening download or delete
+
+**Where:** `Sources/FreeTalker/Settings/StreamingModelStore.swift:75` (`refresh(force:)`).
+
+**Why real, and why LOW:** `refresh()` reads `shouldApplyRefresh` once before its detached
+filesystem inspection and once after, to avoid clobbering a transitional (`.downloading`/`.busy`)
+phase — but nothing ties a given refresh's result to the operation that was current when it
+started. Two overlapping refreshes (for example, an `.onAppear`-triggered refresh racing a
+user-initiated download's own `force: true` refresh at completion) can interleave so the
+earlier-started, later-finishing inspection writes its (now stale) `phase`/`sizeBytes` last,
+briefly showing Settings a model as not-downloaded right after a completed download, or as
+downloaded right after a completed delete. The next refresh (the periodic `.onAppear` in
+`streamingASRSection`, or any subsequent user action) re-inspects the filesystem and repairs it,
+so this is a transient UI-only staleness, not a lost download, a leaked file, or anything the
+capture-active reservation (F14) or the typing/backspace safety checks depend on.
+
+**Suggested fix (follow-up PR):** Give each `refresh()` call an operation generation (incremented
+per `download()`/`delete()`/manual refresh) and discard a refresh's inspection result if the
+generation has moved on by the time the detached inspection returns, instead of only guarding on
+phase.
+
+## Streaming ASR (round 8) — F4, F9
+
+### F4 — `AccessibilityContext`/`SystemAccessibilityNodeAdapter.isSecure` checks the wrong AX attribute
+
+**Where:** `Sources/FreeTalker/Core/AccessibilityContext.swift:144-154` (`SystemAccessibilityNodeAdapter.isSecure`).
+
+```swift
+func isSecure(_ node: AXUIElement) -> Bool {
+    let role = stringAttribute(kAXRoleAttribute, from: node)
+    ...
+    return Self.isSecure(role: role, protected: protected)
+}
+
+nonisolated static func isSecure(role: String?, protected: Bool) -> Bool {
+    role == "AXSecureTextField" || protected
+}
+```
+
+**Why real, and why not fixed here:** `"AXSecureTextField"` is a SUBROLE value
+(`kAXSubroleAttribute`), not a role value (`kAXRoleAttribute`) — a password field typically
+exposes role `AXTextField` with subrole `AXSecureTextField`, so this comparison is always false
+for that shape and the helper silently reports "not secure." This code is byte-for-byte identical
+to `main` (HEAD) — the Streaming ASR PR does not touch it — so fixing it here would be scope creep
+onto a pre-existing bug in a helper several other read-only subsystems (local context capture,
+selection access) also depend on, not a regression this PR introduced.
+
+Streaming ASR does NOT use this helper: `Insertion.streamingStartGate`/`Insertion.streamingSafeElement`
+(`Sources/FreeTalker/Core/Insertion.swift`) implement a correct, streaming-specific check —
+`kAXSubroleAttribute` compared against `"AXSecureTextField"`, plus `AXProtectedContent`, both
+failing closed when unreadable — because live typing is a new, more dangerous consumer than this
+helper's existing read-only callers.
+
+**Suggested fix (follow-up PR):** Change `SystemAccessibilityNodeAdapter.isSecure` to read
+`kAXSubroleAttribute` instead of `kAXRoleAttribute`, and add its own `AXProtectedContent` check
+(currently only `isSecure` on the concrete adapter reads it, `isSecure(role:protected:)`'s `role`
+parameter should become `subrole`). Once fixed, `Insertion.streamingStartGate`/`streamingSafeElement`
+could delegate to it instead of duplicating the check.
+
+### F9 — Crash mid-Recording strands live-typed text with no ledger to reconcile it (accepted residual)
+
+**Where:** `Sources/FreeTalker/Core/LiveInsertionSession.swift` (`ledger` property).
+
+Not a bug to fix: if FreeTalker crashes while a live-streaming Recording is typing partials into
+the target app, those characters remain in the user's document, and the in-memory
+`LiveInsertionSession.ledger` that would know how many characters to backspace is gone on
+relaunch. The ledger is deliberately NOT persisted to disk, and there is deliberately no
+auto-backspace-on-relaunch recovery path — reconciling a possibly-stale on-disk ledger against
+whatever the document looks like after restart (the user may have kept typing, undone something,
+or closed the app) is far more dangerous than leaving the correct-at-the-time partial text as-is.
+See the `// ponytail:` comment at the `ledger` declaration.
+
+---
+
 # Deferred Findings (Codex adversarial review, round 7)
 
 These findings from round 7 describe real flaws, but the flawed code is **byte-for-byte identical

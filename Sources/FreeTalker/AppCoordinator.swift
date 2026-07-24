@@ -199,12 +199,43 @@ final class AppCoordinator: ObservableObject {
     /// `RecordingLanguageSnapshot`'s doc comment and `captureRecordingLanguageSnapshot`.
     private var recordingPinSnapshot: String = AppSettings.shared.languagePin
     private var recordingAppLanguageRulesSnapshot: [String: String] = AppSettings.shared.appLanguageRules
+    /// Streaming ASR (BRAINSTORM_STREAMING_ASR.md): the insertion target to start a
+    /// `LiveInsertionSession` against, decided synchronously in `beginCapture` (same moment the
+    /// language/pin/app-rule snapshots above are taken) and consumed once, in
+    /// `completeCaptureAdmission`, when audio capture actually starts. `nil` means this Recording
+    /// doesn't stream — every gate condition in `shouldStreamLive` must hold for it to be set.
+    private var pendingLiveStreamTarget: InsertionTarget?
     @Published private(set) var recordingOutputSelection = RecordingOutputSelection()
 
     let speechModelDownloadCoordinator: SpeechModelDownloadCoordinator
     let speechModelStore: SpeechModelStore
     let whisperEngine: WhisperKitEngine
     let cloudSTTEngine = CloudSTTEngine()
+    /// Streaming ASR (BRAINSTORM_STREAMING_ASR.md): model download/delete state, mirroring
+    /// `speechModelStore` above.
+    let streamingModelStore = StreamingModelStore()
+    /// The live streaming engine, shared across Recordings — `streamingModelStore` and this hold
+    /// the SAME underlying `FluidAudioStreamingEngine` so a model downloaded once stays loaded.
+    private var streamingEngine: any StreamingTranscriptionEngine { streamingModelStore.engine }
+    /// Live typing session for the current Recording, if Streaming ASR is active for it — nil
+    /// whenever streaming isn't gated on (see `shouldStreamLive`), for the whole duration of every
+    /// Recording that doesn't opt in. Torn down at every terminal transition (stop/cancel).
+    private var liveInsertionSession: LiveInsertionSession?
+    /// The bounded, FIFO audio queue feeding `streamingEngine` for the current Recording's live
+    /// session, if any (Codex finding 8) — `nil` whenever `liveInsertionSession` is `nil`, and
+    /// torn down (`finish()`) at exactly the same points, by `cancelLiveStreaming()`.
+    private var liveAudioFanOut: LiveAudioFanOut?
+    /// The `Task` running `startLiveStreaming`'s prepare/start/setPartialCallback sequence for the
+    /// CURRENT capture, if any (Codex finding 5) — without tracking and cancelling this, a
+    /// suspended sequence from a cancelled capture could resume after teardown and reinstall its
+    /// own (stale) callback on the shared engine.
+    private var liveStreamSetupTask: Task<Void, Never>?
+    /// The most recently spawned `streamingEngine.reset()` teardown `Task` (Codex finding 5) — a
+    /// fire-and-forget reset, if left untracked, can run after the NEXT capture has already
+    /// called `prepare`/`start`/`setPartialCallback` on the same shared engine and wipe its
+    /// callback/decoder state out from under it. `startLiveStreaming` awaits this before touching
+    /// the engine, so a prior capture's teardown always completes before the next one reuses it.
+    private var engineTeardownTask: Task<Void, Never>?
     private let appleFMProcessor = AppleFMProcessor()
     private let localContextProvider: any LocalContextProvider = AccessibilityLocalContextProvider()
     private let screenshotService: any ActiveWindowScreenshotCapturing = ActiveWindowScreenshotService()
@@ -1289,6 +1320,10 @@ final class AppCoordinator: ObservableObject {
     private func handlePanelOneShotLanguage(_ code: String) {
         guard recordingState != .idle else { return }
         oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .panelLanguageTap(code))
+        // A one-shot language change overrides the app-rule/pin resolution a live session's gate
+        // was decided against at Recording start — rather than migrate it, fall back to batch
+        // (BRAINSTORM_STREAMING_ASR.md decision #2).
+        cancelLiveStreaming()
         updateRecordingPanel()
     }
 
@@ -1359,6 +1394,14 @@ final class AppCoordinator: ObservableObject {
         recordingLanguageSnapshot = languageSnapshot.candidateLanguages
         recordingPinSnapshot = languageSnapshot.pin
         recordingAppLanguageRulesSnapshot = languageSnapshot.appLanguageRules
+        // Streaming ASR gate, decided now (key-down) rather than at stop: a live typing session
+        // has to start while the user is still speaking. `oneShot: nil` because `oneShotLanguage`
+        // is always nil at this point (cleared just above) — this is therefore an app-rule/pin
+        // resolution, the same approximation of stop-time `resolveLanguage` every other
+        // capture-start snapshot in this function already makes. If the user taps a one-shot
+        // language on the panel mid-recording, `handlePanelOneShotLanguage` tears the live session
+        // down (silent fallback to batch) rather than trying to migrate it.
+        pendingLiveStreamTarget = prepareLiveStreamingCandidate(languageSnapshot: languageSnapshot, destination: destination)
         let micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
         Self.logger.log("key down: micAuthorizationStatus=\(micStatus.rawValue, privacy: .public)")
         // Guard unconditionally rather than proceeding to record silence — a denied/stale TCC
@@ -1501,8 +1544,55 @@ final class AppCoordinator: ObservableObject {
         let action = reduceCaptureAdmission(.prepared(captureID: active.session.id))
         switch action {
         case .cancel:
+            pendingLiveStreamTarget = nil
             Task { await cleanCancelledAdmission(active, service: service) }
         case .start, .startAndStop:
+            // Codex round 3 finding 5: `pendingLiveStreamTarget` was captured at key-down —
+            // before this asynchronous journal-preparation gap. `captureActive` isn't set true
+            // until `startLiveStreaming` below, so Delete stayed enabled for the streaming model
+            // files for this entire window; the model could have been unloaded and removed since.
+            // Re-validate immediately before ever acting on the stale target, right before
+            // creating the fan-out/session or marking the model active.
+            var liveStreamTarget = pendingLiveStreamTarget
+            if streamingModelStore.phase != .downloaded { liveStreamTarget = nil }
+            pendingLiveStreamTarget = nil
+            // `.startAndStop` (an already-finished tap) never starts a live session below, so its
+            // tap must not feed the engine either — an unstarted/stale engine has no session to
+            // deliver partials to.
+            var liveSampleConsumer: (@Sendable ([Float]) -> Void)?
+            if liveStreamTarget != nil, case .start = action {
+                // Codex finding 8: one bounded, FIFO, session-owned consumer — not a fresh
+                // unstructured `Task` per buffer. `fanOut` is stored on `self` so
+                // `cancelLiveStreaming()` (called on every terminal transition) can `finish()`
+                // it, which is what stops a late chunk from this Recording reaching a later
+                // one's `streamingEngine` state.
+                //
+                // Codex finding 6: the queue is created here (before capture starts, so
+                // `audioCapture.start`'s `liveSampleConsumer` has somewhere to enqueue into
+                // immediately), but draining begins only in `startLiveStreaming`, once
+                // `streamingEngine.start()` and `setPartialCallback` have both succeeded — never
+                // here. Enqueued samples just sit in the bounded queue until then, so nothing is
+                // lost, and none of them can land in whatever state the SHARED manager was in
+                // before `start()`'s `reset()` discards it.
+                let fanOut = LiveAudioFanOut()
+                liveAudioFanOut = fanOut
+                // Codex finding 8: this overflow notification fires from a queue callback that
+                // can outlive the capture that created it — bind it to THIS exact fan-out
+                // instance and generation, not to "whatever `liveInsertionSession` is current
+                // when it happens to run", so a late overflow from a prior capture can never
+                // freeze a later one's session.
+                let generation = recordingGeneration
+                liveSampleConsumer = { [weak fanOut, weak self] samples in
+                    guard let fanOut else { return }
+                    fanOut.enqueue(samples) {
+                        Task { @MainActor in
+                            guard let self, self.liveAudioFanOut === fanOut,
+                                  self.recordingGeneration == generation else { return }
+                            self.liveInsertionSession?.freeze()
+                        }
+                    }
+                }
+            }
             do {
                 try audioCapture.start(
                     deviceUID: AppSettings.shared.microphoneDeviceUID,
@@ -1522,10 +1612,16 @@ final class AppCoordinator: ObservableObject {
                                 decision, captureID: active.session.id
                             )
                         }
-                    }
+                    },
+                    liveSampleConsumer: liveSampleConsumer
                 )
                 activeCaptureJournal = active
                 startLivePreviewIfNeeded()
+                // Only `.start` (not `.startAndStop`, an already-finished tap) bothers spinning up
+                // the live lane — it would just be torn down again immediately.
+                if case .start = action, let liveStreamTarget {
+                    startLiveStreaming(target: liveStreamTarget)
+                }
                 if case .startAndStop = action {
                     let pending = pendingStopRequest
                     pendingStopRequest = nil
@@ -1537,6 +1633,10 @@ final class AppCoordinator: ObservableObject {
                 let message = Self.captureStartFailureMessage(
                     errorDescription: error.localizedDescription
                 )
+                // Codex finding 7: `audioCapture.start` threw AFTER the fan-out above was already
+                // created and stored on `self` — without this, nothing ever `finish()`es or nils
+                // it, stranding it (and its consumer task) past this capture's cleanup.
+                cancelLiveStreaming()
                 _ = reduceCaptureAdmission(.cancelRequested)
                 Task {
                     let destination = recordingDestination ?? .external
@@ -1770,6 +1870,10 @@ final class AppCoordinator: ObservableObject {
         recordingState = .idle
         invalidateCapTimer()
         stopLivePreview()
+        // A journal-writer failure never reaches `runPipeline`'s insert closure — tear the live
+        // session down here so it can't linger and be finalized by a later Recording (Codex
+        // finding 7).
+        cancelLiveStreaming()
         _ = audioCapture.stop()
         let message = "Recording stopped because audio could not be saved"
         lastError = message
@@ -2044,6 +2148,10 @@ final class AppCoordinator: ObservableObject {
                         guard captureAdmission.state == .finalizing(
                             captureID: active.session.id
                         ) else { return }
+                        // A live session was already typing during this Recording — silence
+                        // detection means the pipeline never reaches `runPipeline`'s insert
+                        // closure below, so the ledger must be torn down here instead.
+                        cancelLiveStreaming()
                         _ = reduceCaptureAdmission(.finalizationFinished(
                             captureID: active.session.id
                         ))
@@ -2100,6 +2208,9 @@ final class AppCoordinator: ObservableObject {
                     _ = reduceCaptureAdmission(.failureHandled(
                         captureID: active.session.id
                     ))
+                    // Journal finalization failed — same reasoning as the silent-capture branch
+                    // above: `runPipeline` never runs, so tear the live session down here.
+                    cancelLiveStreaming()
                     journalFinalizationTask = nil
                     activeCaptureJournal = nil
                     captureOwner = .none
@@ -2177,6 +2288,7 @@ final class AppCoordinator: ObservableObject {
         if let issue = Self.capturedAudioIssue(sampleCount: samples.count, peak: peak, rms: rms) {
             lastError = issue
             hud.flash(issue)
+            cancelLiveStreaming()
             recordingHUDDidEndEarly(.externalDeadAudio)
             return
         }
@@ -2239,6 +2351,7 @@ final class AppCoordinator: ObservableObject {
         guard let recoveryStore else {
             lastError = "Could not save recording for processing"
             hud.flash("Recording could not be saved — transcription not started")
+            cancelLiveStreaming()
             isProcessing = false
             recordingHUDDidReachTerminalState(generation: hudGeneration)
             return
@@ -2246,6 +2359,7 @@ final class AppCoordinator: ObservableObject {
         guard let staged = stoppedCapture?.staged else {
             lastError = "Durable recording ownership is unavailable"
             hud.flash("Recording saved for recovery — processing not started")
+            cancelLiveStreaming()
             isProcessing = false
             recordingHUDDidReachTerminalState(generation: hudGeneration)
             return
@@ -2301,6 +2415,10 @@ final class AppCoordinator: ObservableObject {
                     hudGeneration: hudGeneration
                 )
             } catch {
+                // Durable registration failed before `runPipeline` (and its insert closure) ever
+                // ran — tear the live session down here so it can't linger and be finalized by a
+                // later Recording (Codex finding 7).
+                cancelLiveStreaming()
                 lastError = "Failed to queue durable recording: \(error.localizedDescription)"
                 hud.flash("Recording saved for recovery — processing not started")
                 isProcessing = false
@@ -2346,6 +2464,7 @@ final class AppCoordinator: ObservableObject {
     }
 
     private func cancelRecording() {
+        cancelLiveStreaming()
         if case .preparing = captureAdmission.state {
             _ = reduceCaptureAdmission(.cancelRequested)
             pendingStopRequest = nil
@@ -2488,6 +2607,67 @@ final class AppCoordinator: ObservableObject {
         )
     }
 
+    /// Streaming ASR gate (BRAINSTORM_STREAMING_ASR.md edge cases): every condition must hold —
+    /// the toggle is on, the model is already downloaded (never blocks capture start on a
+    /// download), the local WhisperKit engine is selected (never Cloud STT), the resolved
+    /// language is explicit (`Auto` → nil → no live insertion, today's HUD preview) *and* in
+    /// `StreamingASRLanguageSupport`, the focused field isn't secure, the focused field has a
+    /// readable COLLAPSED selection (Codex finding 1 — typing over a real selection would
+    /// silently destroy it with no way to restore it on Cancel), and there's a real insertion
+    /// target to type into.
+    nonisolated static func shouldStreamLive(
+        streamingEnabled: Bool,
+        streamingModelDownloaded: Bool,
+        sttEngine: STTEngineKind,
+        forcedLanguage: String?,
+        isSecureField: Bool,
+        hasCollapsedSelection: Bool,
+        hasInsertionTarget: Bool
+    ) -> Bool {
+        guard streamingEnabled, streamingModelDownloaded, sttEngine == .whisperKit,
+              !isSecureField, hasCollapsedSelection, hasInsertionTarget else { return false }
+        guard let forcedLanguage else { return false }
+        return StreamingASRLanguageSupport.supportedLanguages.contains(forcedLanguage)
+    }
+
+    /// Synchronous, key-down-time evaluation of `shouldStreamLive` against the frontmost app —
+    /// mirrors how every other capture-start snapshot in `beginCapture` reads live AppKit/AX
+    /// state once, up front. Returns the `InsertionTarget` to hand `LiveInsertionSession` when
+    /// every gate condition holds, else nil. `destination != .external` (Codex finding 6) never
+    /// even reads AX state — a Scratchpad recording has no external field to type into.
+    private func prepareLiveStreamingCandidate(languageSnapshot: RecordingLanguageSnapshot, destination: RecordingDestination) -> InsertionTarget? {
+        guard destination == .external else { return nil }
+        let streamingEnabled = AppSettings.shared.streamingASREnabled
+        let streamingModelDownloaded = streamingModelStore.phase == .downloaded
+        let sttEngine = AppSettings.shared.sttEngine
+        guard streamingEnabled, streamingModelDownloaded, sttEngine == .whisperKit else { return nil }
+        let app = NSWorkspace.shared.frontmostApplication
+        guard let target = Insertion.snapshotTarget(app: app) else { return nil }
+        let forcedLanguage = Self.resolveLanguage(
+            oneShot: nil,
+            bundleID: app?.bundleIdentifier,
+            appLanguageRules: languageSnapshot.appLanguageRules,
+            pin: languageSnapshot.pin,
+            candidateSet: languageSnapshot.candidateLanguages
+        )
+        // Deny-by-default (Codex findings 1, 4): only an affirmative "not secure, collapsed
+        // selection" read from a trusted AX query allows streaming. An untrusted AX session or an
+        // unreadable focused field can't confirm either is safe, so both fail closed.
+        let startGate = app.flatMap { Insertion.streamingStartGate(pid: $0.processIdentifier) }
+        let isSecureField = startGate?.isSecure ?? true
+        let hasCollapsedSelection = startGate?.hasCollapsedSelection ?? false
+        guard Self.shouldStreamLive(
+            streamingEnabled: streamingEnabled,
+            streamingModelDownloaded: streamingModelDownloaded,
+            sttEngine: sttEngine,
+            forcedLanguage: forcedLanguage,
+            isSecureField: isSecureField,
+            hasCollapsedSelection: hasCollapsedSelection,
+            hasInsertionTarget: true
+        ) else { return nil }
+        return target
+    }
+
     /// `candidateSet`: the Dictation Language Set the oneShot/rule/pin value is validated
     /// against — the set snapshotted at Recording start (`recordingLanguageSnapshot`), NOT
     /// necessarily the live `AppSettings.shared.dictationLanguages` at the moment this runs. The
@@ -2627,6 +2807,187 @@ final class AppCoordinator: ObservableObject {
     private func stopLivePreview() {
         livePreviewTask?.cancel()
         livePreviewTask = nil
+    }
+
+    /// Whether `self` still owns `session` at exactly `generation` (Codex finding 5) — re-checked
+    /// after EVERY suspension point in `startLiveStreaming`'s setup sequence, since a cancelled
+    /// capture's suspended `prepare`/`start`/`setPartialCallback` chain must never resume and act
+    /// on the shared engine once ownership has moved on (a later capture, or nothing at all).
+    private func ownsLiveSession(_ session: LiveInsertionSession, generation: Int) -> Bool {
+        recordingGeneration == generation && liveInsertionSession === session
+    }
+
+    /// Starts the live typing lane for the Recording that just began — `target` already passed
+    /// every `shouldStreamLive` gate condition in `prepareLiveStreamingCandidate`.
+    ///
+    /// Codex finding 5: this whole sequence — awaiting the PRIOR capture's teardown, then
+    /// `prepare`/`start`/`setPartialCallback` — runs as one tracked, cancellable `Task` stored in
+    /// `liveStreamSetupTask`, with an ownership re-check after every suspension point. Without
+    /// that, cancelling capture A does not stop A's suspended setup from resuming later and
+    /// reinstalling A's callback on the shared engine, and A's fire-and-forget `reset()` (from
+    /// `cancelLiveStreaming`) could otherwise run after B has already configured the engine and
+    /// wipe B's callback/decoder out from under it — `engineTeardownTask` is awaited here before
+    /// touching the engine at all, so a prior capture's teardown always finishes first.
+    ///
+    /// Codex finding 6: audio only starts DRAINING into the engine (`liveAudioFanOut?.start`)
+    /// once `prepare`, `start`, AND `setPartialCallback` have all succeeded — never before. Buffers
+    /// enqueued by `completeCaptureAdmission`'s `liveSampleConsumer` before that just sit in the
+    /// bounded queue; draining them earlier risked the first ones landing in whatever state the
+    /// SHARED manager was in before `start()`'s `reset()` discards it.
+    private func startLiveStreaming(target: InsertionTarget) {
+        let generation = recordingGeneration
+        let session = LiveInsertionSession(target: target, generation: generation)
+        liveInsertionSession = session
+        // Codex finding 9: marks the streaming model "in use" for the exact window `prepare()`
+        // may be suspended loading it into memory — Settings' Delete guards on this so deletion
+        // can no longer unload/remove the model files out from under a suspended `prepare()`,
+        // whose stale resume would then set `isReady = true` again despite the files being gone.
+        streamingModelStore.markCaptureActive(true)
+        let engine = streamingEngine
+        let priorTeardown = engineTeardownTask
+        liveStreamSetupTask = Task { [weak self] in
+            await priorTeardown?.value
+            guard let self, !Task.isCancelled, self.ownsLiveSession(session, generation: generation) else { return }
+            do {
+                try await engine.prepare(progress: nil)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, self.ownsLiveSession(session, generation: generation) else { return }
+            do {
+                try await engine.start()
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, self.ownsLiveSession(session, generation: generation) else { return }
+            await engine.setPartialCallback { [weak self] confirmed in
+                Task { @MainActor in
+                    guard let self, self.recordingGeneration == generation,
+                          self.liveInsertionSession === session else { return }
+                    session.receivePartial(confirmed)
+                }
+            }
+            guard !Task.isCancelled, self.ownsLiveSession(session, generation: generation),
+                  let fanOut = self.liveAudioFanOut else { return }
+            // Codex finding 5 (session token): only THIS fan-out instance's own drained samples
+            // ever reach `streamingEngine.append` — a stale consumer from a torn-down capture
+            // fails the identity check and drops its samples instead of feeding them into
+            // whatever capture currently owns the shared engine.
+            fanOut.start { [weak self, weak fanOut] samples in
+                guard let self, let fanOut else { return }
+                guard await self.isCurrentFanOut(fanOut) else { return }
+                await self.streamingEngine.append(samples: samples)
+            }
+        }
+    }
+
+    /// Codex finding 5 (session token for `append`): true only while `fanOut` is still THE fan-out
+    /// this coordinator currently owns.
+    private func isCurrentFanOut(_ fanOut: LiveAudioFanOut) -> Bool {
+        liveAudioFanOut === fanOut
+    }
+
+    /// Tears an in-progress live session down without inserting anything: backspaces whatever's
+    /// been typed so far (subject to `finalize`'s own fresh identity/security/readback
+    /// re-verification — Codex findings 2, 3, 5) and resets the engine and its audio fan-out
+    /// (Codex finding 8). Used both by Cancel (Esc), by a mid-recording language change (the
+    /// panel's one-shot language tap), and by every terminal AppCoordinator transition that ends
+    /// a Recording without going through `runPipeline`'s insert closure (Codex finding 7) — a
+    /// session left dangling there could otherwise be finalized by a LATER Recording, backspacing
+    /// at the new focus using the old target. Safe even when nothing is streaming
+    /// (`liveInsertionSession` nil); every call site calls this unconditionally. Also cancels a
+    /// still-suspended `startLiveStreaming` setup sequence (Codex finding 5), and tracks its own
+    /// `reset()` teardown so the NEXT capture's `startLiveStreaming` can await it before reusing
+    /// the shared engine.
+    ///
+    /// Codex round 3 findings 3, 4: `liveStreamSetupTask.cancel()` and `liveAudioFanOut.finish()`
+    /// are both merely cooperative — neither stops an already-in-flight `engine.prepare()`/
+    /// `.append()` call that's suspended inside FluidAudio's manager (e.g. mid-CoreML prediction).
+    /// `engineTeardownTask` now AWAITS both of those Tasks' actual completion before ever calling
+    /// `engine.reset()`, so a stray in-flight call from THIS capture can never run concurrently
+    /// with (or resume after) a LATER capture's `prepare`/`start`/`setPartialCallback` on the same
+    /// shared engine actor — every one of which already awaits `engineTeardownTask` first. The
+    /// capture-owned model reservation (`markCaptureActive(false)`) is released only once that
+    /// whole join barrier completes, not synchronously here, so Delete stays blocked for the
+    /// entire window a stray `prepare()` could still be touching the (possibly about-to-be-
+    /// deleted) model.
+    private func cancelLiveStreaming() {
+        let setupTask = liveStreamSetupTask
+        liveStreamSetupTask = nil
+        setupTask?.cancel()
+        let fanOutTeardown = liveAudioFanOut?.finish()
+        liveAudioFanOut = nil
+        guard let session = liveInsertionSession else {
+            streamingModelStore.markCaptureActive(false)
+            return
+        }
+        liveInsertionSession = nil
+        _ = session.finalize(action: .cancel, refinedText: "", rawText: "")
+        engineTeardownTask = Task { [weak self, engine = streamingEngine] in
+            await setupTask?.value
+            await fanOutTeardown?.value
+            await engine.reset()
+            self?.streamingModelStore.markCaptureActive(false)
+        }
+    }
+
+    /// Pure ownership check (Codex finding 7): a live session may only ever be finalized by the
+    /// capture that created it.
+    nonisolated static func sessionBelongsToCapture(sessionGeneration: Int, currentGeneration: Int) -> Bool {
+        sessionGeneration == currentGeneration
+    }
+
+    /// Builds the `insert` closure `runPipeline` hands `processDictation` when a live session is
+    /// active for this Recording — the SAME choke point (`processDictation`'s injectable `insert`
+    /// parameter) the batch path's default `{ Insertion.insert($0, target: $1).posted }` uses, so
+    /// there is exactly one place either path posts text. By the time this runs, `skipPostProcessing`
+    /// has already resolved `result.refined` to raw-or-refined text upstream (Feature 3's Raw
+    /// button), so `finalize(action: .done, …)` with that single string for both parameters is
+    /// correct for both Done and Raw. `target` is intentionally ignored — the live session already
+    /// carries its own (identical) snapshotted target from Recording start. Returns nil (batch's
+    /// default) when nothing is streaming.
+    private func liveStreamingInsertClosure() -> ((String, InsertionTarget?) -> Bool)? {
+        guard let session = liveInsertionSession else { return nil }
+        guard Self.sessionBelongsToCapture(sessionGeneration: session.generation, currentGeneration: recordingGeneration) else {
+            // Defense in depth (Codex finding 7): every terminal transition below is expected to
+            // have already cancelled a capture's own session before this point, so a mismatch
+            // here should be unreachable — never trust an unrelated capture's ledger.
+            cancelLiveStreaming()
+            return nil
+        }
+        return { [weak self] text, _ in
+            guard let self else { return false }
+            // Codex round 3 findings 3, 4: join `setupTask`/`fanOut`'s consumer before resetting
+            // the shared engine, and release the capture-owned model reservation only after that
+            // barrier completes — see `cancelLiveStreaming`'s docs for the full race this closes.
+            let setupTask = self.liveStreamSetupTask
+            self.liveStreamSetupTask = nil
+            setupTask?.cancel()
+            self.liveInsertionSession = nil
+            let fanOutTeardown = self.liveAudioFanOut?.finish()
+            self.liveAudioFanOut = nil
+            self.engineTeardownTask = Task { [weak self, engine = self.streamingEngine] in
+                await setupTask?.value
+                await fanOutTeardown?.value
+                await engine.reset()
+                self?.streamingModelStore.markCaptureActive(false)
+            }
+            switch session.finalize(action: .done, refinedText: text, rawText: text) {
+            case .insert(let finalText):
+                // Codex round 3 finding 1: an empty-ledger `.insert` (nothing was ever typed live)
+                // gets none of `LiveInsertionSession`'s streaming security checks for free — only
+                // `finalize`'s own fresh pre-check gated accepting this branch at all. `strict:
+                // true` here closes the same window at the actual paste: a same-app focus change
+                // (a collapsed-selection element comparison that's `.unavailable`) is refused
+                // rather than permissively pasted, same as every other streaming-live paste site.
+                return Insertion.insert(finalText, target: session.target, strict: true).posted
+            case .clipboardOnly:
+                self.hud.flash("Live dictation moved to the clipboard — the target app changed or the text was long")
+                return false
+            case .none:
+                return true
+            }
+        }
     }
 
     private func runLivePreviewTick(generation: Int) async {
@@ -2798,6 +3159,11 @@ final class AppCoordinator: ObservableObject {
             recordingHUDDidReachTerminalState(generation: hudGeneration)
         }
 
+        // Streaming ASR: captured before the pipeline runs, not read live inside the closure —
+        // `liveInsertionSession` is nilled by the closure itself the moment it fires, and the
+        // pipeline's `insert` closure only ever runs once per stop.
+        let liveInsert = liveStreamingInsertClosure()
+
         await Self.runExternalPipelineTask(
             operation: {
                 try await processDictation(
@@ -2808,6 +3174,7 @@ final class AppCoordinator: ObservableObject {
                     cloudSnapshot: cloudSnapshot.eligibility.isEligible ? cloudSnapshot : nil,
                     voiceCommands: voiceCommands, vocabularySnapshot: vocabularySnapshot,
                     processor: processor, localContext: localContext,
+                    insert: liveInsert ?? { Insertion.insert($0, target: $1).posted },
                     record: { result in
                         try LibraryStore.shared.record(
                             language: result.sourceLanguage.rawValue,
@@ -2850,7 +3217,17 @@ final class AppCoordinator: ObservableObject {
                     hud.hide()
                 }
             },
+            // `onCancellation`/`onEmptyTranscript`/`onTranslationFailure`/`onFailure` all fire
+            // when `processDictation` throws BEFORE its `insert` closure ever runs (the closure
+            // only executes on the success path, inside `external:` — see
+            // `processDictation`/`destinationLifecycle.runAsync`) — so a live session's own
+            // teardown (which happens *inside* that closure) never happens on these paths.
+            // Without an explicit `cancelLiveStreaming()` here, the session — and whatever it
+            // already typed — would linger and could be finalized by a LATER Recording instead
+            // (Codex finding 7). `onRecordFailure`/`onSuccess` don't need this: `insert` has
+            // already run by the time either fires.
             onCancellation: {
+                cancelLiveStreaming()
                 await failForegroundRecovery(recovery, failure: JobFailure(
                     stage: .transcribing,
                     message: "Processing was interrupted"
@@ -2858,6 +3235,7 @@ final class AppCoordinator: ObservableObject {
                 hud.flash("Processing interrupted — audio saved")
             },
             onEmptyTranscript: {
+                cancelLiveStreaming()
                 await failForegroundRecovery(recovery, failure: JobFailure(stage: .transcribing, message: "Empty transcript"))
                 hud.flash("Transcription failed — audio saved")
             },
@@ -2866,6 +3244,7 @@ final class AppCoordinator: ObservableObject {
                 hud.flash("Library save failed — audio saved")
             },
             onTranslationFailure: { failure in
+                cancelLiveStreaming()
                 await failForegroundRecovery(recovery, failure: JobFailure(
                     stage: .postProcessing,
                     message: failure.localizedDescription
@@ -2878,6 +3257,7 @@ final class AppCoordinator: ObservableObject {
                 lastError = message
             },
             onFailure: { error in
+                cancelLiveStreaming()
                 lastError = "Transcription failed: \(error.localizedDescription)"
                 await failForegroundRecovery(recovery, failure: JobFailure(stage: .transcribing, message: error.localizedDescription))
                 hud.flash("Transcription failed — audio saved")

@@ -172,6 +172,45 @@ the same explanation is available as a hover tip.
   re-recording or re-processing — handy when a paste got dismissed or
   overwritten.
 
+## Type as you speak (Streaming ASR)
+
+Turn on **Type as you speak (Streaming ASR)** in Settings → Transcription and confirmed words
+appear directly in the focused field while you're still talking, instead of waiting for
+"Processing…" to finish. When you release the key (or stop hands-free recording), that live-typed
+text is replaced by the same refined output the Active Template would otherwise paste. It's off
+by default, and distinct from **Live preview while recording** above — that preview only updates
+the HUD pill and never touches the field you're dictating into.
+
+Turning it on reveals a separate model to download: **Parakeet EOU 120M (160ms)**, downloaded and
+deleted from Settings → Transcription the same way as the WhisperKit models above, but it's a
+different model dedicated to streaming — the WhisperKit models don't do this.
+
+Streaming only engages for English today — that's the full extent of what the underlying
+streaming model supports right now. It also requires the spoken language for that Recording to
+be explicitly resolved (English, via the language pin or an App Rule) at the moment you start
+recording; leaving language on **Auto** never streams, since there's no known language to type in
+yet. Cloud STT, Scratchpad dictation, and secure fields (password inputs) don't stream either —
+all of these fall back silently to today's batch behavior: no partial typing, refined text pasted
+once you stop, unchanged from before this feature existed. Tapping a one-shot **EN**/**PT**
+language override on the Recording Panel mid-recording also falls back to batch for the rest of
+that Recording, rather than trying to restart streaming under the new language.
+
+Safety comes first. Streaming only starts when the focused field has an empty, collapsed cursor —
+never over a selection, since typing over one would silently destroy it with no way to restore it
+on Cancel. Before removing anything it typed, FreeTalker re-reads the field and confirms its
+typed text is still exactly where it left it. If the frontmost window changes, the field turns
+secure, or anything doesn't match, FreeTalker leaves your typed text on screen untouched and puts
+the refined text on the clipboard instead of pasting it.
+
+If FreeTalker quits or crashes while live-typed text is still on screen, that text stays in your
+document. It is never cleaned up automatically after a relaunch — deliberately: reconciling a
+possibly-stale record of what was typed against a document you may have kept editing since is
+more dangerous than leaving the correct-at-the-time partial text alone.
+
+For a long dictation — past roughly 400 typed characters — FreeTalker skips the replace step
+entirely: the typed text stays on screen as-is, and the refined version goes to the clipboard
+instead of being pasted over it.
+
 ## Floating controls and scratchpad
 
 The edge launcher is off by default. In Settings → Launcher, turn on **Show
