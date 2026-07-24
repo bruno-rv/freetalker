@@ -70,6 +70,11 @@ final class StreamingModelStore: ObservableObject {
     func delete() async throws {
         guard SpeechModelStore.canDelete(phase: phase, active: false) else { return }
         phase = .busy(reloadTarget: "parakeet-eou-160ms")
+        // Tear the in-memory manager down and clear `isReady` BEFORE removing the files (Codex
+        // finding 10) — otherwise a subsequent `prepare()` (re-download) sees `isReady == true`
+        // and returns immediately as a no-op, leaving the UI stuck on "Not downloaded" until
+        // relaunch.
+        await engine.unload()
         let directory = modelDirectory
         do {
             try await Task.detached { try FileManager.default.removeItem(at: directory) }.value

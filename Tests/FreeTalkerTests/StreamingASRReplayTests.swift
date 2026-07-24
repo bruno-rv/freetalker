@@ -69,6 +69,12 @@ private actor FakeStreamingTranscriptionEngine: StreamingTranscriptionEngine {
         chunkIndex = 0
         lastConfirmed = ""
     }
+
+    func unload() async {
+        ready = false
+        chunkIndex = 0
+        lastConfirmed = ""
+    }
 }
 
 @Suite struct StreamingASRReplayTests {

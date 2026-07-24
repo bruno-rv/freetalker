@@ -35,6 +35,12 @@ protocol StreamingTranscriptionEngine: Sendable {
 
     /// Resets engine state for reuse across Recordings. The loaded model stays in memory.
     func reset() async
+
+    /// Tears the loaded manager down and clears `isReady` (Codex finding 10). Distinct from
+    /// `reset()`, which keeps the model loaded for reuse across Recordings — `unload()` is only
+    /// for when the on-disk model files are about to be deleted, so a subsequent `prepare()`
+    /// (re-download) doesn't no-op against a manager that still thinks it's ready.
+    func unload() async
 }
 
 /// The spoken-language codes (`DictationLanguage.rawValue`) the live streaming lane can handle.
@@ -139,9 +145,22 @@ actor FluidAudioStreamingEngine: StreamingTranscriptionEngine {
         return final
     }
 
+    /// Clears `externalCallback` and re-registers a no-op with the manager (Codex finding 11):
+    /// without this, `externalCallback` keeps a strong reference to whatever
+    /// `LiveInsertionSession` (and its captured `InsertionTarget` AX elements) the last Recording
+    /// created, alive until the NEXT Recording overwrites it via `setPartialCallback`.
     func reset() async {
         lastConfirmed = ""
+        externalCallback = nil
+        await manager.setPartialTranscriptCallback { _ in }
         await manager.reset()
+    }
+
+    func unload() async {
+        await manager.cleanup()
+        isReady = false
+        lastConfirmed = ""
+        externalCallback = nil
     }
 
     private func handleRawPartial(_ raw: String) {
