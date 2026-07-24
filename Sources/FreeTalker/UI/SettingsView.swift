@@ -1565,7 +1565,11 @@ private struct GeneralSettingsView: View {
             case .notDownloaded, .failed:
                 Button("Download") { Task { await streamingModelStore.download() } }
             case .downloaded:
+                // Codex finding 9: disabled while capture lifecycle has the streaming model
+                // active — deleting mid-`prepare()` could unload/remove the files out from under
+                // a suspended load, whose stale resume would then set `isReady` back to true.
                 Button("Delete") { Task { try? await streamingModelStore.delete() } }
+                    .disabled(streamingModelStore.captureActive)
             case .downloading(let progress):
                 ProgressView(value: progress).frame(width: 72)
             case .busy:

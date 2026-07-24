@@ -14,6 +14,17 @@ final class StreamingModelStore: ObservableObject {
 
     @Published private(set) var phase: SpeechModelStore.Phase = .notDownloaded
     @Published private(set) var sizeBytes: Int64?
+    /// True for the whole window `AppCoordinator.startLiveStreaming` may have a suspended
+    /// `prepare()`/`start()` in flight for a live-streaming Recording (Codex finding 9): without
+    /// this, Delete stays enabled during capture, and if it unloads + removes the model files
+    /// while `prepare()` is still suspended inside `loadModels`, the stale `prepare()` resumes and
+    /// sets `isReady = true` again — recreating the exact no-op-redownload state round 1 fixed,
+    /// now with the files actually gone.
+    @Published private(set) var captureActive = false
+
+    func markCaptureActive(_ active: Bool) {
+        captureActive = active
+    }
 
     private let modelDirectory: URL
     let engine: FluidAudioStreamingEngine
@@ -68,7 +79,11 @@ final class StreamingModelStore: ObservableObject {
     }
 
     func delete() async throws {
-        guard SpeechModelStore.canDelete(phase: phase, active: false) else { return }
+        // Codex finding 9: `active` now reflects real capture-lifecycle state (see
+        // `captureActive`) instead of the hardcoded `false` that let deletion race a suspended
+        // `prepare()`. Guarded here too, not just in `SettingsView`'s Delete button, since this
+        // method is a public entry point other callers could reach directly.
+        guard SpeechModelStore.canDelete(phase: phase, active: captureActive) else { return }
         phase = .busy(reloadTarget: "parakeet-eou-160ms")
         // Tear the in-memory manager down and clear `isReady` BEFORE removing the files (Codex
         // finding 10) — otherwise a subsequent `prepare()` (re-download) sees `isReady == true`
