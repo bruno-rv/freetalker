@@ -55,9 +55,19 @@ final class LiveAudioFanOut: @unchecked Sendable {
     }
 
     /// Ends the queue and cancels the consumer. Any `enqueue` after this point is a no-op.
-    func finish() {
+    /// Returns the consumer's `Task` (Codex finding 3) so the caller can `await` its actual
+    /// completion before reusing the shared engine: `cancel()` alone is cooperative and does NOT
+    /// stop a chunk that's already `await`ing inside `consume` (e.g. a suspended CoreML
+    /// prediction) — without joining that Task first, a later capture's `setPartialCallback` can
+    /// install its own handoff on the SAME shared engine while this stale chunk is still in
+    /// flight, and the engine can end up delivering this chunk's decoded tokens through the
+    /// later capture's live callback.
+    @discardableResult
+    func finish() -> Task<Void, Never>? {
         continuation.finish()
         consumerTask?.cancel()
+        let task = consumerTask
         consumerTask = nil
+        return task
     }
 }

@@ -1547,7 +1547,14 @@ final class AppCoordinator: ObservableObject {
             pendingLiveStreamTarget = nil
             Task { await cleanCancelledAdmission(active, service: service) }
         case .start, .startAndStop:
-            let liveStreamTarget = pendingLiveStreamTarget
+            // Codex round 3 finding 5: `pendingLiveStreamTarget` was captured at key-down —
+            // before this asynchronous journal-preparation gap. `captureActive` isn't set true
+            // until `startLiveStreaming` below, so Delete stayed enabled for the streaming model
+            // files for this entire window; the model could have been unloaded and removed since.
+            // Re-validate immediately before ever acting on the stale target, right before
+            // creating the fan-out/session or marking the model active.
+            var liveStreamTarget = pendingLiveStreamTarget
+            if streamingModelStore.phase != .downloaded { liveStreamTarget = nil }
             pendingLiveStreamTarget = nil
             // `.startAndStop` (an already-finished tap) never starts a live session below, so its
             // tap must not feed the engine either — an unstarted/stale engine has no session to
@@ -2892,16 +2899,36 @@ final class AppCoordinator: ObservableObject {
     /// still-suspended `startLiveStreaming` setup sequence (Codex finding 5), and tracks its own
     /// `reset()` teardown so the NEXT capture's `startLiveStreaming` can await it before reusing
     /// the shared engine.
+    ///
+    /// Codex round 3 findings 3, 4: `liveStreamSetupTask.cancel()` and `liveAudioFanOut.finish()`
+    /// are both merely cooperative — neither stops an already-in-flight `engine.prepare()`/
+    /// `.append()` call that's suspended inside FluidAudio's manager (e.g. mid-CoreML prediction).
+    /// `engineTeardownTask` now AWAITS both of those Tasks' actual completion before ever calling
+    /// `engine.reset()`, so a stray in-flight call from THIS capture can never run concurrently
+    /// with (or resume after) a LATER capture's `prepare`/`start`/`setPartialCallback` on the same
+    /// shared engine actor — every one of which already awaits `engineTeardownTask` first. The
+    /// capture-owned model reservation (`markCaptureActive(false)`) is released only once that
+    /// whole join barrier completes, not synchronously here, so Delete stays blocked for the
+    /// entire window a stray `prepare()` could still be touching the (possibly about-to-be-
+    /// deleted) model.
     private func cancelLiveStreaming() {
-        liveStreamSetupTask?.cancel()
+        let setupTask = liveStreamSetupTask
         liveStreamSetupTask = nil
-        liveAudioFanOut?.finish()
+        setupTask?.cancel()
+        let fanOutTeardown = liveAudioFanOut?.finish()
         liveAudioFanOut = nil
-        streamingModelStore.markCaptureActive(false)
-        guard let session = liveInsertionSession else { return }
+        guard let session = liveInsertionSession else {
+            streamingModelStore.markCaptureActive(false)
+            return
+        }
         liveInsertionSession = nil
         _ = session.finalize(action: .cancel, refinedText: "", rawText: "")
-        engineTeardownTask = Task { [engine = streamingEngine] in await engine.reset() }
+        engineTeardownTask = Task { [weak self, engine = streamingEngine] in
+            await setupTask?.value
+            await fanOutTeardown?.value
+            await engine.reset()
+            self?.streamingModelStore.markCaptureActive(false)
+        }
     }
 
     /// Pure ownership check (Codex finding 7): a live session may only ever be finalized by the
@@ -2930,16 +2957,30 @@ final class AppCoordinator: ObservableObject {
         }
         return { [weak self] text, _ in
             guard let self else { return false }
-            self.liveStreamSetupTask?.cancel()
+            // Codex round 3 findings 3, 4: join `setupTask`/`fanOut`'s consumer before resetting
+            // the shared engine, and release the capture-owned model reservation only after that
+            // barrier completes — see `cancelLiveStreaming`'s docs for the full race this closes.
+            let setupTask = self.liveStreamSetupTask
             self.liveStreamSetupTask = nil
+            setupTask?.cancel()
             self.liveInsertionSession = nil
-            self.liveAudioFanOut?.finish()
+            let fanOutTeardown = self.liveAudioFanOut?.finish()
             self.liveAudioFanOut = nil
-            self.streamingModelStore.markCaptureActive(false)
-            self.engineTeardownTask = Task { [engine = self.streamingEngine] in await engine.reset() }
+            self.engineTeardownTask = Task { [weak self, engine = self.streamingEngine] in
+                await setupTask?.value
+                await fanOutTeardown?.value
+                await engine.reset()
+                self?.streamingModelStore.markCaptureActive(false)
+            }
             switch session.finalize(action: .done, refinedText: text, rawText: text) {
             case .insert(let finalText):
-                return Insertion.insert(finalText, target: session.target).posted
+                // Codex round 3 finding 1: an empty-ledger `.insert` (nothing was ever typed live)
+                // gets none of `LiveInsertionSession`'s streaming security checks for free — only
+                // `finalize`'s own fresh pre-check gated accepting this branch at all. `strict:
+                // true` here closes the same window at the actual paste: a same-app focus change
+                // (a collapsed-selection element comparison that's `.unavailable`) is refused
+                // rather than permissively pasted, same as every other streaming-live paste site.
+                return Insertion.insert(finalText, target: session.target, strict: true).posted
             case .clipboardOnly:
                 self.hud.flash("Live dictation moved to the clipboard — the target app changed or the text was long")
                 return false
