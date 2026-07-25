@@ -43,48 +43,22 @@ enum AutomationService {
         includeSpeakerLabels: Bool
     ) async throws -> String {
         try AutomationGate.checkEnabled(AppSettings.shared.automationEnabled)
-
-        // Codex round-1 Finding 2 / round-2 Finding 1: the automation toggle alone grants no
-        // per-file authority — only a file inside the user's chosen Automation folder may be
-        // read, and that folder's identity comes from a bookmark bound to the real directory,
-        // never the mutable `automationFolderPath` string. Every check downstream uses the
-        // CANONICAL (symlink-resolved) URL this returns, never the caller-supplied one.
-        let authorized = try AutomationFileAuthorization.authorize(
-            fileURL, automationFolderBookmark: AppSettings.shared.automationFolderBookmark
-        )
-        guard MediaImportService.isSupported(authorized.url) else { throw AutomationError.unsupportedFileType }
-
-        // Codex round-2 Finding 2: no `await` occurs between `authorize` above and `stage` here —
-        // `stage` pins the real file via an `O_NOFOLLOW` file descriptor and copies its verified
-        // bytes into app-owned staging BEFORE any AVFoundation or import call ever runs, so the
-        // async duration probe and `importMedia` below can never reopen a caller-swapped path.
-        let staged = try AutomationMediaStaging.stage(
-            canonicalFolder: authorized.folder,
-            canonicalFile: authorized.url,
-            maximumBytes: AutomationMediaGuard.maximumSourceFileBytes
-        )
-        defer { staged.cleanup() }
-        // Captured by the task group's child task below instead of `staged` itself: `URL` is
-        // `Sendable`, so this avoids requiring `AutomationMediaStaging.StagedFile` (whose cleanup
-        // closure isn't) to cross the child task's concurrency domain.
-        let stagedURL = staged.url
-
-        await AppCoordinator.shared.launchMediaImportWorkflows()
-        guard let jobLibraryStore = AppCoordinator.shared.jobLibraryStore else {
-            throw AutomationErrorSanitizer.processingFailure(
-                message: "import queue not ready", context: "transcribe"
-            )
-        }
+        let automationFolderBookmark = AppSettings.shared.automationFolderBookmark
 
         let handle = JobHandle()
         do {
+            // Codex round-3 Finding 3: the deadline now races the ENTIRE rest of the request —
+            // authorization, staging, import, and waiting for completion — instead of starting
+            // only after staging already finished. A hostile or pathologically slow staging copy
+            // used to run with no deadline supervision at all; now it's bounded by the same
+            // 2-hour ceiling as everything else (Codex round-1 Finding 7).
             return try await withThrowingTaskGroup(of: String.self) { group in
                 group.addTask {
-                    try await performTranscription(
-                        stagedURL: stagedURL,
+                    try await authorizeStageAndTranscribe(
+                        fileURL: fileURL,
+                        automationFolderBookmark: automationFolderBookmark,
                         format: format,
                         includeSpeakerLabels: includeSpeakerLabels,
-                        store: jobLibraryStore,
                         handle: handle
                     )
                 }
@@ -98,17 +72,82 @@ enum AutomationService {
             }
         } catch AutomationError.timedOut {
             if let jobID = await handle.jobID {
-                _ = try? await jobLibraryStore.cancelImport(id: jobID)
+                _ = try? await AppCoordinator.shared.jobLibraryStore?.cancelImport(id: jobID)
             }
             throw AutomationError.timedOut
         }
+    }
+
+    /// Codex round-3 Finding 3: authorizes and stages `fileURL` as one synchronous unit — see
+    /// `authorizeAndStage` — then hands the staged copy to the rest of the pipeline. `nonisolated`
+    /// (unlike the rest of this `@MainActor` enum) so that, run as a `withThrowingTaskGroup` child
+    /// task, it is never pinned to the main actor: the synchronous, potentially multi-GiB copy
+    /// inside `authorizeAndStage` runs on the same executor this function starts on, off
+    /// `@MainActor`, and only the calls that actually need `AppCoordinator`/`JobLibraryStore`
+    /// (both `@MainActor`) hop onto it via `await`, for just their own duration.
+    private static nonisolated func authorizeStageAndTranscribe(
+        fileURL: URL,
+        automationFolderBookmark: Data?,
+        format: TranscriptFormat,
+        includeSpeakerLabels: Bool,
+        handle: JobHandle
+    ) async throws -> String {
+        let staged = try authorizeAndStage(fileURL: fileURL, automationFolderBookmark: automationFolderBookmark)
+
+        // Codex round-3 Finding 6: ownership of `staged` transfers to the durable import job the
+        // moment `performTranscription` below records a `jobID` on `handle` — from that point,
+        // the staged source belongs to the job (its `source.reference`/bookmark point at it), and
+        // only `MediaImportPipeline` (once decode checkpoints), `JobLibraryStore.deleteImport`
+        // (explicit deletion), or startup orphan reconciliation may ever delete it again. Before
+        // that point, no durable job exists yet — THIS function is the only thing that knows the
+        // staged file exists, so any exit path here must clean it up itself.
+        do {
+            return try await performTranscription(
+                stagedURL: staged.url,
+                format: format,
+                includeSpeakerLabels: includeSpeakerLabels,
+                handle: handle
+            )
+        } catch {
+            if await handle.jobID == nil { staged.cleanup() }
+            throw error
+        }
+    }
+
+    /// Codex round-3 Finding 3: authorize and stage as ONE synchronous unit — no `await` between
+    /// them, preserving Codex round-2 Finding 2's no-suspension guarantee — and never on
+    /// `@MainActor` (see `authorizeStageAndTranscribe`'s doc comment). `nonisolated` so it carries
+    /// no actor affinity of its own.
+    private static nonisolated func authorizeAndStage(
+        fileURL: URL,
+        automationFolderBookmark: Data?
+    ) throws -> AutomationMediaStaging.StagedFile {
+        // Codex round-1 Finding 2 / round-2 Finding 1: the automation toggle alone grants no
+        // per-file authority — only a file inside the user's chosen Automation folder may be
+        // read, and that folder's identity comes from a bookmark bound to the real directory,
+        // never the mutable `automationFolderPath` string. Every check downstream uses the
+        // CANONICAL (symlink-resolved) URL this returns, never the caller-supplied one.
+        let authorized = try AutomationFileAuthorization.authorize(
+            fileURL, automationFolderBookmark: automationFolderBookmark
+        )
+        guard MediaImportService.isSupported(authorized.url) else { throw AutomationError.unsupportedFileType }
+
+        // Codex round-2 Finding 2: no `await` occurs between `authorize` above and `stage` here —
+        // `stage` pins the real file via an `O_NOFOLLOW` file descriptor and copies its verified
+        // bytes into app-owned staging BEFORE any AVFoundation or import call ever runs, so the
+        // async duration probe and `importMedia` below can never reopen a caller-swapped path.
+        return try AutomationMediaStaging.stage(
+            canonicalFolder: authorized.folder,
+            canonicalFile: authorized.url,
+            folderIdentity: authorized.folderIdentity,
+            maximumBytes: AutomationMediaGuard.maximumSourceFileBytes
+        )
     }
 
     private static func performTranscription(
         stagedURL: URL,
         format: TranscriptFormat,
         includeSpeakerLabels: Bool,
-        store: JobLibraryStore,
         handle: JobHandle
     ) async throws -> String {
         // Codex round-1 Finding 4 / round-2 Finding 5: a small, compressed file can still decode
@@ -119,16 +158,25 @@ enum AutomationService {
         let asset = AVURLAsset(url: stagedURL)
         try await AutomationMediaGuard.validateDuration { try await asset.load(.duration) }
 
+        await AppCoordinator.shared.launchMediaImportWorkflows()
+        guard let jobLibraryStore = AppCoordinator.shared.jobLibraryStore else {
+            throw AutomationErrorSanitizer.processingFailure(
+                message: "import queue not ready", context: "transcribe"
+            )
+        }
+
         let jobID: UUID
         do {
-            jobID = try await store.importMedia(stagedURL)
+            jobID = try await jobLibraryStore.importMedia(stagedURL)
         } catch let error as MediaImportError {
             if error == .unsupportedType { throw AutomationError.unsupportedFileType }
             throw AutomationErrorSanitizer.processingFailure(error, context: "transcribe (import)")
         }
+        // The durable job now owns `stagedURL` (Codex round-3 Finding 6) — see
+        // `authorizeStageAndTranscribe`'s doc comment.
         await handle.record(jobID)
 
-        let detail = try await waitForCompletion(jobID: jobID, store: store)
+        let detail = try await waitForCompletion(jobID: jobID, store: jobLibraryStore)
         return TranscriptExporter().export(
             detail.attributedTranscript,
             format: format,

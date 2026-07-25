@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// Codex round-1 Finding 2 (HIGH, confused-deputy file read): FreeTalker is unsandboxed, so a
@@ -26,6 +27,27 @@ enum AutomationFileAuthorization {
     struct AuthorizedFile {
         let url: URL
         let folder: URL
+        /// Codex round-3 additional finding: `AutomationMediaStaging.openPinned` reopens `folder`
+        /// by PATHNAME (it can't hold a descriptor open across this call, `stage`'s own async
+        /// call, and everything in between). This is the device+inode identity `folder` had at
+        /// THIS check, captured with `stat` — `openPinned` `fstat`s its own reopen and compares,
+        /// so a same-user process that deletes/replaces the real directory object at that path in
+        /// the gap is caught rather than silently trusted, even though the pathname reopen itself
+        /// can't be made fully atomic without holding a descriptor open across that gap.
+        let folderIdentity: FileIdentity
+    }
+
+    /// A filesystem object's device+inode pair — stable identity for a directory that a pathname
+    /// alone can't provide (a pathname can be deleted and replaced by an unrelated object).
+    struct FileIdentity: Equatable {
+        let device: dev_t
+        let inode: ino_t
+
+        static func of(_ url: URL) throws -> FileIdentity {
+            var info = stat()
+            guard stat(url.path, &info) == 0 else { throw AutomationError.automationFolderUnavailable }
+            return FileIdentity(device: info.st_dev, inode: info.st_ino)
+        }
     }
 
     /// Resolves `automationFolderBookmark` to the real directory it was created from — rejecting a
@@ -78,6 +100,7 @@ enum AutomationFileAuthorization {
         guard canonicalRequested.path.hasPrefix(folderPath) else {
             throw AutomationError.fileNotAuthorized
         }
-        return AuthorizedFile(url: canonicalRequested, folder: canonicalFolder)
+        let folderIdentity = try FileIdentity.of(canonicalFolder)
+        return AuthorizedFile(url: canonicalRequested, folder: canonicalFolder, folderIdentity: folderIdentity)
     }
 }

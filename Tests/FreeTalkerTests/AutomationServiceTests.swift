@@ -255,7 +255,9 @@ struct AutomationServiceTests {
         FileManager.default.createFile(atPath: file.path, contents: contents)
 
         let staged = try AutomationMediaStaging.stage(
-            canonicalFolder: root, canonicalFile: file, maximumBytes: AutomationMediaGuard.maximumSourceFileBytes
+            canonicalFolder: root, canonicalFile: file,
+            folderIdentity: try AutomationFileAuthorization.FileIdentity.of(root),
+            maximumBytes: AutomationMediaGuard.maximumSourceFileBytes
         )
         #expect(staged.url != file)
         #expect(try Data(contentsOf: staged.url) == contents)
@@ -271,7 +273,9 @@ struct AutomationServiceTests {
 
         #expect(throws: AutomationError.unsupportedMediaFile) {
             _ = try AutomationMediaStaging.stage(
-                canonicalFolder: root, canonicalFile: notAFile, maximumBytes: AutomationMediaGuard.maximumSourceFileBytes
+                canonicalFolder: root, canonicalFile: notAFile,
+                folderIdentity: try AutomationFileAuthorization.FileIdentity.of(root),
+                maximumBytes: AutomationMediaGuard.maximumSourceFileBytes
             )
         }
     }
@@ -289,7 +293,9 @@ struct AutomationServiceTests {
         // it because it opens `link.wav` itself with O_NOFOLLOW, never following to `real.wav`.
         #expect(throws: AutomationError.unsupportedMediaFile) {
             _ = try AutomationMediaStaging.stage(
-                canonicalFolder: root, canonicalFile: link, maximumBytes: AutomationMediaGuard.maximumSourceFileBytes
+                canonicalFolder: root, canonicalFile: link,
+                folderIdentity: try AutomationFileAuthorization.FileIdentity.of(root),
+                maximumBytes: AutomationMediaGuard.maximumSourceFileBytes
             )
         }
     }
@@ -304,7 +310,11 @@ struct AutomationServiceTests {
         try handle.close()
 
         #expect(throws: AutomationError.mediaTooLarge) {
-            _ = try AutomationMediaStaging.stage(canonicalFolder: root, canonicalFile: big, maximumBytes: 100)
+            _ = try AutomationMediaStaging.stage(
+                canonicalFolder: root, canonicalFile: big,
+                folderIdentity: try AutomationFileAuthorization.FileIdentity.of(root),
+                maximumBytes: 100
+            )
         }
     }
 
@@ -466,29 +476,80 @@ struct AutomationServiceTests {
         #expect(reloaded.automationFolderPath == "/tmp/some-folder")
     }
 
-    // MARK: - Codex round-2 Finding 1: the bookmark (the real authority) persists independently
+    // MARK: - Codex round-2 Finding 1 / round-3 Finding 1: the bookmark (the real authority)
+    // persists independently, through an injectable Keychain-backed store — never the real system
+    // Keychain in a test, and never `UserDefaults` (see the forged-bookmark test below).
 
     @Test func automationFolderBookmarkIsUnsetByDefault() throws {
         let suite = "AutomationServiceTests.\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
 
-        let settings = AppSettings(defaults: defaults)
+        let settings = AppSettings(defaults: defaults, secretStore: InMemorySecretStore())
 
         #expect(settings.automationFolderBookmark == nil)
     }
 
-    @Test func automationFolderBookmarkPersistsAcrossReload() throws {
+    @Test func automationFolderBookmarkPersistsAcrossReloadThroughTheSameSecretStore() throws {
         let suite = "AutomationServiceTests.\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
-        let settings = AppSettings(defaults: defaults)
+        let secretStore = InMemorySecretStore()
+        let settings = AppSettings(defaults: defaults, secretStore: secretStore)
         let bookmark = Data([0x01, 0x02, 0x03])
 
         settings.automationFolderBookmark = bookmark
 
-        let reloaded = AppSettings(defaults: defaults)
+        let reloaded = AppSettings(defaults: defaults, secretStore: secretStore)
         #expect(reloaded.automationFolderBookmark == bookmark)
+    }
+
+    @Test func clearingTheBookmarkRemovesItFromTheSecretStore() throws {
+        let suite = "AutomationServiceTests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let secretStore = InMemorySecretStore()
+        let settings = AppSettings(defaults: defaults, secretStore: secretStore)
+        settings.automationFolderBookmark = Data([0x01, 0x02, 0x03])
+
+        settings.automationFolderBookmark = nil
+
+        #expect(settings.automationFolderBookmark == nil)
+        #expect(secretStore.values[Keychain.Account.automationFolderBookmark] == nil)
+    }
+
+    // MARK: - Codex round-3 Finding 1: a bookmark forged directly into `UserDefaults` (the exact
+    // round-2 `defaults write` attack, re-encoded as bookmark data instead of a path string) is
+    // never read for authorization — only the Keychain-backed store is.
+
+    @Test func forgedUserDefaultsBookmarkIsIgnoredNeverTrusted() throws {
+        let suite = "AutomationServiceTests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        // Simulates a same-user process running `defaults write org.freetalker.app
+        // automationFolderBookmark <bookmark for />` BEFORE FreeTalker ever launches.
+        let forged = try Self.bookmark(for: URL(fileURLWithPath: "/"))
+        defaults.set(forged, forKey: "automationFolderBookmark")
+
+        let settings = AppSettings(defaults: defaults, secretStore: InMemorySecretStore())
+
+        #expect(settings.automationFolderBookmark == nil)
+    }
+
+    private final class InMemorySecretStore: SecretStore {
+        var values: [String: String]
+
+        init(values: [String: String] = [:]) { self.values = values }
+
+        func get(account: String) -> String? { values[account] }
+        @discardableResult func set(_ value: String, account: String) -> Bool {
+            values[account] = value
+            return true
+        }
+        @discardableResult func delete(account: String) -> Bool {
+            values.removeValue(forKey: account)
+            return true
+        }
     }
 
     // MARK: - Finding 2: the bridged direct-parameter resolver only accepts a real file reference
