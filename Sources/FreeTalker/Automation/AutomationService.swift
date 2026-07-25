@@ -29,8 +29,18 @@ enum AutomationService {
     /// `AutomationError` case at that point.
     static func cleanUpText(_ text: String, templateName: String) async throws -> String {
         try AutomationGate.checkEnabled(AppSettings.shared.automationEnabled)
-        guard let template = TemplateStore.resolveTemplate(named: templateName, in: TemplateStore.shared.templates) else {
+        let template: Template
+        switch TemplateStore.resolveTemplate(named: templateName, in: TemplateStore.shared.templates) {
+        case .found(let match):
+            template = match
+        case .notFound:
             throw AutomationError.unknownTemplate(templateName)
+        case .ambiguous:
+            // Codex round-6 finding: two Templates sharing this exact name (e.g. after the
+            // whitespace-canonicalization migration in `TemplateStore.init` collapses previously-
+            // distinct names onto the same one) must never be resolved by silently picking one —
+            // see `TemplateStore.resolveTemplate`'s doc comment.
+            throw AutomationError.ambiguousTemplateName(templateName)
         }
 
         let request = PostProcessingRequest(

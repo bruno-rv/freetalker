@@ -234,23 +234,44 @@ final class TemplateStore: ObservableObject {
         templates.first { $0.id == id }
     }
 
+    /// Result of `resolveTemplate(named:in:)` below. `.ambiguous` is a distinct case, not folded
+    /// into `.notFound` or silently resolved to a match — see that function's doc comment.
+    enum TemplateNameLookup: Equatable, Sendable {
+        case found(Template)
+        case notFound
+        case ambiguous
+    }
+
     /// Exact-name lookup for the automation surface (`clean up` — see
     /// BRAINSTORM_AUTOMATION_SURFACE.md), which resolves a Template by user-facing name rather
     /// than internal id. Template names aren't enforced unique (the UI never checked this), so a
-    /// collision deterministically returns the first match in `templates`' existing order — the
-    /// same "earliest wins" convention `importTemplates` already uses for dedupe. `nil` means no
-    /// match, which callers must treat as an error, never a silent default (an unknown template
-    /// name is a caller mistake, not something to paper over). Pure/`nonisolated` so it's testable
-    /// without `@MainActor` and reusable by both the real store and tests.
+    /// name that matches MORE THAN ONE stored Template reports `.ambiguous` rather than silently
+    /// picking one. This was previously "earliest wins" (the same convention `importTemplates`
+    /// uses for dedupe), but that convention is unsafe here: the one-time whitespace-
+    /// canonicalization migration (`trimmingTemplateNames` below) can turn two previously-distinct
+    /// stored names (e.g. " Report " and "Report") into the same canonical name while preserving
+    /// storage order, which can silently change WHICH stored Template a first-match lookup
+    /// resolves to across an app update — the same caller, the same requested name, a different
+    /// Template's prompt. An exact-name contract genuinely cannot disambiguate two identically-
+    /// named Templates, so the correct behavior is to refuse and tell the caller to rename one,
+    /// never to guess. `.notFound` means no match, which callers must treat as an error, never a
+    /// silent default (an unknown template name is a caller mistake, not something to paper over).
+    /// Pure/`nonisolated` so it's testable without `@MainActor` and reusable by both the real store
+    /// and tests.
     ///
     /// Compares `name` byte-for-byte against every stored `Template.name` with no trimming here:
     /// every stored name is already canonicalized (leading/trailing whitespace stripped) by
     /// `canonicalizeTemplateName` below, at every path that writes one — `upsert`,
     /// `importTemplates`, and the one-time migration in `init`. `CleanUpTextCommand` trims its
     /// caller-supplied name the same way before calling this, so " Report " and "Report" can
-    /// never be two different Templates that an "exact name" lookup could confuse.
-    nonisolated static func resolveTemplate(named name: String, in templates: [Template]) -> Template? {
-        templates.first { $0.name == name }
+    /// never be two different Templates that an "exact name" lookup could confuse — they CAN,
+    /// however, both already exist on disk as separate Templates that now share that one
+    /// canonical name, which is exactly the case `.ambiguous` exists for.
+    nonisolated static func resolveTemplate(named name: String, in templates: [Template]) -> TemplateNameLookup {
+        let matches = templates.filter { $0.name == name }
+        if matches.count > 1 { return .ambiguous }
+        if let match = matches.first { return .found(match) }
+        return .notFound
     }
 
     /// The one canonicalization rule every path that stores a Template name applies — trims

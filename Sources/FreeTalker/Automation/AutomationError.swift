@@ -13,6 +13,11 @@ enum AutomationError: LocalizedError, Equatable {
     case automationDisabled
     /// No Template named this exists — never silently substituted for a default.
     case unknownTemplate(String)
+    /// More than one Template shares this exact name — an exact-name contract genuinely can't
+    /// tell them apart, so `clean up` refuses to guess rather than silently picking one (see
+    /// `TemplateStore.resolveTemplate`'s doc comment). The caller must rename one of the
+    /// colliding Templates in Settings → Templates.
+    case ambiguousTemplateName(String)
     /// The on-device model (Apple's Foundation Models framework) isn't available on this Mac
     /// right now. `clean up` never falls back to cloud — see `AutomationService.cleanUpText`.
     case modelUnavailable
@@ -35,6 +40,8 @@ enum AutomationError: LocalizedError, Equatable {
             return "Automation is turned off. Enable it in FreeTalker → Settings → Privacy → Automation."
         case .unknownTemplate(let name):
             return "No FreeTalker Template named \"\(name)\" was found."
+        case .ambiguousTemplateName(let name):
+            return "More than one FreeTalker Template is named \"\(name)\". Rename one of them in FreeTalker → Settings → Templates, then try again."
         case .modelUnavailable:
             return "On-device processing isn't available on this Mac right now. Try again once Apple Intelligence is enabled and its model is downloaded."
         case .processingFailed:
@@ -57,6 +64,7 @@ enum AutomationError: LocalizedError, Equatable {
         switch self {
         case .automationDisabled: return 20001
         case .unknownTemplate: return 20003
+        case .ambiguousTemplateName: return 20016
         case .processingFailed: return 20004
         case .invalidInput: return 20006
         case .modelUnavailable: return 20007

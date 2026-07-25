@@ -55,22 +55,28 @@ struct AutomationServiceTests {
 
     @Test func resolvesTemplateByExactName() {
         let resolved = TemplateStore.resolveTemplate(named: "Clean Dictation", in: Self.templates)
-        #expect(resolved?.id == "clean-dictation")
+        #expect(resolved == .found(Self.templates[0]))
     }
 
-    @Test func unknownTemplateNameResolvesToNilNeverASubstitutedDefault() {
-        #expect(TemplateStore.resolveTemplate(named: "Nonexistent Template", in: Self.templates) == nil)
+    @Test func unknownTemplateNameResolvesToNotFoundNeverASubstitutedDefault() {
+        #expect(TemplateStore.resolveTemplate(named: "Nonexistent Template", in: Self.templates) == .notFound)
     }
 
     @Test func nameLookupIsCaseSensitive() {
         // No silent case-insensitive fallback — an exact-name contract is the least surprising
         // one, and matches "unknown name is an error, never a silently substituted default."
-        #expect(TemplateStore.resolveTemplate(named: "clean dictation", in: Self.templates) == nil)
+        #expect(TemplateStore.resolveTemplate(named: "clean dictation", in: Self.templates) == .notFound)
     }
 
-    @Test func duplicateTemplateNamesResolveDeterministicallyToTheFirstMatch() {
+    // Codex round-6 finding: a name matching more than one stored Template must never be resolved
+    // by silently picking one (the previous "first match wins" behavior) — the caller has no way
+    // to know which of the colliding Templates actually ran, and the winner can silently change
+    // across an app update (see `TemplateStore.resolveTemplate`'s doc comment and the whitespace-
+    // migration regression test below). Refusing as `.ambiguous` is the only honest outcome for an
+    // exact-name contract that genuinely cannot disambiguate two identically-named Templates.
+    @Test func duplicateTemplateNamesReportAmbiguousInsteadOfSilentlyResolvingEither() {
         let resolved = TemplateStore.resolveTemplate(named: "Meeting Notes", in: Self.templates)
-        #expect(resolved?.id == "custom-1")
+        #expect(resolved == .ambiguous)
     }
 
     // MARK: - Codex round-9 finding (LOW): a stored Template name is canonicalized (trimmed) so
@@ -92,8 +98,75 @@ struct AutomationServiceTests {
         // canonicalized the same way, a caller asking for "Report" resolves to this Template —
         // there is no separate, distinct " Report " Template left on disk that a different
         // caller could have been asking for instead.
-        #expect(TemplateStore.resolveTemplate(named: "Report", in: store.templates)?.id == "padded")
-        #expect(TemplateStore.resolveTemplate(named: " Report ", in: store.templates) == nil)
+        if case .found(let match) = TemplateStore.resolveTemplate(named: "Report", in: store.templates) {
+            #expect(match.id == "padded")
+        } else {
+            Issue.record("expected .found(padded)")
+        }
+        #expect(TemplateStore.resolveTemplate(named: " Report ", in: store.templates) == .notFound)
+    }
+
+    // MARK: - Codex round-6 finding: the regression this whole fix exists for
+
+    // THE REGRESSION: stored order `[(" Report ", prompt A), ("Report", prompt B)]`. Before this
+    // fix, the caller's trimmed "Report" argument resolved to the first-match Template after
+    // `trimmingTemplateNames` canonicalized BOTH stored names to "Report" (preserving storage
+    // order) — silently running prompt A where, pre-migration, the same call used to resolve
+    // prompt B. Nothing was dropped or corrupted; a user's automation just silently ran the wrong
+    // Template. This test builds that exact on-disk pre-migration state (two Templates whose
+    // stored names differ only by surrounding whitespace) and drives it through the real
+    // `TemplateStore.init` migration path — the same way a real pre-existing install produces it —
+    // then asserts the lookup now refuses to guess.
+    @Test func whitespaceCanonicalizationMigrationNeverMakesAnAmbiguousLookupSilentlyPickAWinner() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("automation-ambiguous-migration-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let fileURL = directory.appendingPathComponent("templates.json")
+        let promptA = Template(id: "template-a", name: " Report ", prompt: "Prompt A")
+        let promptB = Template(id: "template-b", name: "Report", prompt: "Prompt B")
+        let encoder = JSONEncoder()
+        try encoder.encode([promptA, promptB]).write(to: fileURL)
+        let defaults = try #require(UserDefaults(suiteName: "AutomationServiceTests.ambiguousMigration.\(UUID().uuidString)"))
+
+        // The one-time `trimmingTemplateNames` migration runs here, on init, exactly as it does
+        // on a real launch against a real pre-existing `templates.json`.
+        let store = TemplateStore(fileURL: fileURL, defaults: defaults)
+
+        // Both stored names now read "Report" — the migration itself is correct and untouched by
+        // this fix (Codex confirmed it's one-to-one and idempotent).
+        #expect(store.template(id: "template-a")?.name == "Report")
+        #expect(store.template(id: "template-b")?.name == "Report")
+
+        // The regression: this lookup must error as ambiguous, never silently resolve to either
+        // Template's prompt.
+        #expect(TemplateStore.resolveTemplate(named: "Report", in: store.templates) == .ambiguous)
+
+        // The fix must not block the one way a user actually resolves this: the Templates UI
+        // (Settings → Templates) lists both colliding Templates by id via `store.templates`
+        // regardless of the name collision, and can rename either one through the same `upsert`
+        // path it always used — nothing here required touching `upsert`, `delete`, or the
+        // published `templates` list.
+        // Other unrelated one-time migrations (e.g. seeding the Prompt Engineer built-ins into a
+        // non-empty pre-existing library) also fire on this same `init` — irrelevant to this fix,
+        // so only assert the two Templates under test are both still present, not an exact set.
+        #expect(Set(store.templates.map(\.id)).isSuperset(of: ["template-a", "template-b"]))
+        var renamed = try #require(store.template(id: "template-a"))
+        renamed.name = "Report (Original)"
+        try store.upsert(renamed)
+
+        // Listing still shows both, now under distinct names — renaming neither deleted nor
+        // merged either Template.
+        #expect(store.template(id: "template-a")?.name == "Report (Original)")
+        #expect(store.template(id: "template-b")?.name == "Report")
+
+        // And the rename is exactly how a user fixes the ambiguity going forward: each name now
+        // resolves unambiguously to the Template that actually owns it.
+        #expect(TemplateStore.resolveTemplate(named: "Report (Original)", in: store.templates) == .found(renamed))
+        if case .found(let match) = TemplateStore.resolveTemplate(named: "Report", in: store.templates) {
+            #expect(match.id == "template-b")
+        } else {
+            Issue.record("expected .found(template-b)")
+        }
     }
 
     private func makeIsolatedTemplateStore() throws -> TemplateStore {
@@ -108,7 +181,7 @@ struct AutomationServiceTests {
     // MARK: - Error descriptions surface distinct, branchable AppleScript error codes
 
     private static let allErrors: [AutomationError] = [
-        .automationDisabled, .unknownTemplate("x"), .modelUnavailable,
+        .automationDisabled, .unknownTemplate("x"), .ambiguousTemplateName("x"), .modelUnavailable,
         .processingFailed, .invalidInput("x"), .emptyText, .textTooLarge, .busy,
     ]
 
