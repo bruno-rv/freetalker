@@ -165,10 +165,22 @@ import Testing
             "/bin/sh", ["-c", "trap '' TERM; exec sleep 30"], timeout: 0.3, killGracePeriod: 0.3
         )
         let elapsed = Date().timeIntervalSince(start)
-        // SIGKILL cannot be caught: termination status is negative-signal-encoded (via
-        // waitpid's WTERMSIG) rather than a clean exit code once the process is killed.
+        // The real claim: the child was killed by SIGKILL specifically, not merely that it
+        // exited non-zero for some other reason. `Process.terminationStatus` for a
+        // signal-terminated process IS the signal number (confirmed against
+        // `Process.terminationReason == .uncaughtSignal` for this exact scenario), and `sleep`
+        // never exits with status 9 on its own — the only way this child's status can equal
+        // `SIGKILL` is if it was actually sent that signal. `trap '' TERM` makes SIGTERM alone
+        // insufficient, so this also proves the escalation — not the initial `terminate()` —
+        // is what ended it.
+        #expect(result.status == SIGKILL)
         #expect(result.status != 0)
-        #expect(elapsed < 5, "runProcess took \(elapsed)s — SIGKILL escalation did not bound the wait")
+        // Secondary, coarser wall-clock bound: 0.3s timeout + 0.3s grace = 0.6s if the
+        // escalation fires promptly. 2s is generous enough to absorb scheduler jitter without
+        // being fooled by a real regression — if the escalation were removed entirely, this
+        // child (ignoring SIGTERM, `exec`'d so no shell parent to reap it another way) would run
+        // for the full 30s `sleep`, which blows well past this bound either way.
+        #expect(elapsed < 2, "runProcess took \(elapsed)s — SIGKILL escalation did not bound the wait")
     }
 
     /// The real `dist/latest.json` produced by `scripts/release.sh v0.1.0 --dry-run` — not

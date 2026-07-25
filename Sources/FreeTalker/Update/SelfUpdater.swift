@@ -329,9 +329,13 @@ enum SelfUpdater {
     /// `waitUntilExit` below block until the child actually exits and closes its output no
     /// matter what). `SIGKILL` cannot be caught or ignored, so escalating to it after
     /// `killGracePeriod` guarantees this function returns within
-    /// `timeout + killGracePeriod`, not "whenever the child feels like exiting." Not `private`
-    /// so `SelfUpdaterTests` can exercise the escalation directly against a real child process
-    /// that ignores `SIGTERM`.
+    /// `timeout + killGracePeriod`, not "whenever the child feels like exiting." The escalation
+    /// runs on its own dedicated `Thread` rather than `DispatchQueue.global()`'s shared worker
+    /// pool specifically so that this bound holds even when that pool is saturated by unrelated
+    /// blocking work elsewhere in the process (e.g. many other `runProcess` calls in flight) —
+    /// a shared-queue timer can be starved behind that backlog, a dedicated thread cannot. Not
+    /// `private` so `SelfUpdaterTests` can exercise the escalation directly against a real child
+    /// process that ignores `SIGTERM`.
     static func runProcess(
         _ executable: String, _ arguments: [String], timeout: TimeInterval = 30, killGracePeriod: TimeInterval = 2
     ) -> (status: Int32, stdout: String) {
@@ -347,19 +351,50 @@ enum SelfUpdater {
             return (-1, "")
         }
         let terminateWorkItem = DispatchWorkItem { if process.isRunning { process.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: terminateWorkItem)
         // Deliberately unconditional — no `process.isRunning` guard. `isRunning` can go stale
         // (report `false`) once `terminate()` has been called even though the child ignored
         // `SIGTERM` and is still very much alive, which would silently skip the kill this exists
         // to guarantee. `kill(2)` on an already-exited PID just returns `ESRCH`, which is safe
-        // to ignore — nothing here needs its return value.
-        let killWorkItem = DispatchWorkItem { kill(process.processIdentifier, SIGKILL) }
-        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: terminateWorkItem)
-        DispatchQueue.global().asyncAfter(deadline: .now() + timeout + killGracePeriod, execute: killWorkItem)
+        // to ignore — nothing here needs its return value. Runs on a dedicated thread (see the
+        // doc comment above) instead of `DispatchQueue.global().asyncAfter`, which is what
+        // actually made the bound unreliable: under a saturated global queue the timer block
+        // itself can't get a worker thread in time.
+        let killCancelled = KillEscalationCancelToken()
+        let pid = process.processIdentifier
+        let killThread = Thread {
+            Thread.sleep(forTimeInterval: timeout + killGracePeriod)
+            if !killCancelled.isCancelled {
+                kill(pid, SIGKILL)
+            }
+        }
+        killThread.name = "SelfUpdater.runProcess.killEscalation"
+        killThread.start()
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         terminateWorkItem.cancel()
-        killWorkItem.cancel()
+        killCancelled.cancel()
         return (process.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+    }
+
+    /// Lets `runProcess` suppress the kill thread's `SIGKILL` once the child has already exited
+    /// on its own, without needing `DispatchWorkItem.cancel()` (which only applies to
+    /// dispatch-queue-scheduled work, not a plain `Thread`).
+    private final class KillEscalationCancelToken: @unchecked Sendable {
+        private let lock = NSLock()
+        private var cancelled = false
+
+        func cancel() {
+            lock.lock()
+            cancelled = true
+            lock.unlock()
+        }
+
+        var isCancelled: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return cancelled
+        }
     }
 
     // MARK: Relaunch
