@@ -139,8 +139,105 @@ test_interrupted_run_resumes_without_regenerating_the_key() {
     pass "re-running once PEM and compiled key already match is a true no-op"
 }
 
+test_established_anchor_mismatch_is_refused_without_override() {
+    local fixture
+    fixture="$(make_fixture)"
+    trap 'rm -rf "$fixture"' RETURN
+
+    log "Round-4 Finding 3: an ESTABLISHED public key (already trusted by real, already-built"
+    log "installs) must NOT be silently overwritten just because a DIFFERENT valid key happens"
+    log "to be at \$FREETALKER_RELEASE_SIGNING_KEY — the exact accident the finding describes"
+    log "(env var pointing at the wrong file), reproduced with the REAL script establishing the"
+    log "anchor first, not a hand-written fixture Swift file."
+
+    local key_a="$fixture/keys/key-a.pem"
+    local key_b="$fixture/keys/key-b.pem"
+    local swift_path="$fixture/Sources/FreeTalker/Update/UpdatePublicKey.swift"
+
+    # Establish key A as the anchor the same way a real first-time setup would: let the REAL
+    # script generate it and write UpdatePublicKey.swift for it.
+    FREETALKER_RELEASE_SIGNING_KEY="$key_a" "$fixture/scripts/make-release-signing-key.sh" >/dev/null 2>&1
+    local established_swift_content
+    established_swift_content="$(cat "$swift_path")"
+
+    # A DIFFERENT, but perfectly valid, Ed25519 key ends up at the SAME env-var path.
+    openssl genpkey -algorithm ED25519 -out "$key_b" 2>/dev/null
+    local key_b_content_before
+    key_b_content_before="$(cat "$key_b")"
+
+    local output status
+    set +e
+    output="$(FREETALKER_RELEASE_SIGNING_KEY="$key_b" "$fixture/scripts/make-release-signing-key.sh" 2>&1)"
+    status=$?
+    set -e
+    if [[ "$status" -eq 0 ]]; then
+        fail "the script silently rotated the established anchor to key B without --rotate-established-key"
+        echo "$output"
+        return
+    fi
+    if [[ "$output" != *"ESTABLISHED public key"* ]]; then
+        fail "the script refused, but not with the expected established-anchor message; got:"$'\n'"$output"
+        return
+    fi
+    if [[ "$output" != *"--rotate-established-key"* ]]; then
+        fail "the refusal did not mention the override flag by name; got:"$'\n'"$output"
+        return
+    fi
+    if [[ "$(cat "$swift_path")" != "$established_swift_content" ]]; then
+        fail "UpdatePublicKey.swift (the established anchor, key A) was modified despite being refused"
+        return
+    fi
+    if [[ "$(cat "$key_b")" != "$key_b_content_before" ]]; then
+        fail "key B's PEM was modified — this script must never touch a key file it refuses to use"
+        return
+    fi
+    pass "established anchor mismatch refused without --rotate-established-key; UpdatePublicKey.swift (key A) untouched"
+}
+
+test_established_anchor_mismatch_rotates_with_explicit_override() {
+    local fixture
+    fixture="$(make_fixture)"
+    trap 'rm -rf "$fixture"' RETURN
+
+    log "Round-4 Finding 3: the SAME established-mismatch scenario, but with the explicit," \
+        "clearly-named override — this must be the only way to proceed, and must actually work"
+
+    local key_a="$fixture/keys/key-a.pem"
+    local key_b="$fixture/keys/key-b.pem"
+    local swift_path="$fixture/Sources/FreeTalker/Update/UpdatePublicKey.swift"
+
+    FREETALKER_RELEASE_SIGNING_KEY="$key_a" "$fixture/scripts/make-release-signing-key.sh" >/dev/null 2>&1
+    openssl genpkey -algorithm ED25519 -out "$key_b" 2>/dev/null
+    local key_b_content_before
+    key_b_content_before="$(cat "$key_b")"
+
+    local output status
+    set +e
+    output="$(FREETALKER_RELEASE_SIGNING_KEY="$key_b" "$fixture/scripts/make-release-signing-key.sh" --rotate-established-key 2>&1)"
+    status=$?
+    set -e
+    if [[ "$status" -ne 0 ]]; then
+        fail "--rotate-established-key did not proceed; got:"$'\n'"$output"
+        return
+    fi
+    if [[ "$(cat "$key_b")" != "$key_b_content_before" ]]; then
+        fail "rotating regenerated key B's PRIVATE key — it must only ever rewrite UpdatePublicKey.swift"
+        return
+    fi
+    local derived compiled
+    derived="$(derive_public_key_base64 "$key_b")"
+    compiled="$(extract_public_key_swift "$swift_path")"
+    if [[ -z "$derived" || "$derived" != "$compiled" ]]; then
+        fail "after --rotate-established-key, compiled public key ('$compiled') doesn't match key B's ('$derived')"
+        return
+    fi
+    pass "--rotate-established-key rotated the anchor to key B without touching either private key"
+}
+
 test_fresh_generation_produces_a_matching_pair
 test_interrupted_run_resumes_without_regenerating_the_key
+test_established_anchor_mismatch_is_refused_without_override
+test_established_anchor_mismatch_rotates_with_explicit_override
 
 echo
 if [[ "$FAILURES" -eq 0 ]]; then

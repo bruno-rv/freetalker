@@ -27,8 +27,33 @@
 # half against what's compiled in and, on any mismatch, resumes by rewriting
 # UpdatePublicKey.swift from the EXISTING private key — it never generates a new keypair over an
 # existing one.
+#
+# That mismatch check has exactly one blind spot, closed below: it cannot tell "resuming a setup
+# that was genuinely interrupted before UpdatePublicKey.swift was ever written" (no ESTABLISHED
+# public key to protect — safe to auto-repair) apart from "UpdatePublicKey.swift already holds a
+# real, established anchor that simply disagrees with THIS key" (e.g.
+# FREETALKER_RELEASE_SIGNING_KEY accidentally points at a different, but still validly Ed25519,
+# key B, while deployed clients and the tracked Swift file trust key A) — both look identical as
+# "PEM exists, compiled key doesn't match it." Silently "resuming" the second case overwrites A
+# with B and tells the operator to commit it: every future release, now signed with B, is
+# rejected by every already-installed A-pinned client — a silent, self-inflicted update-channel
+# outage with no error at any point. The distinction is the compiled key's PRESENCE: empty/absent
+# means nothing has been established yet (safe to auto-repair); any other value is an anchor real
+# installs already depend on (refuse without --rotate-established-key, see below).
 
 set -euo pipefail
+
+ROTATE_ESTABLISHED_KEY=0
+for arg in "$@"; do
+    case "$arg" in
+        --rotate-established-key) ROTATE_ESTABLISHED_KEY=1 ;;
+        *)
+            echo "error: unrecognized argument: $arg" >&2
+            echo "usage: scripts/make-release-signing-key.sh [--rotate-established-key]" >&2
+            exit 1
+            ;;
+    esac
+done
 
 KEY_DIR="${FREETALKER_RELEASE_SIGNING_KEY_DIR:-$HOME/.freetalker}"
 PRIVATE_KEY_PATH="${FREETALKER_RELEASE_SIGNING_KEY:-$KEY_DIR/release-signing-key.pem}"
@@ -105,14 +130,50 @@ if [[ -f "$PRIVATE_KEY_PATH" ]]; then
         echo "any release signed with the new key, until it's rebuilt with the new one."
         exit 0
     fi
-    # The PEM exists but the compiled public key doesn't match it — an interrupted previous run
-    # (killed between writing the PEM and writing UpdatePublicKey.swift), or the Swift file was
-    # otherwise left stale/missing. RESUME by deriving from the EXISTING private key and
-    # (re)writing UpdatePublicKey.swift to match — never by generating a new keypair, which would
-    # orphan every already-built app the same way deleting-and-regenerating would.
-    echo "$PRIVATE_KEY_PATH exists but $PUBLIC_KEY_SWIFT doesn't match its public key — resuming"
-    echo "an apparently interrupted run. The private key is left untouched; only"
-    echo "$PUBLIC_KEY_SWIFT is (re)written, from the EXISTING key."
+    # The PEM exists but the compiled public key doesn't match it. Two situations look IDENTICAL
+    # at this point and must NOT be handled the same way (see the top-of-file comment): a
+    # genuinely interrupted first-time setup — nothing has been established yet, so
+    # $PUBLIC_KEY_SWIFT is missing or holds no real key — versus an ESTABLISHED anchor that
+    # simply disagrees with this PEM (already-deployed clients trust it). The compiled key's
+    # PRESENCE is what tells them apart.
+    CURRENT_COMPILED_PUBLIC_KEY_BASE64="$(compiled_public_key_base64)"
+    if [[ -z "$CURRENT_COMPILED_PUBLIC_KEY_BASE64" ]]; then
+        # Nothing established yet — RESUME by deriving from the EXISTING private key and
+        # (re)writing UpdatePublicKey.swift to match. Never generates a new keypair, which would
+        # orphan every already-built app the same way deleting-and-regenerating would (moot here
+        # anyway, since nothing has been built against any key yet).
+        echo "$PRIVATE_KEY_PATH exists but $PUBLIC_KEY_SWIFT doesn't have a compiled-in key yet —"
+        echo "resuming an apparently interrupted first-time run. The private key is left"
+        echo "untouched; only $PUBLIC_KEY_SWIFT is (re)written, from the EXISTING key."
+        write_public_key_swift "$EXISTING_PUBLIC_KEY_BASE64"
+        echo
+        echo "Public key compiled into: $PUBLIC_KEY_SWIFT — commit this file."
+        exit 0
+    fi
+    if [[ "$ROTATE_ESTABLISHED_KEY" -ne 1 ]]; then
+        echo "error: $PUBLIC_KEY_SWIFT already has an ESTABLISHED public key compiled in" >&2
+        echo "($CURRENT_COMPILED_PUBLIC_KEY_BASE64), and it does NOT match the key at" >&2
+        echo "$PRIVATE_KEY_PATH ($EXISTING_PUBLIC_KEY_BASE64)." >&2
+        echo >&2
+        echo "This is NOT treated as an interrupted first-time setup, because a real anchor" >&2
+        echo "already exists: every app already built and installed trusts the CURRENTLY" >&2
+        echo "compiled key. If \$PRIVATE_KEY_PATH ($PRIVATE_KEY_PATH) is simply the wrong file —" >&2
+        echo "e.g. FREETALKER_RELEASE_SIGNING_KEY points somewhere unintended — fix that and" >&2
+        echo "re-run instead of overriding this." >&2
+        echo >&2
+        echo "If you are deliberately rotating the release-signing key (the established private" >&2
+        echo "key was lost or compromised), understand the consequence first: every already-" >&2
+        echo "installed app, which can only ever trust the ONE public key it was compiled with," >&2
+        echo "will reject every future release signed with the new key as unverified, with no" >&2
+        echo "further warning at release time — each install must be separately rebuilt and" >&2
+        echo "redistributed with the new compiled-in key before it can accept new releases again." >&2
+        echo "If that's genuinely what you intend, re-run with --rotate-established-key." >&2
+        exit 1
+    fi
+    echo "--rotate-established-key was passed — overwriting the established public key at"
+    echo "$PUBLIC_KEY_SWIFT ($CURRENT_COMPILED_PUBLIC_KEY_BASE64) with the one derived from"
+    echo "$PRIVATE_KEY_PATH ($EXISTING_PUBLIC_KEY_BASE64). Every already-installed app pinned to"
+    echo "the old key will reject future releases until it's rebuilt with this new one."
     write_public_key_swift "$EXISTING_PUBLIC_KEY_BASE64"
     echo
     echo "Public key compiled into: $PUBLIC_KEY_SWIFT — commit this file."
