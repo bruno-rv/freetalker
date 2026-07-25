@@ -63,11 +63,6 @@ final class AppSettings: ObservableObject {
     static let shared = AppSettings()
 
     private let defaults: UserDefaults
-    /// Backs `automationFolderBookmark` only (Codex round-3 Finding 1). Injectable so tests never
-    /// touch the real system Keychain — see `AutomationServiceTests`' `InMemorySecretStore`,
-    /// following the exact pattern `CloudSTTSettingsTests`/`OutputLanguageSettingsTests` already
-    /// use for credential storage.
-    private let secretStore: SecretStore
 
     /// The push-to-talk hotkey: modifier chord and/or non-modifier key. Persisted as JSON;
     /// legacy single-modifier installs (pre-HotKeySpec `hotKeyDeviceMask`) are migrated in
@@ -402,47 +397,13 @@ final class AppSettings: ObservableObject {
     }
 
     /// Automation surface master switch (BRAINSTORM_AUTOMATION_SURFACE.md): the consent gate for
-    /// FreeTalker's Cocoa Scripting commands (`transcribe`, `clean up` — see `FreeTalker.sdef`).
-    /// **Default OFF.** Once a cloud post-processing provider is configured, an arbitrary
-    /// Shortcut/AppleScript could otherwise push text through the user's own API key and off the
-    /// machine — this switch is the explicit opt-in that closes that gap. No provider
-    /// credentials, endpoints, or model identifiers are ever readable or writable through
-    /// automation regardless of this setting.
+    /// FreeTalker's Cocoa Scripting `clean up` command (see `FreeTalker.sdef`). **Default OFF.**
+    /// Once a cloud post-processing provider is configured, an arbitrary Shortcut/AppleScript
+    /// could otherwise push text through the user's own API key and off the machine — this switch
+    /// is the explicit opt-in that closes that gap. No provider credentials, endpoints, or model
+    /// identifiers are ever readable or writable through automation regardless of this setting.
     @Published var automationEnabled: Bool {
         didSet { defaults.set(automationEnabled, forKey: Keys.automationEnabled) }
-    }
-
-    /// DISPLAY ONLY (Codex round-2 Finding 1): the folder path shown in Settings → Privacy →
-    /// Automation. Never read for authorization — a path string in `UserDefaults` is trivially
-    /// replaceable (`defaults write`, or a rename-and-symlink swap at the same path) and is not a
-    /// stable authority. The real authority is `automationFolderBookmark`, below.
-    @Published var automationFolderPath: String? {
-        didSet { defaults.set(automationFolderPath, forKey: Keys.automationFolderPath) }
-    }
-
-    /// The single folder `transcribe` may read files from (Codex round-1 Finding 2), as a
-    /// bookmark captured from the actual directory the folder picker returned. `nil` until the
-    /// user explicitly chooses one — `automationEnabled` alone grants no per-file authority, so
-    /// `transcribe` refuses every file until this is set. Codex round-2 Finding 1: bookmark
-    /// resolution follows the real filesystem object (volume + file identity), not a mutable path
-    /// string, so it survives a rename and is never redirected by a symlink later placed at the
-    /// old path — see `AutomationFileAuthorization`, which resolves and validates it before every
-    /// check.
-    ///
-    /// Codex round-3 Finding 1: this is no longer stored in `UserDefaults`. A same-user process
-    /// can write arbitrary bookmark data for ANY directory (e.g. `/`) into `UserDefaults` before
-    /// FreeTalker even launches — `defaults write` edits the backing plist directly with no
-    /// code-identity check at all — and the resolver has no way to tell that forged bookmark from
-    /// one this app's own folder picker created. The Keychain item below is scoped by macOS to
-    /// this app's own code-signing identity (`SecItemAdd`/`SecItemCopyMatching`'s default access
-    /// group), so a same-user process without FreeTalker's signing identity cannot forge or
-    /// overwrite it — see `AutomationFolderBookmarkStore` (Keychain.swift), which follows the
-    /// exact `SecretStore`-backed pattern `CloudLLMCredentialWriter`/`CloudSTTCredentialWriter`
-    /// already use for API keys. Not `@Published`: nothing in the UI reads this value directly
-    /// (`automationFolderPath` is the display string), so no SwiftUI reactivity is needed.
-    var automationFolderBookmark: Data? {
-        get { AutomationFolderBookmarkStore.get(store: secretStore) }
-        set { AutomationFolderBookmarkStore.set(newValue, store: secretStore) }
     }
 
     /// Streaming ASR master switch (BRAINSTORM_STREAMING_ASR.md): types confirmed partial
@@ -989,11 +950,6 @@ final class AppSettings: ObservableObject {
         static let localContextScope = "localContextScope"
         static let automaticStyleEnabled = "automaticStyleEnabled"
         static let automationEnabled = "automationEnabled"
-        static let automationFolderPath = "automationFolderPath"
-        /// Legacy (read-only, for one-time cleanup only — see `init`): the `UserDefaults` key the
-        /// bookmark used to live under before Codex round-3 Finding 1 moved it to the Keychain.
-        /// Never read for authorization, and never written to again.
-        static let automationFolderBookmark = "automationFolderBookmark"
         static let voiceCommandsEnabled = "voiceCommandsEnabled"
         static let streamingASREnabled = "streamingASREnabled"
         static let commandKeywords = "commandKeywords"
@@ -1007,14 +963,8 @@ final class AppSettings: ObservableObject {
         static let vocabularyText = "vocabularyText"
     }
 
-    init(defaults: UserDefaults = .standard, secretStore: SecretStore = KeychainSecretStore()) {
+    init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        self.secretStore = secretStore
-        // Codex round-3 Finding 1: any bookmark data left over under the old `UserDefaults` key
-        // from before this moved to the Keychain is inert (never read for authorization) but
-        // still worth erasing — a stale plist entry that looks like it might matter is exactly
-        // the kind of thing a future edit could accidentally start trusting again.
-        defaults.removeObject(forKey: Keys.automationFolderBookmark)
         if let data = defaults.data(forKey: Keys.hotKeySpec),
            let spec = try? JSONDecoder().decode(HotKeySpec.self, from: data) {
             hotKeySpec = spec
@@ -1142,9 +1092,6 @@ final class AppSettings: ObservableObject {
         // Default OFF, same reasoning as `voiceCommandsEnabled` below — plain `.bool(forKey:)`
         // resolves an unset key to `false`, matching "off until switched on in Settings."
         automationEnabled = defaults.bool(forKey: Keys.automationEnabled)
-        automationFolderPath = defaults.string(forKey: Keys.automationFolderPath)
-        // `automationFolderBookmark` is now a computed property backed by `secretStore` (the
-        // Keychain in production) — nothing to load here.
         // Default OFF — plain `.bool(forKey:)` is correct here (unlike the `.object(forKey:) as?
         // Bool` idiom used for default-ON flags above): an unset key and an explicit `false` both
         // correctly resolve to `false`. See PLAN.md PR A, item 1.

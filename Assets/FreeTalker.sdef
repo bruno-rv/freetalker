@@ -1,19 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE dictionary SYSTEM "file://localhost/System/Library/DTDs/sdef.dtd">
 <dictionary title="FreeTalker Terminology">
-    <suite name="FreeTalker Suite" code="FrTk" description="Automation commands for FreeTalker. Both commands are refused with an error unless Automation is turned on in FreeTalker's Settings &gt; Privacy.">
-
-        <command name="transcribe" code="FrTktrsc" description="Transcribe an audio or video file and return the transcript. Runs on FreeTalker's normal Imports queue, so the job is visible and cancellable in the Imports window while this command waits for it. Only files inside the Automation folder chosen in Settings &gt; Privacy &gt; Automation may be transcribed — turning Automation on does not by itself grant access to the rest of your files. Long media can take a while to transcribe; FreeTalker enforces its own ~2-hour app-side limit, but a caller transcribing long media should set an explicit sender timeout to match (AppleScript: &quot;with timeout of 7200 ... end timeout&quot;; ScriptingBridge: SBApplication.timeout = 7200) since the default sender timeout (about 2 minutes for AppleScript, about 1 for ScriptingBridge) does not by itself stop FreeTalker's work, only the caller's wait for a reply.">
-            <cocoa class="FreeTalker.TranscribeFileCommand"/>
-            <direct-parameter type="file" description="The audio or video file to transcribe — the same formats FreeTalker's Imports window accepts (WAV, M4A, MP3, MP4, MOV), and it must resolve to a path inside the configured Automation folder."/>
-            <parameter name="format" code="frmt" type="format style" optional="yes" description="Output format. Defaults to plain text.">
-                <cocoa key="format"/>
-            </parameter>
-            <parameter name="with speaker labels" code="spkr" type="boolean" optional="yes" description="Label each line with the speaker who said it. Defaults to true.">
-                <cocoa key="withSpeakerLabels"/>
-            </parameter>
-            <result type="text" description="The transcript, in the requested format."/>
-        </command>
+    <suite name="FreeTalker Suite" code="FrTk" description="Automation commands for FreeTalker. This command is refused with an error unless Automation is turned on in FreeTalker's Settings &gt; Privacy.">
 
         <command name="clean up" code="FrTkclup" description="Post-process text with one of FreeTalker's own Templates and return the result. No microphone, no recording, no permissions. Always runs on-device (Apple's Foundation Models) — never your configured cloud provider, regardless of what's set for interactive dictation, so your API key is never read and no cloud endpoint is ever contacted by this command. A capability that has no on-device equivalent (for example, output-language translation) is simply unavailable through this command and returns a distinct error rather than silently falling back to a different result. Exactly one clean up request may be in flight at a time; a concurrent call is refused as busy.">
             <cocoa class="FreeTalker.CleanUpTextCommand"/>
@@ -23,21 +11,6 @@
             </parameter>
             <result type="text" description="The processed text."/>
         </command>
-
-        <enumeration name="format style" code="FrFm" description="Output format for the transcribe command.">
-            <enumerator name="plain text" code="FfPt" description="One line per segment, prefixed with the speaker label.">
-                <cocoa string-value="plainText"/>
-            </enumerator>
-            <enumerator name="markdown" code="FfMd" description="Speaker labels in bold, one paragraph per segment.">
-                <cocoa string-value="markdown"/>
-            </enumerator>
-            <enumerator name="SRT" code="FfSr" description="SubRip subtitle format.">
-                <cocoa string-value="srt"/>
-            </enumerator>
-            <enumerator name="VTT" code="FfVt" description="WebVTT subtitle format.">
-                <cocoa string-value="vtt"/>
-            </enumerator>
-        </enumeration>
 
     </suite>
 </dictionary>

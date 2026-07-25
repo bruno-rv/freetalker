@@ -2804,10 +2804,7 @@ final class AppCoordinator: ObservableObject {
     /// snapshot taken here, at selection time, decides both *whether* Cloud is used
     /// (`isCloudLLMConfigured`) and — if so — is threaded straight into the `CloudLLMProcessor`
     /// instance that runs it, so the two can never observe different settings. See Amendment A1.
-    /// Not `private` — the automation surface's `clean up` command
-    /// (BRAINSTORM_AUTOMATION_SURFACE.md) calls this exact selection so it runs the same
-    /// processor the UI would, never a parallel implementation.
-    func resolveActiveProcessor() -> any PostProcessor {
+    private func resolveActiveProcessor() -> any PostProcessor {
         let snapshot = AppSettings.shared.cloudLLMSnapshot
         return Self.isCloudLLMConfigured(snapshot: snapshot) ? CloudLLMProcessor(snapshot: snapshot) : appleFMProcessor
     }
@@ -4269,23 +4266,6 @@ final class AppCoordinator: ObservableObject {
         } catch {
             lastError = "Could not prepare local media imports: \(error.localizedDescription)"
             return
-        }
-        // Codex round-3 Finding 6 (startup reconciliation): a crash or SIGKILL between staging a
-        // file and either checkpointing its job's decode or cleaning it up on failure leaves that
-        // staged copy behind forever — nothing else ever revisits it once the process is gone.
-        // Runs once, guarded by the same `mediaImportRunner == nil` gate as the rest of this
-        // function's one-time setup. Keeps only the sources of import jobs whose decode hasn't
-        // checkpointed yet (`MediaImportPipeline.execute` deletes a staged source itself the
-        // moment decode succeeds — see its doc comment); everything else under the staging
-        // directory is orphaned.
-        if let imports = try? await recoveryStore.jobs(kind: .mediaImport) {
-            var pendingDecodeSources: Set<String> = []
-            for job in imports where AutomationMediaStaging.isStagingPath(job.source.reference) {
-                let completedStages = (try? await recoveryStore.completedMediaStages(jobID: job.id)) ?? []
-                guard !completedStages.contains(.decode) else { continue }
-                pendingDecodeSources.insert(job.source.reference)
-            }
-            AutomationMediaStaging.purgeOrphans(keeping: pendingDecodeSources)
         }
         let service = MediaImportService(store: recoveryStore)
         // `resolveLanguageSettings` is called by the pipeline at each job's start, not once here

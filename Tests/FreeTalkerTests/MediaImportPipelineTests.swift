@@ -420,58 +420,6 @@ import Testing
         #expect(try await fixture.store.job(id: job.id) != nil)
     }
 
-    // MARK: - Codex round-3 Finding 6: an automation-staged source's lifetime matches the durable
-    // job's, not a lexical `defer` — it must survive a failed/not-yet-decoded job (so Retry can
-    // still reuse it) and disappear once decode durably checkpoints (so it doesn't leak forever).
-
-    @Test func stagedSourceSurvivesAFailedDecodeSoRetryCanReuseIt() async throws {
-        let fixture = try MediaPipelineFixture()
-        let stagedSource = try fixture.makeStagedSource()
-        defer { try? FileManager.default.removeItem(at: stagedSource) }
-        let job = try await fixture.store.create(kind: .mediaImport, source: .init(reference: stagedSource.path), now: .now)
-        let runner = fixture.pipeline(decoder: FailingDecodeProbe()).localJobRunner()
-
-        await runner.enqueue(job.id)
-        await runner.waitUntilIdle()
-
-        #expect(try await fixture.store.job(id: job.id)?.state.kind == .failed)
-        #expect(!(try await fixture.store.completedMediaStages(jobID: job.id).contains(.decode)))
-        // MediaImportPipeline.execute only removes a staged source AFTER decode checkpoints — a
-        // job that never got that far must keep it, or a later Retry (which re-reads
-        // `job.source.reference`) would have nothing left to decode.
-        #expect(FileManager.default.fileExists(atPath: stagedSource.path))
-    }
-
-    @Test func stagedSourceIsRemovedOnceDecodeCheckpoints() async throws {
-        let fixture = try MediaPipelineFixture()
-        let stagedSource = try fixture.makeStagedSource()
-        let job = try await fixture.store.create(kind: .mediaImport, source: .init(reference: stagedSource.path), now: .now)
-        let runner = fixture.pipeline().localJobRunner()
-
-        await runner.enqueue(job.id)
-        await runner.waitUntilIdle()
-
-        #expect(try await fixture.store.job(id: job.id)?.state == .ready)
-        #expect(!FileManager.default.fileExists(atPath: stagedSource.path))
-    }
-
-    @Test func regularImportSourceIsNeverTouchedEvenThoughItsNotStaged() async throws {
-        // Sanity check: `fixture.source` lives under `fixture.root`, never inside
-        // `AutomationMediaStaging.stagingDirectoryURL` — `removeIfStaged` must be a no-op for it,
-        // same as every other regular (non-automation) import already relies on elsewhere in this
-        // file (e.g. `deletionRemovesRegisteredOwnedFileAndRowsButNotSource`).
-        let fixture = try MediaPipelineFixture()
-        try Data("source".utf8).write(to: fixture.source)
-        let job = try await fixture.store.create(kind: .mediaImport, source: .init(reference: fixture.source.path), now: .now)
-        let runner = fixture.pipeline().localJobRunner()
-
-        await runner.enqueue(job.id)
-        await runner.waitUntilIdle()
-
-        #expect(try await fixture.store.job(id: job.id)?.state == .ready)
-        #expect(FileManager.default.fileExists(atPath: fixture.source.path))
-    }
-
     // MARK: - Language settings resolved per job start, not frozen at pipeline construction (Codex finding)
 
     @Test func languageSettingsAreResolvedFreshAtEachJobsStartNotFrozenAtPipelineConstruction() async throws {
@@ -535,31 +483,12 @@ private struct MediaPipelineFixture {
     func pipeline(decoder: any MediaJobAudioDecoding = PipelineDecodeProbe(), transcriber: any TimestampedTranscribing = PipelineTranscribeProbe(), diarizer: any SpeakerDiarizing = PipelineDiarizeProbe()) -> MediaImportPipeline {
         MediaImportPipeline(store: store, jobsDirectory: root, decoder: decoder, transcriber: transcriber, diarizer: diarizer, language: nil, model: "model")
     }
-    /// A source living under `AutomationMediaStaging.stagingDirectoryURL` — the automation surface's
-    /// exact `job.source.reference` shape (Codex round-3 Finding 6), as opposed to `source` above
-    /// (a regular, non-automation import's own file, which `removeIfStaged` must never touch).
-    func makeStagedSource() throws -> URL {
-        let stagingDirectory = AutomationMediaStaging.stagingDirectoryURL
-        try FileManager.default.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
-        let url = stagingDirectory.appendingPathComponent("MediaImportPipelineTests-\(UUID().uuidString).wav")
-        try Data("staged source".utf8).write(to: url)
-        return url
-    }
 }
 
 private actor PipelineDecodeProbe: MediaJobAudioDecoding {
     private(set) var calls = 0
     func decode(jobID: UUID, destination: URL, cancellation: CancellationToken, progress: @escaping @Sendable (Double) -> Void) async throws {
         calls += 1; try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true); try writeValidWAV(to: destination); progress(1)
-    }
-}
-
-/// Always fails decode, before ever reaching `persistDecodedMedia` — stands in for a real decode
-/// failure so `MediaImportPipeline.execute` never checkpoints `.decode`. Used by
-/// `stagedSourceSurvivesAFailedDecodeSoRetryCanReuseIt` (Codex round-3 Finding 6).
-private struct FailingDecodeProbe: MediaJobAudioDecoding {
-    func decode(jobID: UUID, destination: URL, cancellation: CancellationToken, progress: @escaping @Sendable (Double) -> Void) async throws {
-        throw PipelineTestError.failed
     }
 }
 

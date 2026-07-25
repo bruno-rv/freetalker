@@ -4,39 +4,28 @@ struct TranscriptExporter: Sendable {
     /// Largest timestamp emitted by SRT/VTT exports: 99:59:59.999.
     static let maximumSubtitleTime: TimeInterval = 359_999.999
 
-    /// `includeSpeakerLabels` defaults to `true` so every existing call site (the Imports
-    /// window's export menu) is unaffected — the automation surface
-    /// (BRAINSTORM_AUTOMATION_SURFACE.md) is the only caller that ever passes `false`.
     func export(
         _ segments: [AttributedTranscriptSegment],
         format: TranscriptFormat,
-        speakerNames: [String: String],
-        includeSpeakerLabels: Bool = true
+        speakerNames: [String: String]
     ) -> String {
         switch format {
         case .plainText:
-            return segments.map {
-                includeSpeakerLabels ? "\(label(for: $0, names: speakerNames)): \($0.text)" : $0.text
-            }.joined(separator: "\n")
+            return segments.map { "\(label(for: $0, names: speakerNames)): \($0.text)" }.joined(separator: "\n")
         case .markdown:
             return segments.map {
-                includeSpeakerLabels
-                    ? "**\(escapeMarkup(label(for: $0, names: speakerNames), markdown: true)):** \(escapeMarkup($0.text, markdown: true))"
-                    : escapeMarkup($0.text, markdown: true)
+                "**\(escapeMarkup(label(for: $0, names: speakerNames), markdown: true)):** \(escapeMarkup($0.text, markdown: true))"
             }.joined(separator: "\n\n")
         case .srt:
             return cues(for: segments).enumerated().map { index, cue in
                 let text = cue.segment.text.replacingOccurrences(of: "-->", with: "--&gt;")
-                let body = includeSpeakerLabels ? "\(label(for: cue.segment, names: speakerNames)): \(text)" : text
-                return "\(index + 1)\n\(timestamp(cue.start, separator: ",")) --> \(timestamp(cue.end, separator: ","))\n\(body)"
+                return "\(index + 1)\n\(timestamp(cue.start, separator: ",")) --> \(timestamp(cue.end, separator: ","))\n\(label(for: cue.segment, names: speakerNames)): \(text)"
             }.joined(separator: "\n\n")
         case .vtt:
-            let body = cues(for: segments).map { cue -> String in
-                let text = escapeMarkup(cue.segment.text, markdown: false)
-                let time = "\(timestamp(cue.start, separator: ".")) --> \(timestamp(cue.end, separator: "."))"
-                guard includeSpeakerLabels else { return "\(time)\n\(text)" }
+            let body = cues(for: segments).map { cue in
                 let speaker = escapeMarkup(label(for: cue.segment, names: speakerNames), markdown: false)
-                return "\(time)\n<v \(speaker)>\(text)</v>"
+                let text = escapeMarkup(cue.segment.text, markdown: false)
+                return "\(timestamp(cue.start, separator: ".")) --> \(timestamp(cue.end, separator: "."))\n<v \(speaker)>\(text)</v>"
             }.joined(separator: "\n\n")
             return body.isEmpty ? "WEBVTT" : "WEBVTT\n\n\(body)"
         }

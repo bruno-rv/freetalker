@@ -1,11 +1,17 @@
 import Foundation
 
 /// Cocoa Scripting entry point for `FreeTalker.sdef`'s `clean up` command
-/// (BRAINSTORM_AUTOMATION_SURFACE.md capability 2). No microphone, no recording, no permissions —
-/// a direct call into `AutomationService.cleanUpText`, which resolves the named Template from
+/// (BRAINSTORM_AUTOMATION_SURFACE.md). No microphone, no recording, no permissions — a direct
+/// call into `AutomationService.cleanUpText`, which resolves the named Template from
 /// `TemplateStore` and always runs it through FreeTalker's on-device processor (never cloud — see
-/// `AutomationService.cleanUpText`'s doc comment). See `TranscribeFileCommand`'s doc comment for
-/// why this suspends the AppleEvent reply instead of blocking a thread.
+/// `AutomationService.cleanUpText`'s doc comment).
+///
+/// Suspends the AppleEvent reply (`suspendExecution`/`resumeExecution(withResult:)`) instead of
+/// blocking a thread: `AutomationService` needs the main actor (it goes through
+/// `AppCoordinator`/`AppSettings`), and Apple Event dispatch itself runs there too, so a thread
+/// that actually blocked while resuming that same work would deadlock. The suspend/resume pair is
+/// exactly what Cocoa Scripting has offered slow commands since it's an ordinary async reply, not
+/// a workaround.
 final class CleanUpTextCommand: NSScriptCommand, @unchecked Sendable {
     override func performDefaultImplementation() -> Any? {
         guard let text = directParameter as? String else {
@@ -54,12 +60,22 @@ final class CleanUpTextCommand: NSScriptCommand, @unchecked Sendable {
         }
 
         suspendExecution()
-        // See `TranscribeFileCommand`'s matching comment for why `nonisolated(unsafe)` is needed
-        // here despite the class-level `@unchecked Sendable`.
+        // `self` is only ever touched by the Apple Event Manager's own serialized dispatch, and
+        // this method never reads it again after `return nil` below. The `@unchecked Sendable`
+        // conformance above covers the *type*; `nonisolated(unsafe)` is additionally needed here
+        // because Swift 6's region-based checker still flags a plain `Sendable` value used both
+        // before and after an `await` inside the same task as a potential race — asserting that
+        // away is exactly what a human already reasoning about "single dispatcher, no reentry"
+        // is for.
         nonisolated(unsafe) let command = self
         Task {
             // Codex round-3 additional finding: release the slot BEFORE `resumeExecution`, never
-            // in a `defer` that ran after it — see `TranscribeFileCommand`'s matching comment.
+            // in a `defer` that ran after it — the old ordering could let a new Apple Event see a
+            // stale `.busy` for a moment after this one had already replied, and released the slot
+            // from whatever (possibly non-main) executor this task's body happened to be running
+            // on when the `defer` fired, racing a new `beginCleanUp()` on the main thread without
+            // a lock. `AutomationConcurrencyGate` is now lock-protected regardless, but the
+            // ordering fix is what actually keeps `.busy` truthful.
             do {
                 let output = try await AutomationService.cleanUpText(text, templateName: templateName)
                 AutomationConcurrencyGate.endCleanUp()

@@ -71,9 +71,6 @@ enum Keychain {
         static func cloudLLMKey(for provider: LLMProviderKind) -> String {
             "cloudLLMAPIKey-\(provider.rawValue)"
         }
-        /// Codex round-3 Finding 1: the automation folder's security-scoped bookmark, moved here
-        /// from `UserDefaults` — see `AutomationFolderBookmarkStore` below.
-        static let automationFolderBookmark = "automationFolderBookmark"
     }
 }
 
@@ -117,38 +114,6 @@ enum CloudLLMCredentialWriter {
         guard succeeded else { return false }
         notificationCenter.post(name: .cloudLLMCredentialsDidChange, object: nil)
         return true
-    }
-}
-
-/// Codex round-3 Finding 1 (HIGH, unauthenticated bookmark provenance): a `UserDefaults` path or
-/// bookmark is writable by any same-user process — `defaults write org.freetalker.app
-/// automationFolderBookmark <forged bookmark for />` before FreeTalker even launches is the round-2
-/// `defaults write` attack re-encoded as bookmark `Data`, and `AutomationFileAuthorization` has no
-/// way to tell that forged bookmark from one `SettingsView`'s folder picker legitimately created.
-///
-/// The Keychain closes this: `SecItemAdd`/`SecItemCopyMatching` scope a generic-password item to
-/// the creating app's own code-signing identity by default (a distinct access group per app,
-/// unlike the plist `defaults` edits directly with no identity check at all), so a same-user
-/// process without FreeTalker's own signing identity can neither forge nor overwrite this item. A
-/// missing or unreadable value fails closed the same way an absent bookmark already does in
-/// `AutomationFileAuthorization.authorize` — the user must choose the folder again in Settings.
-///
-/// Reuses the existing String-based `Keychain`/`SecretStore` surface (base64-encoding the
-/// bookmark `Data` at the boundary) rather than adding a parallel Data-typed Keychain API —
-/// follows `CloudLLMCredentialWriter`/`CloudSTTCredentialWriter`'s exact shape immediately above,
-/// including accepting an injectable `SecretStore` so tests never touch the real system Keychain.
-enum AutomationFolderBookmarkStore {
-    @discardableResult
-    static func set(_ bookmark: Data?, store: SecretStore = KeychainSecretStore()) -> Bool {
-        guard let bookmark else {
-            return store.delete(account: Keychain.Account.automationFolderBookmark)
-        }
-        return store.set(bookmark.base64EncodedString(), account: Keychain.Account.automationFolderBookmark)
-    }
-
-    static func get(store: SecretStore = KeychainSecretStore()) -> Data? {
-        guard let encoded = store.get(account: Keychain.Account.automationFolderBookmark) else { return nil }
-        return Data(base64Encoded: encoded)
     }
 }
 
