@@ -17,13 +17,16 @@ struct InsertionTarget {
     let pid: pid_t
     let focusedElement: AXUIElement?
     let window: AXUIElement?
-    /// Stable per-document discriminator (`kAXDocumentAttribute`), snapshotted alongside
-    /// `focusedElement`/`window` — Codex finding 2: some editors recycle ONE AXUIElement/window
-    /// across multiple open tabs/documents, which defeats the `focusedElement`/`window` CFEqual
-    /// identity check alone (same view instance, different document). `nil` when the app doesn't
-    /// expose the attribute at all — the element/window check is all that's available for those
-    /// apps, unchanged from before this fix; a non-nil snapshot value only ever DOWNGRADES an
-    /// already-`.match` element/window verdict, never upgrades a `.mismatch`/`.unavailable` one.
+    /// `kAXDocumentAttribute`, snapshotted alongside `focusedElement`/`window` — Round 3 fix: this
+    /// used to also govern `compareElements`/`streamingSafeElement` (every insertion path), which
+    /// was wrong. Chromium exposes this attribute as the tab's page URL, so it changes on any
+    /// `history.replaceState` — not a document identity — and Round 3 finding 2 further showed a
+    /// URL match doesn't even prove identity (a duplicated tab shares the same URL). It is now
+    /// consulted ONLY by `SelectionAccess`'s correction-fallback revalidation
+    /// (`SelectionSnapshot.correctionDictationID != nil` — see `CorrectionTargeting.
+    /// selectRecentInsertion`), never by `Insertion.insert`, `streamingSafeElement`, or ordinary
+    /// manual Voice Edit, all of which behave exactly as `main`. `nil` when the app doesn't expose
+    /// the attribute at all.
     let document: String?
 
     init(bundleID: String?, pid: pid_t, focusedElement: AXUIElement?, window: AXUIElement?, document: String? = nil) {
@@ -72,37 +75,6 @@ enum Insertion {
         case match
         case mismatch
         case unavailable
-        /// Element/window identity matched, but the snapshotted `kAXDocumentAttribute` differs
-        /// from what's there now (Codex Round 2 finding 1). Distinct from `.mismatch` so a caller
-        /// that has independent provenance for an ALREADY-established session (streaming's own
-        /// caret+baseline+ledger proof) can attempt to salvage it instead of failing closed
-        /// outright — see `streamingSafeElement`'s `ledgerProvenance` parameter. A caller with no
-        /// such proof (the ordinary paste-time drift check in `insert`, or a session's very FIRST
-        /// write) treats this exactly like `.mismatch` — see `shouldSynthesizePaste` below.
-        case documentMismatch
-    }
-
-    /// Proof that survives a changed `kAXDocumentAttribute` value once a streaming session has
-    /// already typed at least one confirmed partial (Codex Round 2 finding 1): Chromium exposes
-    /// that attribute as the tab's URL, and a single-page app can rewrite it via
-    /// `history.replaceState` purely as a SIDE EFFECT of the text the user is dictating changing
-    /// — no element, window, caret, or actual document switch involved. Treating every such
-    /// mutation as a target switch froze the session on the very next partial. Rather than drop
-    /// the document check entirely (Codex finding 2's original tab-reuse protection would be
-    /// lost), a changed document value is permitted ONLY when the caller already has independent
-    /// proof: the ENTIRE current field content must still reconstruct exactly as `baseline` with
-    /// `ledgerText` spliced in at `anchor` — the same provenance check `readbackMatches`/
-    /// `documentMatchesBaselinePlusLedger` perform at finalize, reused here for the same reason
-    /// (matching text alone proves location, not that THIS session produced it). The very FIRST
-    /// write of a session has no established ledger yet and never receives this struct — see
-    /// `LiveInsertionSession.receivePartial`/`streamingWriteCaret` — so it keeps failing closed on
-    /// any document drift, exactly as before this fix. Plain batch (non-streaming) paste never has
-    /// prior ledger provenance either, so `insert(_:target:strict:)` is unaffected by this
-    /// carve-out and keeps its pre-fix strict document check.
-    struct LedgerProvenance: Equatable {
-        let baseline: String
-        let ledgerText: String
-        let anchor: Int
     }
 
     /// Snapshots the frontmost app's identity for a later paste-time comparison — bundle id,
@@ -156,13 +128,12 @@ enum Insertion {
         let currentBundleID = currentApp?.bundleIdentifier
         let currentElement = currentApp.flatMap(focusedElement(for:))
         let currentWindow = currentElement.flatMap(windowElement(for:))
-        let currentDocument = documentDiscriminator(element: currentElement, window: currentWindow)
         // No target snapshotted at all -> nothing to contradict, stays permissive (matches the
         // hasTarget: false branch of shouldSynthesizePaste below). This is distinct from "a
         // target was snapshotted but its bundleID was nil" — see Round 3 Codex finding: paste-
         // target drift with nil bundle id.
         let pidMatch = target.map { $0.pid == currentApp?.processIdentifier } ?? true
-        let elementComparison = compareElements(snapshot: target, currentElement: currentElement, currentWindow: currentWindow, currentDocument: currentDocument)
+        let elementComparison = compareElements(snapshot: target, currentElement: currentElement, currentWindow: currentWindow)
 
         if let reason = classifyPreflightFailure(
             hasTarget: target != nil,
@@ -254,7 +225,7 @@ enum Insertion {
         guard let currentBundleID, snapshotBundleID == currentBundleID else { return false }
         guard pidMatch else { return false }
         switch elementComparison {
-        case .mismatch, .documentMismatch: return false
+        case .mismatch: return false
         case .match: return true
         // Matching bundle id/pid only proves it's the same APP, not the same focused field — a
         // same-app focus change (e.g. the user tabbed to a different field, or a new window took
@@ -312,29 +283,21 @@ enum Insertion {
     /// `strict`) rather than a second, divergent implementation. `nil` (unsafe) covers: AX
     /// untrusted, identity drifted, no focused element, or the focused element is secure/unreadable.
     ///
-    /// `ledgerProvenance`, when non-nil (Codex Round 2 finding 1), is consulted ONLY if the
-    /// element/window otherwise match but the document discriminator alone differs: the entire
-    /// current field content is read ONE extra time and checked against `documentMatchesBaseline
-    /// PlusLedger` — a mutable document token (Chromium's URL) is never trusted on its own once a
-    /// session already has stronger proof available. `nil` (the default) preserves the exact
-    /// pre-fix strict document check for every other caller (a session's own first write,
-    /// `captureCorrectionAnchor`'s batch-paste snapshot, `streamingBaselineValue`).
+    /// Round 3 fix: this used to also carve out an exception for a changed `kAXDocumentAttribute`
+    /// value via a `ledgerProvenance` parameter. That whole mechanism only existed to compensate
+    /// for the document check having been added to this SHARED path in the first place — Chromium
+    /// exposes that attribute as the tab's URL, and rewriting it via `history.replaceState` is a
+    /// side effect of ordinary typing, not a target switch. The document check itself has moved
+    /// to `SelectionAccess`'s correction-fallback-only revalidation (see `InsertionTarget.
+    /// document`'s doc comment); this function is identical to `main` again.
     @MainActor
-    static func streamingSafeElement(target: InsertionTarget, ledgerProvenance: LedgerProvenance? = nil) -> AXUIElement? {
+    static func streamingSafeElement(target: InsertionTarget) -> AXUIElement? {
         guard Permissions.isAccessibilityTrusted() else { return nil }
         let currentApp = NSWorkspace.shared.frontmostApplication
         let currentElement = currentApp.flatMap(focusedElement(for:))
         let currentWindow = currentElement.flatMap(windowElement(for:))
-        let currentDocument = documentDiscriminator(element: currentElement, window: currentWindow)
         let pidMatch = target.pid == currentApp?.processIdentifier
-        var elementComparison = compareElements(snapshot: target, currentElement: currentElement, currentWindow: currentWindow, currentDocument: currentDocument)
-        if elementComparison == .documentMismatch {
-            if let ledgerProvenance, let currentElement, documentProvenanceHolds(element: currentElement, provenance: ledgerProvenance) {
-                elementComparison = .match
-            } else {
-                elementComparison = .mismatch
-            }
-        }
+        let elementComparison = compareElements(snapshot: target, currentElement: currentElement, currentWindow: currentWindow)
         guard shouldSynthesizePaste(
             hasTarget: true,
             snapshotBundleID: target.bundleID,
@@ -345,21 +308,6 @@ enum Insertion {
         ), let currentElement else { return nil }
         guard !isSecureForStreaming(currentElement) else { return nil }
         return currentElement
-    }
-
-    /// Whether `element`'s ENTIRE current value still reconstructs as `provenance.baseline` with
-    /// `provenance.ledgerText` spliced in at `provenance.anchor` — the escape hatch
-    /// `streamingSafeElement` uses when only the (mutable, untrustworthy-alone) document
-    /// discriminator changed. One extra `kAXValueAttribute` read, performed ONLY on that rare
-    /// path — never on the fast, common case where the document token still matches.
-    private static func documentProvenanceHolds(element: AXUIElement, provenance: LedgerProvenance) -> Bool {
-        var valueRef: AnyObject?
-        guard AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &valueRef) == .success,
-              let text = valueRef as? String else { return false }
-        return documentMatchesBaselinePlusLedger(
-            current: Array(text.utf16), baseline: Array(provenance.baseline.utf16),
-            ledger: Array(provenance.ledgerText.utf16), anchor: provenance.anchor
-        )
     }
 
     /// One fresh read combining `streamingSafeElement` (identity/security) with a collapsed-
@@ -374,8 +322,8 @@ enum Insertion {
     /// the selection must still be collapsed. Returns the observed caret (to become the anchor on
     /// the caller's first successful post) or nil if anything is unsafe/unreadable/mismatched.
     @MainActor
-    static func streamingWriteCaret(target: InsertionTarget, expectedCaret: Int?, ledgerProvenance: LedgerProvenance? = nil) -> Int? {
-        guard let element = streamingSafeElement(target: target, ledgerProvenance: ledgerProvenance) else { return nil }
+    static func streamingWriteCaret(target: InsertionTarget, expectedCaret: Int?) -> Int? {
+        guard let element = streamingSafeElement(target: target) else { return nil }
         guard let range = selectedRange(of: element), range.length == 0 else { return nil }
         if let expectedCaret, range.location != expectedCaret { return nil }
         return range.location
@@ -701,31 +649,26 @@ enum Insertion {
     /// Compares the snapshotted focused element/window against what's focused right now.
     /// Prefers the element comparison (finer-grained); falls back to the window only when no
     /// element was snapshotted. Both nil at snapshot time (AX-opaque app) → `.unavailable`.
-    private static func compareElements(snapshot: InsertionTarget?, currentElement: AXUIElement?, currentWindow: AXUIElement?, currentDocument: String?) -> ElementComparison {
+    private static func compareElements(snapshot: InsertionTarget?, currentElement: AXUIElement?, currentWindow: AXUIElement?) -> ElementComparison {
         guard let snapshot else { return .unavailable }
-        let base: ElementComparison
         if let snapshotElement = snapshot.focusedElement {
             guard let currentElement else { return .mismatch }
             // AXUIElement is CFEqual-comparable for identity — see AXUIElement.h.
-            base = CFEqual(snapshotElement, currentElement) ? .match : .mismatch
-        } else if let snapshotWindow = snapshot.window {
-            guard let currentWindow else { return .mismatch }
-            base = CFEqual(snapshotWindow, currentWindow) ? .match : .mismatch
-        } else {
-            base = .unavailable
+            return CFEqual(snapshotElement, currentElement) ? .match : .mismatch
         }
-        // Codex finding 2 (same-window document reuse): element/window identity alone doesn't
-        // prove the same DOCUMENT for editors that recycle one AXUIElement/window across tabs —
-        // only downgrades an already-`.match` verdict, and only when a discriminator WAS captured
-        // at snapshot time; apps that never expose `kAXDocumentAttribute` keep the pre-fix
-        // element/window-only behavior (nothing stronger is available to check for them).
-        guard base == .match, let snapshotDocument = snapshot.document else { return base }
-        return snapshotDocument == currentDocument ? .match : .documentMismatch
+        if let snapshotWindow = snapshot.window {
+            guard let currentWindow else { return .mismatch }
+            return CFEqual(snapshotWindow, currentWindow) ? .match : .mismatch
+        }
+        return .unavailable
     }
 
     /// `kAXDocumentAttribute`, read from whichever of `window`/`element` exposes it (window
-    /// preferred — document identity is generally window-level) — Codex finding 2's stable
-    /// per-document discriminator. `nil` when neither exposes it (most apps).
+    /// preferred — document identity is generally window-level). Captured on every snapshot
+    /// (`snapshotTarget`) for `InsertionTarget.document` — see that property's doc comment for
+    /// why it's consulted only by `SelectionAccess`'s correction-fallback revalidation, never by
+    /// `compareElements`/`streamingSafeElement`/`insert`. `nil` when neither exposes it (most
+    /// apps).
     private static func documentDiscriminator(element: AXUIElement?, window: AXUIElement?) -> String? {
         if let window, let document = stringAttribute(window, kAXDocumentAttribute as CFString) { return document }
         if let element, let document = stringAttribute(element, kAXDocumentAttribute as CFString) { return document }

@@ -60,12 +60,9 @@ final class LiveInsertionSession {
     /// Fresh identity/security/collapsed-selection/caret read, done immediately before EVERY
     /// unicode post (Codex finding 2). `expectedCaret` is `caretAnchor + ledger UTF-16 length`,
     /// or nil for this session's very first post (no anchor yet, but the selection must still be
-    /// collapsed). `provenance` (Codex Round 2 finding 1) is this session's established
-    /// baseline+ledger+anchor once it has one (nil on the very first post) — passed straight to
-    /// `Insertion.streamingWriteCaret` so a changed-but-provable document token doesn't freeze an
-    /// already-typing session. Returns the observed caret (which becomes `caretAnchor` on the
-    /// first success) or nil if anything is unsafe/drifted/mismatched.
-    private let writeSnapshotCaret: (InsertionTarget, Int?, Insertion.LedgerProvenance?) -> Int?
+    /// collapsed). Returns the observed caret (which becomes `caretAnchor` on the first success)
+    /// or nil if anything is unsafe/drifted/mismatched.
+    private let writeSnapshotCaret: (InsertionTarget, Int?) -> Int?
     /// One fresh read of the field's full current value, called once, immediately after the first
     /// successful `writeSnapshotCaret` (Codex finding 2) — becomes `baselineValue`. `nil` fails
     /// the session closed (frozen) since no later delete could ever be proven safe without it.
@@ -75,20 +72,14 @@ final class LiveInsertionSession {
     init(
         target: InsertionTarget,
         generation: Int,
-        writeSnapshotCaret: @escaping (InsertionTarget, Int?, Insertion.LedgerProvenance?) -> Int? = { target, expectedCaret, provenance in
-            Insertion.streamingWriteCaret(target: target, expectedCaret: expectedCaret, ledgerProvenance: provenance)
+        writeSnapshotCaret: @escaping (InsertionTarget, Int?) -> Int? = { target, expectedCaret in
+            Insertion.streamingWriteCaret(target: target, expectedCaret: expectedCaret)
         },
         readBaselineValue: @escaping (InsertionTarget) -> String? = { target in
             Insertion.streamingBaselineValue(target: target)
         },
         verifyBeforeDelete: @escaping (InsertionTarget, String, Int, String) -> Bool = { target, ledgerText, expectedCaret, baseline in
-            // Codex Round 2 finding 1: by the time `finalize` verifies, this session already has
-            // an established ledger (this closure only ever runs when one exists — see
-            // `finalize`'s call site) — a changed document token alone must not refuse the
-            // readback that would otherwise prove the target is still correct.
-            let anchor = expectedCaret - Array(ledgerText.utf16).count
-            let provenance = Insertion.LedgerProvenance(baseline: baseline, ledgerText: ledgerText, anchor: anchor)
-            guard let element = Insertion.streamingSafeElement(target: target, ledgerProvenance: provenance) else { return false }
+            guard let element = Insertion.streamingSafeElement(target: target) else { return false }
             return Insertion.readbackMatches(element: element, expectedTrailingText: ledgerText, expectedCaret: expectedCaret, baseline: baseline)
         }
     ) {
@@ -125,14 +116,7 @@ final class LiveInsertionSession {
         // selected an existing word in the same field) fails this and freezes instead of
         // overwriting it. The very first post still runs this with `expectedCaret == nil`.
         let expectedCaret = caretAnchor.map { $0 + Self.utf16Count(of: ledger) }
-        // Codex Round 2 finding 1: only a session that has ALREADY typed a first post (an
-        // established `caretAnchor`/`baselineValue`) gets the document-drift carve-out — a
-        // changed document is still fail-closed on this session's very first write.
-        let provenance: Insertion.LedgerProvenance? = {
-            guard let anchor = caretAnchor, let baselineValue else { return nil }
-            return Insertion.LedgerProvenance(baseline: baselineValue, ledgerText: String(ledger), anchor: anchor)
-        }()
-        guard let caret = writeSnapshotCaret(target, expectedCaret, provenance) else {
+        guard let caret = writeSnapshotCaret(target, expectedCaret) else {
             isFrozen = true
             return
         }
@@ -196,7 +180,7 @@ final class LiveInsertionSession {
         // ordinary (non-streaming) paste path, which never checks for that. Skipped for Cancel —
         // an empty ledger on Cancel never inserts anything regardless, so there's nothing this
         // read could gate.
-        let emptyLedgerInsertSafe = (ledger.isEmpty && action != .cancel) ? (writeSnapshotCaret(target, nil, nil) != nil) : true
+        let emptyLedgerInsertSafe = (ledger.isEmpty && action != .cancel) ? (writeSnapshotCaret(target, nil) != nil) : true
         let (shouldBackspace, shouldFreeze, outcome) = Self.finalizeDecision(
             action: action, refinedText: refinedText, rawText: rawText,
             isFrozen: isFrozen, ledgerCount: ledger.count, verified: verified,

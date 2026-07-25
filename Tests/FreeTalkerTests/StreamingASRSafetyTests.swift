@@ -158,7 +158,7 @@ import Testing
         let session = LiveInsertionSession(
             target: target,
             generation: 1,
-            writeSnapshotCaret: { _, expectedCaret, _ in
+            writeSnapshotCaret: { _, expectedCaret in
                 writeSnapshotCaretCalls.append(expectedCaret)
                 return 0
             },
@@ -181,7 +181,7 @@ import Testing
         let session = LiveInsertionSession(
             target: target,
             generation: 1,
-            writeSnapshotCaret: { _, _, _ in nil },
+            writeSnapshotCaret: { _, _ in nil },
             readBaselineValue: { _ in "" },
             verifyBeforeDelete: { _, _, _, _ in false }
         )
@@ -198,7 +198,7 @@ import Testing
         let session = LiveInsertionSession(
             target: target,
             generation: 1,
-            writeSnapshotCaret: { _, _, _ in
+            writeSnapshotCaret: { _, _ in
                 writeSnapshotCaretCalled = true
                 return nil
             },
@@ -288,7 +288,7 @@ import Testing
         let session = LiveInsertionSession(
             target: target,
             generation: 1,
-            writeSnapshotCaret: { _, _, _ in nil },
+            writeSnapshotCaret: { _, _ in nil },
             verifyBeforeDelete: { _, _, _, _ in false }
         )
         session.receivePartial("hello")
@@ -307,7 +307,7 @@ import Testing
         let session = LiveInsertionSession(
             target: target,
             generation: 1,
-            writeSnapshotCaret: { _, expectedCaret, _ in
+            writeSnapshotCaret: { _, expectedCaret in
                 wasCalled = true
                 observedExpectedCaret = expectedCaret
                 return nil // still unsafe/unreadable in this test — no real CGEvent posted
@@ -318,48 +318,6 @@ import Testing
         #expect(wasCalled)
         #expect(observedExpectedCaret == nil)
         #expect(session.isFrozen)
-    }
-
-    // MARK: - Codex Round 2 finding 1: a changed document token must not freeze an established ledger
-
-    @MainActor
-    @Test func receivePartialWithholdsLedgerProvenanceOnTheFirstPostButSuppliesItOnceEstablished() {
-        // Codex Round 2 finding 1: Chromium exposes `kAXDocumentAttribute` as the tab's URL, which
-        // a single-page app can rewrite via `history.replaceState` purely as a side effect of the
-        // user's own typing — no element/window/caret change at all. `Insertion.
-        // streamingSafeElement`'s carve-out for that only fires when the caller supplies
-        // `ledgerProvenance`; `receivePartial` is what decides when a caller gets one at all. This
-        // session's very FIRST write has nothing established yet to reconstruct against — it must
-        // stay fail-closed (nil provenance) exactly as before this fix. Every write AFTER that has
-        // an established caret anchor + baseline + everything typed so far, and must supply it so
-        // a merely-changed document token doesn't freeze an otherwise-healthy session.
-        var observedProvenance: [Insertion.LedgerProvenance?] = []
-        let target = InsertionTarget(bundleID: "com.test.app", pid: 1, focusedElement: nil, window: nil)
-        var nextCaret = 10
-        let session = LiveInsertionSession(
-            target: target,
-            generation: 1,
-            writeSnapshotCaret: { _, _, provenance in
-                observedProvenance.append(provenance)
-                defer { nextCaret += 100 }
-                return nextCaret
-            },
-            readBaselineValue: { _ in "Dear Sir, . Best regards" },
-            verifyBeforeDelete: { _, _, _, _ in true }
-        )
-
-        session.receivePartial("hi")
-        #expect(observedProvenance == [nil])
-
-        session.receivePartial("hi there")
-        #expect(observedProvenance.count == 2)
-        guard let provenance = observedProvenance[1] else {
-            Issue.record("expected an established ledger to supply provenance on the second post")
-            return
-        }
-        #expect(provenance.baseline == "Dear Sir, . Best regards")
-        #expect(provenance.ledgerText == "hi")
-        #expect(provenance.anchor == 10)
     }
 
     // MARK: - Round 2 finding 3: caret-anchor mismatch refuses to delete
