@@ -8,11 +8,11 @@ import Testing
 /// deliberately does not exercise (see the build report for what's covered by AX-live smoke
 /// testing instead).
 @Suite @MainActor struct CorrectionRecorderTests {
-    // MARK: - candidate(wrongText:rightText:) reuses VocabularyMiner's diff, unmodified
+    // MARK: - candidate(wrongText:rightText:)/correctionSubstitution: Codex finding 7 —
+    // deliberate corrections are NOT filtered through VocabularyMiner's anchor-position/
+    // minimum-length/edit-distance guess-filtering heuristics.
 
     @Test func singleWordSubstitutionProducesACandidate() {
-        // Anchored on both sides ("hi" before, "how" after) — see VocabularyMiner's own
-        // "replacementAtTheEndOfTheTranscriptProducesNoCandidateBecauseItHasNoRightAnchor".
         let candidate = CorrectionRecorder.candidate(wrongText: "hi joao how are you", rightText: "hi João how are you")
         #expect(candidate?.normalizedTerm == "joão")
         #expect(candidate?.surfaceTerm == "João")
@@ -20,13 +20,55 @@ import Testing
     }
 
     @Test func wholeSentenceRewriteProducesNoCandidate() {
-        // No anchoring context on either side of a total rewrite — VocabularyMiner's own
-        // "anchored local substitution" contract, reused here unmodified.
+        // Three changed tokens, not a single anchored substitution — still out of scope
+        // (BRAINSTORM_CORRECTION_LOOP.md: "single misheard words and names," not phrases).
         #expect(CorrectionRecorder.candidate(wrongText: "hello there friend", rightText: "good morning pal") == nil)
     }
 
     @Test func identicalTextProducesNoCandidate() {
         #expect(CorrectionRecorder.candidate(wrongText: "hi João how are you", rightText: "hi João how are you") == nil)
+    }
+
+    /// Codex finding 7: a correction at the very FIRST word — no left anchor at all — is exactly
+    /// what `VocabularyMiner.candidates` would reject (`hasLeftAnchor == false`), but a deliberate
+    /// user correction here must still be learned.
+    @Test func correctionAtTheFirstWordWithNoLeftAnchorProducesACandidate() {
+        let candidate = CorrectionRecorder.candidate(wrongText: "joao how are you", rightText: "João how are you")
+        #expect(candidate?.normalizedTerm == "joão")
+        #expect(candidate?.surfaceTerm == "João")
+    }
+
+    /// Codex finding 7: a correction at the very LAST word — no right anchor — is exactly what
+    /// `VocabularyMiner.candidates` would reject (`hasRightAnchor == false`).
+    @Test func correctionAtTheLastWordWithNoRightAnchorProducesACandidate() {
+        let candidate = CorrectionRecorder.candidate(wrongText: "meet with joao", rightText: "meet with João")
+        #expect(candidate?.normalizedTerm == "joão")
+        #expect(candidate?.surfaceTerm == "João")
+    }
+
+    /// Codex finding 7: a term shorter than `VocabularyMiner.minTermLength` (4) is exactly what
+    /// the miner would reject as too noisy a signal to trust unattributed — a deliberate
+    /// correction has no such ambiguity.
+    @Test func correctionOfATermShorterThanTheMinersMinimumLengthProducesACandidate() {
+        let candidate = CorrectionRecorder.candidate(wrongText: "call me sam", rightText: "call me Sal")
+        #expect(candidate?.normalizedTerm == "sal")
+        #expect(candidate?.surfaceTerm == "Sal")
+    }
+
+    /// Codex finding 7: an edit distance above `VocabularyMiner.maxEditDistance` (2) is exactly
+    /// what the miner would reject as "probably an unrelated word, not a spelling fix" — a
+    /// deliberate correction proves it's the same word regardless of how different the spellings
+    /// end up looking.
+    @Test func correctionWithEditDistanceAboveTheMinersMaximumProducesACandidate() {
+        let candidate = CorrectionRecorder.candidate(wrongText: "deploy to wrongword now", rightText: "deploy to RightTerm now")
+        #expect(candidate?.normalizedTerm == "rightterm")
+        #expect(candidate?.surfaceTerm == "RightTerm")
+    }
+
+    /// `VocabularyMiner` itself is unchanged by finding 7's fix — its own anchoring/length/edit-
+    /// distance heuristics still apply to MINED (unattributed) evidence.
+    @Test func vocabularyMinerItselfStillRejectsFirstWordCorrectionsForMinedEvidence() {
+        #expect(VocabularyMiner.candidates(transcript: "joao how are you", refined: "João how are you").isEmpty)
     }
 
     // MARK: - decide(...) pure decision core

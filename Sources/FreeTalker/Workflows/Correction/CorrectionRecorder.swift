@@ -32,15 +32,42 @@ enum CorrectionRecorder {
         case noWrongRightPair
     }
 
-    /// Runs the SAME anchored-single-word-substitution diff `VocabularyMiner` uses on
-    /// transcript-vs-refined pairs — reused verbatim here, not reimplemented, so "the user
-    /// rewrote a whole sentence" produces no vocabulary write from ANY of the three signals, only
-    /// a genuine single-word correction does. `surfaceTerm`/`normalizedTerm` come from
-    /// `rightText`'s corrected word (already run through `AppSettings.validatedVocabularyTerm` by
-    /// the miner's own logic).
+    /// A deliberate, explicit user correction (Codex finding 7) — NOT `VocabularyMiner.
+    /// candidates`. The miner's anchor-position/minimum-length/edit-distance heuristics exist to
+    /// filter its own GUESSES out of unattributed transcript-vs-refined diffs (is this really a
+    /// spelling fix, or an unrelated rewrite?); they have no business filtering a correction the
+    /// user just explicitly made through the panel, a spoken correction, or a confirmed observed
+    /// edit. A correction at the first/last word, shorter than `VocabularyMiner.minTermLength`, or
+    /// with an edit distance above `VocabularyMiner.maxEditDistance` was previously repairing the
+    /// live document and then silently discarded as `.noWrongRightPair` — this branch's whole
+    /// premise (a correction is fed directly, past the miner's queue) barely worked. Still
+    /// requires exactly ONE changed token — a whole-sentence rewrite still yields no candidate,
+    /// matching BRAINSTORM_CORRECTION_LOOP.md's "single misheard words and names" scope — via the
+    /// SAME LCS hunk-detection `VocabularyMiner.replacementHunks` uses (reused, not reimplemented;
+    /// `VocabularyMiner` itself is unchanged). `surfaceTerm`/`normalizedTerm` still go through
+    /// `AppSettings.validatedVocabularyTerm` (`record` below), same validation every vocabulary
+    /// write gets regardless of source.
     static func candidate(wrongText: String, rightText: String) -> VocabEvidenceCandidate? {
-        guard let first = VocabularyMiner.candidates(transcript: wrongText, refined: rightText).first else { return nil }
-        return VocabEvidenceCandidate(normalizedTerm: first.normalizedTerm, surfaceTerm: first.surfaceTerm, source: .userSupplied)
+        guard let substitution = correctionSubstitution(wrongText: wrongText, rightText: rightText) else { return nil }
+        guard let canonicalSurface = AppSettings.validatedVocabularyTerm(substitution.newWord) else { return nil }
+        return VocabEvidenceCandidate(normalizedTerm: canonicalSurface.lowercased(), surfaceTerm: canonicalSurface, source: .userSupplied)
+    }
+
+    /// The single-token substitution `candidate(wrongText:rightText:)` requires: exactly one
+    /// changed token between the two texts, at ANY position (including the very first/last word),
+    /// of ANY length, at ANY edit distance — none of `VocabularyMiner`'s guess-filtering
+    /// heuristics apply here (see `candidate`'s doc comment). Reuses `VocabularyMiner.tokenize`/
+    /// `replacementHunks` (unchanged) rather than a parallel diff implementation.
+    static func correctionSubstitution(wrongText: String, rightText: String) -> (oldWord: String, newWord: String)? {
+        let oldTokens = VocabularyMiner.tokenize(wrongText)
+        let newTokens = VocabularyMiner.tokenize(rightText)
+        guard !oldTokens.isEmpty, !newTokens.isEmpty else { return nil }
+        let hunks = VocabularyMiner.replacementHunks(old: oldTokens, new: newTokens)
+        guard hunks.count == 1, let hunk = hunks.first,
+              hunk.oldTokens.count == 1, hunk.newTokens.count == 1,
+              hunk.oldTokens[0] != hunk.newTokens[0]
+        else { return nil }
+        return (hunk.oldTokens[0], hunk.newTokens[0])
     }
 
     /// Pure decision core (Codex-survivability: factored out of the actor-hopping `record` below
@@ -79,9 +106,49 @@ enum CorrectionRecorder {
         }
     }
 
+    /// Minimal FIFO async mutex (Codex finding 10) — `acquire()` suspends until it's this
+    /// caller's turn; `release()` is a plain synchronous call (usable from `defer`) that wakes the
+    /// next waiter, if any. `@MainActor`-isolated since its only caller (`record` below) already
+    /// is — no separate actor hop needed. `record`'s own `@MainActor` isolation alone does NOT
+    /// serialize concurrent calls: the race is entirely across `await` suspension points (the
+    /// `VocabStore` reads/writes below), where the MainActor freely interleaves a second `record`
+    /// call.
+    @MainActor
+    private final class RecordLock {
+        private var isLocked = false
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+
+        func acquire() async {
+            if !isLocked {
+                isLocked = true
+                return
+            }
+            await withCheckedContinuation { waiters.append($0) }
+        }
+
+        func release() {
+            guard !waiters.isEmpty else {
+                isLocked = false
+                return
+            }
+            waiters.removeFirst().resume()
+        }
+    }
+
+    private static let recordLock = RecordLock()
+
     /// `store`/`settings` are the live dependencies; `confirmSwap`/`confirmDismissedOverride` are
     /// explicit re-invocations after a caller showed the user a `.budgetFull`/
     /// `needsDismissalConfirmation` result and got agreement — never inferred automatically.
+    ///
+    /// Codex finding 10: the entire fit-check → write → cache-refresh sequence is serialized
+    /// process-wide via `recordLock` — without it, two corrections landing concurrently (e.g.
+    /// signal B and signal C on different windows) each `await` past the fit-check before either
+    /// has committed its own decision, so both read the SAME stale `settings.
+    /// approvedVocabularyCache`, both conclude they fit, and both approve — one is later silently
+    /// displaced by the other with neither having received the required budget-full offer. Every
+    /// call therefore evaluates its fit-check against the PRECEDING call's fully-committed
+    /// decision, never a stale snapshot from before it.
     @MainActor
     static func record(
         dictationID: Int64,
@@ -91,6 +158,30 @@ enum CorrectionRecorder {
         settings: AppSettings = .shared,
         confirmSwap: Bool = false,
         confirmDismissedOverride: Bool = false
+    ) async throws -> Outcome {
+        await recordLock.acquire()
+        do {
+            let outcome = try await recordLocked(
+                dictationID: dictationID, wrongText: wrongText, rightText: rightText, store: store,
+                settings: settings, confirmSwap: confirmSwap, confirmDismissedOverride: confirmDismissedOverride
+            )
+            recordLock.release()
+            return outcome
+        } catch {
+            recordLock.release()
+            throw error
+        }
+    }
+
+    @MainActor
+    private static func recordLocked(
+        dictationID: Int64,
+        wrongText: String,
+        rightText: String,
+        store: VocabStore,
+        settings: AppSettings,
+        confirmSwap: Bool,
+        confirmDismissedOverride: Bool
     ) async throws -> Outcome {
         guard let candidate = candidate(wrongText: wrongText, rightText: rightText) else { return .noWrongRightPair }
         guard AppSettings.validatedVocabularyTerm(candidate.surfaceTerm) != nil else { return .invalidTerm }
@@ -129,13 +220,23 @@ enum CorrectionRecorder {
         switch decision {
         case .approved:
             if !fits, confirmSwap, let swapNormalized {
-                // Sanctioned swap: drop the offered term, then approve the new one. Two separate
-                // writes (never one, so a failure after the drop still leaves the system in a
-                // valid state — displaced, not silently corrupted) — matches `dismiss`/`approve`
-                // already being independent `VocabStore` actions elsewhere.
-                _ = try await store.dismiss(normalizedTerm: swapNormalized)
+                // Codex finding 11: verify evidence, dismiss the offered term, and approve the
+                // confirmed one in ONE `VocabStore` transaction — two separate writes here
+                // previously meant a failure between them left the offered term dismissed with
+                // the confirmed one never approved, losing both.
+                _ = try await store.swapApprove(
+                    dismissNormalizedTerm: swapNormalized, approveNormalizedTerm: candidate.normalizedTerm,
+                    // Codex finding 8: the candidate's own validated surface, not a mined-evidence
+                    // tie-break that could resurface a higher-frequency mined misspelling.
+                    approveSurfaceTerm: candidate.surfaceTerm
+                )
+            } else {
+                _ = try await store.approve(normalizedTerm: candidate.normalizedTerm, surfaceTerm: candidate.surfaceTerm)
             }
-            _ = try await store.approve(normalizedTerm: candidate.normalizedTerm)
+            // Codex finding 10: refreshed INSIDE the serialized section — not left to the
+            // caller's own async refresh afterward — so the NEXT waiting `record()` call sees
+            // this decision's effect on the fit-check budget, not a stale pre-decision snapshot.
+            settings.applyApprovedVocabularyCache(try await store.approvedTerms())
             return .approved
         default:
             return decision
