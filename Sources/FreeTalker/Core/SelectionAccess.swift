@@ -97,13 +97,17 @@ final class SelectionAccess: SelectionAccessing {
                 && selection.target.bundleID == snapshot.target.bundleID,
             elementMatches: adapter.elementsEqual(selection.target.focusedElement, snapshot.target.focusedElement),
             windowMatches: adapter.elementsEqual(selection.target.window, snapshot.target.window),
-            // Codex Round 2 finding 2: `snapshot.target.document` is the discriminator captured
-            // when this snapshot was taken (e.g. Correction Loop signal B's fallback — see
-            // `CorrectionTargeting.selectRecentInsertion`, which carries `recent.target` straight
-            // through). Element/window identity alone doesn't prove the same DOCUMENT for editors
-            // that recycle one AXUIElement/window across tabs — never checked here before this
-            // fix.
-            documentMatches: Self.documentMatches(expected: snapshot.target.document, current: selection.target.document),
+            // Round 3 findings 1 & 4 (STEP 2 of the fix): the document discriminator is checked
+            // ONLY for Correction Loop signal B's fallback snapshot (`SelectionSnapshot.
+            // correctionDictationID != nil`, set exclusively by `CorrectionTargeting.
+            // selectRecentInsertion`). Ordinary manual Voice Edit — the vast majority of
+            // `replace()` calls — never captured a discriminator FOR THIS PURPOSE and keeps
+            // `main`'s plain element/window/range/text revalidation; applying it there too was
+            // Round 3 finding 4: an SPA rewriting its URL mid-instruction (no target change at
+            // all) failed a manual edit as `.targetChanged`.
+            documentMatches: snapshot.correctionDictationID == nil
+                ? true
+                : Self.correctionFallbackDocumentMatches(expected: snapshot.target.document, current: selection.target.document),
             expectedRange: snapshot.range,
             currentRange: selection.range,
             expectedFingerprint: snapshot.fingerprint,
@@ -115,21 +119,28 @@ final class SelectionAccess: SelectionAccessing {
         lhs.pid == rhs.pid && lhs.bundleID == rhs.bundleID
             && adapter.elementsEqual(lhs.focusedElement, rhs.focusedElement)
             && adapter.elementsEqual(lhs.window, rhs.window)
-            // Codex Round 2 finding 2: the double-read inside `readStableSelection` (`before`/
-            // `after`) is exactly the same kind of window a same-app tab switch could land in —
-            // require the earlier-captured (`lhs`) document discriminator, when present, to still
-            // match.
-            && Self.documentMatches(expected: lhs.document, current: rhs.document)
     }
 
-    /// `expected` is the EARLIER-captured discriminator (a snapshot's, or `readStableSelection`'s
-    /// `before` read) — `nil` means no discriminator was ever captured (an app that doesn't expose
-    /// `kAXDocumentAttribute` at all), which is exactly as uninformative as before this fix and
-    /// stays permissive. A captured NON-nil `expected` that no longer matches `current` (including
-    /// `current == nil`, e.g. the attribute briefly stopped resolving) fails closed.
-    nonisolated private static func documentMatches(expected: String?, current: String?) -> Bool {
+    /// STEP 3 of the Round 3 fix (finding 2): a `kAXDocumentAttribute` value alone never proves
+    /// document identity when it's URL-shaped — Chromium (and every Chromium-derived browser)
+    /// exposes that attribute as the tab's page URL, and a DUPLICATED tab shares the exact same
+    /// URL as its original while being a genuinely different, recycled-element document. Trusting
+    /// a URL-shaped MATCH as proof of "same document" is exactly the hole finding 2 identified, so
+    /// this refuses (fails closed) whenever the remembered discriminator is URL-shaped, regardless
+    /// of whether it currently matches — refusing an ambiguous correction-fallback target is the
+    /// correct, deliberately conservative outcome; the alternative is replacing text in the wrong
+    /// tab. No per-tab-identity machinery (e.g. reading the selected tab's own AX element) is
+    /// built to chase a stronger signal here. A non-URL discriminator (an app exposing a genuine,
+    /// non-URL per-document token) is still trusted via plain equality. `expected == nil` (no
+    /// discriminator was ever captured) stays permissive, same as every other identity check here.
+    nonisolated private static func correctionFallbackDocumentMatches(expected: String?, current: String?) -> Bool {
         guard let expected else { return true }
+        guard !Self.isURLShaped(expected) else { return false }
         return expected == current
+    }
+
+    nonisolated private static func isURLShaped(_ value: String) -> Bool {
+        value.contains("://")
     }
 
     nonisolated static func revalidationError(

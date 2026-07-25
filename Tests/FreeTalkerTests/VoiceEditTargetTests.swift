@@ -290,19 +290,20 @@ import Testing
         }
     }
 
-    /// Codex Round 2 finding 2: Correction Loop signal B's fallback (`CorrectionTargeting.
-    /// selectRecentInsertion`) carries a remembered `document` discriminator into the
-    /// `SelectionSnapshot` it produces, but `replace()`'s revalidation previously compared only
-    /// app/element/window/range/text — never `document`. Concrete failure this closes: the
-    /// remembered dictation lived in document A; the user switches to a DIFFERENT tab reusing the
-    /// same recycled AX element/window with IDENTICAL text at the same range (document B) before
-    /// Replace runs — element/window/range/text all still match, but it's the wrong document.
-    @Test func replaceRejectsADocumentThatChangedEvenWhenElementWindowRangeAndTextStillMatch() {
+    /// Round 3 fix, STEP 2: the document discriminator is checked ONLY for Correction Loop signal
+    /// B's fallback (`SelectionSnapshot.correctionDictationID != nil` — set exclusively by
+    /// `CorrectionTargeting.selectRecentInsertion`). For that fallback, a genuine (non-URL)
+    /// per-document token that CHANGED between snapshot and replace must still refuse — the
+    /// remembered dictation lived in document A; the user switched to a DIFFERENT document
+    /// reusing the same recycled AX element/window with IDENTICAL text at the same range
+    /// (document B) before Replace runs — element/window/range/text all still match, but it's the
+    /// wrong document.
+    @Test func replaceRejectsAChangedDocumentForACorrectionFallbackSnapshot() {
         let adapter = ScriptedSelectionAdapter(reads: Self.stableReads + Self.stableReads)
         // Every live read (before/after, both passes) reports the SAME reused element/window but
         // a document discriminator that differs from what the snapshot remembered.
         let access = Self.access(adapter: adapter, targets: Array(repeating: Self.target(document: "doc-B"), count: 4))
-        let snapshot = Self.snapshot(text: "draft", document: "doc-A")
+        let snapshot = Self.snapshot(text: "draft", document: "doc-A", correctionDictationID: 1)
 
         #expect(throws: SelectionAccessError.targetChanged) {
             try access.replace(snapshot, with: "replacement")
@@ -311,14 +312,58 @@ import Testing
         #expect(adapter.rangesSet.isEmpty)
     }
 
+    /// Round 3 fix, STEP 2's core regression test: ordinary MANUAL Voice Edit (`correctionDictationID
+    /// == nil`) must behave exactly as `main` — a changed `kAXDocumentAttribute` value (e.g. an
+    /// SPA rewriting its URL mid-instruction via `history.replaceState`, with no actual target
+    /// change at all — Round 3 finding 4) must NOT be treated as `.targetChanged` when this
+    /// snapshot was never produced by the correction fallback.
+    @Test func replaceIgnoresAChangedDocumentForAnOrdinaryManualVoiceEditSnapshot() throws {
+        let adapter = ScriptedSelectionAdapter(reads: Self.stableReads + Self.stableReads)
+        let access = Self.access(adapter: adapter, targets: Array(repeating: Self.target(document: "doc-B"), count: 4))
+        let snapshot = Self.snapshot(text: "draft", document: "doc-A") // correctionDictationID: nil
+
+        try access.replace(snapshot, with: "replacement")
+
+        #expect(adapter.replacements == ["replacement"])
+    }
+
+    /// Round 3 fix, STEP 3 (finding 2): a URL-SHAPED discriminator never proves document identity
+    /// on its own — a duplicated tab shares the exact same URL as its original. For the
+    /// correction-fallback path, this must fail closed even when the URL still MATCHES — matching
+    /// is exactly the ambiguous case finding 2 identified (a duplicate tab satisfies it too), and
+    /// refusing is the correct, deliberately conservative outcome.
+    @Test func replaceRejectsACorrectionFallbackWhenTheDocumentDiscriminatorIsURLShapedEvenOnAMatch() {
+        let url = "https://mail.example.com/mail/u/0/#inbox"
+        let adapter = ScriptedSelectionAdapter(reads: Self.stableReads + Self.stableReads)
+        let access = Self.access(adapter: adapter, targets: Array(repeating: Self.target(document: url), count: 4))
+        let snapshot = Self.snapshot(text: "draft", document: url, correctionDictationID: 1)
+
+        #expect(throws: SelectionAccessError.targetChanged) {
+            try access.replace(snapshot, with: "replacement")
+        }
+        #expect(adapter.replacements.isEmpty)
+    }
+
+    /// A non-URL discriminator that still matches is trusted for the correction-fallback path —
+    /// Step 3 only refuses URL-shaped tokens, not every discriminator.
+    @Test func replaceSucceedsForACorrectionFallbackSnapshotWhenANonURLDocumentDiscriminatorMatches() throws {
+        let adapter = ScriptedSelectionAdapter(reads: Self.stableReads + Self.stableReads)
+        let access = Self.access(adapter: adapter, targets: Array(repeating: Self.target(document: "doc-A"), count: 4))
+        let snapshot = Self.snapshot(text: "draft", document: "doc-A", correctionDictationID: 1)
+
+        try access.replace(snapshot, with: "replacement")
+
+        #expect(adapter.replacements == ["replacement"])
+    }
+
     /// A snapshot that never captured a document discriminator (an app that doesn't expose
-    /// `kAXDocumentAttribute` at all) must behave exactly as before this fix — element/window
-    /// identity alone still governs.
+    /// `kAXDocumentAttribute` at all) stays permissive even on the correction-fallback path —
+    /// element/window identity alone still governs.
     @Test func replaceStillSucceedsWhenNeitherSnapshotNorLiveTargetHaveADocumentDiscriminator() throws {
         let adapter = ScriptedSelectionAdapter(reads: Self.stableReads + Self.stableReads)
         let access = Self.access(adapter: adapter, targetCount: 4)
 
-        try access.replace(Self.snapshot(text: "draft"), with: "replacement")
+        try access.replace(Self.snapshot(text: "draft", correctionDictationID: 1), with: "replacement")
 
         #expect(adapter.replacements == ["replacement"])
     }
@@ -444,10 +489,11 @@ import Testing
         InsertionTarget(bundleID: "test.app", pid: 7, focusedElement: element, window: window, document: document)
     }
 
-    private static func snapshot(text: String, document: String? = nil) -> SelectionSnapshot {
+    private static func snapshot(text: String, document: String? = nil, correctionDictationID: Int64? = nil) -> SelectionSnapshot {
         SelectionSnapshot(
             target: target(document: document), range: NSRange(location: 0, length: text.utf16.count),
-            text: text, fingerprint: SelectionSnapshot.fingerprint(for: text)
+            text: text, fingerprint: SelectionSnapshot.fingerprint(for: text),
+            correctionDictationID: correctionDictationID
         )
     }
 
