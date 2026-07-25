@@ -1,5 +1,33 @@
 # Deferred Findings (Codex adversarial review)
 
+## Correction Loop — F16
+
+### F16 — LOW — `kAXDocumentAttribute` can't distinguish two tabs sharing a URL, so the correction-fallback document check fails closed in browsers instead of succeeding
+
+**Where:** `Sources/FreeTalker/Core/SelectionAccess.swift` (`correctionFallbackDocumentMatches`,
+`isURLShaped`), fed by `InsertionTarget.document`, which is captured on every insertion snapshot
+(`Insertion.snapshotTarget`) but is read by this one path only.
+
+**Why real, and why LOW:** `InsertionTarget.document` (`kAXDocumentAttribute`) is captured
+unconditionally whenever FreeTalker snapshots an insertion target, but today it has exactly one
+reader: `SelectionAccess`'s correction-fallback revalidation, used only when a `SelectionSnapshot`
+carries a `correctionDictationID` (Correction Loop signal B's `RecentInsertion`-derived selection —
+see `CorrectionTargeting.selectRecentInsertion`). In a Chromium-derived browser this attribute
+exposes the tab's page URL, not a per-tab identity — a duplicated tab shares the exact same URL as
+its original while being a genuinely different, recycled AX element. `correctionFallbackDocumentMatches`
+already recognizes this and refuses (fails closed, `.targetChanged`) whenever the remembered
+discriminator is URL-shaped, rather than trusting a URL match as proof of "same document." That's
+the correct conservative choice given what's available, but it means a spoken correction (signal B)
+declines by design in any browser whenever two tabs happen to share a URL — not a crash or data
+corruption, just the feature silently not helping in a case it plausibly could.
+
+**Suggested fix (follow-up PR):** Capture a genuinely per-tab AX identity instead of (or alongside)
+`kAXDocumentAttribute` — for example, the browser's selected-tab AX element (`AXSelectedChildren`/
+similar under the tab-group role) rather than the document/page URL — and have
+`correctionFallbackDocumentMatches` compare that instead of falling back to a URL-shaped string.
+That would let signal B succeed in browsers in the common case instead of always declining once two
+tabs share a URL.
+
 ## Streaming ASR (round 9, final) — F14, F15
 
 Both LOW severity, both deliberately not fixed before merge — the affected paths (the streaming

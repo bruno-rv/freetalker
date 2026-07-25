@@ -117,7 +117,7 @@ Settings uses a sidebar with eight focused sections:
 
 - **Privacy** — permissions and on-device context.
 - **Recording** — push-to-talk, hands-free recording, Insert Last Dictation,
-  and Voice Edit.
+  Voice Edit, and Correction Loop.
 - **Transcription** — microphone input, speech engines, models, live preview,
   noise reduction, and vocabulary.
 - **Processing** — app rules, automatic template selection, output
@@ -320,7 +320,9 @@ exact snippet trigger from the on-device snippet database, and uses Apple's
 on-device Foundation Model when generation is needed. It always shows a
 preview of the original and proposed text; nothing is replaced until you
 explicitly confirm. If the app, field, selection, or selected text changed,
-replacement is refused and Copy remains available.
+replacement is refused and Copy remains available. If the focused field is
+editable but nothing is selected, Voice Edit targets your last dictation
+instead of asking you to select text first — see "Correction Loop" below.
 
 Create, edit, rename, or delete reusable snippets under Settings → Snippets. Put one trigger phrase
 per line. Matching ignores case, surrounding punctuation, and repeated whitespace, while duplicate
@@ -338,6 +340,72 @@ Settings → Transcription → **Vocabulary** takes a list of names, jargon,
 or acronyms your dictation tends to get wrong. Terms bias WhisperKit's decoding
 toward the right spelling and are also enforced as corrections during
 post-processing, so they hold even if the transcript missed them.
+
+See "Correction Loop" below for a faster way to fix a single misheard word
+right after it happens.
+
+### Correction Loop
+
+FreeTalker sometimes mishears a name or a piece of jargon. Before Correction
+Loop, fixing that meant retyping it by hand, and the app never learned from
+the fix — it kept mishearing the same word. Correction Loop gives you three
+ways to fix a word in the moment and have FreeTalker remember it, feeding the
+same vocabulary Custom vocabulary (above) already backs.
+
+Assign a **Correct Last Dictation key** in Settings → Recording (unbound by
+default, same as Insert Last Dictation) and press it to open a small panel
+over your most recent dictation. It shows what FreeTalker heard and an
+editable field pre-filled with the same text — fix the word in place and
+press **Fix It** (or Return). **Cancel** or Esc closes without changing
+anything.
+
+You can also just speak the fix. Press the **Voice Edit key** with nothing
+selected — Voice Edit now falls back to targeting your most recent dictation
+instead of asking you to select text first — then work through it exactly as
+described in "Voice Edit and snippets" above: speak the correction, press the
+key again, and confirm the preview.
+
+A third, opt-in path: turn on **"Notice when I edit inserted text and offer
+to remember corrections"** in Settings → Recording — off by default. When
+it's on, FreeTalker briefly watches the text it just inserted; if you
+hand-edit a single word, it opens the same panel, pre-filled with your edit,
+so you only have to confirm. It never changes anything on its own.
+
+Whichever path you use, a correction you make deliberately takes effect
+immediately — active right away — unlike a mined suggestion (Settings →
+Transcription → Vocabulary), which waits in the suggestions list until it's
+recurred enough to be worth asking about. If you'd already dismissed a
+suggestion for that exact term, correcting it again doesn't quietly reinstate
+it — the panel asks you to confirm ("Approve anyway") first.
+
+If your vocabulary is already at its budget, Correction Loop doesn't evict
+anything silently to make room: it names the specific term it would drop and
+asks first ("Drop 'X' to learn 'Y'?"). Confirming swaps exactly the term you
+were shown; if that term stopped being applicable by the time you confirm
+(say, it was dismissed from Settings while the panel was open), you get a
+fresh offer instead of a stale swap going through. If there's nothing left to
+offer swapping — your own vocabulary list alone already fills the budget — it
+says so and the new term simply isn't learned, again never a silent eviction.
+
+Limitations, plainly:
+
+- FreeTalker only remembers where it inserted text for about ten minutes.
+  Past that, confirming a correction still teaches it the right word for next
+  time, but it can no longer reach back into your document to fix the word in
+  place.
+- All three paths correct your most recent dictation only, never an older
+  Library entry.
+- Text dictated into the Scratchpad isn't tracked, so none of the three paths
+  can find it.
+- A dictation you reprocessed with a different Template isn't tracked either.
+- A spoken correction refuses rather than guesses when it can't prove it's
+  looking at the right document — in a browser, two tabs can share the same
+  URL, which FreeTalker can't tell apart, so it may decline there rather than
+  risk editing the wrong tab.
+- The edit watcher only ever reads the exact range FreeTalker itself
+  inserted, allows that text to grow or shrink by up to 32 characters, and
+  stops watching that insertion — rather than reading further — the moment
+  you keep typing past what it can safely account for.
 
 ## Language
 
