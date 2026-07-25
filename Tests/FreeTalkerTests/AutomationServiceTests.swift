@@ -1,4 +1,5 @@
 import CoreMedia
+import Darwin
 import Foundation
 import Testing
 @testable import FreeTalker
@@ -318,6 +319,127 @@ struct AutomationServiceTests {
         }
     }
 
+    // MARK: - Codex round-3 Finding 3: a FIFO is refused WITHOUT hanging, off-main-actor staging
+    // is genuinely cancellable, and a same-user directory exchange is caught (additional finding)
+
+    @Test func stagingRefusesAFIFOWithoutHanging() async throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fifo = root.appendingPathComponent("hang.wav")
+        #expect(mkfifo(fifo.path, 0o600) == 0)
+        let identity = try AutomationFileAuthorization.FileIdentity.of(root)
+
+        // Before the fix, `open()` on a FIFO opened for reading with no writer blocks forever —
+        // this would hang the whole test run (and the CI job with it) instead of failing fast.
+        // Racing it against a short deadline turns "hangs forever" into a reportable failure
+        // rather than a silent timeout of the whole suite.
+        let outcome = try await withThrowingTaskGroup(of: AutomationError?.self) { group in
+            group.addTask {
+                do {
+                    _ = try AutomationMediaStaging.stage(
+                        canonicalFolder: root, canonicalFile: fifo, folderIdentity: identity,
+                        maximumBytes: AutomationMediaGuard.maximumSourceFileBytes
+                    )
+                    return nil
+                } catch let error as AutomationError {
+                    return error
+                }
+            }
+            group.addTask {
+                try await Task.sleep(for: .seconds(5))
+                return .timedOut
+            }
+            let first = try await group.next() ?? .timedOut
+            group.cancelAll()
+            return first
+        }
+        #expect(outcome == .unsupportedMediaFile, "a FIFO must be rejected as non-regular — O_NONBLOCK must keep the open from ever blocking on a missing writer")
+    }
+
+    @Test func stagingCopyIsCancellableInsteadOfAlwaysRunningToCompletion() async throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("clip.wav")
+        // Large enough that reading it fully takes measurably longer than a single chunk — proves
+        // the copy loop's `Task.isCancelled` check (Codex round-3 Finding 3) actually interrupts a
+        // staging copy instead of always running the whole synchronous copy to completion once
+        // started, which is what let a slow/hostile copy defeat the 2-hour deadline race entirely.
+        let contents = Data(repeating: 0x42, count: 64 * 1024 * 1024)
+        FileManager.default.createFile(atPath: file.path, contents: contents)
+        let identity = try AutomationFileAuthorization.FileIdentity.of(root)
+
+        let task = Task<AutomationMediaStaging.StagedFile, Error> {
+            try AutomationMediaStaging.stage(
+                canonicalFolder: root, canonicalFile: file, folderIdentity: identity,
+                maximumBytes: AutomationMediaGuard.maximumSourceFileBytes
+            )
+        }
+        task.cancel()
+        let outcome = await task.result
+        guard case .failure(let error) = outcome else {
+            Issue.record("a cancelled staging copy must fail, not run to completion")
+            return
+        }
+        #expect(error as? AutomationError == .timedOut)
+    }
+
+    // MARK: - Codex round-3 additional finding: the bookmark-resolved folder is reopened by
+    // pathname; a same-user process that swaps the real directory object at that path is caught.
+
+    @Test func directoryExchangeAfterAuthorizationIsRejectedByIdentityCheck() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("clip.wav")
+        FileManager.default.createFile(atPath: file.path, contents: Data("x".utf8))
+        // Simulates `authorize()`'s identity check having captured `root`'s ORIGINAL identity,
+        // then a same-user process deleting and recreating the directory at that same path before
+        // `openPinned` reopens it — a different real object, same pathname.
+        let staleIdentity = try AutomationFileAuthorization.FileIdentity.of(root)
+        try FileManager.default.removeItem(at: root)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: file.path, contents: Data("x".utf8))
+
+        #expect(throws: AutomationError.automationFolderUnavailable) {
+            _ = try AutomationMediaStaging.stage(
+                canonicalFolder: root, canonicalFile: file, folderIdentity: staleIdentity,
+                maximumBytes: AutomationMediaGuard.maximumSourceFileBytes
+            )
+        }
+    }
+
+    // MARK: - Codex round-3 Finding 6: staging lifetime is tied to the durable job, not a lexical
+    // `defer` — an orphan left by a crash before that job existed (or after it was deleted) is
+    // purged by `purgeOrphans`.
+
+    @Test func purgeOrphansDeletesUnreferencedStagingFilesButKeepsReferencedOnes() throws {
+        let stagingDirectory = AutomationMediaStaging.stagingDirectoryURL
+        try FileManager.default.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
+        let kept = stagingDirectory.appendingPathComponent("AutomationServiceTests-keep-\(UUID().uuidString).wav")
+        let orphan = stagingDirectory.appendingPathComponent("AutomationServiceTests-orphan-\(UUID().uuidString).wav")
+        FileManager.default.createFile(atPath: kept.path, contents: Data("keep".utf8))
+        FileManager.default.createFile(atPath: orphan.path, contents: Data("orphan".utf8))
+        defer {
+            try? FileManager.default.removeItem(at: kept)
+            try? FileManager.default.removeItem(at: orphan)
+        }
+
+        AutomationMediaStaging.purgeOrphans(keeping: [kept.path])
+
+        #expect(FileManager.default.fileExists(atPath: kept.path))
+        #expect(!FileManager.default.fileExists(atPath: orphan.path))
+    }
+
+    @Test func removeIfStagedNeverTouchesAFileOutsideTheStagingDirectory() throws {
+        let outside = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: outside) }
+        let userFile = outside.appendingPathComponent("not-staged.wav")
+        FileManager.default.createFile(atPath: userFile.path, contents: Data("mine".utf8))
+
+        AutomationMediaStaging.removeIfStaged(atPath: userFile.path)
+
+        #expect(FileManager.default.fileExists(atPath: userFile.path))
+    }
+
     // MARK: - Codex round-2 Finding 5: duration validation fails CLOSED, never open
 
     @Test func mediaDurationCapIsAPureComparison() {
@@ -450,6 +572,27 @@ struct AutomationServiceTests {
         #expect(AutomationConcurrencyGate.beginTranscribe() == true, "transcribe must not be blocked by an in-flight clean up")
         AutomationConcurrencyGate.endCleanUp()
         AutomationConcurrencyGate.endTranscribe()
+    }
+
+    // MARK: - Codex round-3 additional finding: the gate's flags are lock-protected — concurrent
+    // callers (as `beginTranscribe()` on the main thread vs. `endTranscribe()` off the main actor
+    // now genuinely can be, per Finding 3) must never both observe the slot as free at once.
+
+    @Test func beginTranscribeIsExclusiveUnderConcurrentContention() async {
+        AutomationConcurrencyGate.endTranscribe()
+        defer { AutomationConcurrencyGate.endTranscribe() }
+
+        let grants = await withTaskGroup(of: Bool.self) { group in
+            for _ in 0..<200 {
+                group.addTask { AutomationConcurrencyGate.beginTranscribe() }
+            }
+            var grantedCount = 0
+            for await granted in group where granted { grantedCount += 1 }
+            return grantedCount
+        }
+        // Exactly one of the 200 concurrent callers may claim the single slot — an unsynchronized
+        // check-then-set could let more than one briefly observe it as free.
+        #expect(grants == 1)
     }
 
     // MARK: - Finding 2 (Settings): the automation folder setting persists and defaults to unset
