@@ -92,6 +92,38 @@ if [[ ! -f "$RELEASE_SIGNING_KEY" ]]; then
     exit 1
 fi
 
+# A release signed with a key whose PUBLIC half doesn't match the one compiled into every
+# existing app (UpdatePublicKey.swift) would verify against NOTHING — every existing client
+# would reject it. This happens for real: an interrupted
+# scripts/make-release-signing-key.sh run can leave a PEM whose public half was never written to
+# UpdatePublicKey.swift, or $FREETALKER_RELEASE_SIGNING_KEY can simply point at a different valid
+# key. Derive the public key from THIS key, the exact same way
+# scripts/make-release-signing-key.sh derived the compiled-in one, and refuse to proceed on any
+# mismatch — before any build work, same as the missing-key check above.
+PUBLIC_KEY_SWIFT="$REPO_ROOT/Sources/FreeTalker/Update/UpdatePublicKey.swift"
+COMPILED_PUBLIC_KEY_BASE64="$(sed -n 's/.*base64 = "\([^"]*\)".*/\1/p' "$PUBLIC_KEY_SWIFT")"
+if [[ -z "$COMPILED_PUBLIC_KEY_BASE64" ]]; then
+    echo "error: could not read the compiled-in public key from $PUBLIC_KEY_SWIFT." >&2
+    exit 1
+fi
+if ! DERIVED_PUBLIC_KEY_BASE64="$(
+    openssl pkey -in "$RELEASE_SIGNING_KEY" -pubout 2>/dev/null \
+        | openssl pkey -pubin -outform DER 2>/dev/null \
+        | tail -c 32 | openssl base64 -A
+)" || [[ -z "$DERIVED_PUBLIC_KEY_BASE64" ]]; then
+    echo "error: could not derive a public key from $RELEASE_SIGNING_KEY — is it a valid Ed25519" >&2
+    echo "private key?" >&2
+    exit 1
+fi
+if [[ "$DERIVED_PUBLIC_KEY_BASE64" != "$COMPILED_PUBLIC_KEY_BASE64" ]]; then
+    echo "error: the release signing key at $RELEASE_SIGNING_KEY does NOT match the public key" >&2
+    echo "compiled into every existing build ($PUBLIC_KEY_SWIFT). Signing with it would publish" >&2
+    echo "a release every existing client rejects. Refusing to proceed." >&2
+    echo "If you just ran scripts/make-release-signing-key.sh and it was interrupted, re-run it" >&2
+    echo "to resume (it will bring $PUBLIC_KEY_SWIFT back in sync with the existing key)." >&2
+    exit 1
+fi
+
 if git rev-parse "$VERSION" >/dev/null 2>&1; then
     echo "error: tag $VERSION already exists." >&2
     exit 1
@@ -114,11 +146,25 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
 fi
 
 # Recorded BEFORE the build so the tag created at the end is bound to the exact commit that
-# actually produced the artifact — not whatever HEAD happens to be after a potentially long
-# `make bundle`. Without this, a checkout to a different (but still clean, so the
-# re-verification below wouldn't catch it) commit mid-build would get the version tag while the
-# published asset still contains the EARLIER commit's code.
+# actually produced the artifact.
 BUILD_COMMIT="$(git rev-parse HEAD)"
+
+# Build from a PRISTINE checkout of $BUILD_COMMIT in its own throwaway `git worktree` — never
+# from this working tree. This is what actually proves provenance rather than merely narrowing
+# the window: a `git status`/`HEAD` re-check against THIS tree after the build (the previous
+# approach) reads clean whenever a concurrent actor checks out a different commit, lets `make
+# bundle` build THAT commit's code, and checks back to $BUILD_COMMIT before the check runs —
+# `git worktree add --detach` instead checks out ONLY $BUILD_COMMIT's committed content into a
+# directory nothing else knows about or has any reason to touch, so nothing happening in this
+# tree (an uncommitted edit, a checkout away and back, anything) can influence the artifact at
+# all, no matter the timing.
+WORKTREE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/freetalker-release-XXXXXX")"
+cleanup_worktree() {
+    git worktree remove --force "$WORKTREE_DIR" >/dev/null 2>&1 || rm -rf "$WORKTREE_DIR"
+}
+trap cleanup_worktree EXIT
+echo "==> Checking out $(git rev-parse --short "$BUILD_COMMIT") into an isolated worktree"
+git worktree add --quiet --detach "$WORKTREE_DIR" "$BUILD_COMMIT"
 
 echo "==> Building and signing the bundle"
 # VERSION_OVERRIDE stamps the bundle with this already-validated version directly, without
@@ -127,9 +173,10 @@ echo "==> Building and signing the bundle"
 # here the way plain `make bundle` uses it for dev builds. Passed as a `make` command-line
 # assignment, which `make` exports to the recipe's shell environment automatically, so the
 # Makefile reads it as a real shell variable — never textually inlined by Make into recipe text.
-make bundle CODESIGN_IDENTITY="$CODESIGN_IDENTITY" VERSION_OVERRIDE="$VERSION"
+# Run inside the isolated worktree (not $REPO_ROOT) — see above.
+( cd "$WORKTREE_DIR" && make bundle CODESIGN_IDENTITY="$CODESIGN_IDENTITY" VERSION_OVERRIDE="$VERSION" )
 
-BUNDLE_VERSION="$(plutil -extract CFBundleShortVersionString raw "$APP_NAME.app/Contents/Info.plist")"
+BUNDLE_VERSION="$(plutil -extract CFBundleShortVersionString raw "$WORKTREE_DIR/$APP_NAME.app/Contents/Info.plist")"
 if [[ "$BUNDLE_VERSION" != "$VERSION" ]]; then
     echo "error: built bundle reports version '$BUNDLE_VERSION', expected '$VERSION'." >&2
     exit 1
@@ -142,7 +189,7 @@ ASSET_NAME="$APP_NAME-$VERSION.app.zip"
 ASSET_PATH="$DIST_DIR/$ASSET_NAME"
 
 echo "==> Zipping (ditto, to preserve the code signature)"
-ditto -c -k --sequesterRsrc --keepParent "$APP_NAME.app" "$ASSET_PATH"
+ditto -c -k --sequesterRsrc --keepParent "$WORKTREE_DIR/$APP_NAME.app" "$ASSET_PATH"
 
 echo "==> Computing checksum"
 SHA256="$(shasum -a 256 "$ASSET_PATH" | awk '{print $1}')"
@@ -175,31 +222,12 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
     exit 0
 fi
 
-# Re-verify cleanliness AFTER the (potentially long) build, not just before it — an edit made
-# during `make bundle` would otherwise get signed, zipped, and published under this tag without
-# ever having been checked. Same exit-status check as the pre-build one above — a failing
-# `git status --porcelain` must not read as "clean."
-if ! GIT_STATUS_OUTPUT="$(git status --porcelain)"; then
-    echo "error: 'git status --porcelain' failed — cannot verify the working tree is clean." >&2
-    exit 1
-fi
-if [[ -n "$GIT_STATUS_OUTPUT" ]]; then
-    echo "error: working tree changed during the build — commit or discard the changes and" >&2
-    echo "re-run. Nothing has been tagged, pushed, or published." >&2
-    exit 1
-fi
-
-# A clean `git status` only means no UNCOMMITTED changes — it says nothing about whether HEAD
-# itself moved to a different (already-committed) commit mid-build, which is exactly the
-# scenario that binding the tag to $BUILD_COMMIT (recorded before the build) protects against.
-# Surface that explicitly rather than silently tagging a commit other than the one just built.
-CURRENT_COMMIT="$(git rev-parse HEAD)"
-if [[ "$CURRENT_COMMIT" != "$BUILD_COMMIT" ]]; then
-    echo "error: HEAD moved from $BUILD_COMMIT to $CURRENT_COMMIT during the build — the built" >&2
-    echo "asset was produced from $BUILD_COMMIT. Nothing has been tagged, pushed, or published;" >&2
-    echo "re-run from the commit you want to release." >&2
-    exit 1
-fi
+# No re-verification of THIS tree's cleanliness/HEAD is needed here (a previous version of this
+# script did, as a "narrow the window" mitigation): the artifact was built from an isolated
+# worktree pinned to $BUILD_COMMIT (see above), so nothing that happened in this tree during the
+# build — an edit, a checkout away and back, anything — could have influenced it. What gets
+# tagged below and what got built are provably the same commit by construction, not by a
+# best-effort check that a sufficiently-timed race could still slip past.
 
 # Tag the exact commit the artifact was built from ($BUILD_COMMIT, recorded before `make
 # bundle`), not "HEAD" — the last local step before anything is pushed or published, so a

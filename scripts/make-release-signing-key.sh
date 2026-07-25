@@ -18,6 +18,15 @@
 # generating a new keypair and shipping a build with the new public key, which every existing
 # install must then separately be told to trust again. Back the private key up somewhere safe
 # (a password manager or an encrypted volume) as soon as this script finishes.
+#
+# Resumable by design: if this is killed after the PEM is written but before
+# UpdatePublicKey.swift is updated to match it, re-running does NOT silently treat "the PEM
+# exists" as "nothing to do" (that was a real bug — a rerun exited 0 while the compiled public
+# key still didn't match the private key on disk, so scripts/release.sh would go on to sign
+# every release with a key no existing app could verify). It compares the PEM's actual public
+# half against what's compiled in and, on any mismatch, resumes by rewriting
+# UpdatePublicKey.swift from the EXISTING private key — it never generates a new keypair over an
+# existing one.
 
 set -euo pipefail
 
@@ -26,43 +35,35 @@ PRIVATE_KEY_PATH="${FREETALKER_RELEASE_SIGNING_KEY:-$KEY_DIR/release-signing-key
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PUBLIC_KEY_SWIFT="$REPO_ROOT/Sources/FreeTalker/Update/UpdatePublicKey.swift"
 
-if [[ -f "$PRIVATE_KEY_PATH" ]]; then
-    echo "A release signing key already exists at $PRIVATE_KEY_PATH. Nothing to do."
-    echo "Delete it manually first if you really want to generate a new one — doing so makes"
-    echo "every already-built app (which has the OLD public key compiled in) unable to verify"
-    echo "any release signed with the new key, until it's rebuilt with the new one."
-    exit 0
-fi
+# Derives the base64 raw 32-byte Ed25519 public key from a private key PEM, on stdout. Fails
+# (nonzero exit, nothing printed) if the input isn't a readable Ed25519 private key, or if the
+# derived SubjectPublicKeyInfo DER isn't exactly the expected 44 bytes (12-byte algorithm-ID
+# header + 32-byte raw key — see the size check below) — refusing to hand back something that
+# might not be the raw 32-byte key CryptoKit's `Curve25519.Signing.PublicKey(rawRepresentation:)`
+# expects, rather than silently truncating/misreading it.
+derive_public_key_base64() {
+    local private_key_path="$1"
+    local public_key_pem public_key_der der_size
+    public_key_pem="$(mktemp)"
+    public_key_der="$(mktemp)"
+    trap 'rm -f "$public_key_pem" "$public_key_der"' RETURN
+    openssl pkey -in "$private_key_path" -pubout -out "$public_key_pem" 2>/dev/null || return 1
+    openssl pkey -pubin -in "$public_key_pem" -outform DER -out "$public_key_der" 2>/dev/null || return 1
+    der_size="$(wc -c <"$public_key_der" | tr -d ' ')"
+    [[ "$der_size" -eq 44 ]] || return 1
+    tail -c 32 "$public_key_der" | openssl base64 -A
+}
 
-PRIVATE_KEY_DIR="$(dirname "$PRIVATE_KEY_PATH")"
-mkdir -p "$PRIVATE_KEY_DIR"
-chmod 700 "$PRIVATE_KEY_DIR"
+# The base64 public key currently compiled into UpdatePublicKey.swift, or empty if the file
+# doesn't exist or doesn't match the expected shape.
+compiled_public_key_base64() {
+    [[ -f "$PUBLIC_KEY_SWIFT" ]] || return 0
+    sed -n 's/.*base64 = "\([^"]*\)".*/\1/p' "$PUBLIC_KEY_SWIFT"
+}
 
-echo "Generating Ed25519 release-signing keypair..."
-openssl genpkey -algorithm ED25519 -out "$PRIVATE_KEY_PATH"
-chmod 600 "$PRIVATE_KEY_PATH"
-
-PUBLIC_KEY_PEM="$(mktemp)"
-PUBLIC_KEY_DER="$(mktemp)"
-trap 'rm -f "$PUBLIC_KEY_PEM" "$PUBLIC_KEY_DER"' EXIT
-
-openssl pkey -in "$PRIVATE_KEY_PATH" -pubout -out "$PUBLIC_KEY_PEM"
-openssl pkey -pubin -in "$PUBLIC_KEY_PEM" -outform DER -out "$PUBLIC_KEY_DER"
-
-# An Ed25519 SubjectPublicKeyInfo DER encoding is always exactly 44 bytes: a fixed 12-byte
-# algorithm-identifier header (30 2a 30 05 06 03 2b 65 70 03 21 00) followed by the raw 32-byte
-# public key — the last 32 bytes are exactly what CryptoKit's
-# Curve25519.Signing.PublicKey(rawRepresentation:) expects. Empirically confirmed against this
-# machine's openssl (3.6.2).
-DER_SIZE="$(wc -c <"$PUBLIC_KEY_DER" | tr -d ' ')"
-if [[ "$DER_SIZE" -ne 44 ]]; then
-    echo "error: unexpected Ed25519 public key DER size ($DER_SIZE bytes, expected 44) — refusing" >&2
-    echo "to write a public key that might not be the raw 32-byte key CryptoKit expects." >&2
-    exit 1
-fi
-PUBLIC_KEY_BASE64="$(tail -c 32 "$PUBLIC_KEY_DER" | openssl base64 -A)"
-
-cat >"$PUBLIC_KEY_SWIFT" <<EOF
+write_public_key_swift() {
+    local public_key_base64="$1"
+    cat >"$PUBLIC_KEY_SWIFT" <<EOF
 import CryptoKit
 import Foundation
 
@@ -73,7 +74,7 @@ import Foundation
 /// signer's machine; regenerating this file with a new keypair is a breaking change for every
 /// already-built app, since it can only ever trust the ONE public key it was compiled with.
 enum UpdatePublicKey {
-    static let base64 = "$PUBLIC_KEY_BASE64"
+    static let base64 = "$public_key_base64"
 
     static var current: Curve25519.Signing.PublicKey? { Self.parse(base64: base64) }
 
@@ -88,6 +89,62 @@ enum UpdatePublicKey {
     }
 }
 EOF
+}
+
+if [[ -f "$PRIVATE_KEY_PATH" ]]; then
+    if ! EXISTING_PUBLIC_KEY_BASE64="$(derive_public_key_base64 "$PRIVATE_KEY_PATH")" || [[ -z "$EXISTING_PUBLIC_KEY_BASE64" ]]; then
+        echo "error: $PRIVATE_KEY_PATH exists but isn't a readable Ed25519 private key." >&2
+        echo "Investigate manually — refusing to touch it or generate a new one over it." >&2
+        exit 1
+    fi
+    if [[ "$(compiled_public_key_base64)" == "$EXISTING_PUBLIC_KEY_BASE64" ]]; then
+        echo "A release signing key already exists at $PRIVATE_KEY_PATH, and $PUBLIC_KEY_SWIFT"
+        echo "already matches it. Nothing to do."
+        echo "Delete the PEM manually first if you really want to generate a new one — doing so makes"
+        echo "every already-built app (which has the OLD public key compiled in) unable to verify"
+        echo "any release signed with the new key, until it's rebuilt with the new one."
+        exit 0
+    fi
+    # The PEM exists but the compiled public key doesn't match it — an interrupted previous run
+    # (killed between writing the PEM and writing UpdatePublicKey.swift), or the Swift file was
+    # otherwise left stale/missing. RESUME by deriving from the EXISTING private key and
+    # (re)writing UpdatePublicKey.swift to match — never by generating a new keypair, which would
+    # orphan every already-built app the same way deleting-and-regenerating would.
+    echo "$PRIVATE_KEY_PATH exists but $PUBLIC_KEY_SWIFT doesn't match its public key — resuming"
+    echo "an apparently interrupted run. The private key is left untouched; only"
+    echo "$PUBLIC_KEY_SWIFT is (re)written, from the EXISTING key."
+    write_public_key_swift "$EXISTING_PUBLIC_KEY_BASE64"
+    echo
+    echo "Public key compiled into: $PUBLIC_KEY_SWIFT — commit this file."
+    exit 0
+fi
+
+PRIVATE_KEY_DIR="$(dirname "$PRIVATE_KEY_PATH")"
+mkdir -p "$PRIVATE_KEY_DIR"
+chmod 700 "$PRIVATE_KEY_DIR"
+
+echo "Generating Ed25519 release-signing keypair..."
+# Generated into a temp file in the SAME directory (so the final `mv` below is a same-volume
+# rename, not a copy) and moved into place only once fully written and mode-600 — makes the
+# PRIVATE KEY's own creation atomic. A process killed mid-`genpkey` (or between writing it and
+# `chmod`) can then never leave a truncated, or briefly-world-readable, file AT
+# $PRIVATE_KEY_PATH for a later run (or anything else) to mistake for a complete, properly
+# permissioned key.
+TMP_PRIVATE_KEY_PATH="$(mktemp "$PRIVATE_KEY_DIR/.release-signing-key.XXXXXX")"
+trap 'rm -f "$TMP_PRIVATE_KEY_PATH"' EXIT
+openssl genpkey -algorithm ED25519 -out "$TMP_PRIVATE_KEY_PATH"
+chmod 600 "$TMP_PRIVATE_KEY_PATH"
+mv "$TMP_PRIVATE_KEY_PATH" "$PRIVATE_KEY_PATH"
+trap - EXIT
+
+if ! PUBLIC_KEY_BASE64="$(derive_public_key_base64 "$PRIVATE_KEY_PATH")" || [[ -z "$PUBLIC_KEY_BASE64" ]]; then
+    echo "error: generated $PRIVATE_KEY_PATH but could not derive its public key (or the" >&2
+    echo "derived SubjectPublicKeyInfo DER wasn't the expected 44 bytes) — refusing to write a" >&2
+    echo "public key that might not be the raw 32-byte key CryptoKit expects. The private key" >&2
+    echo "is still at $PRIVATE_KEY_PATH; re-run this script to resume once investigated." >&2
+    exit 1
+fi
+write_public_key_swift "$PUBLIC_KEY_BASE64"
 
 echo
 echo "Private key written to: $PRIVATE_KEY_PATH (outside this repo, mode 600)."
