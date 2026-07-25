@@ -1,3 +1,4 @@
+import CoreMedia
 import Foundation
 import Testing
 @testable import FreeTalker
@@ -108,6 +109,7 @@ struct AutomationServiceTests {
         .modelUnavailable, .cloudCapabilityUnavailable, .processingFailed, .cancelled,
         .invalidInput("x"), .automationFolderNotConfigured, .fileNotAuthorized,
         .unsupportedMediaFile, .mediaTooLarge, .emptyText, .textTooLarge, .busy, .timedOut,
+        .automationFolderUnavailable,
     ]
 
     @Test func everyAutomationErrorHasADistinctAppleScriptErrorCode() {
@@ -147,14 +149,11 @@ struct AutomationServiceTests {
         #expect(AutomationErrorSanitizer.processorFailure(AppleFMProcessor.FMError.translationUnsupported) == .cloudCapabilityUnavailable)
     }
 
-    // MARK: - Finding 2: folder-scoped file authorization
+    // MARK: - Finding 2 (round 1) / Finding 1 (round 2): folder-scoped file authorization via bookmark
 
     @Test func noAutomationFolderConfiguredRefusesEveryFile() {
         #expect(throws: AutomationError.automationFolderNotConfigured) {
-            _ = try AutomationFileAuthorization.authorize(URL(fileURLWithPath: "/tmp/clip.wav"), automationFolderPath: nil)
-        }
-        #expect(throws: AutomationError.automationFolderNotConfigured) {
-            _ = try AutomationFileAuthorization.authorize(URL(fileURLWithPath: "/tmp/clip.wav"), automationFolderPath: "")
+            _ = try AutomationFileAuthorization.authorize(URL(fileURLWithPath: "/tmp/clip.wav"), automationFolderBookmark: nil)
         }
     }
 
@@ -163,9 +162,11 @@ struct AutomationServiceTests {
         defer { try? FileManager.default.removeItem(at: root) }
         let file = root.appendingPathComponent("clip.wav")
         FileManager.default.createFile(atPath: file.path, contents: Data("x".utf8))
+        let bookmark = try Self.bookmark(for: root)
 
-        let authorized = try AutomationFileAuthorization.authorize(file, automationFolderPath: root.path)
-        #expect(authorized.path == file.resolvingSymlinksInPath().standardizedFileURL.path)
+        let authorized = try AutomationFileAuthorization.authorize(file, automationFolderBookmark: bookmark)
+        #expect(authorized.url.path == file.resolvingSymlinksInPath().standardizedFileURL.path)
+        #expect(authorized.folder.path == root.resolvingSymlinksInPath().standardizedFileURL.path)
     }
 
     @Test func fileOutsideTheConfiguredFolderIsRefused() throws {
@@ -177,9 +178,10 @@ struct AutomationServiceTests {
         }
         let file = outside.appendingPathComponent("clip.wav")
         FileManager.default.createFile(atPath: file.path, contents: Data("x".utf8))
+        let bookmark = try Self.bookmark(for: root)
 
         #expect(throws: AutomationError.fileNotAuthorized) {
-            _ = try AutomationFileAuthorization.authorize(file, automationFolderPath: root.path)
+            _ = try AutomationFileAuthorization.authorize(file, automationFolderBookmark: bookmark)
         }
     }
 
@@ -194,26 +196,87 @@ struct AutomationServiceTests {
         FileManager.default.createFile(atPath: realFile.path, contents: Data("x".utf8))
         let escapingSymlink = root.appendingPathComponent("escape.wav")
         try FileManager.default.createSymbolicLink(at: escapingSymlink, withDestinationURL: realFile)
+        let bookmark = try Self.bookmark(for: root)
 
         #expect(throws: AutomationError.fileNotAuthorized) {
-            _ = try AutomationFileAuthorization.authorize(escapingSymlink, automationFolderPath: root.path)
+            _ = try AutomationFileAuthorization.authorize(escapingSymlink, automationFolderBookmark: bookmark)
         }
     }
 
-    // MARK: - Finding 4: non-regular-file and oversized-file refusal
+    // MARK: - Codex round-2 Finding 1: a bookmark whose directory was replaced/removed is rejected,
+    // never silently re-resolved against whatever now sits at the old path. This is the concrete
+    // defeat the raw-path design allowed: a caller (or `defaults write`) could repoint the folder
+    // string at an attacker-chosen directory. A bookmark instead follows the real filesystem
+    // object; when that object is gone, resolution/existence must fail closed.
 
-    @Test func nonRegularFileIsRefused() throws {
+    @Test func bookmarkForARemovedDirectoryIsRejected() throws {
+        let root = try Self.makeTempDirectory()
+        let bookmark = try Self.bookmark(for: root)
+        try FileManager.default.removeItem(at: root)
+
+        #expect(throws: AutomationError.automationFolderUnavailable) {
+            _ = try AutomationFileAuthorization.authorize(
+                URL(fileURLWithPath: "/tmp/clip.wav"), automationFolderBookmark: bookmark
+            )
+        }
+    }
+
+    @Test func bookmarkWhoseDirectoryWasReplacedByAFileIsRejected() throws {
+        let root = try Self.makeTempDirectory()
+        let bookmark = try Self.bookmark(for: root)
+        try FileManager.default.removeItem(at: root)
+        // Same path, a different real object (a file, not a directory) — simulates the folder
+        // being replaced out from under the saved bookmark.
+        FileManager.default.createFile(atPath: root.path, contents: Data("x".utf8))
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        #expect(throws: AutomationError.automationFolderUnavailable) {
+            _ = try AutomationFileAuthorization.authorize(
+                URL(fileURLWithPath: "/tmp/clip.wav"), automationFolderBookmark: bookmark
+            )
+        }
+    }
+
+    @Test func garbageBookmarkDataIsRejected() {
+        #expect(throws: AutomationError.automationFolderUnavailable) {
+            _ = try AutomationFileAuthorization.authorize(
+                URL(fileURLWithPath: "/tmp/clip.wav"), automationFolderBookmark: Data([0x01, 0x02, 0x03])
+            )
+        }
+    }
+
+    // MARK: - Codex round-2 Finding 2: file descriptors pinned with O_NOFOLLOW, fstat, staging copy
+
+    @Test func stagingCopiesTheAuthorizedFileAndCleansUpAfter() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("clip.wav")
+        let contents = Data("audio-bytes".utf8)
+        FileManager.default.createFile(atPath: file.path, contents: contents)
+
+        let staged = try AutomationMediaStaging.stage(
+            canonicalFolder: root, canonicalFile: file, maximumBytes: AutomationMediaGuard.maximumSourceFileBytes
+        )
+        #expect(staged.url != file)
+        #expect(try Data(contentsOf: staged.url) == contents)
+        staged.cleanup()
+        #expect(!FileManager.default.fileExists(atPath: staged.url.path))
+    }
+
+    @Test func stagingRefusesANonRegularFile() throws {
         let root = try Self.makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let notAFile = root.appendingPathComponent("subdirectory")
         try FileManager.default.createDirectory(at: notAFile, withIntermediateDirectories: false)
 
         #expect(throws: AutomationError.unsupportedMediaFile) {
-            try AutomationMediaGuard.requireRegularFile(at: notAFile)
+            _ = try AutomationMediaStaging.stage(
+                canonicalFolder: root, canonicalFile: notAFile, maximumBytes: AutomationMediaGuard.maximumSourceFileBytes
+            )
         }
     }
 
-    @Test func symlinkFileIsRefusedEvenWhenExtensionAndTargetAreValid() throws {
+    @Test func stagingRefusesASymlinkEvenWhenItsTargetIsARegularFile() throws {
         let root = try Self.makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let realFile = root.appendingPathComponent("real.wav")
@@ -221,28 +284,78 @@ struct AutomationServiceTests {
         let link = root.appendingPathComponent("link.wav")
         try FileManager.default.createSymbolicLink(at: link, withDestinationURL: realFile)
 
+        // Codex round-2 Finding 2's exact attack: the symlink is planted AFTER the authorization
+        // check already ran against `link`'s canonical (resolved) path — `stage` must still refuse
+        // it because it opens `link.wav` itself with O_NOFOLLOW, never following to `real.wav`.
         #expect(throws: AutomationError.unsupportedMediaFile) {
-            try AutomationMediaGuard.requireRegularFile(at: link)
+            _ = try AutomationMediaStaging.stage(
+                canonicalFolder: root, canonicalFile: link, maximumBytes: AutomationMediaGuard.maximumSourceFileBytes
+            )
         }
     }
 
-    @Test func oversizedRegularFileIsRefused() throws {
+    @Test func stagingRefusesAnOversizedFile() throws {
         let root = try Self.makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let big = root.appendingPathComponent("big.wav")
         FileManager.default.createFile(atPath: big.path, contents: nil)
         let handle = try FileHandle(forWritingTo: big)
-        try handle.truncate(atOffset: UInt64(AutomationMediaGuard.maximumSourceFileBytes) + 1)
+        try handle.truncate(atOffset: 1024)
         try handle.close()
 
         #expect(throws: AutomationError.mediaTooLarge) {
-            try AutomationMediaGuard.requireRegularFile(at: big)
+            _ = try AutomationMediaStaging.stage(canonicalFolder: root, canonicalFile: big, maximumBytes: 100)
         }
     }
 
+    // MARK: - Codex round-2 Finding 5: duration validation fails CLOSED, never open
+
     @Test func mediaDurationCapIsAPureComparison() {
-        #expect(!AutomationMediaGuard.exceedsMaximumDuration(seconds: 60))
-        #expect(AutomationMediaGuard.exceedsMaximumDuration(seconds: AutomationMediaGuard.maximumMediaDurationSeconds + 1))
+        #expect(AutomationMediaGuard.isDurationWithinLimit(seconds: 60))
+        #expect(!AutomationMediaGuard.isDurationWithinLimit(seconds: AutomationMediaGuard.maximumMediaDurationSeconds + 1))
+    }
+
+    @Test func durationValidationRejectsAFailedLoad() async {
+        struct LoadFailure: Error {}
+        await #expect(throws: AutomationError.mediaTooLarge) {
+            try await AutomationMediaGuard.validateDuration { throw LoadFailure() }
+        }
+    }
+
+    @Test func durationValidationRejectsIndefiniteDuration() async {
+        // `CMTime.indefinite.seconds` is NaN — the exact "playable fragmented file with indefinite
+        // duration" case the finding describes bypassing the guard.
+        await #expect(throws: AutomationError.mediaTooLarge) {
+            try await AutomationMediaGuard.validateDuration { .indefinite }
+        }
+    }
+
+    @Test func durationValidationRejectsInfiniteDuration() async {
+        await #expect(throws: AutomationError.mediaTooLarge) {
+            try await AutomationMediaGuard.validateDuration { .positiveInfinity }
+        }
+    }
+
+    @Test func durationValidationRejectsAnInvalidCMTime() async {
+        await #expect(throws: AutomationError.mediaTooLarge) {
+            try await AutomationMediaGuard.validateDuration { .invalid }
+        }
+    }
+
+    @Test func durationValidationAcceptsAValidWithinLimitDuration() async throws {
+        try await AutomationMediaGuard.validateDuration { CMTime(seconds: 60, preferredTimescale: 600) }
+    }
+
+    @Test func durationValidationRejectsAValidButOverLimitDuration() async {
+        await #expect(throws: AutomationError.mediaTooLarge) {
+            try await AutomationMediaGuard.validateDuration {
+                CMTime(seconds: AutomationMediaGuard.maximumMediaDurationSeconds + 1, preferredTimescale: 600)
+            }
+        }
+    }
+
+    private static func bookmark(for url: URL) throws -> Data {
+        try url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil)
     }
 
     private static func makeTempDirectory() throws -> URL {
@@ -275,6 +388,19 @@ struct AutomationServiceTests {
         try AutomationTextValidation.validateCleanUpText(atLimit)
     }
 
+    // MARK: - Codex round-2 Finding 3: raw byte count is checked BEFORE trimming
+
+    @Test func oversizedWhitespaceOnlyTextIsRejectedForSizeNotEmptiness() {
+        // If `trimmingCharacters(in:)` ran first (the round-1 order), this text — all whitespace,
+        // over the byte cap — would trim down to empty and report `.emptyText`. Checking the raw
+        // byte count first must report `.textTooLarge` instead, proving the size check runs
+        // before the (expensive, scan-and-allocate) trim ever executes.
+        let oversizedWhitespace = String(repeating: " ", count: AutomationTextValidation.maximumCleanUpTextBytes + 1)
+        #expect(throws: AutomationError.textTooLarge) {
+            try AutomationTextValidation.validateCleanUpText(oversizedWhitespace)
+        }
+    }
+
     @Test func oversizedTemplateNameIsRefused() {
         let oversized = String(repeating: "a", count: BackupBundleBounds.maxTemplateNameBytes + 1)
         #expect(throws: AutomationError.invalidInput("The template name is too long.")) {
@@ -291,6 +417,29 @@ struct AutomationServiceTests {
         AutomationConcurrencyGate.endCleanUp()
         #expect(AutomationConcurrencyGate.beginCleanUp() == true, "the slot must be free again once the first call ends")
         AutomationConcurrencyGate.endCleanUp()
+    }
+
+    // MARK: - Codex round-2 Finding 4: `transcribe` gets its own single-in-flight slot
+
+    @Test func onlyOneTranscribeMayBeInFlightAtATime() {
+        // Ensure a clean slate regardless of test ordering.
+        AutomationConcurrencyGate.endTranscribe()
+
+        #expect(AutomationConcurrencyGate.beginTranscribe() == true)
+        #expect(AutomationConcurrencyGate.beginTranscribe() == false, "a second concurrent call must be rejected as busy")
+        AutomationConcurrencyGate.endTranscribe()
+        #expect(AutomationConcurrencyGate.beginTranscribe() == true, "the slot must be free again once the first call ends")
+        AutomationConcurrencyGate.endTranscribe()
+    }
+
+    @Test func transcribeAndCleanUpSlotsAreIndependent() {
+        AutomationConcurrencyGate.endCleanUp()
+        AutomationConcurrencyGate.endTranscribe()
+
+        #expect(AutomationConcurrencyGate.beginCleanUp() == true)
+        #expect(AutomationConcurrencyGate.beginTranscribe() == true, "transcribe must not be blocked by an in-flight clean up")
+        AutomationConcurrencyGate.endCleanUp()
+        AutomationConcurrencyGate.endTranscribe()
     }
 
     // MARK: - Finding 2 (Settings): the automation folder setting persists and defaults to unset
@@ -315,6 +464,31 @@ struct AutomationServiceTests {
 
         let reloaded = AppSettings(defaults: defaults)
         #expect(reloaded.automationFolderPath == "/tmp/some-folder")
+    }
+
+    // MARK: - Codex round-2 Finding 1: the bookmark (the real authority) persists independently
+
+    @Test func automationFolderBookmarkIsUnsetByDefault() throws {
+        let suite = "AutomationServiceTests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let settings = AppSettings(defaults: defaults)
+
+        #expect(settings.automationFolderBookmark == nil)
+    }
+
+    @Test func automationFolderBookmarkPersistsAcrossReload() throws {
+        let suite = "AutomationServiceTests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = AppSettings(defaults: defaults)
+        let bookmark = Data([0x01, 0x02, 0x03])
+
+        settings.automationFolderBookmark = bookmark
+
+        let reloaded = AppSettings(defaults: defaults)
+        #expect(reloaded.automationFolderBookmark == bookmark)
     }
 
     // MARK: - Finding 2: the bridged direct-parameter resolver only accepts a real file reference
