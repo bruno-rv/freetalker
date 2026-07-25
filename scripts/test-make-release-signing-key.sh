@@ -234,9 +234,118 @@ test_established_anchor_mismatch_rotates_with_explicit_override() {
     pass "--rotate-established-key rotated the anchor to key B without touching either private key"
 }
 
+test_missing_pem_with_established_anchor_is_refused_without_override() {
+    local fixture
+    fixture="$(make_fixture)"
+    trap 'rm -rf "$fixture"' RETURN
+
+    log "Round-5 Finding 1: an ESTABLISHED public key must be protected even when the configured"
+    log "private-key PATH DOESN'T EXIST AT ALL — a typo in FREETALKER_RELEASE_SIGNING_KEY, a lost" \
+        "key, or a fresh publisher workstation must not be treated as 'nothing established yet'" \
+        "just because there's no file to compare against."
+
+    local key_a="$fixture/keys/key-a.pem"
+    local missing_key="$fixture/keys/does-not-exist.pem"
+    local swift_path="$fixture/Sources/FreeTalker/Update/UpdatePublicKey.swift"
+
+    # Establish key A as the anchor the same way a real first-time setup would.
+    FREETALKER_RELEASE_SIGNING_KEY="$key_a" "$fixture/scripts/make-release-signing-key.sh" >/dev/null 2>&1
+    local established_swift_content
+    established_swift_content="$(cat "$swift_path")"
+
+    if [[ -e "$missing_key" ]]; then
+        fail "test setup bug: $missing_key unexpectedly exists"
+        return
+    fi
+
+    local output status
+    set +e
+    output="$(FREETALKER_RELEASE_SIGNING_KEY="$missing_key" "$fixture/scripts/make-release-signing-key.sh" 2>&1)"
+    status=$?
+    set -e
+    if [[ "$status" -eq 0 ]]; then
+        fail "the script silently generated a NEW key and rotated the established anchor merely" \
+            "because the configured private-key path was missing"
+        echo "$output"
+        return
+    fi
+    if [[ "$output" != *"ESTABLISHED public key"* ]]; then
+        fail "the script refused, but not with the expected established-anchor message; got:"$'\n'"$output"
+        return
+    fi
+    if [[ "$output" != *"--rotate-established-key"* ]]; then
+        fail "the refusal did not mention the override flag by name; got:"$'\n'"$output"
+        return
+    fi
+    if [[ -e "$missing_key" ]]; then
+        fail "the script created a new private key at $missing_key despite being refused"
+        return
+    fi
+    if [[ "$(cat "$swift_path")" != "$established_swift_content" ]]; then
+        fail "UpdatePublicKey.swift (the established anchor, key A) was modified despite being refused"
+        return
+    fi
+    pass "missing PEM with an established anchor refused without --rotate-established-key;" \
+        "no new key generated, UpdatePublicKey.swift (key A) untouched"
+}
+
+test_missing_pem_with_established_anchor_rotates_with_explicit_override() {
+    local fixture
+    fixture="$(make_fixture)"
+    trap 'rm -rf "$fixture"' RETURN
+
+    log "Round-5 Finding 1: the SAME missing-PEM scenario, but with the explicit override — this" \
+        "must be the only way to proceed, and must actually generate and compile in a new key" \
+        "since there is no existing private key to derive one from."
+
+    local key_a="$fixture/keys/key-a.pem"
+    local missing_key="$fixture/keys/does-not-exist.pem"
+    local swift_path="$fixture/Sources/FreeTalker/Update/UpdatePublicKey.swift"
+
+    FREETALKER_RELEASE_SIGNING_KEY="$key_a" "$fixture/scripts/make-release-signing-key.sh" >/dev/null 2>&1
+    local key_a_public
+    key_a_public="$(extract_public_key_swift "$swift_path")"
+
+    local output status
+    set +e
+    output="$(FREETALKER_RELEASE_SIGNING_KEY="$missing_key" "$fixture/scripts/make-release-signing-key.sh" --rotate-established-key 2>&1)"
+    status=$?
+    set -e
+    if [[ "$status" -ne 0 ]]; then
+        fail "--rotate-established-key did not proceed for a missing PEM; got:"$'\n'"$output"
+        return
+    fi
+    if [[ ! -f "$missing_key" ]]; then
+        fail "--rotate-established-key did not generate a new private key at $missing_key"
+        return
+    fi
+    local perms
+    perms="$(stat -f '%Lp' "$missing_key")"
+    if [[ "$perms" != "600" ]]; then
+        fail "newly generated private key mode is $perms, expected 600"
+        return
+    fi
+    local derived compiled
+    derived="$(derive_public_key_base64 "$missing_key")"
+    compiled="$(extract_public_key_swift "$swift_path")"
+    if [[ -z "$derived" || "$derived" != "$compiled" ]]; then
+        fail "after --rotate-established-key, compiled public key ('$compiled') doesn't match the" \
+            "newly generated key's ('$derived')"
+        return
+    fi
+    if [[ "$compiled" == "$key_a_public" ]]; then
+        fail "compiled public key is still key A's — no rotation actually happened"
+        return
+    fi
+    pass "--rotate-established-key generated a fresh key and rotated the anchor when the" \
+        "configured PEM path didn't exist"
+}
+
 test_fresh_generation_produces_a_matching_pair
 test_interrupted_run_resumes_without_regenerating_the_key
 test_established_anchor_mismatch_is_refused_without_override
+test_missing_pem_with_established_anchor_is_refused_without_override
+test_missing_pem_with_established_anchor_rotates_with_explicit_override
 test_established_anchor_mismatch_rotates_with_explicit_override
 
 echo

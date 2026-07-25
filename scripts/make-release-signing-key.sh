@@ -180,6 +180,36 @@ if [[ -f "$PRIVATE_KEY_PATH" ]]; then
     exit 0
 fi
 
+# No file at $PRIVATE_KEY_PATH. The established-anchor guard above applies here too — a missing
+# PEM (a typo in $FREETALKER_RELEASE_SIGNING_KEY, a lost key, or a fresh publisher workstation)
+# must NOT be treated as "nothing established yet" just because there's no file to compare
+# against. If $PUBLIC_KEY_SWIFT already holds a real anchor, falling through to key generation
+# below would silently mint a brand-new key and overwrite it — exactly the destructive case this
+# guard exists for, and losing the private key does not make it safer to do so silently: there is
+# no way back once an already-deployed anchor is rotated out from under it.
+CURRENT_COMPILED_PUBLIC_KEY_BASE64="$(compiled_public_key_base64)"
+if [[ -n "$CURRENT_COMPILED_PUBLIC_KEY_BASE64" && "$ROTATE_ESTABLISHED_KEY" -ne 1 ]]; then
+    echo "error: $PRIVATE_KEY_PATH does not exist, but $PUBLIC_KEY_SWIFT already has an" >&2
+    echo "ESTABLISHED public key compiled in ($CURRENT_COMPILED_PUBLIC_KEY_BASE64)." >&2
+    echo >&2
+    echo "This is NOT treated as a fresh first-time setup, because a real anchor already" >&2
+    echo "exists: every app already built and installed trusts the CURRENTLY compiled key." >&2
+    echo "Generating a brand-new key here would silently overwrite that anchor — every" >&2
+    echo "already-installed app, which can only ever trust the ONE public key it was compiled" >&2
+    echo "with, would reject every future release signed with the new key, with no further" >&2
+    echo "warning at release time — each install must be separately rebuilt and redistributed" >&2
+    echo "with the new compiled-in key before it can accept new releases again." >&2
+    echo >&2
+    echo "If \$PRIVATE_KEY_PATH ($PRIVATE_KEY_PATH) is simply the wrong path — e.g." >&2
+    echo "FREETALKER_RELEASE_SIGNING_KEY points somewhere unintended, or the key file was" >&2
+    echo "moved/lost — fix that and re-run instead of overriding this." >&2
+    echo >&2
+    echo "If you are deliberately rotating the release-signing key (the established private" >&2
+    echo "key was lost or compromised), understand the consequence first, same as above. If" >&2
+    echo "that's genuinely what you intend, re-run with --rotate-established-key." >&2
+    exit 1
+fi
+
 PRIVATE_KEY_DIR="$(dirname "$PRIVATE_KEY_PATH")"
 mkdir -p "$PRIVATE_KEY_DIR"
 chmod 700 "$PRIVATE_KEY_DIR"

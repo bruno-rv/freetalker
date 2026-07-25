@@ -337,10 +337,72 @@ test_hostile_codesign_identity_is_rejected_end_to_end() {
     pass "legitimate codesign identity still accepted, dry run produced dist/FreeTalker-v0.0.1.app.zip"
 }
 
+test_missing_build_commit_key_source_aborts_and_cleans_dist() {
+    local fixture commit_a commit_b
+    { read -r fixture; read -r commit_a; read -r commit_b; } < <(make_fixture)
+    : "$commit_b" # unused in this test
+    trap 'rm -rf "$fixture"' RETURN
+
+    log "Round-5 Finding 2: BUILD_COMMIT's own compiled-in public key source going missing (e.g. an"
+    log "old commit that predates UpdatePublicKey.swift entirely, reached mid-flight the same way" \
+        "Round-4 Finding 4's concurrent-checkout race reaches BUILD_COMMIT) must abort AND clean up" \
+        "dist/, not let a bare 'sed ...' assignment under 'set -e' kill the script before the" \
+        "existing cleanup path (the -z check right after it) ever runs."
+
+    # Reproduces the missing-source state inside release.sh's OWN isolated worktree — never this
+    # fixture's live tree, which must keep a valid, matching UpdatePublicKey.swift throughout so
+    # the pre-build key-match check (Round-3 Finding 3) still passes — by deleting the file from
+    # the worktree the instant it appears, well before the fake bundle recipe's own 0.5s sleep
+    # completes, let alone the zip/checksum/sign/post-verify steps that follow it. The glob matches
+    # only release.sh's own `mktemp -d ".../freetalker-release-XXXXXX"` worktree, never this
+    # fixture's root (`freetalker-release-test-XXXXXX`) — six wildcard characters then end of
+    # pattern excludes the longer "-test-XXXXXX" suffix.
+    (
+        for _ in $(seq 1 200); do
+            for candidate in "${TMPDIR:-/tmp}"/freetalker-release-??????; do
+                [[ -d "$candidate" ]] || continue
+                target="$candidate/Sources/FreeTalker/Update/UpdatePublicKey.swift"
+                if [[ -f "$target" ]]; then
+                    rm -f "$target"
+                    exit 0
+                fi
+            done
+            sleep 0.01
+        done
+    ) &
+    local racer_pid=$!
+
+    local output status
+    set +e
+    output="$(cd "$fixture" && FREETALKER_RELEASE_SIGNING_KEY="$fixture/release-signing-key.pem" ./scripts/release.sh v0.0.1 --dry-run 2>&1)"
+    status=$?
+    set -e
+    wait "$racer_pid"
+
+    if [[ "$status" -eq 0 ]]; then
+        fail "release.sh --dry-run succeeded despite BUILD_COMMIT's own public-key source going missing"
+        echo "$output"
+        return
+    fi
+    if [[ "$output" != *"could not read the compiled-in public key from BUILD_COMMIT's own source"* ]]; then
+        fail "release.sh failed for an unexpected reason (expected the missing-source message);" \
+            "got:"$'\n'"$output"
+        return
+    fi
+    if [[ -e "$fixture/dist" ]]; then
+        fail "release.sh left dist/ behind despite BUILD_COMMIT's own public-key source going" \
+            "missing — this is exactly Finding 2: a bare 'sed ...' assignment under set -e must not" \
+            "exit before the existing cleanup path runs"
+        return
+    fi
+    pass "missing BUILD_COMMIT public-key source aborted with the expected message, and dist/ was cleaned up"
+}
+
 test_key_mismatch_rejected_and_matching_key_accepted
 test_artifact_is_immune_to_a_concurrent_checkout_away_and_back
 test_signature_is_rejected_if_the_signing_key_file_is_swapped_mid_build
 test_hostile_codesign_identity_is_rejected_end_to_end
+test_missing_build_commit_key_source_aborts_and_cleans_dist
 
 echo
 if [[ "$FAILURES" -eq 0 ]]; then

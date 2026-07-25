@@ -236,7 +236,15 @@ SIGNATURE_BASE64="$(openssl base64 -A -in "$SIGNATURE_PATH")"
 # built from BUILD_COMMIT actually trusts.
 echo "==> Verifying the signature against BUILD_COMMIT's own compiled-in public key"
 PRISTINE_PUBLIC_KEY_SWIFT="$WORKTREE_DIR/Sources/FreeTalker/Update/UpdatePublicKey.swift"
-PRISTINE_PUBLIC_KEY_BASE64="$(sed -n 's/.*base64 = "\([^"]*\)".*/\1/p' "$PRISTINE_PUBLIC_KEY_SWIFT")"
+# `|| true` keeps a missing/unreadable BUILD_COMMIT source (e.g. an older commit that predates
+# UpdatePublicKey.swift entirely, reached via --dry-run testing against an old BUILD_COMMIT, or
+# any other checkout that simply lacks the file) from being fatal here under `set -e`: `sed`
+# exits nonzero on ENOENT with no stdout, and since this assignment is a bare simple command,
+# set -e would otherwise abort the whole script on the spot — skipping the -z check right below
+# and, with it, the `rm -rf "$DIST_DIR"` cleanup that check performs. Falling through to that
+# check with an empty value here treats "missing source file" exactly like "empty/unreadable
+# key", which is already handled the same way "does not verify" is: abort AND clean up dist/.
+PRISTINE_PUBLIC_KEY_BASE64="$(sed -n 's/.*base64 = "\([^"]*\)".*/\1/p' "$PRISTINE_PUBLIC_KEY_SWIFT" 2>/dev/null || true)"
 if [[ -z "$PRISTINE_PUBLIC_KEY_BASE64" ]]; then
     echo "error: could not read the compiled-in public key from BUILD_COMMIT's own source" >&2
     echo "($PRISTINE_PUBLIC_KEY_SWIFT)." >&2
