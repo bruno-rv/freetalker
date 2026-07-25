@@ -325,6 +325,9 @@ private struct GeneralSettingsView: View {
     @State private var capturingHistoryPanelHotKey = false
     @State private var historyPanelCaptureSession: HotKeyCapture.Session?
     @State private var historyPanelRecorderMessage: String?
+    @State private var capturingCorrectionPanelHotKey = false
+    @State private var correctionPanelCaptureSession: HotKeyCapture.Session?
+    @State private var correctionPanelRecorderMessage: String?
     @State private var inputDevices: [AudioInputDevices.Device] = []
     @State private var runningApps: [NSRunningApplication] = []
     @State private var newRuleBundleID: String?
@@ -887,6 +890,36 @@ private struct GeneralSettingsView: View {
                         .font(.caption)
                         .foregroundStyle(.red)
                 }
+                HStack {
+                    Text("Correct Last Dictation key: \(settings.correctionPanelHotKeySpec?.displayLabel ?? "Unbound")")
+                    SettingsHelpButton(
+                        title: "Correct Last Dictation key",
+                        message: "Opens a small panel over your most recent dictation so you can fix a misheard word in place. The corrected word is remembered for next time."
+                    )
+                    Spacer()
+                    Button("Clear") {
+                        settings.correctionPanelHotKeySpec = nil
+                        correctionPanelRecorderMessage = nil
+                    }
+                    .disabled(settings.correctionPanelHotKeySpec == nil)
+                    Button(capturingCorrectionPanelHotKey ? "Press a key or combination… (⎋ cancels)" : "Change…") {
+                        beginCorrectionPanelCapture()
+                    }
+                    .disabled(capturingCorrectionPanelHotKey)
+                }
+                Text("Opens a panel over your most recent dictation — fix a misheard word and FreeTalker remembers it for next time.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let correctionPanelRecorderMessage {
+                    Text(correctionPanelRecorderMessage)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+                Toggle("Notice when I edit inserted text and offer to remember corrections", isOn: $settings.correctionLoopEditWatcherEnabled)
+                    .padding(.top, 4)
+                Text("Off by default. When on, FreeTalker briefly watches text it just inserted; if you hand-edit a single word, it offers — via the same panel — to remember the correction. It never edits anything on its own.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             .padding(.vertical, 12)
             Divider()
@@ -1626,7 +1659,8 @@ private struct GeneralSettingsView: View {
             let actions: [(label: String, spec: HotKeySpec?)] = [
                 ("Insert Last Dictation", settings.insertLastDictationHotKeySpec),
                 ("Voice Edit", settings.voiceEditHotKeySpec),
-                ("Dictation History", settings.historyPanelHotKeySpec)
+                ("Dictation History", settings.historyPanelHotKeySpec),
+                ("Correct Last Dictation", settings.correctionPanelHotKeySpec)
             ]
             for (label, action) in actions {
                 guard let action else { continue }
@@ -1665,7 +1699,7 @@ private struct GeneralSettingsView: View {
             guard HotKeySpec.validActionSpec(
                 spec,
                 pttSpec: settings.hotKeySpec,
-                otherActionSpecs: [settings.voiceEditHotKeySpec, settings.historyPanelHotKeySpec]
+                otherActionSpecs: [settings.voiceEditHotKeySpec, settings.historyPanelHotKeySpec, settings.correctionPanelHotKeySpec]
             ) != nil else {
                 insertLastDictationRecorderMessage = "This conflicts with another hotkey — pick a different chord."
                 return
@@ -1696,7 +1730,7 @@ private struct GeneralSettingsView: View {
             guard HotKeySpec.validActionSpec(
                 spec,
                 pttSpec: settings.hotKeySpec,
-                otherActionSpecs: [settings.insertLastDictationHotKeySpec, settings.historyPanelHotKeySpec]
+                otherActionSpecs: [settings.insertLastDictationHotKeySpec, settings.historyPanelHotKeySpec, settings.correctionPanelHotKeySpec]
             ) != nil else {
                 voiceEditRecorderMessage = "This conflicts with another hotkey — pick a different chord."
                 return
@@ -1725,13 +1759,42 @@ private struct GeneralSettingsView: View {
             guard HotKeySpec.validActionSpec(
                 spec,
                 pttSpec: settings.hotKeySpec,
-                otherActionSpecs: [settings.insertLastDictationHotKeySpec, settings.voiceEditHotKeySpec]
+                otherActionSpecs: [settings.insertLastDictationHotKeySpec, settings.voiceEditHotKeySpec, settings.correctionPanelHotKeySpec]
             ) != nil else {
                 historyPanelRecorderMessage = "This conflicts with another hotkey — pick a different chord."
                 return
             }
             historyPanelRecorderMessage = nil
             settings.historyPanelHotKeySpec = spec
+        }
+    }
+
+    private func beginCorrectionPanelCapture() {
+        capturingCorrectionPanelHotKey = true
+        NSApp.activate()
+        NSApp.windows.first(where: { $0.title == "Settings" })?.makeKeyAndOrderFront(nil)
+        let session = HotKeyCapture.Session()
+        correctionPanelCaptureSession = session
+        session.start { spec in
+            defer {
+                capturingCorrectionPanelHotKey = false
+                correctionPanelCaptureSession = nil
+            }
+            guard let spec else { return }
+            guard HotKeySpec.isValidInsertLastDictationSpec(spec) else {
+                correctionPanelRecorderMessage = "Correct Last Dictation needs a key, not just modifiers."
+                return
+            }
+            guard HotKeySpec.validActionSpec(
+                spec,
+                pttSpec: settings.hotKeySpec,
+                otherActionSpecs: [settings.insertLastDictationHotKeySpec, settings.voiceEditHotKeySpec, settings.historyPanelHotKeySpec]
+            ) != nil else {
+                correctionPanelRecorderMessage = "This conflicts with another hotkey — pick a different chord."
+                return
+            }
+            correctionPanelRecorderMessage = nil
+            settings.correctionPanelHotKeySpec = spec
         }
     }
 
