@@ -40,6 +40,24 @@ import Testing
         ) == .selectionChanged)
     }
 
+    /// Codex Round 2 finding 2: `revalidationError`'s new `documentMatches` parameter fails closed
+    /// to `.targetChanged` on its own — independent of app/element/window/range/text all still
+    /// agreeing — and its default (`true`) preserves every pre-fix call site that never captured a
+    /// document discriminator at all.
+    @Test func revalidationErrorTreatsADocumentMismatchAsTargetChanged() {
+        let fingerprint = SelectionSnapshot.fingerprint(for: "selected")
+        #expect(SelectionAccess.revalidationError(
+            appMatches: true, elementMatches: true, windowMatches: true, documentMatches: false,
+            expectedRange: NSRange(location: 3, length: 8), currentRange: NSRange(location: 3, length: 8),
+            expectedFingerprint: fingerprint, currentText: "selected"
+        ) == .targetChanged)
+        #expect(SelectionAccess.revalidationError(
+            appMatches: true, elementMatches: true, windowMatches: true,
+            expectedRange: NSRange(location: 3, length: 8), currentRange: NSRange(location: 3, length: 8),
+            expectedFingerprint: fingerprint, currentText: "selected"
+        ) == nil)
+    }
+
     @Test func voiceEditHotkeyDispatchIsSynchronousAndSwallowed() {
         let ptt = HotKeyMatcher(spec: .default)
         let insertLastDictation = HotKeyMatcher(spec: HotKeySpec(modifiers: 0, keyCode: 105))
@@ -48,17 +66,18 @@ import Testing
         var mutableInsertLastDictation: HotKeyMatcher? = insertLastDictation
         var mutableVoice: HotKeyMatcher? = voice
         var mutableHistoryPanel: HotKeyMatcher?
+        var mutableCorrectionPanel: HotKeyMatcher?
 
         let down = HotKeyManager.dispatch(
             kind: .keyDown, keyCode: 107, flags: 0, isAutorepeat: false,
-            matcher: &mutablePTT, insertLastDictationMatcher: &mutableInsertLastDictation, voiceEditMatcher: &mutableVoice, historyPanelMatcher: &mutableHistoryPanel
+            matcher: &mutablePTT, insertLastDictationMatcher: &mutableInsertLastDictation, voiceEditMatcher: &mutableVoice, historyPanelMatcher: &mutableHistoryPanel, correctionPanelMatcher: &mutableCorrectionPanel
         )
         #expect(down.voiceEditEngaged)
         #expect(down.swallow)
 
         let up = HotKeyManager.dispatch(
             kind: .keyUp, keyCode: 107, flags: 0, isAutorepeat: false,
-            matcher: &mutablePTT, insertLastDictationMatcher: &mutableInsertLastDictation, voiceEditMatcher: &mutableVoice, historyPanelMatcher: &mutableHistoryPanel
+            matcher: &mutablePTT, insertLastDictationMatcher: &mutableInsertLastDictation, voiceEditMatcher: &mutableVoice, historyPanelMatcher: &mutableHistoryPanel, correctionPanelMatcher: &mutableCorrectionPanel
         )
         #expect(!up.voiceEditEngaged)
         #expect(up.swallow)
@@ -69,10 +88,11 @@ import Testing
         var mutableInsertLastDictation: HotKeyMatcher? = HotKeyMatcher(spec: HotKeySpec(modifiers: 0, keyCode: 105))
         var mutableVoice: HotKeyMatcher? = HotKeyMatcher(spec: HotKeySpec(modifiers: 0, keyCode: 107))
         var mutableHistoryPanel: HotKeyMatcher? = HotKeyMatcher(spec: HotKeySpec(modifiers: 0, keyCode: 4))
+        var mutableCorrectionPanel: HotKeyMatcher?
 
         let down = HotKeyManager.dispatch(
             kind: .keyDown, keyCode: 4, flags: 0, isAutorepeat: false,
-            matcher: &mutablePTT, insertLastDictationMatcher: &mutableInsertLastDictation, voiceEditMatcher: &mutableVoice, historyPanelMatcher: &mutableHistoryPanel
+            matcher: &mutablePTT, insertLastDictationMatcher: &mutableInsertLastDictation, voiceEditMatcher: &mutableVoice, historyPanelMatcher: &mutableHistoryPanel, correctionPanelMatcher: &mutableCorrectionPanel
         )
         #expect(down.historyPanelEngaged)
         #expect(down.swallow)
@@ -81,7 +101,7 @@ import Testing
 
         let up = HotKeyManager.dispatch(
             kind: .keyUp, keyCode: 4, flags: 0, isAutorepeat: false,
-            matcher: &mutablePTT, insertLastDictationMatcher: &mutableInsertLastDictation, voiceEditMatcher: &mutableVoice, historyPanelMatcher: &mutableHistoryPanel
+            matcher: &mutablePTT, insertLastDictationMatcher: &mutableInsertLastDictation, voiceEditMatcher: &mutableVoice, historyPanelMatcher: &mutableHistoryPanel, correctionPanelMatcher: &mutableCorrectionPanel
         )
         #expect(!up.historyPanelEngaged)
         #expect(up.swallow)
@@ -137,14 +157,68 @@ import Testing
         var pending: SelectionSnapshot?
         var messages: [String] = []
 
+        // `recentInsertionSelection: { nil }` — deterministic regardless of
+        // `RecentInsertionStore.shared`'s process-wide state; the fallback itself is covered by
+        // `voiceEditFallsBackToRecentInsertionOnlyForNoEditableSelection` below.
         AppCoordinator.handleVoiceEditHotKey(
             selectionAccess: access,
             pendingSelection: &pending,
+            recentInsertionSelection: { nil },
             flash: { messages.append($0) }
         )
 
         #expect(pending == nil)
         #expect(messages == [message])
+    }
+
+    /// Correction Loop signal B (BRAINSTORM_CORRECTION_LOOP.md): the fallback is consulted ONLY
+    /// on `.noEditableSelection` — never on `.secureField` (would bypass a security check) or
+    /// `.targetChanged`/`.selectionChanged` (the live capture just proved this isn't the right
+    /// target). A `.noEditableSelection` with a fallback available uses it instead of flashing.
+    @Test func voiceEditFallsBackToRecentInsertionOnlyForNoEditableSelection() {
+        let fallback = Self.snapshot(text: "the recent dictation")
+        let calls = CallCounter()
+
+        var pending: SelectionSnapshot?
+        var messages: [String] = []
+        AppCoordinator.handleVoiceEditHotKey(
+            selectionAccess: StubSelectionAccess(result: .failure(SelectionAccessError.noEditableSelection)),
+            pendingSelection: &pending,
+            recentInsertionSelection: { calls.increment(); return fallback },
+            flash: { messages.append($0) }
+        )
+        #expect(pending?.text == "the recent dictation")
+        #expect(messages.isEmpty)
+        #expect(calls.count == 1)
+
+        for error in [SelectionAccessError.secureField, .targetChanged, .selectionChanged, .noFrontmostApplication, .replacementFailed] {
+            pending = nil
+            messages = []
+            calls.reset()
+            AppCoordinator.handleVoiceEditHotKey(
+                selectionAccess: StubSelectionAccess(result: .failure(error)),
+                pendingSelection: &pending,
+                recentInsertionSelection: { calls.increment(); return fallback },
+                flash: { messages.append($0) }
+            )
+            #expect(pending == nil)
+            #expect(calls.count == 0, "fallback must not be consulted for \(error)")
+        }
+    }
+
+    /// A `.noEditableSelection` with NO fallback available (nothing recent, or it's drifted)
+    /// falls through to the ordinary "select text first" message exactly as before this feature.
+    @Test func voiceEditNoEditableSelectionWithNoFallbackFlashesTheOrdinaryMessage() {
+        var pending: SelectionSnapshot?
+        var messages: [String] = []
+        AppCoordinator.handleVoiceEditHotKey(
+            selectionAccess: StubSelectionAccess(result: .failure(SelectionAccessError.noEditableSelection)),
+            pendingSelection: &pending,
+            recentInsertionSelection: { nil },
+            flash: { messages.append($0) }
+        )
+        #expect(pending == nil)
+        #expect(messages == ["Select editable text first"])
     }
 
     @Test func captureRejectsDriftAtEveryRangeAndTextReadBoundary() {
@@ -216,17 +290,109 @@ import Testing
         }
     }
 
+    /// Round 3 fix, STEP 2: the document discriminator is checked ONLY for Correction Loop signal
+    /// B's fallback (`SelectionSnapshot.correctionDictationID != nil` — set exclusively by
+    /// `CorrectionTargeting.selectRecentInsertion`). For that fallback, a genuine (non-URL)
+    /// per-document token that CHANGED between snapshot and replace must still refuse — the
+    /// remembered dictation lived in document A; the user switched to a DIFFERENT document
+    /// reusing the same recycled AX element/window with IDENTICAL text at the same range
+    /// (document B) before Replace runs — element/window/range/text all still match, but it's the
+    /// wrong document.
+    @Test func replaceRejectsAChangedDocumentForACorrectionFallbackSnapshot() {
+        let adapter = ScriptedSelectionAdapter(reads: Self.stableReads + Self.stableReads)
+        // Every live read (before/after, both passes) reports the SAME reused element/window but
+        // a document discriminator that differs from what the snapshot remembered.
+        let access = Self.access(adapter: adapter, targets: Array(repeating: Self.target(document: "doc-B"), count: 4))
+        let snapshot = Self.snapshot(text: "draft", document: "doc-A", correctionDictationID: 1)
+
+        #expect(throws: SelectionAccessError.targetChanged) {
+            try access.replace(snapshot, with: "replacement")
+        }
+        #expect(adapter.replacements.isEmpty)
+        #expect(adapter.rangesSet.isEmpty)
+    }
+
+    /// Round 3 fix, STEP 2's core regression test: ordinary MANUAL Voice Edit (`correctionDictationID
+    /// == nil`) must behave exactly as `main` — a changed `kAXDocumentAttribute` value (e.g. an
+    /// SPA rewriting its URL mid-instruction via `history.replaceState`, with no actual target
+    /// change at all — Round 3 finding 4) must NOT be treated as `.targetChanged` when this
+    /// snapshot was never produced by the correction fallback.
+    @Test func replaceIgnoresAChangedDocumentForAnOrdinaryManualVoiceEditSnapshot() throws {
+        let adapter = ScriptedSelectionAdapter(reads: Self.stableReads + Self.stableReads)
+        let access = Self.access(adapter: adapter, targets: Array(repeating: Self.target(document: "doc-B"), count: 4))
+        let snapshot = Self.snapshot(text: "draft", document: "doc-A") // correctionDictationID: nil
+
+        try access.replace(snapshot, with: "replacement")
+
+        #expect(adapter.replacements == ["replacement"])
+    }
+
+    /// Round 3 fix, STEP 3 (finding 2): a URL-SHAPED discriminator never proves document identity
+    /// on its own — a duplicated tab shares the exact same URL as its original. For the
+    /// correction-fallback path, this must fail closed even when the URL still MATCHES — matching
+    /// is exactly the ambiguous case finding 2 identified (a duplicate tab satisfies it too), and
+    /// refusing is the correct, deliberately conservative outcome.
+    ///
+    /// Codex regression fix: `isURLShaped` previously only recognised `://`, so non-hierarchical
+    /// Chromium document URLs — `data:`, `about:`, `file:`, `mailto:` — were misclassified as
+    /// NON-URL and trusted as stable discriminators, letting a recycled AX element/window with a
+    /// matching `data:`/`about:` value pass this gate for the WRONG duplicated tab. Covering every
+    /// valid URI scheme (via `URLComponents(string:)?.scheme`) closes that hole.
+    @Test func replaceRejectsACorrectionFallbackWhenTheDocumentDiscriminatorIsURLShapedEvenOnAMatch() {
+        for url in [
+            "https://mail.example.com/mail/u/0/#inbox",
+            "data:text/html,<p>hi</p>",
+            "about:blank",
+            "file:///Users/x/doc.html",
+            "mailto:a@b.com",
+        ] {
+            let adapter = ScriptedSelectionAdapter(reads: Self.stableReads + Self.stableReads)
+            let access = Self.access(adapter: adapter, targets: Array(repeating: Self.target(document: url), count: 4))
+            let snapshot = Self.snapshot(text: "draft", document: url, correctionDictationID: 1)
+
+            #expect(throws: SelectionAccessError.targetChanged) {
+                try access.replace(snapshot, with: "replacement")
+            }
+            #expect(adapter.replacements.isEmpty)
+        }
+    }
+
+    /// A non-URL discriminator that still matches is trusted for the correction-fallback path —
+    /// Step 3 only refuses URL-shaped tokens, not every discriminator.
+    @Test func replaceSucceedsForACorrectionFallbackSnapshotWhenANonURLDocumentDiscriminatorMatches() throws {
+        let adapter = ScriptedSelectionAdapter(reads: Self.stableReads + Self.stableReads)
+        let access = Self.access(adapter: adapter, targets: Array(repeating: Self.target(document: "doc-A"), count: 4))
+        let snapshot = Self.snapshot(text: "draft", document: "doc-A", correctionDictationID: 1)
+
+        try access.replace(snapshot, with: "replacement")
+
+        #expect(adapter.replacements == ["replacement"])
+    }
+
+    /// A snapshot that never captured a document discriminator (an app that doesn't expose
+    /// `kAXDocumentAttribute` at all) stays permissive even on the correction-fallback path —
+    /// element/window identity alone still governs.
+    @Test func replaceStillSucceedsWhenNeitherSnapshotNorLiveTargetHaveADocumentDiscriminator() throws {
+        let adapter = ScriptedSelectionAdapter(reads: Self.stableReads + Self.stableReads)
+        let access = Self.access(adapter: adapter, targetCount: 4)
+
+        try access.replace(Self.snapshot(text: "draft", correctionDictationID: 1), with: "replacement")
+
+        #expect(adapter.replacements == ["replacement"])
+    }
+
     @Test func stopStartPreservesSwallowedKeyUpExactlyOnce() {
         var ptt = HotKeyMatcher(spec: .default)
         var insertLastDictation: HotKeyMatcher? = HotKeyMatcher(spec: HotKeySpec(modifiers: 0, keyCode: 105))
         var voice: HotKeyMatcher? = HotKeyMatcher(spec: HotKeySpec(modifiers: 0, keyCode: 107))
         var historyPanel: HotKeyMatcher?
+        var correctionPanel: HotKeyMatcher?
         _ = voice?.handle(.keyDown, keyCode: 107, flags: 0)
         var tombstones = HotKeyManager.captureSwallowedKeyUpTombstones(
-            matcher: ptt, insertLastDictationMatcher: insertLastDictation, voiceEditMatcher: voice, historyPanelMatcher: historyPanel
+            matcher: ptt, insertLastDictationMatcher: insertLastDictation, voiceEditMatcher: voice, historyPanelMatcher: historyPanel, correctionPanelMatcher: correctionPanel
         )
 
-        HotKeyManager.resetMatchers(matcher: &ptt, insertLastDictationMatcher: &insertLastDictation, voiceEditMatcher: &voice, historyPanelMatcher: &historyPanel)
+        HotKeyManager.resetMatchers(matcher: &ptt, insertLastDictationMatcher: &insertLastDictation, voiceEditMatcher: &voice, historyPanelMatcher: &historyPanel, correctionPanelMatcher: &correctionPanel)
 
         #expect(HotKeyManager.handleSwallowedKeyUpTombstone(
             kind: .keyUp, keyCode: 105, isAutorepeat: false, tombstones: &tombstones
@@ -332,14 +498,15 @@ import Testing
     private static let element = AXUIElementCreateSystemWide()
     private static let window = AXUIElementCreateSystemWide()
 
-    private static func target(element: AXUIElement = element, window: AXUIElement = window) -> InsertionTarget {
-        InsertionTarget(bundleID: "test.app", pid: 7, focusedElement: element, window: window)
+    private static func target(element: AXUIElement = element, window: AXUIElement = window, document: String? = nil) -> InsertionTarget {
+        InsertionTarget(bundleID: "test.app", pid: 7, focusedElement: element, window: window, document: document)
     }
 
-    private static func snapshot(text: String) -> SelectionSnapshot {
+    private static func snapshot(text: String, document: String? = nil, correctionDictationID: Int64? = nil) -> SelectionSnapshot {
         SelectionSnapshot(
-            target: target(), range: NSRange(location: 0, length: text.utf16.count),
-            text: text, fingerprint: SelectionSnapshot.fingerprint(for: text)
+            target: target(document: document), range: NSRange(location: 0, length: text.utf16.count),
+            text: text, fingerprint: SelectionSnapshot.fingerprint(for: text),
+            correctionDictationID: correctionDictationID
         )
     }
 
@@ -359,6 +526,15 @@ private final class StubSelectionAccess: SelectionAccessing {
     init(result: Result<SelectionSnapshot, Error>) { self.result = result }
     func capture() throws -> SelectionSnapshot { try result.get() }
     func replace(_ snapshot: SelectionSnapshot, with text: String) throws {}
+}
+
+/// Mutable call counter for a `@MainActor @Sendable` closure — a plain captured `var` is
+/// non-Sendable and fails the `recentInsertionSelection` closure's type check.
+@MainActor
+private final class CallCounter {
+    private(set) var count = 0
+    func increment() { count += 1 }
+    func reset() { count = 0 }
 }
 
 @MainActor

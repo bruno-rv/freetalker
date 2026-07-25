@@ -23,6 +23,14 @@ struct VoiceEditPreviewWindowPresentation {
 
 struct VoiceEditPreviewView: View {
     @ObservedObject var coordinator: VoiceEditCoordinator
+    /// Correction Loop signal B (BRAINSTORM_CORRECTION_LOOP.md): fired with (original, replaced)
+    /// text ONLY after `coordinator.confirm()` actually succeeds — never on Cancel/Close, and
+    /// never speculatively before the drift-checked replace has landed. `AppCoordinator` decides
+    /// whether this edit was targeting a `RecentInsertion` at all; a plain manual-selection Voice
+    /// Edit (the ordinary, pre-existing flow) passes a no-op here. Declared BEFORE `onDismiss` so
+    /// existing/production call sites using trailing-closure syntax for `onDismiss` (the last
+    /// parameter) are unaffected by this addition.
+    var onReplaced: (String, String) -> Void = { _, _ in }
     let onDismiss: () -> Void
 
     var body: some View {
@@ -77,8 +85,11 @@ struct VoiceEditPreviewView: View {
     }
 
     private func confirm() {
+        guard let preview = coordinator.preview else { return }
+        let original = coordinator.originalText
         do {
             try coordinator.confirm()
+            onReplaced(original, preview.result)
             onDismiss()
         } catch {}
     }

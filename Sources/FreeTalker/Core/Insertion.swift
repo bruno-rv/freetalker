@@ -17,6 +17,25 @@ struct InsertionTarget {
     let pid: pid_t
     let focusedElement: AXUIElement?
     let window: AXUIElement?
+    /// `kAXDocumentAttribute`, snapshotted alongside `focusedElement`/`window` — Round 3 fix: this
+    /// used to also govern `compareElements`/`streamingSafeElement` (every insertion path), which
+    /// was wrong. Chromium exposes this attribute as the tab's page URL, so it changes on any
+    /// `history.replaceState` — not a document identity — and Round 3 finding 2 further showed a
+    /// URL match doesn't even prove identity (a duplicated tab shares the same URL). It is now
+    /// consulted ONLY by `SelectionAccess`'s correction-fallback revalidation
+    /// (`SelectionSnapshot.correctionDictationID != nil` — see `CorrectionTargeting.
+    /// selectRecentInsertion`), never by `Insertion.insert`, `streamingSafeElement`, or ordinary
+    /// manual Voice Edit, all of which behave exactly as `main`. `nil` when the app doesn't expose
+    /// the attribute at all.
+    let document: String?
+
+    init(bundleID: String?, pid: pid_t, focusedElement: AXUIElement?, window: AXUIElement?, document: String? = nil) {
+        self.bundleID = bundleID
+        self.pid = pid
+        self.focusedElement = focusedElement
+        self.window = window
+        self.document = document
+    }
 }
 
 /// `Insertion.insert`'s structured failure reason (PLAN.md F2.4). Only `axDenied` is
@@ -65,7 +84,8 @@ enum Insertion {
         guard let app else { return nil }
         let element = focusedElement(for: app)
         let window = element.flatMap(windowElement(for:))
-        return InsertionTarget(bundleID: app.bundleIdentifier, pid: app.processIdentifier, focusedElement: element, window: window)
+        let document = documentDiscriminator(element: element, window: window)
+        return InsertionTarget(bundleID: app.bundleIdentifier, pid: app.processIdentifier, focusedElement: element, window: window, document: document)
     }
 
     /// Returns true if a synthetic ⌘V was posted. Skips posting (leaving the text on the
@@ -262,6 +282,14 @@ enum Insertion {
     /// paste time (bundle id + pid + best-effort focused element/window comparison, always
     /// `strict`) rather than a second, divergent implementation. `nil` (unsafe) covers: AX
     /// untrusted, identity drifted, no focused element, or the focused element is secure/unreadable.
+    ///
+    /// Round 3 fix: this used to also carve out an exception for a changed `kAXDocumentAttribute`
+    /// value via a `ledgerProvenance` parameter. That whole mechanism only existed to compensate
+    /// for the document check having been added to this SHARED path in the first place — Chromium
+    /// exposes that attribute as the tab's URL, and rewriting it via `history.replaceState` is a
+    /// side effect of ordinary typing, not a target switch. The document check itself has moved
+    /// to `SelectionAccess`'s correction-fallback-only revalidation (see `InsertionTarget.
+    /// document`'s doc comment); this function is identical to `main` again.
     @MainActor
     static func streamingSafeElement(target: InsertionTarget) -> AXUIElement? {
         guard Permissions.isAccessibilityTrusted() else { return nil }
@@ -362,6 +390,167 @@ enum Insertion {
         guard AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &valueRef) == .success,
               let text = valueRef as? String else { return nil }
         return text
+    }
+
+    /// Correction Loop signal C (edit-watcher, `EditWatcher`): given the document's CURRENT value
+    /// and `baseline` — the field's value immediately BEFORE the insertion (the SAME PRE-insertion
+    /// snapshot `RecentInsertion.baselineValue`/`documentMatchesBaselinePlusLedger` use; it never
+    /// contains the ledger itself) plus the anchor it was spliced in at — returns whatever now
+    /// sits BETWEEN the unchanged prefix/suffix — i.e. exactly what the user edited the app's own
+    /// inserted text INTO — or `nil` if anything outside that range changed at all. This is the
+    /// requirement 5 boundary made concrete: "reads only the range the app itself inserted...
+    /// never the rest of the field, never anything typed before or after." A change to the prefix
+    /// or suffix (the user edited something ELSE in the same field) fails closed to `nil` rather
+    /// than guessing which part moved.
+    ///
+    /// Codex finding 5: `baseline` was previously (incorrectly) treated as POST-insertion here —
+    /// the ONLY caller (`EditWatcher`) always passes the pre-insertion value, so an end-of-field
+    /// insertion always failed `anchor + ledgerLength <= baseline.count` (baseline never contained
+    /// the ledger, so that bound could never hold once `anchor` reached the pre-insertion length),
+    /// and a middle insertion incorrectly absorbed the first `ledgerLength` UTF-16 units of
+    /// pre-existing suffix into the "edited" region. `anchor <= baseline.count` (not
+    /// `anchor + ledgerLength`) and `baseline[anchor...]` as the suffix match what's actually
+    /// stored.
+    nonisolated static func extractEditedReplacement(
+        current: [UInt16], baseline: [UInt16], ledgerLength: Int, anchor: Int
+    ) -> [UInt16]? {
+        guard anchor >= 0, ledgerLength >= 0, anchor <= baseline.count else { return nil }
+        let prefix = Array(baseline[0..<anchor])
+        let suffix = Array(baseline[anchor...])
+        guard current.count >= prefix.count + suffix.count else { return nil }
+        guard Array(current.prefix(prefix.count)) == prefix else { return nil }
+        guard Array(current.suffix(suffix.count)) == suffix else { return nil }
+        return Array(current[prefix.count..<(current.count - suffix.count)])
+    }
+
+    /// The ONLY AX read `EditWatcher` performs per poll (Codex finding 4): reads `element`'s
+    /// character COUNT (`kAXNumberOfCharactersAttribute` — a bare `Int`, no content at all) to
+    /// compute where the edited middle region now ends, then reads EXACTLY that middle region via
+    /// `kAXStringForRangeParameterizedAttribute` — never the prefix, never the suffix, never the
+    /// whole field. The pre-fix implementation read the field's entire `kAXValueAttribute` value
+    /// every poll, "materialising the entire field contents" (a confidential document's whole text)
+    /// just to confirm a short edit; this reconstructs the same `(anchor, editedLength)` window
+    /// `extractEditedReplacement` computes from lengths alone, so the round-trip AX request is
+    /// PROVABLY bounded to the range that changed, not merely "current implementation happens not
+    /// to read more." A negative computed `editedLength` (the document shrank more than the
+    /// tracked prefix+suffix allow for — something outside the watched range changed) fails closed
+    /// without reading anything else to find out what. `nil` whenever the parameterized attribute
+    /// isn't supported at all (Electron/most web views) — signal C is simply UNAVAILABLE for that
+    /// poll rather than ever falling back to an unbounded whole-field read.
+    ///
+    /// Codex Round 2 finding 3: deriving `editedLength` from the field's CURRENT total length
+    /// alone (`currentLength - anchor - suffixLength`) never actually proves the prefix/suffix
+    /// are unchanged — at an end-of-field insertion (`suffixLength == 0`) it degenerates to
+    /// "current length minus anchor," so the user simply CONTINUING TO TYPE after the dictation
+    /// (never touching the inserted range at all) kept inflating `editedLength` forever, and the
+    /// next poll read the dictation plus everything typed after it. `boundedEditedLength` bounds
+    /// how far the document's total length may have moved from `baseline.count` at all — see its
+    /// doc comment — and requests exactly that many characters, never more.
+    @MainActor
+    static func rangeLimitedEditedReplacement(
+        element: AXUIElement, baseline: [UInt16], ledgerLength: Int, anchor: Int
+    ) -> [UInt16]? {
+        guard anchor >= 0, ledgerLength >= 0, anchor <= baseline.count else { return nil }
+        guard let currentLength = numberOfCharacters(element) else { return nil }
+        guard let editedLength = boundedEditedLength(
+            currentLength: currentLength, baselineLength: baseline.count, ledgerLength: ledgerLength
+        ) else { return nil }
+        guard let edited = stringForRange(element, location: anchor, length: editedLength) else { return nil }
+        return Array(edited.utf16)
+    }
+
+    // ponytail: 32-char delta bound keeps the read near the inserted range; a position-stable AX
+    // marker design would remove the bound.
+    static let editWatcherDeltaBound = 32
+
+    /// Pure bound check (Codex Round 2 finding 3, delta arithmetic corrected by Round 3 finding
+    /// 3), factored out of `rangeLimitedEditedReplacement` so it's directly unit-testable without
+    /// a live AX session — same style as `documentMatchesBaselinePlusLedger`/
+    /// `extractEditedReplacement` above.
+    ///
+    /// Round 3 finding 3: `baselineLength` is the PRE-insertion field length (the same
+    /// pre-insertion snapshot `extractEditedReplacement`'s `baseline` uses — see that doc
+    /// comment), so an UNTOUCHED insertion has `currentLength == baselineLength + ledgerLength`,
+    /// never `currentLength == baselineLength`. The prior formula (`delta = currentLength -
+    /// baselineLength`) treated the ledger's own length as if it were drift, so even a completely
+    /// untouched insertion reported `delta == ledgerLength` and requested `ledgerLength +
+    /// ledgerLength` characters — for an insertion at the END of an otherwise-untouched field
+    /// this silently absorbed whatever the user typed right after it and reported it as an edit
+    /// to the dictated text (concretely: baseline "Hello dog", inserted "cat" before "dog" →
+    /// field becomes "Hello catdog"; the old formula read six characters — "catdog" — and treated
+    /// it as a one-token correction `cat -> catdog`, which then REPLACED the real "cat" and left
+    /// "Hello catdogdog" behind).
+    ///
+    /// `delta` now measures drift against `baselineLength + ledgerLength` — the field's expected
+    /// length if nothing outside the tracked range changed — so 0 means exactly that: an
+    /// untouched insertion, or an edit within the tracked range that didn't change its length.
+    /// `delta` is allowed up to `editWatcherDeltaBound` in either direction (a genuine correction
+    /// shifts the total length by a handful of characters; continued unrelated typing blows past
+    /// the bound almost immediately and fails closed rather than reading arbitrarily far past the
+    /// range the app itself inserted), and the read is bounded to exactly `ledgerLength + delta` —
+    /// the true length of whatever now occupies the tracked range, growing OR shrinking with it,
+    /// never clamped back up to `ledgerLength` on a shrink (unlike the pre-fix formula's `max(0,
+    /// delta)`, which existed only to compensate for the wrong baseline and would otherwise mask
+    /// a genuine same-range shrink, e.g. a misheard four-letter word corrected down to one).
+    nonisolated static func boundedEditedLength(
+        currentLength: Int, baselineLength: Int, ledgerLength: Int
+    ) -> Int? {
+        let delta = currentLength - (baselineLength + ledgerLength)
+        guard abs(delta) <= editWatcherDeltaBound else { return nil }
+        let editedLength = ledgerLength + delta
+        guard editedLength >= 0 else { return nil }
+        return editedLength
+    }
+
+    private static func numberOfCharacters(_ element: AXUIElement) -> Int? {
+        var ref: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, kAXNumberOfCharactersAttribute as CFString, &ref) == .success,
+              let number = ref as? NSNumber else { return nil }
+        return number.intValue
+    }
+
+    private static func stringForRange(_ element: AXUIElement, location: Int, length: Int) -> String? {
+        var range = CFRange(location: location, length: length)
+        guard let rangeValue = AXValueCreate(.cfRange, &range) else { return nil }
+        var ref: AnyObject?
+        guard AXUIElementCopyParameterizedAttributeValue(
+            element, kAXStringForRangeParameterizedAttribute as CFString, rangeValue, &ref
+        ) == .success, let text = ref as? String else { return nil }
+        return text
+    }
+
+    /// One fresh caret+baseline snapshot, taken immediately before a BATCH (non-streaming) paste
+    /// — the Correction Loop counterpart of what `LiveInsertionSession.receivePartial` captures
+    /// on its first post, reusing the exact same two primitives (`streamingWriteCaret`,
+    /// `streamingBaselineValue`) rather than a parallel implementation. `nil` (AX untrusted,
+    /// drifted, secure, or an active selection) means Correction Loop simply won't offer a
+    /// correction for this insertion — it never blocks or alters the paste itself, which runs
+    /// through its own, separate (non-strict) drift check in `insert(_:target:strict:)`. See
+    /// `RecentInsertion`.
+    @MainActor
+    static func captureCorrectionAnchor(target: InsertionTarget) -> (anchor: Int, baseline: String)? {
+        guard let anchor = streamingWriteCaret(target: target, expectedCaret: nil) else { return nil }
+        guard let baseline = streamingBaselineValue(target: target) else { return nil }
+        return (anchor, baseline)
+    }
+
+    /// The BATCH (non-streaming) paste path's `insert:` closure, shared by every call site
+    /// (`processDictation`'s two default parameters, `runPipeline`'s production closure) so none
+    /// of them can independently forget to either note or clear the pending Correction Loop
+    /// snapshot (`RecentInsertionStore`'s doc comment explains why a stale pending must always be
+    /// explicitly cleared, never just left for the next dictation to overwrite). Captures the
+    /// pre-paste caret+baseline BEFORE posting (position after paste is unknowable — it's
+    /// whatever the target app does with ⌘V) and only keeps it if the paste actually posted.
+    @MainActor
+    static func insertTrackingCorrection(_ text: String, target: InsertionTarget?) -> Bool {
+        let snapshot = target.flatMap { captureCorrectionAnchor(target: $0) }
+        let posted = insert(text, target: target).posted
+        if posted, let target, let snapshot {
+            RecentInsertionStore.shared.notePending(.init(target: target, baselineValue: snapshot.baseline, anchor: snapshot.anchor, text: text))
+        } else {
+            RecentInsertionStore.shared.clearPending()
+        }
+        return posted
     }
 
     /// One AX attribute read, classified into whether the value was affirmatively present, is
@@ -485,6 +674,24 @@ enum Insertion {
             return CFEqual(snapshotWindow, currentWindow) ? .match : .mismatch
         }
         return .unavailable
+    }
+
+    /// `kAXDocumentAttribute`, read from whichever of `window`/`element` exposes it (window
+    /// preferred — document identity is generally window-level). Captured on every snapshot
+    /// (`snapshotTarget`) for `InsertionTarget.document` — see that property's doc comment for
+    /// why it's consulted only by `SelectionAccess`'s correction-fallback revalidation, never by
+    /// `compareElements`/`streamingSafeElement`/`insert`. `nil` when neither exposes it (most
+    /// apps).
+    private static func documentDiscriminator(element: AXUIElement?, window: AXUIElement?) -> String? {
+        if let window, let document = stringAttribute(window, kAXDocumentAttribute as CFString) { return document }
+        if let element, let document = stringAttribute(element, kAXDocumentAttribute as CFString) { return document }
+        return nil
+    }
+
+    private static func stringAttribute(_ element: AXUIElement, _ attribute: CFString) -> String? {
+        var ref: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, attribute, &ref) == .success else { return nil }
+        return ref as? String
     }
 
     /// Returns the given app's currently focused UI element via AX, or nil if there is none or
