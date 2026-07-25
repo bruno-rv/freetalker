@@ -468,6 +468,78 @@ OpenAI-compatible BYOK provider with `http://localhost:11434/v1`. Ollama's local
 doesn't require an API key; FreeTalker omits the Authorization header when the key is empty.
 This local endpoint applies to Cloud processing (LLM) only, not Cloud STT.
 
+## Automation (Shortcuts, AppleScript)
+
+Other apps on the Mac — Shortcuts, `osascript`, Raycast, Alfred, Keyboard Maestro — can ask
+FreeTalker to **clean up a piece of text** with one of your own Templates. Nothing else is
+exposed; there's no way to start a dictation, read your Library, transcribe a file, or touch
+your settings from automation.
+
+It's off by default. To turn it on: Settings → Privacy → **Automation**, toggle **"Allow
+automation (Shortcuts, AppleScript)"**.
+
+The exact command syntax lives in FreeTalker's own AppleScript dictionary — open it from Script
+Editor via File → Open Dictionary → FreeTalker — and it's reproduced below verbatim from
+`Assets/FreeTalker.sdef`.
+
+### `clean up`
+
+Runs any text you already have through one of your own Templates and returns the result.
+
+| Parameter | AppleScript keyword | Type | Required | Default |
+|---|---|---|---|---|
+| direct parameter | *(none, positional)* | `text` | yes | — |
+| `using template` | `using template` | `text` (exact Template name) | yes | — |
+
+```sh
+osascript <<'EOF'
+tell application "FreeTalker"
+    clean up "so basically what we need is uh three things by friday" using template "Email"
+end tell
+EOF
+```
+
+An unknown Template name is an error, never a silently-substituted default.
+
+*(The example above has not been executed — the first automation call to FreeTalker triggers a
+one-time macOS Automation consent dialog that only an interactive user, not a script, can
+accept; see below.)*
+
+### What the caller sees
+
+- `clean up` **blocks until the result is ready** — like any other slow step in a Shortcut or
+  AppleScript.
+- Failures come back as AppleScript errors the caller can branch on, not silent empty results —
+  for example: automation turned off, an unknown Template name, or another automation request
+  already in flight (`busy`).
+- **The first automation call triggers a one-time macOS Automation consent dialog** — macOS
+  asking whether the calling app (Script Editor, Terminal, Shortcuts, …) may control FreeTalker.
+  Someone has to be at the Mac to click Allow; this can't be granted unattended or from a
+  headless/non-interactive session. Once granted, it's remembered for that calling app.
+
+### `clean up` and on-device processing
+
+`clean up` **always** runs on FreeTalker's on-device model — Apple's Foundation Models
+framework — never a cloud provider, regardless of what's configured for interactive dictation.
+That means no API key is ever read, no cloud endpoint is ever contacted, and no cloud tokens are
+ever spent by this command. It also **never applies your learned/custom vocabulary** — text
+handed to `clean up` from outside FreeTalker has no legitimate reason to see the words FreeTalker
+has learned from your own dictations, so that list is never threaded into the prompt for this
+path. A capability that has no on-device equivalent — output-language translation, for
+instance — is simply unavailable through `clean up` and returns a distinct error rather than
+silently falling back to a different result.
+
+Once Automation is on, `clean up`'s `using template` parameter can invoke any of your Templates,
+and the text you pass in shares a prompt with that Template's own instructions — treat every
+enabled Template's prompt as readable by an automation caller.
+
+### Limitations
+
+- **The security boundary is the macOS Automation consent prompt — not a sandbox.** FreeTalker
+  itself isn't sandboxed, honestly stated: a program already running as the same Mac user account
+  as FreeTalker is not something Automation defends against — it only restricts what a
+  well-behaved calling app can reach.
+
 ## Manual end-to-end checklist
 
 1. `make run`. Confirm the menu bar waveform icon appears (no Dock icon — it's

@@ -123,7 +123,14 @@ final class TemplateStore: ObservableObject {
 
         let (upgraded, changed) = Template.upgradingBuiltIns(loadedTemplates)
         let (renamedTemplates, renameChanged) = Self.renamingReservedNameCollisions(upgraded)
-        var renamed = renamedTemplates
+        // Codex round-9 finding (LOW) — canonicalize names already on disk the SAME way `upsert`
+        // and `importTemplates` now canonicalize every new one (see `canonicalizeTemplateName`
+        // below), so an install with a pre-existing whitespace-padded name doesn't keep silently
+        // differing from what `resolveTemplate`'s exact-name lookup expects. One-time and
+        // idempotent: a name with no surrounding whitespace round-trips unchanged, exactly like
+        // the reserved-name rename this mirrors.
+        let (trimmedTemplates, trimChanged) = Self.trimmingTemplateNames(renamedTemplates)
+        var renamed = trimmedTemplates
         let migrationComplete = defaults.integer(forKey: Self.promptEngineerMigrationKey)
             >= Self.promptEngineerMigrationVersion
         let migrationNeeded = !migrationComplete
@@ -184,8 +191,8 @@ final class TemplateStore: ObservableObject {
             defaults.removeObject(forKey: Self.pendingLegacyCommandRuleWarningKey)
         }
 
-        let needsSave = migrationNeeded || didSeed || changed || renameChanged || addedPromptEngineer
-            || spokenCommandMigrationNeeded || modelPromptEngineersMigrationNeeded
+        let needsSave = migrationNeeded || didSeed || changed || renameChanged || trimChanged
+            || addedPromptEngineer || spokenCommandMigrationNeeded || modelPromptEngineersMigrationNeeded
         if needsSave {
             // ponytail: init can't throw here without changing every call site (this predates
             // throwing save()); a failed initial-seed write just means it retries on next
@@ -227,7 +234,79 @@ final class TemplateStore: ObservableObject {
         templates.first { $0.id == id }
     }
 
+    /// Result of `resolveTemplate(named:in:)` below. `.ambiguous` is a distinct case, not folded
+    /// into `.notFound` or silently resolved to a match — see that function's doc comment.
+    enum TemplateNameLookup: Equatable, Sendable {
+        case found(Template)
+        case notFound
+        case ambiguous
+    }
+
+    /// Exact-name lookup for the automation surface (`clean up` — see
+    /// BRAINSTORM_AUTOMATION_SURFACE.md), which resolves a Template by user-facing name rather
+    /// than internal id. Template names aren't enforced unique (the UI never checked this), so a
+    /// name that matches MORE THAN ONE stored Template reports `.ambiguous` rather than silently
+    /// picking one. This was previously "earliest wins" (the same convention `importTemplates`
+    /// uses for dedupe), but that convention is unsafe here: the one-time whitespace-
+    /// canonicalization migration (`trimmingTemplateNames` below) can turn two previously-distinct
+    /// stored names (e.g. " Report " and "Report") into the same canonical name while preserving
+    /// storage order, which can silently change WHICH stored Template a first-match lookup
+    /// resolves to across an app update — the same caller, the same requested name, a different
+    /// Template's prompt. An exact-name contract genuinely cannot disambiguate two identically-
+    /// named Templates, so the correct behavior is to refuse and tell the caller to rename one,
+    /// never to guess. `.notFound` means no match, which callers must treat as an error, never a
+    /// silent default (an unknown template name is a caller mistake, not something to paper over).
+    /// Pure/`nonisolated` so it's testable without `@MainActor` and reusable by both the real store
+    /// and tests.
+    ///
+    /// Compares `name` byte-for-byte against every stored `Template.name` with no trimming here:
+    /// every stored name is already canonicalized (leading/trailing whitespace stripped) by
+    /// `canonicalizeTemplateName` below, at every path that writes one — `upsert`,
+    /// `importTemplates`, and the one-time migration in `init`. `CleanUpTextCommand` trims its
+    /// caller-supplied name the same way before calling this, so " Report " and "Report" can
+    /// never be two different Templates that an "exact name" lookup could confuse — they CAN,
+    /// however, both already exist on disk as separate Templates that now share that one
+    /// canonical name, which is exactly the case `.ambiguous` exists for.
+    nonisolated static func resolveTemplate(named name: String, in templates: [Template]) -> TemplateNameLookup {
+        let matches = templates.filter { $0.name == name }
+        if matches.count > 1 { return .ambiguous }
+        if let match = matches.first { return .found(match) }
+        return .notFound
+    }
+
+    /// The one canonicalization rule every path that stores a Template name applies — trims
+    /// leading/trailing whitespace, nothing else. Chosen (over requiring lookup callers to match
+    /// stored names byte-for-byte, whitespace included) because a Template name is something a
+    /// person types into a text field or an automation caller copies into a Shortcuts variable;
+    /// invisible surrounding whitespace is never an intentional part of a name, and a caller who
+    /// picks up a stray leading/trailing space has no way to notice it before "unknown template"
+    /// fails their whole Shortcut. See `resolveTemplate` above and `CleanUpTextCommand`, which
+    /// trims its argument the same way before ever calling `resolveTemplate`.
+    nonisolated static func canonicalizeTemplateName(_ name: String) -> String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// One-time migration companion to `canonicalizeTemplateName`: re-canonicalizes every name
+    /// already on disk so an install created before this rule existed converges on it too,
+    /// instead of only new/edited Templates being canonical. Mirrors
+    /// `renamingReservedNameCollisions`'s shape exactly. Idempotent — a name with no surrounding
+    /// whitespace is returned unchanged, so calling this again is always a no-op.
+    nonisolated static func trimmingTemplateNames(_ templates: [Template]) -> (templates: [Template], changed: Bool) {
+        var changed = false
+        let trimmed = templates.map { template -> Template in
+            let canonical = canonicalizeTemplateName(template.name)
+            guard canonical != template.name else { return template }
+            changed = true
+            var updated = template
+            updated.name = canonical
+            return updated
+        }
+        return (trimmed, changed)
+    }
+
     func upsert(_ template: Template) throws {
+        var template = template
+        template.name = Self.canonicalizeTemplateName(template.name)
         guard !Self.isReservedTemplateName(template.name) else {
             throw TemplateStoreError.reservedName
         }
@@ -338,6 +417,12 @@ final class TemplateStore: ObservableObject {
         var importedUnrecognizedIDs: [String] = []
 
         for var template in reconciled {
+            // Codex round-9 finding (LOW): canonicalize the incoming name the same way `upsert`
+            // does BEFORE computing the dedupe key, so an imported Template (Backup Bundle
+            // restore, the Templates tab's file importer) can't land on disk with surrounding
+            // whitespace `resolveTemplate`'s exact-name lookup would then have to worry about —
+            // see `canonicalizeTemplateName`.
+            template.name = Self.canonicalizeTemplateName(template.name)
             let key = Self.dedupeKey(template)
             if let existingID = existingIDByDedupeKey[key] {
                 // Skipped as a duplicate of existing content — map its old id (if it had one) to

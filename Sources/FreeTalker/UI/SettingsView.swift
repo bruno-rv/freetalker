@@ -369,6 +369,9 @@ private struct GeneralSettingsView: View {
                 SettingsCard(title: "Local privacy", subtitle: "Choose what on-device context FreeTalker may use") {
                     localContextSection
                 }
+                SettingsCard(title: "Automation", subtitle: "Let other apps ask FreeTalker to clean up text") {
+                    automationSection
+                }
             }
 
             settingsPage(
@@ -692,6 +695,24 @@ private struct GeneralSettingsView: View {
         }
         .padding(.vertical, 12)
         .help("Control what nearby text FreeTalker may read when dictation stops. Context stays on this Mac and is used only with Apple's on-device processing.")
+    }
+
+    @ViewBuilder
+    private var automationSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Toggle("Allow automation (Shortcuts, AppleScript)", isOn: $settings.automationEnabled)
+                SettingsHelpButton(
+                    title: "Automation",
+                    message: "Lets Shortcuts, osascript, Raycast, and similar tools ask FreeTalker to clean up text using your existing Templates. It always runs on-device — it never reads your API keys, contacts your cloud provider, or spends cloud tokens, regardless of what's configured for interactive dictation. Off by default — no automation request is accepted until this is on."
+                )
+            }
+            Text("Off by default. When on, other apps on this Mac can run FreeTalker's \"clean up\" command — see the FreeTalker dictionary in Script Editor (File > Open Dictionary) for the exact syntax. Custom Template prompts are readable by any automation caller once this is on.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 12)
+        .help("Turn on to let Shortcuts, AppleScript, and similar tools ask FreeTalker to clean up text. Off by default.")
     }
 
     @ViewBuilder

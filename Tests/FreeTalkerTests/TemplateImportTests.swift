@@ -282,6 +282,29 @@ struct TemplateImportTests {
         #expect(reloaded.templates.isEmpty)
     }
 
+    // Codex round-9 finding (LOW): a Template name already on disk with surrounding whitespace —
+    // written before `TemplateStore.canonicalizeTemplateName` existed — is trimmed once, on load,
+    // by the same rule `upsert`/`importTemplates` now apply to every new name. Without this
+    // one-time migration a pre-existing " Report " could keep differing from a "Report" created
+    // after this fix shipped, exactly the confusion this fix exists to prevent.
+    @Test func canonicalizesAPreExistingWhitespacePaddedTemplateNameOnLoadOnlyOnce() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("template-migration-whitespace-name-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let fileURL = directory.appendingPathComponent("templates.json")
+        let padded = Template(id: "padded", name: " Report ", prompt: "Padded name.")
+        try encode([padded]).write(to: fileURL)
+        let defaults = try isolatedDefaults()
+
+        let store = TemplateStore(fileURL: fileURL, defaults: defaults)
+        #expect(store.template(id: "padded")?.name == "Report")
+
+        // The trimmed name is durably saved back to disk, not just held in memory — a fresh
+        // instance backed by the same file sees the already-canonical name.
+        let reloaded = TemplateStore(fileURL: fileURL, defaults: defaults)
+        #expect(reloaded.template(id: "padded")?.name == "Report")
+    }
+
     @Test func rejectsOversizedImportData() throws {
         let store = try makeStore()
         let oversized = Data(repeating: 0, count: 5 * 1024 * 1024 + 1)

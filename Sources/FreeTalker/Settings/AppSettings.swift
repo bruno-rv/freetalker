@@ -396,6 +396,16 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(voiceCommandsEnabled, forKey: Keys.voiceCommandsEnabled) }
     }
 
+    /// Automation surface master switch (BRAINSTORM_AUTOMATION_SURFACE.md): the consent gate for
+    /// FreeTalker's Cocoa Scripting `clean up` command (see `FreeTalker.sdef`). **Default OFF.**
+    /// Once a cloud post-processing provider is configured, an arbitrary Shortcut/AppleScript
+    /// could otherwise push text through the user's own API key and off the machine — this switch
+    /// is the explicit opt-in that closes that gap. No provider credentials, endpoints, or model
+    /// identifiers are ever readable or writable through automation regardless of this setting.
+    @Published var automationEnabled: Bool {
+        didSet { defaults.set(automationEnabled, forKey: Keys.automationEnabled) }
+    }
+
     /// Streaming ASR master switch (BRAINSTORM_STREAMING_ASR.md): types confirmed partial
     /// transcripts live into the focused field while the user is still speaking, for explicit
     /// supported-language Recordings (see `StreamingASRLanguageSupport`). **Default OFF** for the
@@ -939,6 +949,7 @@ final class AppSettings: ObservableObject {
         static let mediaImportRetention = "mediaImportRetention"
         static let localContextScope = "localContextScope"
         static let automaticStyleEnabled = "automaticStyleEnabled"
+        static let automationEnabled = "automationEnabled"
         static let voiceCommandsEnabled = "voiceCommandsEnabled"
         static let streamingASREnabled = "streamingASREnabled"
         static let commandKeywords = "commandKeywords"
@@ -1078,6 +1089,9 @@ final class AppSettings: ObservableObject {
         let storedLocalContextScope = defaults.string(forKey: Keys.localContextScope)
         localContextScope = storedLocalContextScope.flatMap(LocalContextScope.init(rawValue:)) ?? .off
         automaticStyleEnabled = defaults.bool(forKey: Keys.automaticStyleEnabled)
+        // Default OFF, same reasoning as `voiceCommandsEnabled` below — plain `.bool(forKey:)`
+        // resolves an unset key to `false`, matching "off until switched on in Settings."
+        automationEnabled = defaults.bool(forKey: Keys.automationEnabled)
         // Default OFF — plain `.bool(forKey:)` is correct here (unlike the `.object(forKey:) as?
         // Bool` idiom used for default-ON flags above): an unset key and an explicit `false` both
         // correctly resolve to `false`. See PLAN.md PR A, item 1.

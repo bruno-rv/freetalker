@@ -45,6 +45,7 @@ app: build
 	cp Assets/SettingsIconsInfo.plist $(BUNDLE)/Contents/Resources/$(RESOURCE_BUNDLE_NAME)/Contents/Info.plist
 	cp Info.plist $(BUNDLE)/Contents/Info.plist
 	cp Assets/AppIcon.icns $(BUNDLE)/Contents/Resources/AppIcon.icns
+	cp Assets/FreeTalker.sdef $(BUNDLE)/Contents/Resources/FreeTalker.sdef
 	codesign --force --deep -s "$(CODESIGN_IDENTITY)" $(BUNDLE)
 	@echo "Built $(BUNDLE). Launch with: open $(BUNDLE)"
 ifeq ($(CODESIGN_IDENTITY),-)
