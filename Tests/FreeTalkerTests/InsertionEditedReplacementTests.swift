@@ -141,12 +141,21 @@ import Testing
         #expect(result.map(Self.str) == "João Silva")
     }
 
-    // MARK: - Codex Round 2 finding 3: `rangeLimitedEditedReplacement`'s 32-char delta bound
+    // MARK: - Codex Round 2 finding 3 / Round 3 finding 3: `rangeLimitedEditedReplacement`'s
+    // 32-char delta bound, against the CORRECTED (pre-insertion) baseline arithmetic.
+    //
+    // Round 3 finding 3: `baselineLength` is always the PRE-insertion field length — production
+    // never observes `currentLength == baselineLength` for an untouched insertion (that would
+    // mean the inserted ledger simply vanished). Every fixture below derives `currentLength` the
+    // way production actually would: `baselineLength + ledgerLength` for "untouched," adjusted by
+    // whatever the simulated edit changed — never a bare `baselineLength` restated as if nothing
+    // was ever inserted.
 
     @Test func boundedEditedLengthAllowsGrowthUpToTheBound() {
         // A genuine correction growing the inserted text by up to 32 UTF-16 units is still read.
-        #expect(Insertion.boundedEditedLength(currentLength: 132, baselineLength: 100, ledgerLength: 4) == 36)
-        #expect(Insertion.boundedEditedLength(currentLength: 100, baselineLength: 100, ledgerLength: 4) == 4)
+        // baseline 100, ledger 4 -> untouched current length is 104; +32 growth is 136.
+        #expect(Insertion.boundedEditedLength(currentLength: 136, baselineLength: 100, ledgerLength: 4) == 36)
+        #expect(Insertion.boundedEditedLength(currentLength: 104, baselineLength: 100, ledgerLength: 4) == 4)
     }
 
     @Test func boundedEditedLengthFailsClosedPastThePositiveBound() {
@@ -154,21 +163,39 @@ import Testing
         // never touching the inserted range at all — `delta` keeps growing with every character,
         // and once it exceeds the bound this must refuse to read rather than reading the
         // dictation plus everything typed after it.
-        #expect(Insertion.boundedEditedLength(currentLength: 100 + Insertion.editWatcherDeltaBound, baselineLength: 100, ledgerLength: 4) != nil)
-        #expect(Insertion.boundedEditedLength(currentLength: 100 + Insertion.editWatcherDeltaBound + 1, baselineLength: 100, ledgerLength: 4) == nil)
+        #expect(Insertion.boundedEditedLength(currentLength: 100 + 4 + Insertion.editWatcherDeltaBound, baselineLength: 100, ledgerLength: 4) != nil)
+        #expect(Insertion.boundedEditedLength(currentLength: 100 + 4 + Insertion.editWatcherDeltaBound + 1, baselineLength: 100, ledgerLength: 4) == nil)
     }
 
     @Test func boundedEditedLengthFailsClosedPastTheNegativeBound() {
         // A shrink past the bound (something well outside the tracked range was deleted) fails
-        // closed exactly the same way growth does.
-        #expect(Insertion.boundedEditedLength(currentLength: 100 - Insertion.editWatcherDeltaBound, baselineLength: 100, ledgerLength: 4) != nil)
-        #expect(Insertion.boundedEditedLength(currentLength: 100 - Insertion.editWatcherDeltaBound - 1, baselineLength: 100, ledgerLength: 4) == nil)
+        // closed exactly the same way growth does. Uses a ledger (40) longer than the bound (32)
+        // so the boundary itself — not the separate `editedLength >= 0` floor — is what's tested.
+        #expect(Insertion.boundedEditedLength(currentLength: 100 + 40 - Insertion.editWatcherDeltaBound, baselineLength: 100, ledgerLength: 40) != nil)
+        #expect(Insertion.boundedEditedLength(currentLength: 100 + 40 - Insertion.editWatcherDeltaBound - 1, baselineLength: 100, ledgerLength: 40) == nil)
     }
 
-    @Test func boundedEditedLengthNeverShrinksBelowTheOriginalLedgerLength() {
-        // A negative delta within bounds still requests at least `ledgerLength` characters (never
-        // shrunk below it) — see `boundedEditedLength`'s doc comment for why.
-        #expect(Insertion.boundedEditedLength(currentLength: 95, baselineLength: 100, ledgerLength: 4) == 4)
+    @Test func boundedEditedLengthAllowsTheEditedRegionToShrinkBelowTheOriginalLedgerLength() {
+        // Round 3 finding 3 fix: with the corrected delta (measured against baseline + ledger,
+        // not baseline alone), a genuine shrink WITHIN the tracked range — a 4-character ledger
+        // corrected down to a 1-character region — is requested at its true, shorter length, not
+        // clamped back up to `ledgerLength`. The old clamp (`max(0, delta)`) existed only to
+        // compensate for the wrong delta baseline; with the fix there's no reason to over-read
+        // past the edit.
+        #expect(Insertion.boundedEditedLength(currentLength: 100 + 1, baselineLength: 100, ledgerLength: 4) == 1)
+    }
+
+    @Test func boundedEditedLengthTreatsAnUntouchedInsertionAsZeroDelta() {
+        // Round 3 finding 3's concrete failure case: baseline "Hello dog", ledger "cat" inserted
+        // before "dog" (anchor 6, ledgerLength 3) — an untouched field becomes "Hello catdog"
+        // (length 12 = baseline 9 + ledger 3). The old (buggy) formula computed
+        // `delta = currentLength - baselineLength = 3`, requesting `ledgerLength + delta = 6`
+        // characters ("catdog") and misreading the untouched insertion as an edit. The corrected
+        // formula must report exactly `ledgerLength` (3) — nothing changed.
+        let baselineLength = "Hello dog".utf16.count
+        let ledgerLength = "cat".utf16.count
+        let currentLength = "Hello catdog".utf16.count
+        #expect(Insertion.boundedEditedLength(currentLength: currentLength, baselineLength: baselineLength, ledgerLength: ledgerLength) == ledgerLength)
     }
 
     @Test func middleInsertionDoesNotAbsorbPreExistingSuffixIntoTheEditedRegion() {

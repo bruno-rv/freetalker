@@ -463,28 +463,41 @@ enum Insertion {
     // marker design would remove the bound.
     static let editWatcherDeltaBound = 32
 
-    /// Pure bound check (Codex Round 2 finding 3), factored out of `rangeLimitedEditedReplacement`
-    /// so the delta-bound arithmetic is directly unit-testable without a live AX session — same
-    /// style as `documentMatchesBaselinePlusLedger`/`extractEditedReplacement` above.
+    /// Pure bound check (Codex Round 2 finding 3, delta arithmetic corrected by Round 3 finding
+    /// 3), factored out of `rangeLimitedEditedReplacement` so it's directly unit-testable without
+    /// a live AX session — same style as `documentMatchesBaselinePlusLedger`/
+    /// `extractEditedReplacement` above.
     ///
-    /// `delta` is how far the document's total length has moved from `baselineLength` since the
-    /// insertion — 0 means nothing outside the tracked range changed length at all. Codex's own
-    /// minimal fix (fail closed whenever `delta != 0`, request exactly `ledgerLength`) is safe but
-    /// restricts signal C to same-length edits only, which rejects most real corrections (a
-    /// misheard name is rarely the exact same length as the right one). Instead: `delta` is
-    /// allowed up to `editWatcherDeltaBound` in either direction, and the read is bounded to
-    /// `ledgerLength + max(0, delta)` — enough to cover the inserted range plus whatever grew it,
-    /// deliberately never shrunk below `ledgerLength` even when `delta` is negative, since a
-    /// shorter document proves nothing about WHERE inside the tracked range the shrink happened
-    /// without reading it. A genuine correction shifts the total length by a handful of
-    /// characters; continued unrelated typing blows past the bound almost immediately and fails
-    /// closed rather than reading arbitrarily far past the range the app itself inserted.
+    /// Round 3 finding 3: `baselineLength` is the PRE-insertion field length (the same
+    /// pre-insertion snapshot `extractEditedReplacement`'s `baseline` uses — see that doc
+    /// comment), so an UNTOUCHED insertion has `currentLength == baselineLength + ledgerLength`,
+    /// never `currentLength == baselineLength`. The prior formula (`delta = currentLength -
+    /// baselineLength`) treated the ledger's own length as if it were drift, so even a completely
+    /// untouched insertion reported `delta == ledgerLength` and requested `ledgerLength +
+    /// ledgerLength` characters — for an insertion at the END of an otherwise-untouched field
+    /// this silently absorbed whatever the user typed right after it and reported it as an edit
+    /// to the dictated text (concretely: baseline "Hello dog", inserted "cat" before "dog" →
+    /// field becomes "Hello catdog"; the old formula read six characters — "catdog" — and treated
+    /// it as a one-token correction `cat -> catdog`, which then REPLACED the real "cat" and left
+    /// "Hello catdogdog" behind).
+    ///
+    /// `delta` now measures drift against `baselineLength + ledgerLength` — the field's expected
+    /// length if nothing outside the tracked range changed — so 0 means exactly that: an
+    /// untouched insertion, or an edit within the tracked range that didn't change its length.
+    /// `delta` is allowed up to `editWatcherDeltaBound` in either direction (a genuine correction
+    /// shifts the total length by a handful of characters; continued unrelated typing blows past
+    /// the bound almost immediately and fails closed rather than reading arbitrarily far past the
+    /// range the app itself inserted), and the read is bounded to exactly `ledgerLength + delta` —
+    /// the true length of whatever now occupies the tracked range, growing OR shrinking with it,
+    /// never clamped back up to `ledgerLength` on a shrink (unlike the pre-fix formula's `max(0,
+    /// delta)`, which existed only to compensate for the wrong baseline and would otherwise mask
+    /// a genuine same-range shrink, e.g. a misheard four-letter word corrected down to one).
     nonisolated static func boundedEditedLength(
         currentLength: Int, baselineLength: Int, ledgerLength: Int
     ) -> Int? {
-        let delta = currentLength - baselineLength
+        let delta = currentLength - (baselineLength + ledgerLength)
         guard abs(delta) <= editWatcherDeltaBound else { return nil }
-        let editedLength = ledgerLength + max(0, delta)
+        let editedLength = ledgerLength + delta
         guard editedLength >= 0 else { return nil }
         return editedLength
     }
