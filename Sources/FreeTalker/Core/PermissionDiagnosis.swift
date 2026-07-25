@@ -218,7 +218,7 @@ struct PermissionDiagnosis: Equatable, Sendable {
 }
 
 /// Dedicated relaunch helper for `staleGranted` recovery (PLAN.md F2.2) — deliberately NOT
-/// `scripts/self-update.sh` (which pulls git and rebuilds); this only restarts the current
+/// `SelfUpdater` (which downloads and swaps a whole new bundle); this only restarts the current
 /// bundle so a fresh process re-establishes the capabilities TCC already claims to grant it.
 /// Runs `/usr/bin/open` directly with an argument array — never a shell — so `bundlePath`
 /// (normally `Bundle.main.bundlePath`, but a caller-suppliable install path) can never be

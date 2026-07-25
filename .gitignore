@@ -3,9 +3,12 @@
 FreeTalker.app/
 .DS_Store
 .worktrees/
-# Machine-local stable signing identity (see scripts/make-signing-cert.sh, README). Must
-# stay untracked and out of `git status --porcelain`, which SelfUpdater's dirty-check reads.
+# Machine-local stable signing identity (see scripts/make-signing-cert.sh, README) — the
+# private key backing it never leaves this machine, so this file can't either.
 /.codesign-identity
+# scripts/release.sh build output (signed zip, checksum, manifest) — regenerated per release,
+# never committed.
+/dist/
 /.superpowers/sdd/
 .codex/sdd/features/
 graphify-out/
