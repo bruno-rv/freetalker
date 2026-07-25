@@ -347,7 +347,12 @@ enum SelfUpdater {
             return (-1, "")
         }
         let terminateWorkItem = DispatchWorkItem { if process.isRunning { process.terminate() } }
-        let killWorkItem = DispatchWorkItem { if process.isRunning { kill(process.processIdentifier, SIGKILL) } }
+        // Deliberately unconditional — no `process.isRunning` guard. `isRunning` can go stale
+        // (report `false`) once `terminate()` has been called even though the child ignored
+        // `SIGTERM` and is still very much alive, which would silently skip the kill this exists
+        // to guarantee. `kill(2)` on an already-exited PID just returns `ESRCH`, which is safe
+        // to ignore — nothing here needs its return value.
+        let killWorkItem = DispatchWorkItem { kill(process.processIdentifier, SIGKILL) }
         DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: terminateWorkItem)
         DispatchQueue.global().asyncAfter(deadline: .now() + timeout + killGracePeriod, execute: killWorkItem)
         let data = pipe.fileHandleForReading.readDataToEndOfFile()

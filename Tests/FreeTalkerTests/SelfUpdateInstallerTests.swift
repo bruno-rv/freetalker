@@ -80,8 +80,13 @@ private final class FakeFileSystem {
     }
 
     /// Worst case: promotion fails AND restoring the backup also fails. Distinguishable from
-    /// `.rolledBack` so the caller can tell the user their previous app needs manual recovery.
-    @Test func promotionAndRollbackBothFailingIsReportedDistinctly() {
+    /// `.rolledBack` so the caller can tell the user their previous app needs manual recovery —
+    /// and, critically (Finding 5), `swap` itself must never have removed the backup in this
+    /// case: it's the user's ONLY surviving copy of their previous app. A verifier that only
+    /// checked `result == .rollbackFailed` (the original form of this test) would still pass if
+    /// `swap` started deleting `backupPath` on this path — only the explicit path assertions
+    /// below catch that.
+    @Test func promotionAndRollbackBothFailingIsReportedDistinctlyAndPreservesTheBackup() {
         let fs = FakeFileSystem(existingPaths: [installed.path, staged.path])
         fs.failMoveFrom = staged.path
         let originalOps = fs.ops()
@@ -97,6 +102,12 @@ private final class FakeFileSystem {
         )
         let result = SelfUpdateInstaller.swap(installedPath: installed, stagedPath: staged, backupPath: backup, ops: failingOps)
         #expect(result == .rollbackFailed)
+        // The user's original app must still be recoverable at `backupPath` — this is the
+        // property `SelfUpdater.shouldPreserveStagingRoot`/its staging-root `defer` depend on:
+        // if `swap` had removed it here, preserving the staging directory would preserve
+        // nothing.
+        #expect(fs.paths.contains(backup.path))
+        #expect(!fs.paths.contains(installed.path))
     }
 
     /// A failure removing the now-redundant backup after a successful promotion is not itself a

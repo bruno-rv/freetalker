@@ -45,6 +45,132 @@ import Testing
         #expect(SelfUpdater.sha256Hex(of: payload) == expected)
     }
 
+    // MARK: shouldPreserveStagingRoot (Finding 5 — rollback-failure data loss)
+
+    /// The one outcome that must preserve staging: `SelfUpdateInstaller.swap` already moved the
+    /// user's original app to `backupPath` (inside staging) and then failed to put it back. A
+    /// verifier that dropped this guard would still pass every other case here — only this one
+    /// fails if the guard is removed.
+    @Test func shouldPreserveStagingRootOnlyWhenRollbackFailed() {
+        #expect(SelfUpdater.shouldPreserveStagingRoot(after: .rollbackFailed))
+        #expect(!SelfUpdater.shouldPreserveStagingRoot(after: .success))
+        #expect(!SelfUpdater.shouldPreserveStagingRoot(after: .rolledBack))
+        #expect(!SelfUpdater.shouldPreserveStagingRoot(after: nil))
+    }
+
+    // MARK: validateStagedVersion (Finding 4 — manifest/artifact version binding)
+
+    @Test func validateStagedVersionAcceptsAMatchingNewerVersion() {
+        #expect(SelfUpdater.validateStagedVersion(
+            stagedVersionString: "1.3.0", manifestVersion: "v1.3.0", currentVersion: SemanticVersion(major: 1, minor: 2, patch: 0)
+        ) == .ok)
+    }
+
+    @Test func validateStagedVersionRejectsUnreadableOrUnparsableStampedVersion() {
+        #expect(SelfUpdater.validateStagedVersion(
+            stagedVersionString: nil, manifestVersion: "v1.3.0", currentVersion: SemanticVersion(major: 1, minor: 2, patch: 0)
+        ) == .unreadable)
+        #expect(SelfUpdater.validateStagedVersion(
+            stagedVersionString: "not-a-version", manifestVersion: "v1.3.0", currentVersion: SemanticVersion(major: 1, minor: 2, patch: 0)
+        ) == .unreadable)
+    }
+
+    /// The core replay/downgrade guard: a manifest claiming an inflated version whose asset ZIP
+    /// actually stamps an OLD version must be rejected — this is what stops "claim v999.0.0,
+    /// ship the v1.0.0 artifact" from ever installing the old artifact.
+    @Test func validateStagedVersionRejectsAStampedVersionThatDoesNotMatchTheManifestClaim() {
+        let result = SelfUpdater.validateStagedVersion(
+            stagedVersionString: "1.0.0", manifestVersion: "v999.0.0", currentVersion: SemanticVersion(major: 1, minor: 2, patch: 0)
+        )
+        guard case .mismatchedManifest(let staged, let claimed) = result else {
+            Issue.record("expected .mismatchedManifest, got \(result)")
+            return
+        }
+        #expect(staged == "1.0.0")
+        #expect(claimed == "v999.0.0")
+    }
+
+    /// Replaying the currently-installed ZIP under a fabricated newer manifest version: the
+    /// stamped version matches the (fabricated) claim, but isn't newer than what's running —
+    /// this is the case that would otherwise loop forever without ever actually updating.
+    @Test func validateStagedVersionRejectsAVersionThatIsNotNewerThanCurrent() {
+        let result = SelfUpdater.validateStagedVersion(
+            stagedVersionString: "1.2.0", manifestVersion: "v1.2.0", currentVersion: SemanticVersion(major: 1, minor: 2, patch: 0)
+        )
+        guard case .notNewer = result else {
+            Issue.record("expected .notNewer, got \(result)")
+            return
+        }
+    }
+
+    // MARK: containsSymlink (Finding 3 — symlinked .app swap-and-destroy)
+
+    /// A plain directory tree with no symlinks anywhere — the shape of every real release —
+    /// must never be rejected.
+    @Test func containsSymlinkIsFalseForAnOrdinaryDirectoryTree() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("FreeTalker.app/Contents/MacOS"), withIntermediateDirectories: true)
+        try Data("binary".utf8).write(to: root.appendingPathComponent("FreeTalker.app/Contents/MacOS/FreeTalker"))
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        #expect(!SelfUpdater.containsSymlink(at: root))
+    }
+
+    /// Reproduces the actual attack: the top-level `.app` entry itself is a symlink to another
+    /// real directory — exactly what `FreeTalker.app -> /Applications/FreeTalker.app` inside a
+    /// malicious ZIP would extract to via `ditto`. A real symlink, not a hand-invented flag.
+    @Test func containsSymlinkIsTrueWhenTheTopLevelAppEntryIsASymlink() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let realTarget = root.appendingPathComponent("RealTarget.app")
+        try FileManager.default.createDirectory(at: realTarget, withIntermediateDirectories: true)
+        let symlinkedApp = root.appendingPathComponent("FreeTalker.app")
+        try FileManager.default.createSymbolicLink(at: symlinkedApp, withDestinationURL: realTarget)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        #expect(SelfUpdater.containsSymlink(at: symlinkedApp))
+    }
+
+    /// A symlink nested deep inside an otherwise-ordinary bundle tree — the same escape, just
+    /// not at the top level — must also be caught.
+    @Test func containsSymlinkIsTrueForANestedSymlinkAnywhereInsideTheTree() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let macOSDir = root.appendingPathComponent("FreeTalker.app/Contents/MacOS")
+        try FileManager.default.createDirectory(at: macOSDir, withIntermediateDirectories: true)
+        let elsewhere = root.appendingPathComponent("Elsewhere")
+        try FileManager.default.createDirectory(at: elsewhere, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: macOSDir.appendingPathComponent("FreeTalker"), withDestinationURL: elsewhere
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        #expect(SelfUpdater.containsSymlink(at: root))
+    }
+
+    // MARK: runProcess SIGKILL escalation (Finding 8 — unbounded smoke-test wait)
+
+    /// A real child process that traps and ignores SIGTERM. Without the SIGKILL escalation this
+    /// would hang for the full `timeout` (or forever, since `terminate()` alone can't force it),
+    /// not just the short grace period — this is exactly the "hung child" scenario the fix
+    /// closes, reproduced with a real ignoring process rather than an assumption about signals.
+    @Test func runProcessEscalatesToSIGKILLWhenTheChildIgnoresSIGTERM() {
+        // `exec` replaces the shell's own process image with `sleep` in place (same PID, no
+        // fork) — SIG_IGN dispositions set before `exec` (unlike custom handlers) persist across
+        // it, per POSIX, so the resulting single process genuinely ignores SIGTERM itself.
+        // Without `exec`, `sh -c "trap '' TERM; sleep 30"` forks `sleep` as a CHILD of the
+        // shell — killing only the shell's PID would leave that child running (and still
+        // holding the pipe open), which isn't the scenario this test is about.
+        let start = Date()
+        let result = SelfUpdater.runProcess(
+            "/bin/sh", ["-c", "trap '' TERM; exec sleep 30"], timeout: 0.3, killGracePeriod: 0.3
+        )
+        let elapsed = Date().timeIntervalSince(start)
+        // SIGKILL cannot be caught: termination status is negative-signal-encoded (via
+        // waitpid's WTERMSIG) rather than a clean exit code once the process is killed.
+        #expect(result.status != 0)
+        #expect(elapsed < 5, "runProcess took \(elapsed)s — SIGKILL escalation did not bound the wait")
+    }
+
     /// The real `dist/latest.json` produced by `scripts/release.sh v0.1.0 --dry-run` — not
     /// hand-invented, this is exactly what the release script writes.
     @Test func decodesTheManifestJSONShapeReleaseScriptWrites() throws {
