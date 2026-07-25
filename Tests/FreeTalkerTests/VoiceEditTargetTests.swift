@@ -332,16 +332,29 @@ import Testing
     /// correction-fallback path, this must fail closed even when the URL still MATCHES — matching
     /// is exactly the ambiguous case finding 2 identified (a duplicate tab satisfies it too), and
     /// refusing is the correct, deliberately conservative outcome.
+    ///
+    /// Codex regression fix: `isURLShaped` previously only recognised `://`, so non-hierarchical
+    /// Chromium document URLs — `data:`, `about:`, `file:`, `mailto:` — were misclassified as
+    /// NON-URL and trusted as stable discriminators, letting a recycled AX element/window with a
+    /// matching `data:`/`about:` value pass this gate for the WRONG duplicated tab. Covering every
+    /// valid URI scheme (via `URLComponents(string:)?.scheme`) closes that hole.
     @Test func replaceRejectsACorrectionFallbackWhenTheDocumentDiscriminatorIsURLShapedEvenOnAMatch() {
-        let url = "https://mail.example.com/mail/u/0/#inbox"
-        let adapter = ScriptedSelectionAdapter(reads: Self.stableReads + Self.stableReads)
-        let access = Self.access(adapter: adapter, targets: Array(repeating: Self.target(document: url), count: 4))
-        let snapshot = Self.snapshot(text: "draft", document: url, correctionDictationID: 1)
+        for url in [
+            "https://mail.example.com/mail/u/0/#inbox",
+            "data:text/html,<p>hi</p>",
+            "about:blank",
+            "file:///Users/x/doc.html",
+            "mailto:a@b.com",
+        ] {
+            let adapter = ScriptedSelectionAdapter(reads: Self.stableReads + Self.stableReads)
+            let access = Self.access(adapter: adapter, targets: Array(repeating: Self.target(document: url), count: 4))
+            let snapshot = Self.snapshot(text: "draft", document: url, correctionDictationID: 1)
 
-        #expect(throws: SelectionAccessError.targetChanged) {
-            try access.replace(snapshot, with: "replacement")
+            #expect(throws: SelectionAccessError.targetChanged) {
+                try access.replace(snapshot, with: "replacement")
+            }
+            #expect(adapter.replacements.isEmpty)
         }
-        #expect(adapter.replacements.isEmpty)
     }
 
     /// A non-URL discriminator that still matches is trusted for the correction-fallback path —

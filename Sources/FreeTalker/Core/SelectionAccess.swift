@@ -140,7 +140,7 @@ final class SelectionAccess: SelectionAccessing {
     }
 
     nonisolated private static func isURLShaped(_ value: String) -> Bool {
-        value.contains("://")
+        URLComponents(string: value)?.scheme != nil
     }
 
     nonisolated static func revalidationError(
