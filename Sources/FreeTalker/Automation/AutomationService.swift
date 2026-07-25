@@ -23,9 +23,10 @@ enum AutomationService {
     /// Consequence, stated honestly: cloud-only capabilities have no automation path. Today that's
     /// output-language translation (`AppleFMProcessor` throws `FMError.translationUnsupported` for
     /// any `languagePolicy` other than `.preserveSource`, which is unreachable from `clean up`
-    /// today — this sdef exposes no language parameter). If cloud-only capabilities are ever added
-    /// to the sdef, they surface `AutomationError.cloudCapabilityUnavailable` here — a clear,
-    /// distinct error, never a silent fallback to a different result.
+    /// today — this sdef exposes no language parameter). There is deliberately no `AutomationError`
+    /// case reserved for that today-unreachable path — see `AutomationErrorSanitizer.processorFailure`.
+    /// If a cloud-only capability is ever added to the sdef, add its own distinct, non-silent
+    /// `AutomationError` case at that point.
     static func cleanUpText(_ text: String, templateName: String) async throws -> String {
         try AutomationGate.checkEnabled(AppSettings.shared.automationEnabled)
         guard let template = TemplateStore.resolveTemplate(named: templateName, in: TemplateStore.shared.templates) else {

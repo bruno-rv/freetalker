@@ -73,10 +73,42 @@ struct AutomationServiceTests {
         #expect(resolved?.id == "custom-1")
     }
 
+    // MARK: - Codex round-9 finding (LOW): a stored Template name is canonicalized (trimmed) so
+    // an exact-name lookup can never resolve to the wrong Template because of invisible
+    // surrounding whitespace — see `TemplateStore.canonicalizeTemplateName`/`upsert`.
+
+    @Test func templateNameWhitespaceIsCanonicalizedOnStoreSoItCannotDistinguishTwoTemplates() throws {
+        let store = try makeIsolatedTemplateStore()
+
+        try store.upsert(Template(id: "padded", name: " Report ", prompt: "Padded name."))
+
+        // The invariant itself: revert the trim in `upsert` and this is the first thing to fail —
+        // the stored name would still carry its surrounding whitespace.
+        let stored = try #require(store.template(id: "padded"))
+        #expect(stored.name == "Report")
+
+        // End-to-end: `CleanUpTextCommand` trims its caller-supplied "using template" argument
+        // before ever calling `resolveTemplate` (CleanUpTextCommand.swift). Because storage is
+        // canonicalized the same way, a caller asking for "Report" resolves to this Template —
+        // there is no separate, distinct " Report " Template left on disk that a different
+        // caller could have been asking for instead.
+        #expect(TemplateStore.resolveTemplate(named: "Report", in: store.templates)?.id == "padded")
+        #expect(TemplateStore.resolveTemplate(named: " Report ", in: store.templates) == nil)
+    }
+
+    private func makeIsolatedTemplateStore() throws -> TemplateStore {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("automation-template-canonicalization-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let fileURL = directory.appendingPathComponent("templates.json")
+        let defaults = try #require(UserDefaults(suiteName: "AutomationServiceTests.templateStore.\(UUID().uuidString)"))
+        return TemplateStore(fileURL: fileURL, defaults: defaults)
+    }
+
     // MARK: - Error descriptions surface distinct, branchable AppleScript error codes
 
     private static let allErrors: [AutomationError] = [
-        .automationDisabled, .unknownTemplate("x"), .modelUnavailable, .cloudCapabilityUnavailable,
+        .automationDisabled, .unknownTemplate("x"), .modelUnavailable,
         .processingFailed, .invalidInput("x"), .emptyText, .textTooLarge, .busy,
     ]
 
@@ -113,8 +145,13 @@ struct AutomationServiceTests {
         #expect(AutomationErrorSanitizer.processorFailure(AppleFMProcessor.FMError.unavailable) == .modelUnavailable)
     }
 
-    @Test func translationUnsupportedMapsToCloudCapabilityUnavailableNeverASilentFallback() {
-        #expect(AutomationErrorSanitizer.processorFailure(AppleFMProcessor.FMError.translationUnsupported) == .cloudCapabilityUnavailable)
+    @Test func translationUnsupportedIsUnreachableFromCleanUpAndFallsThroughToTheGenericSanitizedError() {
+        // AutomationService.cleanUpText always passes `languagePolicy: .preserveSource` — the only
+        // condition that ever makes AppleFMProcessor throw `.translationUnsupported` — and this
+        // sdef exposes no language parameter, so no AppleEvent input can reach this branch. No
+        // AutomationError case is reserved for it; it falls through to the same sanitized mapping
+        // as any other unexpected FMError case.
+        #expect(AutomationErrorSanitizer.processorFailure(AppleFMProcessor.FMError.translationUnsupported) == .processingFailed)
     }
 
     // MARK: - Finding 3: text/template bounds and single in-flight enforcement

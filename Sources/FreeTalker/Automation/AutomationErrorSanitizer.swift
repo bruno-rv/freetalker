@@ -24,14 +24,20 @@ enum AutomationErrorSanitizer {
     }
 
     /// `clean up`'s processor-specific mapping: `AppleFMProcessor.FMError.unavailable` (on-device
-    /// model not ready) and `.translationUnsupported` (a cloud-only capability — Finding 1) each
-    /// get their own distinct, sanitized case so a caller can branch; anything else falls back to
-    /// the generic mapping above.
+    /// model not ready) gets its own distinct, sanitized case so a caller can branch.
+    /// `.translationUnsupported` is handled here only to keep this switch exhaustive over
+    /// `AppleFMProcessor.FMError`'s full case set — `AppleFMProcessor` (Engines, outside
+    /// automation) is what actually throws it, and only when `languagePolicy != .preserveSource`.
+    /// `AutomationService.cleanUpText` always passes `.preserveSource` and this sdef exposes no
+    /// language parameter, so no AppleEvent input can ever produce it here; it falls through to
+    /// the same generic sanitized mapping as anything else.
     static func processorFailure(_ error: Error) -> AutomationError {
         if let fmError = error as? AppleFMProcessor.FMError {
             switch fmError {
-            case .unavailable: return .modelUnavailable
-            case .translationUnsupported: return .cloudCapabilityUnavailable
+            case .unavailable:
+                return .modelUnavailable
+            case .translationUnsupported:
+                break
             }
         }
         return processingFailure(error, context: "clean up")

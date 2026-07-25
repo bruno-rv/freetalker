@@ -16,9 +16,6 @@ enum AutomationError: LocalizedError, Equatable {
     /// The on-device model (Apple's Foundation Models framework) isn't available on this Mac
     /// right now. `clean up` never falls back to cloud — see `AutomationService.cleanUpText`.
     case modelUnavailable
-    /// The request needs cloud processing (e.g. output-language translation) and automation never
-    /// uses cloud, ever — see Codex round-1 Finding 1. Never silently degraded to something else.
-    case cloudCapabilityUnavailable
     /// The underlying pipeline failed. The real error is logged privately, never returned here —
     /// see `AutomationErrorSanitizer`.
     case processingFailed
@@ -40,8 +37,6 @@ enum AutomationError: LocalizedError, Equatable {
             return "No FreeTalker Template named \"\(name)\" was found."
         case .modelUnavailable:
             return "On-device processing isn't available on this Mac right now. Try again once Apple Intelligence is enabled and its model is downloaded."
-        case .cloudCapabilityUnavailable:
-            return "This request needs cloud processing, which automation never uses. It isn't available through automation."
         case .processingFailed:
             return "FreeTalker couldn't complete this request. Check FreeTalker's logs for details."
         case .invalidInput(let message):
@@ -65,7 +60,6 @@ enum AutomationError: LocalizedError, Equatable {
         case .processingFailed: return 20004
         case .invalidInput: return 20006
         case .modelUnavailable: return 20007
-        case .cloudCapabilityUnavailable: return 20008
         case .emptyText: return 20013
         case .textTooLarge: return 20014
         case .busy: return 20015

@@ -8,10 +8,10 @@ import Foundation
 ///
 /// Suspends the AppleEvent reply (`suspendExecution`/`resumeExecution(withResult:)`) instead of
 /// blocking a thread: `AutomationService` needs the main actor (it goes through
-/// `AppCoordinator`/`AppSettings`), and Apple Event dispatch itself runs there too, so a thread
-/// that actually blocked while resuming that same work would deadlock. The suspend/resume pair is
-/// exactly what Cocoa Scripting has offered slow commands since it's an ordinary async reply, not
-/// a workaround.
+/// `AppSettings`/`TemplateStore`, not `AppCoordinator` — see `AutomationService.cleanUpText`'s doc
+/// comment), and Apple Event dispatch itself runs there too, so a thread that actually blocked
+/// while resuming that same work would deadlock. The suspend/resume pair is exactly what Cocoa
+/// Scripting has offered slow commands since it's an ordinary async reply, not a workaround.
 final class CleanUpTextCommand: NSScriptCommand, @unchecked Sendable {
     override func performDefaultImplementation() -> Any? {
         guard let text = directParameter as? String else {
