@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE dictionary SYSTEM "file://localhost/System/Library/DTDs/sdef.dtd">
+<dictionary title="FreeTalker Terminology">
+    <suite name="FreeTalker Suite" code="FrTk" description="Automation commands for FreeTalker. Both commands are refused with an error unless Automation is turned on in FreeTalker's Settings &gt; Privacy.">
+
+        <command name="transcribe" code="FrTktrsc" description="Transcribe an audio or video file and return the transcript. Runs on FreeTalker's normal Imports queue, so the job is visible and cancellable in the Imports window while this command waits for it.">
+            <cocoa class="FreeTalker.TranscribeFileCommand"/>
+            <direct-parameter type="file" description="The audio or video file to transcribe — the same formats FreeTalker's Imports window accepts (WAV, M4A, MP3, MP4, MOV)."/>
+            <parameter name="format" code="frmt" type="format style" optional="yes" description="Output format. Defaults to plain text.">
+                <cocoa key="format"/>
+            </parameter>
+            <parameter name="with speaker labels" code="spkr" type="boolean" optional="yes" description="Label each line with the speaker who said it. Defaults to true.">
+                <cocoa key="withSpeakerLabels"/>
+            </parameter>
+            <result type="text" description="The transcript, in the requested format."/>
+        </command>
+
+        <command name="clean up" code="FrTkclup" description="Post-process text with one of FreeTalker's own Templates and return the result. No microphone, no recording, no permissions.">
+            <cocoa class="FreeTalker.CleanUpTextCommand"/>
+            <direct-parameter type="text" description="The text to clean up."/>
+            <parameter name="using template" code="tmpl" type="text" description="The exact name of an existing FreeTalker Template (Settings &gt; Templates). An unknown name is an error, never a silently substituted default.">
+                <cocoa key="templateName"/>
+            </parameter>
+            <result type="text" description="The processed text."/>
+        </command>
+
+        <enumeration name="format style" code="FrFm" description="Output format for the transcribe command.">
+            <enumerator name="plain text" code="FfPt" description="One line per segment, prefixed with the speaker label.">
+                <cocoa string-value="plainText"/>
+            </enumerator>
+            <enumerator name="markdown" code="FfMd" description="Speaker labels in bold, one paragraph per segment.">
+                <cocoa string-value="markdown"/>
+            </enumerator>
+            <enumerator name="SRT" code="FfSr" description="SubRip subtitle format.">
+                <cocoa string-value="srt"/>
+            </enumerator>
+            <enumerator name="VTT" code="FfVt" description="WebVTT subtitle format.">
+                <cocoa string-value="vtt"/>
+            </enumerator>
+        </enumeration>
+
+    </suite>
+</dictionary>
