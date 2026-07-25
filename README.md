@@ -99,11 +99,16 @@ scripts/make-release-signing-key.sh   # once: generates the Ed25519 release-sign
 
 Writes the PRIVATE key outside this repo (default `~/.freetalker/release-signing-key.pem`,
 override with `$FREETALKER_RELEASE_SIGNING_KEY`) and the PUBLIC key into
-`Sources/FreeTalker/Update/UpdatePublicKey.swift`, which gets committed and compiled into every
-build. Back the private key up somewhere safe immediately — if it's lost, no future release can
-ever be verified by an app already built with the current public key; there's no recovery path
-short of shipping a new build with a new public key and telling every existing install to
-manually trust it again.
+`keys/release-public-key.base64` — a plain text file holding nothing but that one base64 value,
+which gets committed. `Sources/FreeTalker/Update/UpdatePublicKey.swift` (compiled into every
+build) is **generated automatically from that file on every `swift build`/`swift test`** by the
+`GenerateUpdatePublicKey` SwiftPM build tool plugin (`Plugins/GenerateUpdatePublicKey`) — it is
+gitignored and never hand-edited; if you ever need to change the key, edit
+`keys/release-public-key.base64` (normally only `scripts/make-release-signing-key.sh` does this)
+and rebuild. Back the private key up somewhere safe immediately — if it's lost, no future
+release can ever be verified by an app already built with the current public key; there's no
+recovery path short of shipping a new build with a new public key and telling every existing
+install to manually trust it again.
 
 ## Releasing
 

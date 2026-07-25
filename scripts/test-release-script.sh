@@ -7,9 +7,9 @@
 # target, so these exercise release.sh's actual logic rather than a re-derived stand-in. Two
 # scenarios, both regressions closed in this round:
 #
-#   1. Round-3 Finding 3 — a release-signing key whose PUBLIC half doesn't match the compiled-in
-#      UpdatePublicKey.swift must be rejected before any build work; the matching key must be
-#      accepted.
+#   1. Round-3 Finding 3 — a release-signing key whose PUBLIC half doesn't match the established
+#      keys/release-public-key.base64 must be rejected before any build work; the matching key
+#      must be accepted.
 #   2. Round-3 Finding 4 — the published artifact must come from a PRISTINE checkout of
 #      BUILD_COMMIT, immune to a concurrent `git checkout` to a different commit and back in the
 #      live working tree during the build.
@@ -52,8 +52,8 @@ racer_delete_target_under() {
 #     invoked from) into the bundle — the property release.sh's own worktree isolation depends
 #     on to be testable at all.
 #   - a copy of the REAL scripts/release.sh (never a rewritten stand-in).
-#   - a fixture Sources/FreeTalker/Update/UpdatePublicKey.swift and a matching (or, for the
-#     mismatch test, deliberately non-matching) Ed25519 private key.
+#   - a fixture keys/release-public-key.base64 and a matching (or, for the mismatch test,
+#     deliberately non-matching) Ed25519 private key.
 #   - a non-"-" .codesign-identity (release.sh only checks this string; the fake `bundle` target
 #     never actually invokes `codesign`, so this doesn't need to be a real Keychain identity).
 # Prints two lines on stdout: the fixture root, then commit A's hash, then commit B's hash.
@@ -65,13 +65,13 @@ make_fixture() {
     git -C "$fixture" config user.email "test@example.com"
     git -C "$fixture" config user.name "Release Script Test"
 
-    mkdir -p "$fixture/scripts/lib" "$fixture/Sources/FreeTalker/Update"
+    mkdir -p "$fixture/scripts/lib" "$fixture/keys"
     cp "$REPO_ROOT/scripts/release.sh" "$fixture/scripts/release.sh"
     chmod +x "$fixture/scripts/release.sh"
     # release.sh sources this relative to its OWN location (REPO_ROOT), so the fixture needs its
-    # own copy too — the REAL file, never a re-derived stand-in, so extraction logic here is
-    # exactly what production uses (round-6 finding 1).
-    cp "$REPO_ROOT/scripts/lib/public-key-extract.sh" "$fixture/scripts/lib/public-key-extract.sh"
+    # own copy too — the REAL file, never a re-derived stand-in, so the read logic here is
+    # exactly what production uses.
+    cp "$REPO_ROOT/scripts/lib/public-key-data-file.sh" "$fixture/scripts/lib/public-key-data-file.sh"
 
     # The REAL Makefile, byte-for-byte — never a re-derived stand-in — `include`d so this
     # fixture's `codesign-identity-check` target (and the `export CODESIGN_IDENTITY` /
@@ -117,11 +117,7 @@ MAKEFILE
             | openssl pkey -pubin -outform DER 2>/dev/null \
             | tail -c 32 | openssl base64 -A
     )"
-    cat >"$fixture/Sources/FreeTalker/Update/UpdatePublicKey.swift" <<EOF
-enum UpdatePublicKey {
-    static let base64 = "$pubkey_base64"
-}
-EOF
+    printf '%s\n' "$pubkey_base64" >"$fixture/keys/release-public-key.base64"
 
     git -C "$fixture" add -A
     git -C "$fixture" commit --quiet -m "commit A"
@@ -390,27 +386,27 @@ test_missing_build_commit_key_source_aborts_and_cleans_dist() {
     # either the racer's glob root or the `TMPDIR=` override below makes this fail.
     local decoy_worktree decoy_target
     decoy_worktree="$(mktemp -d "${TMPDIR:-/tmp}/freetalker-release-XXXXXX")"
-    mkdir -p "$decoy_worktree/Sources/FreeTalker/Update"
-    decoy_target="$decoy_worktree/Sources/FreeTalker/Update/UpdatePublicKey.swift"
+    mkdir -p "$decoy_worktree/keys"
+    decoy_target="$decoy_worktree/keys/release-public-key.base64"
     echo "decoy content — must never be touched by a properly confined racer" >"$decoy_target"
 
-    log "Round-5 Finding 2: BUILD_COMMIT's own compiled-in public key source going missing (e.g. an"
-    log "old commit that predates UpdatePublicKey.swift entirely, reached mid-flight the same way" \
-        "Round-4 Finding 4's concurrent-checkout race reaches BUILD_COMMIT) must abort AND clean up" \
-        "dist/, not let a bare 'sed ...' assignment under 'set -e' kill the script before the" \
-        "existing cleanup path (the -z check right after it) ever runs."
+    log "Round-5 Finding 2: BUILD_COMMIT's own established public key source going missing (e.g." \
+        "an old commit that predates keys/release-public-key.base64 entirely, reached mid-flight" \
+        "the same way Round-4 Finding 4's concurrent-checkout race reaches BUILD_COMMIT) must" \
+        "abort AND clean up dist/, not let a bare 'sed ...' assignment under 'set -e' kill the" \
+        "script before the existing cleanup path (the -z check right after it) ever runs."
 
     # Reproduces the missing-source state inside release.sh's OWN isolated worktree — never this
-    # fixture's live tree, which must keep a valid, matching UpdatePublicKey.swift throughout so
-    # the pre-build key-match check (Round-3 Finding 3) still passes — by deleting the file from
-    # the worktree the instant it appears, well before the fake bundle recipe's own 0.5s sleep
-    # completes, let alone the zip/checksum/sign/post-verify steps that follow it. The glob is
-    # confined to $racer_root (see above), so even though it still matches release.sh's own
-    # "freetalker-release-XXXXXX" naming scheme by design, it can never see (let alone delete)
-    # anything outside the root this test alone created.
+    # fixture's live tree, which must keep a valid, matching keys/release-public-key.base64
+    # throughout so the pre-build key-match check (Round-3 Finding 3) still passes — by deleting
+    # the file from the worktree the instant it appears, well before the fake bundle recipe's
+    # own 0.5s sleep completes, let alone the zip/checksum/sign/post-verify steps that follow it.
+    # The glob is confined to $racer_root (see above), so even though it still matches
+    # release.sh's own "freetalker-release-XXXXXX" naming scheme by design, it can never see
+    # (let alone delete) anything outside the root this test alone created.
     (
         for _ in $(seq 1 200); do
-            if racer_delete_target_under "$racer_root" "Sources/FreeTalker/Update/UpdatePublicKey.swift"; then
+            if racer_delete_target_under "$racer_root" "keys/release-public-key.base64"; then
                 exit 0
             fi
             sleep 0.01
@@ -454,53 +450,35 @@ test_missing_build_commit_key_source_aborts_and_cleans_dist() {
         "namespace outside \$racer_root — confinement holds"
 }
 
-test_ambiguous_public_key_declaration_is_rejected_not_silently_misextracted() {
+test_decoy_second_value_in_data_file_is_rejected_not_silently_misextracted() {
     local fixture commit_a commit_b
     { read -r fixture; read -r commit_a; read -r commit_b; } < <(make_fixture)
     : "$commit_a" "$commit_b" # unused in this test
     trap 'rm -rf "$fixture"' RETURN
 
-    log "Round-6 Finding 1: a UpdatePublicKey.swift line where a naive greedy sed extraction" \
-        "disagrees with what Swift actually compiles must be rejected outright, never silently" \
-        "signed against the wrong (attacker-controlled) value."
+    log "Round-7 Finding 1's shape, closed by construction rather than by tightening a regex" \
+        "again: keys/release-public-key.base64 holding a real value PLUS a second, decoy value" \
+        "must be rejected outright, never silently signed against whichever one a parser" \
+        "happened to prefer. Unlike the old Swift-source design (where a decoy could hide" \
+        "behind a trailing comment, an inactive #if, or a block comment and still look like" \
+        "exactly one well-formed declaration to a regex), this file format has no syntax those" \
+        "constructs could exploit — any second value is just a second line, which is" \
+        "unambiguously invalid on its face."
 
-    # The exact shape from the finding. Swift compiles ONLY the first quoted literal (key A) —
-    # everything after it, even text that itself looks like `base64 = "..."`, is just a trailing
-    # comment with no effect on the compiled constant. A naive, unanchored, greedy
-    # `sed 's/.*base64 = "\(...\)".*'` instead matches the LAST occurrence on the line and
-    # silently returns key B. Generating a real PRIVATE key for B (not just a public value) is
-    # what makes this a meaningful demonstration rather than an accidental pass: signing with
-    # key_b_private is exactly what a naive extraction would let through as "matching," even
-    # though every already-built client only trusts key A.
     local key_a key_b_private key_b
     key_a="$(openssl genpkey -algorithm ED25519 2>/dev/null | openssl pkey -pubout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | tail -c 32 | openssl base64 -A)"
     key_b_private="$(mktemp -d)/key-b.pem"
     openssl genpkey -algorithm ED25519 -out "$key_b_private" 2>/dev/null
     key_b="$(openssl pkey -in "$key_b_private" -pubout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | tail -c 32 | openssl base64 -A)"
-    local swift_path="$fixture/Sources/FreeTalker/Update/UpdatePublicKey.swift"
-    cat >"$swift_path" <<EOF
-enum UpdatePublicKey {
-    static let base64 = "$key_a" // base64 = "$key_b"
-}
-EOF
+    local data_file="$fixture/keys/release-public-key.base64"
+    printf '%s\n%s\n' "$key_a" "$key_b" >"$data_file"
     git -C "$fixture" add -A
-    git -C "$fixture" commit --quiet -m "ambiguous base64 declaration"
+    git -C "$fixture" commit --quiet -m "decoy second value in release-public-key.base64"
 
-    # Sanity-check the fixture really reproduces the finding: the OLD naive sed must disagree
-    # with what Swift compiles (key A) and return key B instead. If this ever stops being true
-    # (e.g. the fixture's shape drifts), the test below would pass for the wrong reason.
-    local naive_extraction
-    naive_extraction="$(sed -n 's/.*base64 = "\([^"]*\)".*/\1/p' "$swift_path")"
-    if [[ "$naive_extraction" != "$key_b" ]]; then
-        fail "test setup invalid: expected the naive greedy sed to disagree with Swift and" \
-            "extract key B ($key_b), got '$naive_extraction' — fixture doesn't reproduce Finding 1"
-        return
-    fi
-
-    # Sign with key B's PRIVATE key — the one a naive extraction would treat as "matching" the
-    # compiled-in value (it isn't; Swift compiles key A). A vulnerable release.sh happily accepts
-    # this and produces dist/; the fix must reject the file outright, before ever looking at
-    # which signing key was supplied.
+    # Sign with key B's PRIVATE key — the one a value-picking (rather than outright-rejecting)
+    # reader might have preferred. A vulnerable release.sh would happily accept this and produce
+    # dist/; the fix must reject the file outright, before ever looking at which signing key was
+    # supplied.
     local output status
     set +e
     output="$(cd "$fixture" && FREETALKER_RELEASE_SIGNING_KEY="$key_b_private" ./scripts/release.sh v0.0.1 --dry-run 2>&1)"
@@ -508,18 +486,17 @@ EOF
     set -e
     rm -rf "$(dirname "$key_b_private")"
     if [[ "$status" -eq 0 ]]; then
-        fail "release.sh --dry-run accepted an ambiguous base64 declaration and signed with key" \
-            "B's private key ($key_b) instead of rejecting the file outright — Swift actually" \
-            "compiles key A ($key_a), so every already-built client would reject this release"
+        fail "release.sh --dry-run accepted a two-value release-public-key.base64 and signed with" \
+            "key B's private key ($key_b) instead of rejecting the file outright"
         echo "$output"
         return
     fi
     if [[ -e "$fixture/dist" ]]; then
-        fail "release.sh created dist/ despite the ambiguous base64 declaration"
+        fail "release.sh created dist/ despite the two-value release-public-key.base64"
         return
     fi
-    pass "ambiguous base64 declaration (naive sed disagrees with what Swift compiles) rejected" \
-        "before any build or signing work, instead of being silently misextracted"
+    pass "decoy second value in keys/release-public-key.base64 rejected before any build or" \
+        "signing work, instead of being silently misread"
 }
 
 test_key_mismatch_rejected_and_matching_key_accepted
@@ -527,7 +504,7 @@ test_artifact_is_immune_to_a_concurrent_checkout_away_and_back
 test_signature_is_rejected_if_the_signing_key_file_is_swapped_mid_build
 test_hostile_codesign_identity_is_rejected_end_to_end
 test_missing_build_commit_key_source_aborts_and_cleans_dist
-test_ambiguous_public_key_declaration_is_rejected_not_silently_misextracted
+test_decoy_second_value_in_data_file_is_rejected_not_silently_misextracted
 
 echo
 if [[ "$FAILURES" -eq 0 ]]; then

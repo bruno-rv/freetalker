@@ -32,8 +32,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_SLUG="bruno-rv/freetalker"
 APP_NAME="FreeTalker"
 
-# shellcheck source=lib/public-key-extract.sh
-source "$REPO_ROOT/scripts/lib/public-key-extract.sh"
+# shellcheck source=lib/public-key-data-file.sh
+source "$REPO_ROOT/scripts/lib/public-key-data-file.sh"
 
 DRY_RUN=0
 VERSION=""
@@ -58,9 +58,10 @@ if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     exit 1
 fi
 
-# Reconstructs a PEM Ed25519 public key from the raw 32-byte base64 value UpdatePublicKey.swift
-# stores (see scripts/make-release-signing-key.sh's `derive_public_key_base64`, which goes the
-# other direction). `302a300506032b6570032100` is the fixed 12-byte SubjectPublicKeyInfo header
+# Reconstructs a PEM Ed25519 public key from the raw 32-byte base64 value
+# keys/release-public-key.base64 stores (see scripts/make-release-signing-key.sh's
+# `derive_public_key_base64`, which goes the other direction). `302a300506032b6570032100` is the
+# fixed 12-byte SubjectPublicKeyInfo header
 # for Ed25519 (RFC 8410: SEQUENCE(AlgorithmIdentifier(OID 1.3.101.112), BIT STRING(32 bytes))) —
 # confirmed byte-for-byte against `openssl pkey -pubout`'s own DER output for a real generated
 # key, not assumed. Used by the post-sign verification below (Round-4 Finding 2) to turn
@@ -110,26 +111,27 @@ if [[ ! -f "$RELEASE_SIGNING_KEY" ]]; then
     exit 1
 fi
 
-# A release signed with a key whose PUBLIC half doesn't match the one compiled into every
-# existing app (UpdatePublicKey.swift) would verify against NOTHING — every existing client
-# would reject it. This happens for real: an interrupted
-# scripts/make-release-signing-key.sh run can leave a PEM whose public half was never written to
-# UpdatePublicKey.swift, or $FREETALKER_RELEASE_SIGNING_KEY can simply point at a different valid
-# key. Derive the public key from THIS key, the exact same way
-# scripts/make-release-signing-key.sh derived the compiled-in one, and refuse to proceed on any
-# mismatch — before any build work, same as the missing-key check above.
-PUBLIC_KEY_SWIFT="$REPO_ROOT/Sources/FreeTalker/Update/UpdatePublicKey.swift"
-# extract_compiled_public_key_base64 (scripts/lib/public-key-extract.sh) is anchored to the
-# exact `static let base64 = "..."` declaration, requires exactly one well-formed match on its
-# own line, and sanity-checks the surrounding file's braces are balanced — never a greedy,
-# unanchored sed that a decoy trailing assignment on the same line could fool (round-6 finding
-# 1). A nonzero return means the file exists but couldn't be safely parsed as either "no anchor
-# yet" or "a valid anchor" — fail closed rather than guess (its own stderr explains why).
-if ! COMPILED_PUBLIC_KEY_BASE64="$(extract_compiled_public_key_base64 "$PUBLIC_KEY_SWIFT")"; then
+# A release signed with a key whose PUBLIC half doesn't match the one every existing app
+# compiles in (generated from keys/release-public-key.base64 — see
+# Plugins/GenerateUpdatePublicKey) would verify against NOTHING — every existing client would
+# reject it. This happens for real: an interrupted scripts/make-release-signing-key.sh run can
+# leave a PEM whose public half was never written to keys/release-public-key.base64, or
+# $FREETALKER_RELEASE_SIGNING_KEY can simply point at a different valid key. Derive the public
+# key from THIS key, the exact same way scripts/make-release-signing-key.sh derived the
+# established one, and refuse to proceed on any mismatch — before any build work, same as the
+# missing-key check above.
+PUBLIC_KEY_DATA_FILE="$REPO_ROOT/keys/release-public-key.base64"
+# read_established_public_key_base64 (scripts/lib/public-key-data-file.sh) reads this file
+# directly — there is no Swift parsing anywhere in this script: Sources/FreeTalker/Update/
+# UpdatePublicKey.swift is GENERATED from this exact file on every build, so there is nothing
+# else it could disagree with. A nonzero return means the file exists but couldn't be safely
+# read as either "no anchor yet" or "a valid anchor" — fail closed rather than guess (its own
+# stderr explains why).
+if ! COMPILED_PUBLIC_KEY_BASE64="$(read_established_public_key_base64 "$PUBLIC_KEY_DATA_FILE")"; then
     exit 1
 fi
 if [[ -z "$COMPILED_PUBLIC_KEY_BASE64" ]]; then
-    echo "error: could not read the compiled-in public key from $PUBLIC_KEY_SWIFT." >&2
+    echo "error: could not read the release-signing public key from $PUBLIC_KEY_DATA_FILE." >&2
     exit 1
 fi
 if ! DERIVED_PUBLIC_KEY_BASE64="$(
@@ -143,10 +145,10 @@ if ! DERIVED_PUBLIC_KEY_BASE64="$(
 fi
 if [[ "$DERIVED_PUBLIC_KEY_BASE64" != "$COMPILED_PUBLIC_KEY_BASE64" ]]; then
     echo "error: the release signing key at $RELEASE_SIGNING_KEY does NOT match the public key" >&2
-    echo "compiled into every existing build ($PUBLIC_KEY_SWIFT). Signing with it would publish" >&2
-    echo "a release every existing client rejects. Refusing to proceed." >&2
+    echo "every existing build compiles in ($PUBLIC_KEY_DATA_FILE). Signing with it would" >&2
+    echo "publish a release every existing client rejects. Refusing to proceed." >&2
     echo "If you just ran scripts/make-release-signing-key.sh and it was interrupted, re-run it" >&2
-    echo "to resume (it will bring $PUBLIC_KEY_SWIFT back in sync with the existing key)." >&2
+    echo "to resume (it will bring $PUBLIC_KEY_DATA_FILE back in sync with the existing key)." >&2
     exit 1
 fi
 
@@ -231,56 +233,56 @@ openssl pkeyutl -sign -inkey "$RELEASE_SIGNING_KEY" -rawin -in "$ASSET_PATH" -ou
 SIGNATURE_BASE64="$(openssl base64 -A -in "$SIGNATURE_PATH")"
 
 # The pre-build check above (COMPILED_PUBLIC_KEY_BASE64 vs DERIVED_PUBLIC_KEY_BASE64) validates
-# that $RELEASE_SIGNING_KEY matches the LIVE tree's UpdatePublicKey.swift — read BEFORE the build,
-# from a path nothing here holds any lock on. Two live sequences can still slip a mismatched
-# signature past that alone: (a) $RELEASE_SIGNING_KEY's PEM path gets atomically replaced with a
-# different (but validly Ed25519) key partway through the multi-second `make bundle` above —
-# `openssl pkeyutl -sign` just reopened the path and signed with whatever's there NOW, which may
-# no longer be what was validated; (b) commit B's public key gets validated in the live tree,
-# then the live tree is checked out to commit A before $BUILD_COMMIT is captured, so `make bundle`
-# builds A's source (in the isolated worktree) while still signing with the key that matches B.
-# Neither is caught by re-checking the LIVE tree afterward (a compromised/racing actor can just as
-# easily have restored it to look clean by then) — verifying the signature just produced against
-# BUILD_COMMIT's OWN compiled-in public key, read from the pristine worktree `make bundle` itself
-# built from (never the live tree), closes both regardless of what changed mid-flight or when:
-# whatever key the artifact ends up verifying against IS, by construction, the one every client
-# built from BUILD_COMMIT actually trusts.
+# that $RELEASE_SIGNING_KEY matches the LIVE tree's keys/release-public-key.base64 — read BEFORE
+# the build, from a path nothing here holds any lock on. Two live sequences can still slip a
+# mismatched signature past that alone: (a) $RELEASE_SIGNING_KEY's PEM path gets atomically
+# replaced with a different (but validly Ed25519) key partway through the multi-second `make
+# bundle` above — `openssl pkeyutl -sign` just reopened the path and signed with whatever's
+# there NOW, which may no longer be what was validated; (b) commit B's public key gets validated
+# in the live tree, then the live tree is checked out to commit A before $BUILD_COMMIT is
+# captured, so `make bundle` builds A's source (in the isolated worktree) while still signing
+# with the key that matches B. Neither is caught by re-checking the LIVE tree afterward (a
+# compromised/racing actor can just as easily have restored it to look clean by then) —
+# verifying the signature just produced against BUILD_COMMIT's OWN established public key, read
+# from the pristine worktree `make bundle` itself built from (never the live tree), closes both
+# regardless of what changed mid-flight or when: whatever key the artifact ends up verifying
+# against IS, by construction, the one every client built from BUILD_COMMIT actually trusts.
 echo "==> Verifying the signature against BUILD_COMMIT's own compiled-in public key"
-PRISTINE_PUBLIC_KEY_SWIFT="$WORKTREE_DIR/Sources/FreeTalker/Update/UpdatePublicKey.swift"
-# extract_compiled_public_key_base64 (scripts/lib/public-key-extract.sh) already treats a
-# missing file as "nothing to extract" (exit 0, empty output) rather than a fatal error — e.g.
-# an older BUILD_COMMIT that predates UpdatePublicKey.swift entirely, reached via --dry-run
-# testing against an old commit — so the `if !` guard below only ever trips on a MALFORMED file
-# (exists but couldn't be safely parsed as either state, round-6 finding 1/2), and the -z check
-# right after it catches "missing" exactly as before. Using the same `if !`/command-substitution
-# guard release.sh already uses above keeps this exempt from `set -e` without needing a bare
+PRISTINE_PUBLIC_KEY_DATA_FILE="$WORKTREE_DIR/keys/release-public-key.base64"
+# read_established_public_key_base64 (scripts/lib/public-key-data-file.sh) already treats a
+# missing file as "nothing to read" (exit 0, empty output) rather than a fatal error — e.g. an
+# older BUILD_COMMIT that predates keys/release-public-key.base64 entirely, reached via
+# --dry-run testing against an old commit — so the `if !` guard below only ever trips on a
+# MALFORMED file (exists but couldn't be safely read as either state), and the -z check right
+# after it catches "missing" exactly as before. Using the same `if !`/command-substitution guard
+# release.sh already uses above keeps this exempt from `set -e` without needing a bare
 # `|| true` to paper over it.
-if ! PRISTINE_PUBLIC_KEY_BASE64="$(extract_compiled_public_key_base64 "$PRISTINE_PUBLIC_KEY_SWIFT")"; then
-    echo "error: BUILD_COMMIT's own source ($PRISTINE_PUBLIC_KEY_SWIFT) exists but its" >&2
-    echo "compiled-in public key could not be safely parsed — see the error above. Refusing to" >&2
-    echo "publish an artifact whose own trust anchor can't be verified." >&2
+if ! PRISTINE_PUBLIC_KEY_BASE64="$(read_established_public_key_base64 "$PRISTINE_PUBLIC_KEY_DATA_FILE")"; then
+    echo "error: BUILD_COMMIT's own source ($PRISTINE_PUBLIC_KEY_DATA_FILE) exists but its" >&2
+    echo "value could not be safely read — see the error above. Refusing to publish an" >&2
+    echo "artifact whose own trust anchor can't be verified." >&2
     rm -rf "$DIST_DIR"
     exit 1
 fi
 if [[ -z "$PRISTINE_PUBLIC_KEY_BASE64" ]]; then
     echo "error: could not read the compiled-in public key from BUILD_COMMIT's own source" >&2
-    echo "($PRISTINE_PUBLIC_KEY_SWIFT)." >&2
+    echo "($PRISTINE_PUBLIC_KEY_DATA_FILE)." >&2
     rm -rf "$DIST_DIR"
     exit 1
 fi
 PRISTINE_PUBLIC_KEY_PEM="$WORKTREE_DIR/.build-verify-pubkey.pem"
 if ! reconstruct_public_key_pem "$PRISTINE_PUBLIC_KEY_BASE64" "$PRISTINE_PUBLIC_KEY_PEM" || [[ ! -s "$PRISTINE_PUBLIC_KEY_PEM" ]]; then
-    echo "error: could not reconstruct a public key from BUILD_COMMIT's compiled-in base64" >&2
-    echo "($PRISTINE_PUBLIC_KEY_SWIFT) — is it a valid 32-byte raw Ed25519 public key?" >&2
+    echo "error: could not reconstruct a public key from BUILD_COMMIT's own base64" >&2
+    echo "($PRISTINE_PUBLIC_KEY_DATA_FILE) — is it a valid 32-byte raw Ed25519 public key?" >&2
     rm -rf "$DIST_DIR"
     exit 1
 fi
 if ! openssl pkeyutl -verify -pubin -inkey "$PRISTINE_PUBLIC_KEY_PEM" -rawin -in "$ASSET_PATH" -sigfile "$SIGNATURE_PATH" >/dev/null 2>&1; then
     echo "error: the signature just produced does NOT verify against BUILD_COMMIT's own" >&2
-    echo "compiled-in public key ($PRISTINE_PUBLIC_KEY_SWIFT). The key actually used to sign no" >&2
-    echo "longer matches what was validated before the build, or BUILD_COMMIT's own public key" >&2
-    echo "differs from what was validated — refusing to publish an artifact that every client" >&2
-    echo "built from BUILD_COMMIT would reject." >&2
+    echo "compiled-in public key ($PRISTINE_PUBLIC_KEY_DATA_FILE). The key actually used to sign" >&2
+    echo "no longer matches what was validated before the build, or BUILD_COMMIT's own public" >&2
+    echo "key differs from what was validated — refusing to publish an artifact that every" >&2
+    echo "client built from BUILD_COMMIT would reject." >&2
     # Removed, not left behind for someone to accidentally hand-publish: this is a real, validly
     # zipped/checksummed artifact, just signed with (or compiled against) the wrong key — nothing
     # about its own shape looks obviously broken.
