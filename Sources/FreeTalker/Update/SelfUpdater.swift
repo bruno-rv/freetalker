@@ -32,14 +32,14 @@ enum SelfUpdater {
         case failed(String)
     }
 
-    /// Whether `runUpdate`'s staging directory (which, after a backup-then-promote swap, may be
-    /// the ONLY place the user's previous app still exists — see `backupPath`) may be deleted
-    /// once the update attempt finishes. Pure and independently testable: the one case that
-    /// must answer `false` is `.rollbackFailed`, where `SelfUpdateInstaller.swap` already
-    /// backed up the original app but couldn't put it back. Every other outcome (including
-    /// "no swap was attempted at all" — `nil`, e.g. a download/verification failure) is safe to
-    /// clean up, because nothing that survives only in staging is unique to the user in those
-    /// cases.
+    /// Whether a swap's working backup — see `elevatePreservedBackup` — must be rescued out of
+    /// the per-invocation staging directory before that directory is deleted. Pure and
+    /// independently testable: the one case that must answer `true` is `.rollbackFailed`, where
+    /// `SelfUpdateInstaller.swap` already backed up the original app but couldn't put it back.
+    /// Every other outcome (including "no swap was attempted at all" — `nil`, e.g. a
+    /// download/verification failure) is safe to clean up as part of ordinary per-invocation
+    /// staging cleanup, because nothing that survives only in staging is unique to the user in
+    /// those cases.
     static func shouldPreserveStagingRoot(after result: SelfUpdateInstaller.SwapResult?) -> Bool {
         result == .rollbackFailed
     }
@@ -134,30 +134,113 @@ enum SelfUpdater {
     }
 
     /// True when a PRIOR update attempt left the user's original app preserved at
-    /// `stagingRoot/backup.app` because `SelfUpdateInstaller.swap` backed it up but then failed
-    /// to restore it (`.rollbackFailed` — see `shouldPreserveStagingRoot`). That backup is the
-    /// user's ONLY surviving copy of their previous app in that state. Checked against the
-    /// filesystem directly (not any in-memory result, which doesn't survive a relaunch) so it
-    /// catches a backup left by a PREVIOUS run of the app, not just this one — `runUpdate` must
-    /// refuse to proceed while this is true, rather than its old behavior of unconditionally
-    /// deleting the whole staging directory (backup included) before ever looking inside it.
-    static func stagingHasPreservedBackup(stagingRoot: URL, fileManager: FileManager = .default) -> Bool {
-        fileManager.fileExists(atPath: stagingRoot.appendingPathComponent("backup.app").path)
+    /// `updateRoot/backup.app` — the ONE canonical, fixed location, shared by every invocation
+    /// past and future — because `SelfUpdateInstaller.swap` backed it up but then failed to
+    /// restore it (`.rollbackFailed` — see `shouldPreserveStagingRoot`/`elevatePreservedBackup`).
+    /// That backup is the user's ONLY surviving copy of their previous app in that state. Checked
+    /// against the filesystem directly (not any in-memory result, which doesn't survive a
+    /// relaunch) so it catches a backup left by a PREVIOUS run of the app, not just this one —
+    /// `runUpdate` must refuse to proceed while this is true.
+    static func stagingHasPreservedBackup(stagingRoot updateRoot: URL, fileManager: FileManager = .default) -> Bool {
+        fileManager.fileExists(atPath: updateRoot.appendingPathComponent("backup.app").path)
     }
+
+    /// Builds a fresh, unpredictable-to-nobody-but-this-call staging directory under
+    /// `updateRoot` for ONE invocation of `runUpdate`. Pulled out as its own pure function
+    /// (rather than inlined) so it's directly testable: the property that matters is that two
+    /// calls never collide, which `SelfUpdaterTests` verifies without needing to run two real
+    /// updates concurrently. `UUID()` gives that uniqueness the same way it does everywhere else
+    /// in this codebase that needs an unguessable, collision-free name.
+    ///
+    /// This is the isolation half of the fix for the concurrent-update finding: `update.zip`,
+    /// `extracted/`, and the in-flight working backup all end up nested under this per-call
+    /// directory, so a second invocation — even one racing the first — can never write to, or
+    /// read from, the same path the first is verifying and unpacking.
+    static func makeInvocationStagingRoot(updateRoot: URL) -> URL {
+        updateRoot.appendingPathComponent("run-\(UUID().uuidString)", isDirectory: true)
+    }
+
+    /// Moves a swap's in-flight working backup (private to one `runUpdate` invocation, see
+    /// `makeInvocationStagingRoot`) into the ONE canonical, cross-relaunch-discoverable location
+    /// `stagingHasPreservedBackup` checks. Called ONLY when `SelfUpdateInstaller.swap` reports
+    /// `.rollbackFailed` — i.e. only when this content is genuinely the user's sole surviving
+    /// copy of their previous app, never on a successful update. That discipline is what keeps
+    /// `backupPath`'s mere existence trustworthy: a caller can act on "this backup exists" as
+    /// "you must recover this" without also having to ask "or is this just leftover junk from a
+    /// healthy install?" — the two can no longer be confused, because a healthy install's
+    /// leftover junk (if any) never gets moved here in the first place; see `runUpdate`.
+    static func elevatePreservedBackup(from workingBackupPath: URL, to backupPath: URL, fileManager: FileManager = .default) -> Bool {
+        do {
+            try fileManager.createDirectory(at: backupPath.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try fileManager.moveItem(at: workingBackupPath, to: backupPath)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Ensures at most one `runUpdate` body executes at a time. Necessary IN ADDITION to the
+    /// per-invocation staging isolation above, not instead of it: `SelfUpdateInstaller.swap`
+    /// mutates `installedBundlePath` itself — a single resource shared by every invocation no
+    /// matter how private each one's own staging directory is. Two concurrent swaps racing to
+    /// move the same live install out from under each other (or a second invocation deleting a
+    /// backup a slower one just preserved at the canonical `backupPath`) are both races on that
+    /// SHARED state, which private staging alone does nothing to prevent. In-process (an
+    /// `NSLock`-guarded flag, same pattern as `LockedOutputBuffer`/`KillEscalationCancelToken`
+    /// below) is sufficient because `FreeTalker` only ever runs as a single instance — see
+    /// whatever enforces that single-instance lease elsewhere in the app.
+    private final class UpdateInProgressGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var inProgress = false
+
+        /// Atomically claims the gate; `false` means another update is already running and
+        /// nothing was claimed.
+        func begin() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !inProgress else { return false }
+            inProgress = true
+            return true
+        }
+
+        func end() {
+            lock.lock()
+            inProgress = false
+            lock.unlock()
+        }
+    }
+
+    private static let updateGate = UpdateInProgressGate()
 
     private static func runUpdate(
         manifest: UpdateManifest, installedBundlePath: URL, session: URLSession
     ) async -> UpdateOutcome {
+        // Claimed FIRST, before any filesystem or network access, so a second concurrent call
+        // fails fast rather than racing the first through download/verify/swap. See
+        // `UpdateInProgressGate`'s doc comment for why staging isolation alone can't replace
+        // this.
+        guard Self.updateGate.begin() else {
+            return .failed("An update is already in progress — try again once it finishes.")
+        }
+        defer { Self.updateGate.end() }
+
         let fileManager = FileManager.default
-        let stagingRoot = installedBundlePath.deletingLastPathComponent()
+        let updateRoot = installedBundlePath.deletingLastPathComponent()
             .appendingPathComponent(".freetalker-update", isDirectory: true)
-        let backupPath = stagingRoot.appendingPathComponent("backup.app")
+        // The ONE canonical, fixed location a preserved rollback-failure backup can ever live —
+        // NOT per-invocation, so it stays discoverable across process relaunches (a backup left
+        // by a previous run of the app must still block this one). Populated ONLY via
+        // `elevatePreservedBackup` below, and ONLY on `.rollbackFailed` — never by a successful
+        // update, whose own working backup lives and dies inside that invocation's private
+        // `stagingRoot` instead. See `elevatePreservedBackup`'s doc comment for why that
+        // discipline matters.
+        let backupPath = updateRoot.appendingPathComponent("backup.app")
 
         // A preserved backup from a previous failed update is the user's only surviving copy of
-        // their previous app — refuse to proceed (and, critically, don't wipe `stagingRoot`)
-        // until it's been recovered manually. Must run BEFORE the unconditional
-        // `removeItem(at: stagingRoot)` below, which used to destroy exactly this.
-        guard !Self.stagingHasPreservedBackup(stagingRoot: stagingRoot, fileManager: fileManager) else {
+        // their previous app — refuse to proceed until it's been recovered manually. Checked
+        // against `updateRoot`, not any per-invocation staging directory, so it catches a backup
+        // left by a PREVIOUS run of the app.
+        guard !Self.stagingHasPreservedBackup(stagingRoot: updateRoot, fileManager: fileManager) else {
             return .failed(
                 "A previous update couldn't restore your prior app automatically, and it's still "
                     + "preserved at \(backupPath.path). Move it to \(installedBundlePath.path) "
@@ -165,19 +248,28 @@ enum SelfUpdater {
                     + "is there, to avoid deleting your only remaining copy."
             )
         }
-        try? fileManager.removeItem(at: stagingRoot)
+
+        // Private to THIS invocation — see `makeInvocationStagingRoot`. `update.zip`,
+        // `extracted/`, and the working backup used during this invocation's swap all live
+        // here, under a name no other invocation (past, concurrent, or future) ever knows or
+        // reuses, so nothing can overwrite bytes this invocation has already verified.
+        let stagingRoot = Self.makeInvocationStagingRoot(updateRoot: updateRoot)
         do {
             try fileManager.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
         } catch {
             return .failed("Could not create a staging directory next to the installed app.")
         }
-        // `swapResult` is set only once a swap is actually attempted (step 6). Preserving
-        // staging on `.rollbackFailed` matters because `backupPath` — the user's only surviving
-        // copy of their previous app in that case — lives inside it; see
-        // `shouldPreserveStagingRoot`.
-        var swapResult: SelfUpdateInstaller.SwapResult?
+        let workingBackupPath = stagingRoot.appendingPathComponent("backup.app")
+        // Whether it's safe to delete this invocation's ENTIRE private `stagingRoot` once the
+        // attempt finishes. Starts `true` (the common case: nothing in a private, per-invocation
+        // directory is ever unique to the user) and is flipped to `false` only in the narrow
+        // window between a `.rollbackFailed` swap and a successful `elevatePreservedBackup` —
+        // i.e. only while `workingBackupPath`, still inside `stagingRoot`, is the user's sole
+        // surviving copy of their previous app and hasn't yet been rescued out to the canonical
+        // `backupPath`.
+        var stagingRootSafeToDelete = true
         defer {
-            if !Self.shouldPreserveStagingRoot(after: swapResult) {
+            if stagingRootSafeToDelete {
                 try? fileManager.removeItem(at: stagingRoot)
             }
         }
@@ -287,27 +379,45 @@ enum SelfUpdater {
             return .failed("The downloaded update failed to start — refusing to install it.")
         }
 
-        // 7. Atomic swap with rollback.
+        // 7. Atomic swap with rollback. `backupPath` here is `workingBackupPath` — private to
+        // THIS invocation — never the canonical, fixed `backupPath` above; see
+        // `elevatePreservedBackup`.
         let result = SelfUpdateInstaller.swap(
             installedPath: installedBundlePath,
             stagedPath: stagedBundle,
-            backupPath: backupPath,
+            backupPath: workingBackupPath,
             ops: SelfUpdateInstaller.FileOps(
                 moveItem: { try fileManager.moveItem(at: $0, to: $1) },
                 removeItem: { try fileManager.removeItem(at: $0) },
                 fileExists: { fileManager.fileExists(atPath: $0.path) }
             )
         )
-        swapResult = result
         switch result {
         case .success:
             return .success
         case .rolledBack:
             return .failed("The update couldn't be installed — your previous version is unchanged.")
         case .rollbackFailed:
+            // The user's only surviving copy of their previous app is at `workingBackupPath`,
+            // still inside this invocation's private `stagingRoot` — rescue it to the canonical,
+            // cross-relaunch-discoverable `backupPath` BEFORE the `defer` above can delete
+            // `stagingRoot`. See `shouldPreserveStagingRoot`/`elevatePreservedBackup`.
+            if Self.shouldPreserveStagingRoot(after: result),
+                Self.elevatePreservedBackup(from: workingBackupPath, to: backupPath, fileManager: fileManager)
+            {
+                return .failed(
+                    "The update failed partway and your previous app couldn't be restored automatically. "
+                        + "It's preserved at \(backupPath.path) — move it to \(installedBundlePath.path) manually."
+                )
+            }
+            // Elevation itself failed (e.g. couldn't create `updateRoot`) — the backup is still
+            // only reachable at `workingBackupPath`. Must not let the `defer` above delete it:
+            // report its ACTUAL location rather than claiming it's at `backupPath`, which would
+            // be false.
+            stagingRootSafeToDelete = false
             return .failed(
                 "The update failed partway and your previous app couldn't be restored automatically. "
-                    + "It's preserved at \(backupPath.path) — move it to \(installedBundlePath.path) manually."
+                    + "It's preserved at \(workingBackupPath.path) — move it to \(installedBundlePath.path) manually."
             )
         case .backupFailed:
             return .failed(

@@ -2,7 +2,12 @@ import Foundation
 import Testing
 @testable import FreeTalker
 
-@Suite struct SelfUpdaterTests {
+// `.serialized`: several tests here drive `SelfUpdater.performUpdate`, which claims a
+// process-wide, in-process `UpdateInProgressGate` (see `SelfUpdater.swift`) — exactly the
+// production behavior the concurrent-update fix relies on. Running this suite's tests in
+// parallel (Swift Testing's default) would make that shared gate a source of cross-TEST
+// flakiness having nothing to do with the production bug it exists to catch.
+@Suite(.serialized) struct SelfUpdaterTests {
     @Test func evaluateReportsAvailableWhenManifestIsNewer() {
         let manifest = UpdateManifest(version: "v1.3.0", assetURL: URL(string: "https://example.com/a.zip")!, sha256: "deadbeef", signature: "sig")
         let result = SelfUpdater.evaluate(current: SemanticVersion(major: 1, minor: 2, patch: 0), manifest: manifest)
@@ -127,6 +132,165 @@ import Testing
         #expect(message.contains(backupPath.path))
         // The property that actually matters: the preserved backup must survive untouched.
         #expect(FileManager.default.fileExists(atPath: backupBinary.path))
+    }
+
+    // MARK: makeInvocationStagingRoot / concurrent-update isolation (Round-3 Finding 1)
+
+    /// The core isolation property the fix depends on: two invocations must never compute the
+    /// same staging path. `UUID()`-based, but asserted directly rather than assumed — if this
+    /// ever started returning a fixed/predictable name (the exact shape of the original bug,
+    /// where every invocation shared `.freetalker-update/update.zip`), this is what would catch
+    /// it.
+    @Test func makeInvocationStagingRootIsUniquePerCall() {
+        let updateRoot = URL(fileURLWithPath: "/Applications/.freetalker-update", isDirectory: true)
+        let first = SelfUpdater.makeInvocationStagingRoot(updateRoot: updateRoot)
+        let second = SelfUpdater.makeInvocationStagingRoot(updateRoot: updateRoot)
+        #expect(first != second)
+        #expect(first.deletingLastPathComponent() == updateRoot)
+        #expect(second.deletingLastPathComponent() == updateRoot)
+    }
+
+    /// Blocks `startLoading()` until the test explicitly releases it, so a test can GUARANTEE two
+    /// `performUpdate` calls are genuinely overlapping in time — not hoping a wall-clock race
+    /// lines up — before asserting what happens when a second one starts while the first is still
+    /// mid-download. This is exactly the "call B starts... stalls" shape from the finding.
+    private final class StallingURLProtocol: URLProtocol, @unchecked Sendable {
+        static let requestStarted = DispatchSemaphore(value: 0)
+        static let releaseResponse = DispatchSemaphore(value: 0)
+
+        override class func canInit(with request: URLRequest) -> Bool { true }
+        override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+        override func startLoading() {
+            Self.requestStarted.signal()
+            Self.releaseResponse.wait()
+            guard let url = request.url, let client else { return }
+            let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            client.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client.urlProtocol(self, didLoad: Data("not a real signed zip — only used to prove the gate rejects overlap".utf8))
+            client.urlProtocolDidFinishLoading(self)
+        }
+
+        override func stopLoading() {}
+
+        // Plain (non-`async`) wrappers around the semaphore waits: `DispatchSemaphore.wait()`
+        // is `@available(*, noasync)` — calling it directly from an `async` test body is a
+        // compile error (it would block a cooperative-pool thread). Routing through an ordinary
+        // synchronous function sidesteps that while keeping the actual blocking-wait behavior
+        // this test needs to guarantee real overlap between the two calls.
+        static func blockUntilRequestStarted() { requestStarted.wait() }
+        static func releaseTheBlockedResponse() { releaseResponse.signal() }
+    }
+
+    /// Reproduces the exact concurrency shape of Round-3 Finding 1: call A is genuinely mid-flight
+    /// (blocked on the network, past the point where a shared `update.zip` would already have
+    /// been created under the OLD code) when call B starts against the SAME installed bundle.
+    /// Demonstrates the fix concretely: B is rejected by `SelfUpdater`'s in-process gate
+    /// IMMEDIATELY — before it can create a staging directory, write anything, or observe A's
+    /// path at all — and A completing afterward is unaffected by B having been attempted. A
+    /// revert that dropped `UpdateInProgressGate` (while leaving per-invocation staging in place)
+    /// would fail this test: B would proceed to create its OWN staging directory instead of being
+    /// rejected, so `secondReason.contains("already in progress")` would fail.
+    @Test func secondConcurrentUpdateIsRejectedWhileFirstIsInFlightRatherThanRacingItsStagingPath() async throws {
+        let installedRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: installedRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: installedRoot) }
+        let installedBundlePath = installedRoot.appendingPathComponent("FreeTalker.app")
+
+        let manifest = UpdateManifest(
+            version: "v99.0.0", assetURL: URL(string: "https://stalling.freetalker.invalid/update.zip")!,
+            sha256: "unused", signature: "unused"
+        )
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [StallingURLProtocol.self]
+        let session = URLSession(configuration: config)
+
+        async let firstOutcome = SelfUpdater.performUpdate(
+            manifest: manifest, installedBundlePath: installedBundlePath, session: session
+        )
+
+        // Block until call A has genuinely reached the network — guarantees real overlap rather
+        // than a timing-dependent race.
+        StallingURLProtocol.blockUntilRequestStarted()
+
+        let secondOutcome = await SelfUpdater.performUpdate(
+            manifest: manifest, installedBundlePath: installedBundlePath, session: session
+        )
+        guard case .failed(let secondReason) = secondOutcome else {
+            Issue.record("expected the second concurrent call to fail, got \(secondOutcome)")
+            StallingURLProtocol.releaseTheBlockedResponse()
+            _ = await firstOutcome
+            return
+        }
+        #expect(secondReason.contains("already in progress"))
+
+        // Let call A proceed — it fails later for an unrelated reason (bogus checksum, since this
+        // test never constructs a real signed zip), which is irrelevant here: the property under
+        // test is that B never got to run AT ALL while A held the gate, not what became of A.
+        StallingURLProtocol.releaseResponse.signal()
+        let resolvedFirst = await firstOutcome
+        guard case .failed(let firstReason) = resolvedFirst else {
+            Issue.record("expected call A to also fail (bogus checksum), got \(resolvedFirst)")
+            return
+        }
+        #expect(!firstReason.contains("already in progress"))
+        // And the gate is released again afterward — a THIRD call isn't permanently wedged by
+        // the two above.
+        let thirdOutcome = await SelfUpdater.performUpdate(
+            manifest: manifest, installedBundlePath: installedBundlePath, session: .shared
+        )
+        guard case .failed(let thirdReason) = thirdOutcome else {
+            Issue.record("expected the third call to also fail (unreachable host), got \(thirdOutcome)")
+            return
+        }
+        #expect(!thirdReason.contains("already in progress"))
+    }
+
+    // MARK: elevatePreservedBackup (Round-3 Finding 2 — a successful update wedging the next one)
+
+    /// The genuine-rollback-failure path: `elevatePreservedBackup` must move the per-invocation
+    /// working backup to the canonical location `stagingHasPreservedBackup` checks, so it stays
+    /// discoverable across process relaunches. This is the EXACT function `runUpdate` calls on
+    /// `.rollbackFailed` — not a re-derived stand-in.
+    @Test func elevatePreservedBackupMovesTheWorkingBackupToTheCanonicalLocationAndMakesItDiscoverable() throws {
+        let updateRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: updateRoot) }
+        let workingBackupPath = updateRoot.appendingPathComponent("run-\(UUID().uuidString)/backup.app")
+        let backupBinary = workingBackupPath.appendingPathComponent("Contents/MacOS/FreeTalker")
+        try FileManager.default.createDirectory(at: backupBinary.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("genuine previous app".utf8).write(to: backupBinary)
+        let canonicalBackupPath = updateRoot.appendingPathComponent("backup.app")
+
+        #expect(SelfUpdater.elevatePreservedBackup(from: workingBackupPath, to: canonicalBackupPath))
+        #expect(!FileManager.default.fileExists(atPath: workingBackupPath.path))
+        #expect(FileManager.default.fileExists(atPath: canonicalBackupPath.appendingPathComponent("Contents/MacOS/FreeTalker").path))
+        // Discoverable across a relaunch the same way a genuine `.rollbackFailed` backup must be.
+        #expect(SelfUpdater.stagingHasPreservedBackup(stagingRoot: updateRoot))
+    }
+
+    /// Fails closed rather than crashing when there's nothing to elevate — defensive, but matters
+    /// because this runs on the failure path of an already-failing update.
+    @Test func elevatePreservedBackupFailsClosedWhenTheSourceIsMissing() {
+        let updateRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let missingSource = updateRoot.appendingPathComponent("run-\(UUID().uuidString)/backup.app")
+        let canonicalBackupPath = updateRoot.appendingPathComponent("backup.app")
+        #expect(!SelfUpdater.elevatePreservedBackup(from: missingSource, to: canonicalBackupPath))
+    }
+
+    /// Reproduces Round-3 Finding 2 directly: leftover junk from a swallowed cleanup failure
+    /// after a SUCCESSFUL update sits inside a per-invocation `run-*` directory — NEVER at the
+    /// canonical `backup.app` path, because `elevatePreservedBackup` (the ONLY thing that ever
+    /// populates the canonical path) is called ONLY on `.rollbackFailed`. A verifier that let
+    /// success-path leftovers reach the canonical name would fail this test: it would see
+    /// `stagingHasPreservedBackup` report `true` for stray junk from a HEALTHY install, wedging
+    /// every future update exactly the way the finding describes.
+    @Test func leftoverJunkInsideAPerInvocationDirectoryNeverWedgesFutureUpdates() throws {
+        let updateRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: updateRoot) }
+        let leftoverJunk = updateRoot.appendingPathComponent("run-\(UUID().uuidString)/backup.app/Contents/MacOS")
+        try FileManager.default.createDirectory(at: leftoverJunk, withIntermediateDirectories: true)
+
+        #expect(!SelfUpdater.stagingHasPreservedBackup(stagingRoot: updateRoot))
     }
 
     // MARK: validateStagedVersion (Finding 4 — manifest/artifact version binding)
