@@ -421,6 +421,11 @@ final class AppCoordinator: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.restartHotKeyListening() }
             .store(in: &cancellables)
+        AppSettings.shared.$correctionPanelHotKeySpec
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.restartHotKeyListening() }
+            .store(in: &cancellables)
         // Tracks the last non-FreeTalker frontmost app for the Dictation History Quick Panel's
         // menu-item fallback (PLAN.md F3.2) — never removed, same lifetime as this singleton.
         NSWorkspace.shared.notificationCenter.addObserver(
@@ -589,11 +594,18 @@ final class AppCoordinator: ObservableObject {
         hotKeyManager.onHistoryPanelKeyDown = { [weak self] _, target in
             self?.handleHistoryPanelHotKey(target: target)
         }
+        // Correction Loop signal A: gated on the SAME recording-state check
+        // `HistoryPanelController` uses (`CorrectionPanelController.open()`), so pressing it
+        // mid-Recording is simply a no-op, same as every other panel hotkey.
+        hotKeyManager.onCorrectionPanelKeyDown = { _, _ in
+            CorrectionPanelController.shared.open()
+        }
         if hotKeyManager.start(
             spec: AppSettings.shared.hotKeySpec,
             insertLastDictationSpec: AppSettings.shared.insertLastDictationHotKeySpec,
             voiceEditSpec: AppSettings.shared.voiceEditHotKeySpec,
-            historyPanelSpec: AppSettings.shared.historyPanelHotKeySpec
+            historyPanelSpec: AppSettings.shared.historyPanelHotKeySpec,
+            correctionPanelSpec: AppSettings.shared.correctionPanelHotKeySpec
         ) {
             isHotKeyListening = true
             hotKeyStatusText = nil
@@ -772,7 +784,33 @@ final class AppCoordinator: ObservableObject {
         window.isFloatingPanel = true
         window.title = "Voice Edit Preview"
         window.isReleasedWhenClosed = false
-        window.contentView = NSHostingView(rootView: VoiceEditPreviewView(coordinator: coordinator) { [weak self] in
+        // Correction Loop signal B: this Voice Edit session targeted `RecentInsertion` (rather
+        // than a plain manual selection) only if `selection` is EXACTLY what `CorrectionTargeting.
+        // selectRecentInsertion` would have produced from the store's CURRENT recent insertion —
+        // re-derived here rather than threaded through the whole capture→transcribe→present
+        // pipeline as extra mutable state. A newer dictation completing while the user spoke
+        // their instruction naturally fails this match (different text/anchor), which correctly
+        // means no vocabulary write, not a mismatched one.
+        let correctionDictationID: Int64? = {
+            guard let recent = RecentInsertionStore.shared.recent(),
+                  recent.text == selection.text, recent.anchor == selection.range.location
+            else { return nil }
+            return recent.dictationID
+        }()
+        window.contentView = NSHostingView(rootView: VoiceEditPreviewView(
+            coordinator: coordinator,
+            onReplaced: { [weak self] original, replaced in
+                guard let self, let dictationID = correctionDictationID, let vocabStore = self.vocabStore else { return }
+                Task {
+                    if let outcome = try? await CorrectionRecorder.record(
+                        dictationID: dictationID, wrongText: original, rightText: replaced, store: vocabStore
+                    ) {
+                        await self.refreshApprovedVocabularyCache()
+                        self.flashCorrectionOutcome(outcome)
+                    }
+                }
+            }
+        ) { [weak self] in
             self?.closeVoiceEditWindow(clearCoordinator: true)
         })
         let delegate = VoiceEditWindowDelegate { [weak self] in
@@ -789,6 +827,27 @@ final class AppCoordinator: ObservableObject {
         Task { await coordinator.begin() }
     }
 
+    /// Shared informational surface for `CorrectionRecorder.record(...)` results (Correction Loop
+    /// signals B and C — signal A's panel shows its own interactive confirm/swap UI instead, since
+    /// it already has a window open to put one in). `.approved`/`.alreadyApproved`/
+    /// `.invalidTerm`/`.noWrongRightPair` need no user action, so they stay silent — only the two
+    /// outcomes that require an explicit follow-up decision (requirements 5, 10: never evict or
+    /// resurrect silently) get a HUD flash naming what to do next.
+    func flashCorrectionOutcome(_ outcome: CorrectionRecorder.Outcome) {
+        switch outcome {
+        case .approved, .alreadyApproved, .invalidTerm, .noWrongRightPair:
+            break
+        case .needsDismissalConfirmation(let surfaceTerm):
+            hud.flash("\"\(surfaceTerm)\" was previously dismissed — open Settings > Vocabulary to approve it again")
+        case .budgetFull(_, let swapSurface, let newTerm):
+            if swapSurface.isEmpty {
+                hud.flash("\"\(newTerm)\" doesn't fit your vocabulary budget — trim it in Settings")
+            } else {
+                hud.flash("\"\(newTerm)\" doesn't fit — open Settings > Vocabulary to swap out \"\(swapSurface)\"")
+            }
+        }
+    }
+
     private func closeVoiceEditWindow(clearCoordinator: Bool) {
         if clearCoordinator { voiceEditCoordinator?.cancel() }
         voiceEditWindow?.delegate = nil
@@ -798,9 +857,24 @@ final class AppCoordinator: ObservableObject {
         if clearCoordinator { voiceEditCoordinator = nil }
     }
 
+    /// `recentInsertionSelection`: Correction Loop signal B (BRAINSTORM_CORRECTION_LOOP.md — "a
+    /// spoken correction targets the most recent dictation WITHOUT requiring the user to select
+    /// text first"). Consulted ONLY on `.noEditableSelection` (an editable, non-secure focused
+    /// element with nothing currently highlighted) — never on `.secureField`, `.targetChanged`,
+    /// `.selectionChanged`, or `.noFrontmostApplication`, where falling back would either bypass a
+    /// security check or target a field/app the live capture just proved isn't the one in front.
+    /// Its production default lives-selects the most recent dictation's remembered insertion range
+    /// via AX (`CorrectionTargeting.selectRecentInsertion`) so the REST of this flow — preview,
+    /// confirm, drift-refusal — is the exact same, unmodified Voice Edit machinery downstream; a
+    /// nil result (nothing recent, or it's drifted) falls through to the ordinary "select text
+    /// first" message exactly as before. Injectable so existing capture-error tests stay
+    /// deterministic regardless of `RecentInsertionStore.shared`'s process-wide state.
     static func handleVoiceEditHotKey(
         selectionAccess: any SelectionAccessing,
         pendingSelection: inout SelectionSnapshot?,
+        recentInsertionSelection: @MainActor () -> SelectionSnapshot? = {
+            RecentInsertionStore.shared.recent().flatMap { CorrectionTargeting.selectRecentInsertion($0) }
+        },
         flash: (String) -> Void
     ) {
         do {
@@ -810,7 +884,13 @@ final class AppCoordinator: ObservableObject {
             switch error {
             case .secureField:
                 flash("Voice Edit is unavailable in secure fields")
-            case .noEditableSelection, .noFrontmostApplication:
+            case .noEditableSelection:
+                if let fallback = recentInsertionSelection() {
+                    pendingSelection = fallback
+                    return
+                }
+                flash("Select editable text first")
+            case .noFrontmostApplication:
                 flash("Select editable text first")
             case .targetChanged, .selectionChanged:
                 flash("Selection changed — select text and try again")
@@ -2972,6 +3052,16 @@ final class AppCoordinator: ObservableObject {
                 await engine.reset()
                 self?.streamingModelStore.markCaptureActive(false)
             }
+            // Correction Loop: captured BEFORE `finalize()` below, which clears the ledger on a
+            // verified `.insert` — `baselineValue`/`caretAnchor` are the exact pre-typing
+            // document value and splice offset `LiveInsertionSession` already tracked for its own
+            // streaming-safety readback (`Insertion.documentMatchesBaselinePlusLedger`); once the
+            // ledger is backspaced back to nothing, the paste below lands `finalText` at that same
+            // offset, so this is the correct baseline/anchor for the FINAL paste too — reused, not
+            // recomputed via a second AX read the way the batch path's `captureCorrectionAnchor`
+            // needs to.
+            let preFinalizeBaseline = session.baselineValue
+            let preFinalizeAnchor = session.caretAnchor
             switch session.finalize(action: .done, refinedText: text, rawText: text) {
             case .insert(let finalText):
                 // Codex round 3 finding 1: an empty-ledger `.insert` (nothing was ever typed live)
@@ -2980,11 +3070,30 @@ final class AppCoordinator: ObservableObject {
                 // true` here closes the same window at the actual paste: a same-app focus change
                 // (a collapsed-selection element comparison that's `.unavailable`) is refused
                 // rather than permissively pasted, same as every other streaming-live paste site.
-                return Insertion.insert(finalText, target: session.target, strict: true).posted
+                let posted = Insertion.insert(finalText, target: session.target, strict: true).posted
+                if posted, let preFinalizeBaseline, let preFinalizeAnchor {
+                    RecentInsertionStore.shared.notePending(.init(
+                        target: session.target, baselineValue: preFinalizeBaseline,
+                        anchor: preFinalizeAnchor, text: finalText
+                    ))
+                } else {
+                    // Either the paste didn't post, or the ledger was empty (nothing was ever
+                    // typed live, so `LiveInsertionSession` never captured a baseline/anchor to
+                    // reuse) — Correction Loop simply won't offer a correction for this
+                    // insertion; never a parallel, less-verified AX read just to cover this rare
+                    // edge case.
+                    RecentInsertionStore.shared.clearPending()
+                }
+                return posted
             case .clipboardOnly:
                 self.hud.flash("Live dictation moved to the clipboard — the target app changed or the text was long")
+                // The ledger text stayed on screen unverified against `finalText` (refined) — not
+                // what Correction Loop would show as "what was heard" for this dictation, so no
+                // insertion is tracked for it (see `RecentInsertion`'s doc comment).
+                RecentInsertionStore.shared.clearPending()
                 return false
             case .none:
+                RecentInsertionStore.shared.clearPending()
                 return true
             }
         }
@@ -3174,7 +3283,7 @@ final class AppCoordinator: ObservableObject {
                     cloudSnapshot: cloudSnapshot.eligibility.isEligible ? cloudSnapshot : nil,
                     voiceCommands: voiceCommands, vocabularySnapshot: vocabularySnapshot,
                     processor: processor, localContext: localContext,
-                    insert: liveInsert ?? { Insertion.insert($0, target: $1).posted },
+                    insert: liveInsert ?? { Insertion.insertTrackingCorrection($0, target: $1) },
                     record: { result in
                         try LibraryStore.shared.record(
                             language: result.sourceLanguage.rawValue,
@@ -3517,7 +3626,7 @@ final class AppCoordinator: ObservableObject {
         processor: (any PostProcessor)? = nil,
         translator: any Translating = TranslationService(),
         localContext: LocalProcessingContext? = nil,
-        insert: (String, InsertionTarget?) -> Bool = { Insertion.insert($0, target: $1).posted },
+        insert: (String, InsertionTarget?) -> Bool = { Insertion.insertTrackingCorrection($0, target: $1) },
         record: (RecordingProcessingResult) throws -> Void = { result in
             try LibraryStore.shared.record(
                 language: result.sourceLanguage.rawValue,
@@ -3559,7 +3668,7 @@ final class AppCoordinator: ObservableObject {
         processor: (any PostProcessor)? = nil,
         translator: any Translating = TranslationService(),
         localContext: LocalProcessingContext? = nil,
-        insert: (String, InsertionTarget?) -> Bool = { Insertion.insert($0, target: $1).posted },
+        insert: (String, InsertionTarget?) -> Bool = { Insertion.insertTrackingCorrection($0, target: $1) },
         record: (RecordingProcessingResult) throws -> Void = { result in
             try LibraryStore.shared.record(
                 language: result.sourceLanguage.rawValue,
@@ -3797,6 +3906,22 @@ final class AppCoordinator: ObservableObject {
     private func wireVocabularyMining() {
         guard let vocabStore else { return }
         LibraryStore.shared.onDictationRecorded = { dictation in
+            // Correction Loop (BRAINSTORM_CORRECTION_LOOP.md): promotes whatever `RecentInsertionStore`
+            // pending snapshot this dictation's paste noted (see `processDictation`'s `external:`
+            // closure and `liveStreamingInsertClosure`) to `current`, now that the row has an id. A
+            // no-op when nothing is pending (paste failed, drift prevented a snapshot, or this
+            // dictation came through `reprocess`, which sets `suppressMining` and never reaches
+            // here at all — correcting a reprocessed dictation is out of scope, same as re-running
+            // it through a different template). Runs synchronously, before the mining `Task` below,
+            // so it never races a later dictation's own pending snapshot.
+            RecentInsertionStore.shared.attachDictationID(dictation.id)
+            // Correction Loop signal C: a no-op unless AppSettings.correctionLoopEditWatcherEnabled
+            // is on. Only starts watching when RecentInsertionStore actually promoted a pending
+            // snapshot for THIS dictation (attachDictationID above is a no-op otherwise, but
+            // RecentInsertionStore.shared.recent() below re-confirms rather than assuming).
+            if RecentInsertionStore.shared.recent()?.dictationID == dictation.id {
+                EditWatcher.shared.beginWatching(dictationID: dictation.id)
+            }
             Task {
                 let row = VocabMiningRow(
                     id: dictation.id, transcript: dictation.transcript, refined: dictation.refined,

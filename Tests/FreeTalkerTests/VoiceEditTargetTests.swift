@@ -48,17 +48,18 @@ import Testing
         var mutableInsertLastDictation: HotKeyMatcher? = insertLastDictation
         var mutableVoice: HotKeyMatcher? = voice
         var mutableHistoryPanel: HotKeyMatcher?
+        var mutableCorrectionPanel: HotKeyMatcher?
 
         let down = HotKeyManager.dispatch(
             kind: .keyDown, keyCode: 107, flags: 0, isAutorepeat: false,
-            matcher: &mutablePTT, insertLastDictationMatcher: &mutableInsertLastDictation, voiceEditMatcher: &mutableVoice, historyPanelMatcher: &mutableHistoryPanel
+            matcher: &mutablePTT, insertLastDictationMatcher: &mutableInsertLastDictation, voiceEditMatcher: &mutableVoice, historyPanelMatcher: &mutableHistoryPanel, correctionPanelMatcher: &mutableCorrectionPanel
         )
         #expect(down.voiceEditEngaged)
         #expect(down.swallow)
 
         let up = HotKeyManager.dispatch(
             kind: .keyUp, keyCode: 107, flags: 0, isAutorepeat: false,
-            matcher: &mutablePTT, insertLastDictationMatcher: &mutableInsertLastDictation, voiceEditMatcher: &mutableVoice, historyPanelMatcher: &mutableHistoryPanel
+            matcher: &mutablePTT, insertLastDictationMatcher: &mutableInsertLastDictation, voiceEditMatcher: &mutableVoice, historyPanelMatcher: &mutableHistoryPanel, correctionPanelMatcher: &mutableCorrectionPanel
         )
         #expect(!up.voiceEditEngaged)
         #expect(up.swallow)
@@ -69,10 +70,11 @@ import Testing
         var mutableInsertLastDictation: HotKeyMatcher? = HotKeyMatcher(spec: HotKeySpec(modifiers: 0, keyCode: 105))
         var mutableVoice: HotKeyMatcher? = HotKeyMatcher(spec: HotKeySpec(modifiers: 0, keyCode: 107))
         var mutableHistoryPanel: HotKeyMatcher? = HotKeyMatcher(spec: HotKeySpec(modifiers: 0, keyCode: 4))
+        var mutableCorrectionPanel: HotKeyMatcher?
 
         let down = HotKeyManager.dispatch(
             kind: .keyDown, keyCode: 4, flags: 0, isAutorepeat: false,
-            matcher: &mutablePTT, insertLastDictationMatcher: &mutableInsertLastDictation, voiceEditMatcher: &mutableVoice, historyPanelMatcher: &mutableHistoryPanel
+            matcher: &mutablePTT, insertLastDictationMatcher: &mutableInsertLastDictation, voiceEditMatcher: &mutableVoice, historyPanelMatcher: &mutableHistoryPanel, correctionPanelMatcher: &mutableCorrectionPanel
         )
         #expect(down.historyPanelEngaged)
         #expect(down.swallow)
@@ -81,7 +83,7 @@ import Testing
 
         let up = HotKeyManager.dispatch(
             kind: .keyUp, keyCode: 4, flags: 0, isAutorepeat: false,
-            matcher: &mutablePTT, insertLastDictationMatcher: &mutableInsertLastDictation, voiceEditMatcher: &mutableVoice, historyPanelMatcher: &mutableHistoryPanel
+            matcher: &mutablePTT, insertLastDictationMatcher: &mutableInsertLastDictation, voiceEditMatcher: &mutableVoice, historyPanelMatcher: &mutableHistoryPanel, correctionPanelMatcher: &mutableCorrectionPanel
         )
         #expect(!up.historyPanelEngaged)
         #expect(up.swallow)
@@ -137,14 +139,68 @@ import Testing
         var pending: SelectionSnapshot?
         var messages: [String] = []
 
+        // `recentInsertionSelection: { nil }` — deterministic regardless of
+        // `RecentInsertionStore.shared`'s process-wide state; the fallback itself is covered by
+        // `voiceEditFallsBackToRecentInsertionOnlyForNoEditableSelection` below.
         AppCoordinator.handleVoiceEditHotKey(
             selectionAccess: access,
             pendingSelection: &pending,
+            recentInsertionSelection: { nil },
             flash: { messages.append($0) }
         )
 
         #expect(pending == nil)
         #expect(messages == [message])
+    }
+
+    /// Correction Loop signal B (BRAINSTORM_CORRECTION_LOOP.md): the fallback is consulted ONLY
+    /// on `.noEditableSelection` — never on `.secureField` (would bypass a security check) or
+    /// `.targetChanged`/`.selectionChanged` (the live capture just proved this isn't the right
+    /// target). A `.noEditableSelection` with a fallback available uses it instead of flashing.
+    @Test func voiceEditFallsBackToRecentInsertionOnlyForNoEditableSelection() {
+        let fallback = Self.snapshot(text: "the recent dictation")
+        let calls = CallCounter()
+
+        var pending: SelectionSnapshot?
+        var messages: [String] = []
+        AppCoordinator.handleVoiceEditHotKey(
+            selectionAccess: StubSelectionAccess(result: .failure(SelectionAccessError.noEditableSelection)),
+            pendingSelection: &pending,
+            recentInsertionSelection: { calls.increment(); return fallback },
+            flash: { messages.append($0) }
+        )
+        #expect(pending?.text == "the recent dictation")
+        #expect(messages.isEmpty)
+        #expect(calls.count == 1)
+
+        for error in [SelectionAccessError.secureField, .targetChanged, .selectionChanged, .noFrontmostApplication, .replacementFailed] {
+            pending = nil
+            messages = []
+            calls.reset()
+            AppCoordinator.handleVoiceEditHotKey(
+                selectionAccess: StubSelectionAccess(result: .failure(error)),
+                pendingSelection: &pending,
+                recentInsertionSelection: { calls.increment(); return fallback },
+                flash: { messages.append($0) }
+            )
+            #expect(pending == nil)
+            #expect(calls.count == 0, "fallback must not be consulted for \(error)")
+        }
+    }
+
+    /// A `.noEditableSelection` with NO fallback available (nothing recent, or it's drifted)
+    /// falls through to the ordinary "select text first" message exactly as before this feature.
+    @Test func voiceEditNoEditableSelectionWithNoFallbackFlashesTheOrdinaryMessage() {
+        var pending: SelectionSnapshot?
+        var messages: [String] = []
+        AppCoordinator.handleVoiceEditHotKey(
+            selectionAccess: StubSelectionAccess(result: .failure(SelectionAccessError.noEditableSelection)),
+            pendingSelection: &pending,
+            recentInsertionSelection: { nil },
+            flash: { messages.append($0) }
+        )
+        #expect(pending == nil)
+        #expect(messages == ["Select editable text first"])
     }
 
     @Test func captureRejectsDriftAtEveryRangeAndTextReadBoundary() {
@@ -221,12 +277,13 @@ import Testing
         var insertLastDictation: HotKeyMatcher? = HotKeyMatcher(spec: HotKeySpec(modifiers: 0, keyCode: 105))
         var voice: HotKeyMatcher? = HotKeyMatcher(spec: HotKeySpec(modifiers: 0, keyCode: 107))
         var historyPanel: HotKeyMatcher?
+        var correctionPanel: HotKeyMatcher?
         _ = voice?.handle(.keyDown, keyCode: 107, flags: 0)
         var tombstones = HotKeyManager.captureSwallowedKeyUpTombstones(
-            matcher: ptt, insertLastDictationMatcher: insertLastDictation, voiceEditMatcher: voice, historyPanelMatcher: historyPanel
+            matcher: ptt, insertLastDictationMatcher: insertLastDictation, voiceEditMatcher: voice, historyPanelMatcher: historyPanel, correctionPanelMatcher: correctionPanel
         )
 
-        HotKeyManager.resetMatchers(matcher: &ptt, insertLastDictationMatcher: &insertLastDictation, voiceEditMatcher: &voice, historyPanelMatcher: &historyPanel)
+        HotKeyManager.resetMatchers(matcher: &ptt, insertLastDictationMatcher: &insertLastDictation, voiceEditMatcher: &voice, historyPanelMatcher: &historyPanel, correctionPanelMatcher: &correctionPanel)
 
         #expect(HotKeyManager.handleSwallowedKeyUpTombstone(
             kind: .keyUp, keyCode: 105, isAutorepeat: false, tombstones: &tombstones
@@ -359,6 +416,15 @@ private final class StubSelectionAccess: SelectionAccessing {
     init(result: Result<SelectionSnapshot, Error>) { self.result = result }
     func capture() throws -> SelectionSnapshot { try result.get() }
     func replace(_ snapshot: SelectionSnapshot, with text: String) throws {}
+}
+
+/// Mutable call counter for a `@MainActor @Sendable` closure — a plain captured `var` is
+/// non-Sendable and fails the `recentInsertionSelection` closure's type check.
+@MainActor
+private final class CallCounter {
+    private(set) var count = 0
+    func increment() { count += 1 }
+    func reset() { count = 0 }
 }
 
 @MainActor

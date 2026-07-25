@@ -364,6 +364,26 @@ enum Insertion {
         return text
     }
 
+    /// Correction Loop signal C (edit-watcher, `EditWatcher`): given the document's CURRENT value
+    /// and the same `(baseline, ledger length, anchor)` triple `documentMatchesBaselinePlusLedger`
+    /// checks, returns whatever now sits BETWEEN the unchanged prefix/suffix — i.e. exactly what
+    /// the user edited the app's own inserted text INTO — or `nil` if anything outside that range
+    /// changed at all. This is the requirement 5 boundary made concrete: "reads only the range the
+    /// app itself inserted... never the rest of the field, never anything typed before or after."
+    /// A change to the prefix or suffix (the user edited something ELSE in the same field) fails
+    /// closed to `nil` rather than guessing which part moved.
+    nonisolated static func extractEditedReplacement(
+        current: [UInt16], baseline: [UInt16], ledgerLength: Int, anchor: Int
+    ) -> [UInt16]? {
+        guard anchor >= 0, ledgerLength >= 0, anchor + ledgerLength <= baseline.count else { return nil }
+        let prefix = Array(baseline[0..<anchor])
+        let suffix = Array(baseline[(anchor + ledgerLength)...])
+        guard current.count >= prefix.count + suffix.count else { return nil }
+        guard Array(current.prefix(prefix.count)) == prefix else { return nil }
+        guard Array(current.suffix(suffix.count)) == suffix else { return nil }
+        return Array(current[prefix.count..<(current.count - suffix.count)])
+    }
+
     /// One fresh caret+baseline snapshot, taken immediately before a BATCH (non-streaming) paste
     /// — the Correction Loop counterpart of what `LiveInsertionSession.receivePartial` captures
     /// on its first post, reusing the exact same two primitives (`streamingWriteCaret`,
@@ -377,6 +397,25 @@ enum Insertion {
         guard let anchor = streamingWriteCaret(target: target, expectedCaret: nil) else { return nil }
         guard let baseline = streamingBaselineValue(target: target) else { return nil }
         return (anchor, baseline)
+    }
+
+    /// The BATCH (non-streaming) paste path's `insert:` closure, shared by every call site
+    /// (`processDictation`'s two default parameters, `runPipeline`'s production closure) so none
+    /// of them can independently forget to either note or clear the pending Correction Loop
+    /// snapshot (`RecentInsertionStore`'s doc comment explains why a stale pending must always be
+    /// explicitly cleared, never just left for the next dictation to overwrite). Captures the
+    /// pre-paste caret+baseline BEFORE posting (position after paste is unknowable — it's
+    /// whatever the target app does with ⌘V) and only keeps it if the paste actually posted.
+    @MainActor
+    static func insertTrackingCorrection(_ text: String, target: InsertionTarget?) -> Bool {
+        let snapshot = target.flatMap { captureCorrectionAnchor(target: $0) }
+        let posted = insert(text, target: target).posted
+        if posted, let target, let snapshot {
+            RecentInsertionStore.shared.notePending(.init(target: target, baselineValue: snapshot.baseline, anchor: snapshot.anchor, text: text))
+        } else {
+            RecentInsertionStore.shared.clearPending()
+        }
+        return posted
     }
 
     /// One AX attribute read, classified into whether the value was affirmatively present, is

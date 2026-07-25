@@ -92,6 +92,9 @@ final class AppSettings: ObservableObject {
             if let historyPanelHotKeySpec, HotKeySpec.validActionSpec(historyPanelHotKeySpec, pttSpec: hotKeySpec, otherActionSpecs: []) == nil {
                 self.historyPanelHotKeySpec = nil
             }
+            if let correctionPanelHotKeySpec, HotKeySpec.validActionSpec(correctionPanelHotKeySpec, pttSpec: hotKeySpec, otherActionSpecs: []) == nil {
+                self.correctionPanelHotKeySpec = nil
+            }
         }
     }
 
@@ -111,7 +114,7 @@ final class AppSettings: ObservableObject {
             // this falls straight through to the persistence branch below on the next (nil)
             // value. See Round 1 Codex finding 10.
             if let insertLastDictationHotKeySpec,
-               HotKeySpec.validActionSpec(insertLastDictationHotKeySpec, pttSpec: hotKeySpec, otherActionSpecs: [voiceEditHotKeySpec, historyPanelHotKeySpec]) == nil {
+               HotKeySpec.validActionSpec(insertLastDictationHotKeySpec, pttSpec: hotKeySpec, otherActionSpecs: [voiceEditHotKeySpec, historyPanelHotKeySpec, correctionPanelHotKeySpec]) == nil {
                 self.insertLastDictationHotKeySpec = nil
                 defaults.removeObject(forKey: Keys.insertLastDictationHotKeySpec)
                 return
@@ -127,7 +130,7 @@ final class AppSettings: ObservableObject {
     @Published var voiceEditHotKeySpec: HotKeySpec? {
         didSet {
             if let voiceEditHotKeySpec,
-               HotKeySpec.validActionSpec(voiceEditHotKeySpec, pttSpec: hotKeySpec, otherActionSpecs: [insertLastDictationHotKeySpec, historyPanelHotKeySpec]) == nil {
+               HotKeySpec.validActionSpec(voiceEditHotKeySpec, pttSpec: hotKeySpec, otherActionSpecs: [insertLastDictationHotKeySpec, historyPanelHotKeySpec, correctionPanelHotKeySpec]) == nil {
                 self.voiceEditHotKeySpec = nil
                 defaults.removeObject(forKey: Keys.voiceEditHotKeySpec)
                 return
@@ -146,7 +149,7 @@ final class AppSettings: ObservableObject {
     @Published var historyPanelHotKeySpec: HotKeySpec? {
         didSet {
             if let historyPanelHotKeySpec,
-               HotKeySpec.validActionSpec(historyPanelHotKeySpec, pttSpec: hotKeySpec, otherActionSpecs: [insertLastDictationHotKeySpec, voiceEditHotKeySpec]) == nil {
+               HotKeySpec.validActionSpec(historyPanelHotKeySpec, pttSpec: hotKeySpec, otherActionSpecs: [insertLastDictationHotKeySpec, voiceEditHotKeySpec, correctionPanelHotKeySpec]) == nil {
                 self.historyPanelHotKeySpec = nil
                 defaults.removeObject(forKey: Keys.historyPanelHotKeySpec)
                 return
@@ -157,6 +160,40 @@ final class AppSettings: ObservableObject {
                 defaults.removeObject(forKey: Keys.historyPanelHotKeySpec)
             }
         }
+    }
+
+    /// Fifth fixed hotkey slot (Correction Loop signal A, BRAINSTORM_CORRECTION_LOOP.md): opens
+    /// the correction panel for the most recent dictation. Unbound by default, validated the same
+    /// way as the other action slots. Not part of `exportableKeys`/Backup Bundle round-tripping
+    /// (ponytail: the other four slots' full quartet-validation-on-restore machinery is
+    /// significant surface area already covered by its own tests; adding a fifth touches all of
+    /// it — `SettingsPatch`, `HotKeyQuartetTargets`, `validateHotKeyQuartet`, restore/reset. A
+    /// backup made before this key existed simply never mentions it, so restoring one leaves
+    /// whatever is currently bound untouched, same as any other unlisted key — never corrupts or
+    /// silently unbinds it).
+    @Published var correctionPanelHotKeySpec: HotKeySpec? {
+        didSet {
+            if let correctionPanelHotKeySpec,
+               HotKeySpec.validActionSpec(correctionPanelHotKeySpec, pttSpec: hotKeySpec, otherActionSpecs: [insertLastDictationHotKeySpec, voiceEditHotKeySpec, historyPanelHotKeySpec]) == nil {
+                self.correctionPanelHotKeySpec = nil
+                defaults.removeObject(forKey: Keys.correctionPanelHotKeySpec)
+                return
+            }
+            if let correctionPanelHotKeySpec, let data = try? JSONEncoder().encode(correctionPanelHotKeySpec) {
+                defaults.set(data, forKey: Keys.correctionPanelHotKeySpec)
+            } else {
+                defaults.removeObject(forKey: Keys.correctionPanelHotKeySpec)
+            }
+        }
+    }
+
+    /// Correction Loop signal C (BRAINSTORM_CORRECTION_LOOP.md), off by default: watches the
+    /// range FreeTalker itself just inserted for a bounded window and offers to remember a
+    /// single-word edit as vocabulary. Default OFF for the same reason `voiceCommandsEnabled` is
+    /// — this is the one signal that reads text the user didn't explicitly hand over, and it's
+    /// the least reliable of the three (apps that expose text badly won't support it at all).
+    @Published var correctionLoopEditWatcherEnabled: Bool {
+        didSet { defaults.set(correctionLoopEditWatcherEnabled, forKey: Keys.correctionLoopEditWatcherEnabled) }
     }
 
     @Published var sttEngine: STTEngineKind {
@@ -873,6 +910,8 @@ final class AppSettings: ObservableObject {
         static let insertLastDictationHotKeySpec = "redoHotKeySpec"
         static let voiceEditHotKeySpec = "voiceEditHotKeySpec"
         static let historyPanelHotKeySpec = "historyPanelHotKeySpec"
+        static let correctionPanelHotKeySpec = "correctionPanelHotKeySpec"
+        static let correctionLoopEditWatcherEnabled = "correctionLoopEditWatcherEnabled"
         /// Legacy (read-only, for migration): single-modifier NX device mask bit.
         static let legacyHotKeyDeviceMask = "hotKeyDeviceMask"
         static let sttEngine = "sttEngine"
@@ -939,6 +978,12 @@ final class AppSettings: ObservableObject {
         } else {
             historyPanelHotKeySpec = nil
         }
+        if let data = defaults.data(forKey: Keys.correctionPanelHotKeySpec) {
+            correctionPanelHotKeySpec = try? JSONDecoder().decode(HotKeySpec.self, from: data)
+        } else {
+            correctionPanelHotKeySpec = nil
+        }
+        correctionLoopEditWatcherEnabled = defaults.bool(forKey: Keys.correctionLoopEditWatcherEnabled)
         sttEngine = STTEngineKind(rawValue: defaults.string(forKey: Keys.sttEngine) ?? "") ?? .whisperKit
         // One-time load normalization: a value stored before setter-level stripping existed (or
         // hand-edited) may still carry userinfo/query/fragment credentials — strip and persist
@@ -1251,7 +1296,8 @@ extension AppSettings {
         Keys.vocabularyText,
         Keys.voiceCommandsEnabled,
         Keys.commandKeywords,
-        Keys.streamingASREnabled
+        Keys.streamingASREnabled,
+        Keys.correctionLoopEditWatcherEnabled
     ]
 
     /// Exports every non-secret setting to a human-readable JSON file. Reads only the
@@ -1335,6 +1381,7 @@ extension AppSettings {
         out[Keys.voiceCommandsEnabled] = voiceCommandsEnabled
         out[Keys.commandKeywords] = commandKeywords
         out[Keys.streamingASREnabled] = streamingASREnabled
+        out[Keys.correctionLoopEditWatcherEnabled] = correctionLoopEditWatcherEnabled
         return out
     }
 }

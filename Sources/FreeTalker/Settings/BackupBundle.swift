@@ -143,6 +143,7 @@ struct SettingsPatch {
     var voiceCommandsEnabled: PatchField<Bool> = .absent
     var commandKeywords: PatchField<[String]> = .absent
     var streamingASREnabled: PatchField<Bool> = .absent
+    var correctionLoopEditWatcherEnabled: PatchField<Bool> = .absent
 }
 
 /// What each hotkey slot in the quartet (PTT / Insert Last Dictation / Voice Edit / Dictation
@@ -490,6 +491,9 @@ private enum SettingsPatchDecoding {
         if let raw = dict[Keys.streamingASREnabled] {
             patch.streamingASREnabled = .present(try bool(raw, Keys.streamingASREnabled))
         }
+        if let raw = dict[Keys.correctionLoopEditWatcherEnabled] {
+            patch.correctionLoopEditWatcherEnabled = .present(try bool(raw, Keys.correctionLoopEditWatcherEnabled))
+        }
 
         return patch
     }
@@ -587,6 +591,7 @@ extension AppSettings {
         apply(patch.voiceCommandsEnabled, default: false) { voiceCommandsEnabled = $0 }
         apply(patch.commandKeywords, default: AppSettings.defaultCommandKeywords) { commandKeywords = $0 }
         apply(patch.streamingASREnabled, default: false) { streamingASREnabled = $0 }
+        apply(patch.correctionLoopEditWatcherEnabled, default: false) { correctionLoopEditWatcherEnabled = $0 }
     }
 
     /// Clears both action specs, sets PTT, then re-applies each action spec in turn — so no
