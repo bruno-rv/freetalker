@@ -55,10 +55,11 @@ installed copy (this is what `scripts/release.sh` uses).
 
 Ad-hoc signing (`-s -`) gives every build a different signature, so macOS treats each
 rebuild as a new app and can drop TCC grants (Accessibility, Input Monitoring, Microphone)
-that were previously approved — see "Permissions walkthrough" below. It also means the app
-can never self-update (see "Updating" below): update verification pins the downloaded
-release's signing certificate against the *running* app's own certificate, and an ad-hoc build
-has no certificate to pin. To make grants (and self-updates) survive rebuilds:
+that were previously approved — see "Permissions walkthrough" below. This is purely a TCC-grant
+concern now: self-update verification (see "Updating" below) uses a separate Ed25519 signature
+that doesn't depend on this identity at all, so an ad-hoc build can still self-update fine — it
+just loses its permission grants on every rebuild in the meantime. To make grants survive
+rebuilds:
 
 ```sh
 scripts/make-signing-cert.sh   # once: creates a self-signed "FreeTalker Dev" cert
@@ -78,29 +79,49 @@ this file pointing at it, never leave the machine that created them).
 ## Updating
 
 The menu bar's "Check for Updates…" downloads the latest published release, verifies its
-checksum, verifies its code signature is signed by the exact same certificate as the app
-that's currently running, launches the downloaded build once as a smoke test, and only then
-swaps it into place and restarts — see `Sources/FreeTalker/Update/SelfUpdater.swift`. Any
-verification failure leaves the currently-installed app untouched.
+checksum (corruption check only), verifies its Ed25519 signature against the public key
+compiled into the running app (the actual authenticity boundary — see
+`Sources/FreeTalker/Update/UpdateSignatureVerifier.swift`), launches the downloaded build once
+as a smoke test, and only then swaps it into place and restarts — see
+`Sources/FreeTalker/Update/SelfUpdater.swift`. Any verification failure leaves the
+currently-installed app untouched.
 
-Because verification is a certificate pin against the running app, self-update only works for
-a build signed with a real, stable identity (see "Stable signing identity" above) — ad-hoc
-builds report "up to date"/"unavailable" but can never actually install an update.
+Unlike a codesign-identity pin (which only ever validates against a self-signed certificate's
+own trust chain — something that fails closed on every machine except the one that manually
+marked it "Always Trust" in Keychain Access), the Ed25519 public key has no keychain/trust-store
+dependency at all, so this works identically regardless of how the app itself is codesigned.
+
+## Release signing key (one-time, release-publisher only)
+
+```sh
+scripts/make-release-signing-key.sh   # once: generates the Ed25519 release-signing keypair
+```
+
+Writes the PRIVATE key outside this repo (default `~/.freetalker/release-signing-key.pem`,
+override with `$FREETALKER_RELEASE_SIGNING_KEY`) and the PUBLIC key into
+`Sources/FreeTalker/Update/UpdatePublicKey.swift`, which gets committed and compiled into every
+build. Back the private key up somewhere safe immediately — if it's lost, no future release can
+ever be verified by an app already built with the current public key; there's no recovery path
+short of shipping a new build with a new public key and telling every existing install to
+manually trust it again.
 
 ## Releasing
 
 ```sh
-scripts/release.sh vMAJOR.MINOR.PATCH          # tag, build, sign, zip, checksum, publish
+scripts/release.sh vMAJOR.MINOR.PATCH          # tag, build, sign (codesign + Ed25519), zip, checksum, publish
 scripts/release.sh vMAJOR.MINOR.PATCH --dry-run # everything except tag/push/publish
 ```
 
-Requires `.codesign-identity` to name a real (non ad-hoc) identity and `gh` (GitHub CLI) to be
-authenticated. Releases are signed locally with the same `FreeTalker Dev` certificate every
-time — there's no CI and no Apple Developer account involved (see
-`.claude/sdd/features/BRAINSTORM_INSTALL_AND_UPDATES.md` for why). macOS will still block first
-launch of a downloaded build with "Apple could not verify..." — that's expected for a
-non-notarized app; the person installing it right-clicks (or Control-clicks) the app and
-chooses "Open" once. This is a one-time step per machine, not per update.
+Requires `.codesign-identity` to name a real (non ad-hoc) identity, the release-signing key
+from `scripts/make-release-signing-key.sh` above, and `gh` (GitHub CLI) to be authenticated.
+Every release is signed twice: with the local `FreeTalker Dev` certificate (TCC-grant
+stability only, not a trust boundary — see "Stable signing identity" above) and with the
+Ed25519 release-signing key (the actual update-authenticity boundary) — there's no CI and no
+Apple Developer account involved (see `.claude/sdd/features/BRAINSTORM_INSTALL_AND_UPDATES.md`
+for why). macOS will still block first launch of a downloaded build with "Apple could not
+verify..." — that's expected for a non-notarized app; the person installing it right-clicks (or
+Control-clicks) the app and chooses "Open" once. This is a one-time step per machine, not per
+update.
 
 ## Speech models
 

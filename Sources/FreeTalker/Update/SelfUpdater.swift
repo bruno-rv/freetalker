@@ -133,12 +133,38 @@ enum SelfUpdater {
         }.value
     }
 
+    /// True when a PRIOR update attempt left the user's original app preserved at
+    /// `stagingRoot/backup.app` because `SelfUpdateInstaller.swap` backed it up but then failed
+    /// to restore it (`.rollbackFailed` — see `shouldPreserveStagingRoot`). That backup is the
+    /// user's ONLY surviving copy of their previous app in that state. Checked against the
+    /// filesystem directly (not any in-memory result, which doesn't survive a relaunch) so it
+    /// catches a backup left by a PREVIOUS run of the app, not just this one — `runUpdate` must
+    /// refuse to proceed while this is true, rather than its old behavior of unconditionally
+    /// deleting the whole staging directory (backup included) before ever looking inside it.
+    static func stagingHasPreservedBackup(stagingRoot: URL, fileManager: FileManager = .default) -> Bool {
+        fileManager.fileExists(atPath: stagingRoot.appendingPathComponent("backup.app").path)
+    }
+
     private static func runUpdate(
         manifest: UpdateManifest, installedBundlePath: URL, session: URLSession
     ) async -> UpdateOutcome {
         let fileManager = FileManager.default
         let stagingRoot = installedBundlePath.deletingLastPathComponent()
             .appendingPathComponent(".freetalker-update", isDirectory: true)
+        let backupPath = stagingRoot.appendingPathComponent("backup.app")
+
+        // A preserved backup from a previous failed update is the user's only surviving copy of
+        // their previous app — refuse to proceed (and, critically, don't wipe `stagingRoot`)
+        // until it's been recovered manually. Must run BEFORE the unconditional
+        // `removeItem(at: stagingRoot)` below, which used to destroy exactly this.
+        guard !Self.stagingHasPreservedBackup(stagingRoot: stagingRoot, fileManager: fileManager) else {
+            return .failed(
+                "A previous update couldn't restore your prior app automatically, and it's still "
+                    + "preserved at \(backupPath.path). Move it to \(installedBundlePath.path) "
+                    + "manually, then try updating again — this won't proceed while that backup "
+                    + "is there, to avoid deleting your only remaining copy."
+            )
+        }
         try? fileManager.removeItem(at: stagingRoot)
         do {
             try fileManager.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
@@ -156,30 +182,19 @@ enum SelfUpdater {
             }
         }
 
-        // 0. The running app's own certificate fingerprint is the trust anchor for every check
-        // below (see `CodeSignatureVerifier`'s doc comment) — resolve it first, and fail
-        // closed immediately if there isn't one. An ad-hoc-signed running app (`codesign -s -`,
-        // the default `make app` build) has no certificate to pin against at all, so it can
-        // never verify a downloaded update no matter what that update contains — see README's
-        // "Stable signing identity" section. Extracting this into its own explicit up-front
-        // step (rather than letting it fall through to the generic mismatch message below) is
-        // itself part of the fix for the ad-hoc self-comparison bug this guards against: it
-        // means the running app's fingerprint is always resolved on its own, in its own fresh
-        // extraction directory, before the downloaded bundle's fingerprint is ever computed.
-        guard
-            let runningFingerprintSHA1 = CodeSignatureVerifier.leafCertificateFingerprint(
-                bundlePath: installedBundlePath.path, workingDirectory: stagingRoot, digest: "sha1"
-            ),
-            !runningFingerprintSHA1.isEmpty
-        else {
+        // 0. The public key compiled into THIS binary is the trust anchor for every update —
+        // resolve it first and fail closed immediately if it's missing, before any network
+        // access. Can only happen if scripts/make-release-signing-key.sh was never run for this
+        // build (see UpdatePublicKey.swift) — unlike the certificate-fingerprint pin this
+        // replaces, this has no dependency on codesign identity or machine-local keychain trust
+        // at all, so an ad-hoc (`-s -`) build can still verify updates fine as long as the
+        // public key is compiled in.
+        guard let publicKey = UpdatePublicKey.current else {
             return .failed(
-                "This copy of FreeTalker isn't signed with a stable identity, so it can never "
-                    + "verify or install an update. See the README's \"Stable signing identity\" section."
+                "This build has no release-signing public key compiled in, so it can never "
+                    + "verify a downloaded update. See scripts/make-release-signing-key.sh."
             )
         }
-        let runningFingerprint = CodeSignatureVerifier.leafCertificateFingerprint(
-            bundlePath: installedBundlePath.path, workingDirectory: stagingRoot
-        )
 
         // 1. Download.
         let zipPath = stagingRoot.appendingPathComponent("update.zip")
@@ -195,29 +210,43 @@ enum SelfUpdater {
             return .failed("Download failed: \(error.localizedDescription)")
         }
 
-        // 2. Integrity: published checksum (transport corruption, not authenticity — see
-        // UpdateManifest).
+        // 2. Integrity: published checksum. This is a CORRUPTION check only, not authenticity —
+        // the manifest comes from the same host as the release, so a compromised host could
+        // publish a matching checksum for tampered bytes just as easily as the real ones. Step 3
+        // below (the Ed25519 signature) is the actual trust boundary.
         guard sha256Hex(of: downloadedData).caseInsensitiveCompare(manifest.sha256) == .orderedSame else {
             return .failed("The downloaded file's checksum didn't match the published release — discarded.")
         }
 
-        // 3. Unzip (ditto preserves the code signature's resource fork / extended attributes;
-        // `unzip` does not, and would break step 4 below).
+        // 3. Authenticity: verify the detached Ed25519 signature over the raw downloaded bytes,
+        // BEFORE anything is unzipped or executed — this is the actual security boundary for
+        // self-update. The trust anchor is `publicKey`, compiled into THIS binary; it never
+        // depends on anything fetched over the network (including this manifest) or on any
+        // machine's local codesign/keychain trust.
+        switch UpdateSignatureVerifier.verify(data: downloadedData, signatureBase64: manifest.signature, publicKey: publicKey) {
+        case .valid:
+            break
+        case .missingSignature, .invalidEncoding:
+            return .failed("The published release has no valid signature — refusing to install it.")
+        case .mismatch:
+            return .failed("The downloaded update's signature didn't verify — refusing to install it.")
+        }
+
+        // 4. Unzip (ditto preserves the code signature's resource fork / extended attributes;
+        // `unzip` does not).
         let extractedRoot = stagingRoot.appendingPathComponent("extracted", isDirectory: true)
         guard runProcess("/usr/bin/ditto", ["-x", "-k", zipPath.path, extractedRoot.path]).status == 0 else {
             return .failed("Could not unpack the downloaded update.")
         }
-        // Reject a malicious archive before ever touching its contents with codesign/openssl/a
-        // real launch: a ZIP whose top-level `.app` entry (or anything nested inside it) is a
-        // symlink survives `ditto` intact. If that symlink pointed at, say,
-        // `/Applications/FreeTalker.app` itself, every check below (codesign, cert extraction,
-        // the smoke test) would transparently follow it and inspect the CURRENTLY INSTALLED
-        // app instead of what was actually staged — passing every check while never having had
-        // to defeat any of them — and then `SelfUpdateInstaller.swap` would promote the
-        // self-referential symlink into place, destroying the install. A real release built by
-        // `scripts/release.sh`/`make bundle` never contains a symlink anywhere (confirmed:
-        // `find FreeTalker.app -type l` is always empty for this app), so this can't reject a
-        // legitimate update.
+        // Defense in depth even though step 3 already authenticated these exact bytes: a ZIP
+        // whose top-level `.app` entry (or anything nested inside it) is a symlink survives
+        // `ditto` intact. If that symlink pointed at, say, `/Applications/FreeTalker.app`
+        // itself, the smoke test below would transparently follow it and launch the CURRENTLY
+        // INSTALLED app instead of what was actually staged, and `SelfUpdateInstaller.swap`
+        // would promote the self-referential symlink into place, destroying the install. A real
+        // release built by `scripts/release.sh`/`make bundle` never contains a symlink anywhere
+        // (confirmed: `find FreeTalker.app -type l` is always empty for this app), so this can't
+        // reject a legitimate update.
         guard !Self.containsSymlink(at: extractedRoot, fileManager: fileManager) else {
             return .failed("The downloaded update contained a symbolic link — refusing to install it.")
         }
@@ -229,13 +258,15 @@ enum SelfUpdater {
             return .failed("The downloaded update didn't contain an app bundle.")
         }
 
-        // 4. Version binding: the staged bundle's OWN stamped version (`Makefile`'s
+        // 5. Version binding: the staged bundle's OWN stamped version (`Makefile`'s
         // `plutil -replace CFBundleShortVersionString`) must match what the manifest claims AND
         // be strictly newer than what's currently running — `evaluate(current:manifest:)` above
-        // only ever looked at the manifest's *claim*, so without this a manifest claiming an
-        // inflated version (say v999.0.0) whose `assetURL` still points at an old signed ZIP
-        // would install that old artifact anyway, and replaying the currently-installed ZIP
-        // under a fabricated version number would create a permanent "update available" loop.
+        // only ever looked at the manifest's *claim*, and step 3's signature only authenticates
+        // the asset bytes, not the version number in the manifest JSON next to it. Without this,
+        // a manifest claiming an inflated version (say v999.0.0) whose `assetURL`/`signature`
+        // still point at an old, validly-signed ZIP would install that old artifact anyway, and
+        // replaying the currently-installed ZIP under a fabricated version number would create a
+        // permanent "update available" loop.
         let stagedVersionString = Bundle(url: stagedBundle)?.infoDictionary?["CFBundleShortVersionString"] as? String
         switch Self.validateStagedVersion(
             stagedVersionString: stagedVersionString, manifestVersion: manifest.version, currentVersion: AppVersion.current
@@ -250,23 +281,6 @@ enum SelfUpdater {
             return .failed("The downloaded update isn't newer than the version currently running — refusing to install it.")
         }
 
-        // 5. Code signature: seal integrity + pinned fingerprint against the running app (see
-        // `CodeSignatureVerifier`'s doc comment for why this is a `-R`-pinned check rather than
-        // `codesign --verify`'s default trust-chain validation).
-        let signatureValid = CodeSignatureVerifier.verifySignature(
-            bundlePath: stagedBundle.path, pinnedLeafFingerprintSHA1: runningFingerprintSHA1
-        )
-        let downloadedFingerprint = CodeSignatureVerifier.leafCertificateFingerprint(
-            bundlePath: stagedBundle.path, workingDirectory: stagingRoot
-        )
-        guard CodeSignatureVerifier.isTrusted(
-            signatureValid: signatureValid,
-            downloadedFingerprint: downloadedFingerprint,
-            runningFingerprint: runningFingerprint
-        ) else {
-            return .failed("The downloaded update's signature didn't match this app's signing identity — refusing to install it.")
-        }
-
         // 6. Smoke test: the staged binary actually starts (catches a corrupt build or an
         // architecture/framework mismatch before it ever touches the installed app).
         guard verifyLaunches(bundlePath: stagedBundle.path) else {
@@ -274,7 +288,6 @@ enum SelfUpdater {
         }
 
         // 7. Atomic swap with rollback.
-        let backupPath = stagingRoot.appendingPathComponent("backup.app")
         let result = SelfUpdateInstaller.swap(
             installedPath: installedBundlePath,
             stagedPath: stagedBundle,
@@ -295,6 +308,11 @@ enum SelfUpdater {
             return .failed(
                 "The update failed partway and your previous app couldn't be restored automatically. "
                     + "It's preserved at \(backupPath.path) — move it to \(installedBundlePath.path) manually."
+            )
+        case .backupFailed:
+            return .failed(
+                "Could not back up the currently installed app before updating — nothing was "
+                    + "moved. Your existing installation at \(installedBundlePath.path) is untouched."
             )
         }
     }
@@ -325,17 +343,15 @@ enum SelfUpdater {
     }
 
     /// `killGracePeriod` bounds the OVERALL wait: `SIGTERM` alone isn't a hard bound (a hung or
-    /// deliberately misbehaving child can ignore it indefinitely, and `readDataToEndOfFile`/
-    /// `waitUntilExit` below block until the child actually exits and closes its output no
-    /// matter what). `SIGKILL` cannot be caught or ignored, so escalating to it after
-    /// `killGracePeriod` guarantees this function returns within
-    /// `timeout + killGracePeriod`, not "whenever the child feels like exiting." The escalation
-    /// runs on its own dedicated `Thread` rather than `DispatchQueue.global()`'s shared worker
-    /// pool specifically so that this bound holds even when that pool is saturated by unrelated
-    /// blocking work elsewhere in the process (e.g. many other `runProcess` calls in flight) —
-    /// a shared-queue timer can be starved behind that backlog, a dedicated thread cannot. Not
-    /// `private` so `SelfUpdaterTests` can exercise the escalation directly against a real child
-    /// process that ignores `SIGTERM`.
+    /// deliberately misbehaving child can ignore it indefinitely). `SIGKILL` cannot be caught or
+    /// ignored, so escalating to it after `killGracePeriod` guarantees the CHILD PROCESS itself
+    /// exits within `timeout + killGracePeriod`. The escalation runs on its own dedicated
+    /// `Thread` rather than `DispatchQueue.global()`'s shared worker pool specifically so that
+    /// this bound holds even when that pool is saturated by unrelated blocking work elsewhere in
+    /// the process (e.g. many other `runProcess` calls in flight) — a shared-queue timer can be
+    /// starved behind that backlog, a dedicated thread cannot. Not `private` so
+    /// `SelfUpdaterTests` can exercise the escalation directly against a real child process that
+    /// ignores `SIGTERM`.
     static func runProcess(
         _ executable: String, _ arguments: [String], timeout: TimeInterval = 30, killGracePeriod: TimeInterval = 2
     ) -> (status: Int32, stdout: String) {
@@ -370,11 +386,82 @@ enum SelfUpdater {
         }
         killThread.name = "SelfUpdater.runProcess.killEscalation"
         killThread.start()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        // Bound the READ itself, not just the process's own lifetime (Finding 8): both
+        // `terminate()` and the `SIGKILL` escalation above target only `pid`, the DIRECT child.
+        // If that child forks a descendant that inherits the pipe's write end and outlives it
+        // (e.g. `sh -c "sleep 30 & exit 0"`), the direct child exits promptly — `waitUntilExit`
+        // returns fine — but the pipe is NOT at EOF, because the descendant still holds its own
+        // copy of the write end open. The old code called the unbounded
+        // `readDataToEndOfFile()` FIRST, so it stayed blocked waiting for that EOF no matter
+        // what happened to `pid`, defeating both the timeout and the kill escalation entirely.
+        // `readAvailableOutput` instead gives up waiting for more output after
+        // `timeout + killGracePeriod` regardless of whether EOF ever arrives.
+        let data = Self.readAvailableOutput(from: pipe, deadline: timeout + killGracePeriod)
         process.waitUntilExit()
         terminateWorkItem.cancel()
         killCancelled.cancel()
         return (process.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+    }
+
+    /// Reads whatever output arrives on `pipe` within `deadline`, then stops waiting — unlike
+    /// `FileHandle.readDataToEndOfFile()`, this never blocks past `deadline` just because some
+    /// process (not necessarily the one `runProcess` launched — see its doc comment) still holds
+    /// the write end open. `readabilityHandler` schedules its callback via GCD only when data is
+    /// actually available, so this doesn't itself dedicate a thread to blocking on the fd; the
+    /// semaphore's `wait(timeout:)` is what makes the overall wait bounded regardless of whether
+    /// the handler ever sees EOF (an empty read) before then.
+    private static func readAvailableOutput(from pipe: Pipe, deadline: TimeInterval) -> Data {
+        let fileHandle = pipe.fileHandleForReading
+        let collected = LockedOutputBuffer()
+        let doneSemaphore = DispatchSemaphore(value: 0)
+        fileHandle.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            if chunk.isEmpty {
+                // EOF: every writer, direct child or descendant, has closed its copy of the pipe.
+                if collected.finish() { doneSemaphore.signal() }
+            } else {
+                collected.append(chunk)
+            }
+        }
+        _ = doneSemaphore.wait(timeout: .now() + deadline)
+        fileHandle.readabilityHandler = nil
+        return collected.finishAndTakeData()
+    }
+
+    /// Backs `readAvailableOutput`'s accumulation with a lock instead of a captured `var`:
+    /// `FileHandle.readabilityHandler`'s closure runs on a GCD-managed dispatch source, a
+    /// different execution context than the caller reading the result afterward, and Swift 6's
+    /// strict concurrency checking correctly refuses to let a plain captured `var` cross that
+    /// boundary. `@unchecked Sendable` is safe here because every access is lock-guarded, same
+    /// pattern as `KillEscalationCancelToken` below.
+    private final class LockedOutputBuffer: @unchecked Sendable {
+        private let lock = NSLock()
+        private var data = Data()
+        private var finished = false
+
+        func append(_ chunk: Data) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !finished else { return }
+            data.append(chunk)
+        }
+
+        /// Marks the buffer finished; returns `true` only the first time (so the caller signals
+        /// its semaphore exactly once even if more empty reads arrive afterward).
+        func finish() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !finished else { return false }
+            finished = true
+            return true
+        }
+
+        func finishAndTakeData() -> Data {
+            lock.lock()
+            defer { lock.unlock() }
+            finished = true
+            return data
+        }
     }
 
     /// Lets `runProcess` suppress the kill thread's `SIGKILL` once the child has already exited

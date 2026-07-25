@@ -16,8 +16,15 @@ enum SelfUpdateInstaller {
         /// the user is left exactly where they started.
         case rolledBack
         /// Promotion failed AND restoring the backup also failed — the worst case, surfaced
-        /// distinctly so the caller can tell the user exactly where their old app went.
+        /// distinctly so the caller can tell the user exactly where their old app went
+        /// (`backupPath` — this case is the ONLY one where it still exists afterward).
         case rollbackFailed
+        /// The very FIRST step — backing up the installed app — failed. Nothing was moved: the
+        /// installed app is untouched at `installedPath` and no backup exists anywhere. Distinct
+        /// from `.rollbackFailed` because that case's message points the user at `backupPath` as
+        /// where their previous app went — saying that here would be false, since backing it up
+        /// is exactly what didn't happen.
+        case backupFailed
     }
 
     /// File primitives injected so this algorithm is unit-testable against an in-memory fake
@@ -42,15 +49,18 @@ enum SelfUpdateInstaller {
             do {
                 try ops.moveItem(installedPath, backupPath)
             } catch {
-                // Nothing was moved yet — installedPath is untouched, nothing to roll back.
-                return .rollbackFailed
+                // Nothing was moved yet — installedPath is untouched, and no backup exists to
+                // roll back to. Distinct from `.rollbackFailed`: that case's caller-facing
+                // message claims the previous app is "preserved at backupPath," which would be
+                // false here — this is the case where backing it up is exactly what failed.
+                return .backupFailed
             }
         }
 
         do {
             try ops.moveItem(stagedPath, installedPath)
         } catch {
-            guard hadExistingInstall else { return .rollbackFailed }
+            guard hadExistingInstall else { return .backupFailed }
             do {
                 try ops.moveItem(backupPath, installedPath)
                 return .rolledBack

@@ -4,19 +4,19 @@ import Testing
 
 @Suite struct SelfUpdaterTests {
     @Test func evaluateReportsAvailableWhenManifestIsNewer() {
-        let manifest = UpdateManifest(version: "v1.3.0", assetURL: URL(string: "https://example.com/a.zip")!, sha256: "deadbeef")
+        let manifest = UpdateManifest(version: "v1.3.0", assetURL: URL(string: "https://example.com/a.zip")!, sha256: "deadbeef", signature: "sig")
         let result = SelfUpdater.evaluate(current: SemanticVersion(major: 1, minor: 2, patch: 0), manifest: manifest)
         #expect(result == .available(manifest: manifest))
     }
 
     @Test func evaluateReportsUpToDateWhenCurrentIsNewerOrEqual() {
-        let manifest = UpdateManifest(version: "v1.2.0", assetURL: URL(string: "https://example.com/a.zip")!, sha256: "deadbeef")
+        let manifest = UpdateManifest(version: "v1.2.0", assetURL: URL(string: "https://example.com/a.zip")!, sha256: "deadbeef", signature: "sig")
         #expect(SelfUpdater.evaluate(current: SemanticVersion(major: 1, minor: 2, patch: 0), manifest: manifest) == .upToDate)
         #expect(SelfUpdater.evaluate(current: SemanticVersion(major: 1, minor: 3, patch: 0), manifest: manifest) == .upToDate)
     }
 
     @Test func evaluateFailsClosedOnUnparsableManifestVersion() {
-        let manifest = UpdateManifest(version: "not-a-version", assetURL: URL(string: "https://example.com/a.zip")!, sha256: "deadbeef")
+        let manifest = UpdateManifest(version: "not-a-version", assetURL: URL(string: "https://example.com/a.zip")!, sha256: "deadbeef", signature: "sig")
         guard case .unavailable = SelfUpdater.evaluate(current: SemanticVersion(major: 0, minor: 0, patch: 0), manifest: manifest) else {
             Issue.record("expected .unavailable for an unparsable manifest version")
             return
@@ -55,7 +55,78 @@ import Testing
         #expect(SelfUpdater.shouldPreserveStagingRoot(after: .rollbackFailed))
         #expect(!SelfUpdater.shouldPreserveStagingRoot(after: .success))
         #expect(!SelfUpdater.shouldPreserveStagingRoot(after: .rolledBack))
+        // `.backupFailed` (Finding 9) never creates a backup in the first place — nothing in
+        // staging is unique to the user in that case either, same as the other non-preserved
+        // outcomes.
+        #expect(!SelfUpdater.shouldPreserveStagingRoot(after: .backupFailed))
         #expect(!SelfUpdater.shouldPreserveStagingRoot(after: nil))
+    }
+
+    // MARK: stagingHasPreservedBackup (Finding 3 — destroying a preserved rollback-failure backup)
+
+    /// Reproduces the actual bug: a REAL directory at `stagingRoot/backup.app` (exactly what a
+    /// prior `.rollbackFailed` leaves behind — see `SelfUpdateInstallerTests`) must be detected
+    /// so `runUpdate` can refuse to wipe it, not a hand-invented boolean.
+    @Test func stagingHasPreservedBackupIsTrueWhenABackupAppDirectoryExists() throws {
+        let stagingRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(
+            at: stagingRoot.appendingPathComponent("backup.app/Contents/MacOS"), withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: stagingRoot) }
+
+        #expect(SelfUpdater.stagingHasPreservedBackup(stagingRoot: stagingRoot))
+    }
+
+    /// The common case — no staging directory at all (first update ever, or a prior update that
+    /// cleaned up normally) — must never be treated as a preserved backup.
+    @Test func stagingHasPreservedBackupIsFalseWhenStagingDoesNotExist() {
+        let stagingRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        #expect(!SelfUpdater.stagingHasPreservedBackup(stagingRoot: stagingRoot))
+    }
+
+    /// A staging directory can legitimately exist without a preserved backup inside it (e.g. a
+    /// download/verification failure that hasn't been cleaned up yet for some other reason) —
+    /// only the presence of `backup.app` itself must trigger the refusal.
+    @Test func stagingHasPreservedBackupIsFalseWhenStagingExistsWithoutABackup() throws {
+        let stagingRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: stagingRoot.appendingPathComponent("extracted"), withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: stagingRoot) }
+
+        #expect(!SelfUpdater.stagingHasPreservedBackup(stagingRoot: stagingRoot))
+    }
+
+    /// Full-path regression test through the actual public entry point (`performUpdate`, not
+    /// just the pure `stagingHasPreservedBackup` helper): reproduces a REAL preserved backup on
+    /// disk exactly where a previous `.rollbackFailed` would have left one, then confirms
+    /// `runUpdate` refuses BEFORE ever touching the network — no `URLSession` mocking needed,
+    /// since this must be the very first thing checked, ahead of the old unconditional
+    /// `removeItem(at: stagingRoot)`. A revert that dropped the guard (while leaving
+    /// `stagingHasPreservedBackup` itself intact and passing its own unit tests above) would
+    /// only be caught by an integration-level test like this one: it would delete the backup
+    /// directory as its very next step, so the final assertion below would fail.
+    @Test func performUpdateRefusesAndPreservesABackupLeftByAPreviousRollbackFailure() async throws {
+        let installedRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: installedRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: installedRoot) }
+        let installedBundlePath = installedRoot.appendingPathComponent("FreeTalker.app")
+        let backupPath = installedRoot.appendingPathComponent(".freetalker-update/backup.app")
+        let backupBinary = backupPath.appendingPathComponent("Contents/MacOS/FreeTalker")
+        try FileManager.default.createDirectory(at: backupBinary.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("preserved backup binary".utf8).write(to: backupBinary)
+
+        let manifest = UpdateManifest(
+            version: "v99.0.0", assetURL: URL(string: "https://example.invalid/never-reached.zip")!,
+            sha256: "unused", signature: "unused"
+        )
+        let outcome = await SelfUpdater.performUpdate(manifest: manifest, installedBundlePath: installedBundlePath, session: .shared)
+
+        guard case .failed(let message) = outcome else {
+            Issue.record("expected .failed (refusing to proceed), got \(outcome)")
+            return
+        }
+        #expect(message.contains(backupPath.path))
+        // The property that actually matters: the preserved backup must survive untouched.
+        #expect(FileManager.default.fileExists(atPath: backupBinary.path))
     }
 
     // MARK: validateStagedVersion (Finding 4 — manifest/artifact version binding)
@@ -183,14 +254,16 @@ import Testing
         #expect(elapsed < 2, "runProcess took \(elapsed)s — SIGKILL escalation did not bound the wait")
     }
 
-    /// The real `dist/latest.json` produced by `scripts/release.sh v0.1.0 --dry-run` — not
-    /// hand-invented, this is exactly what the release script writes.
+    /// The real `dist/latest.json` shape produced by `scripts/release.sh v0.1.0 --dry-run` —
+    /// not hand-invented, this is exactly what the release script writes, `signature` field
+    /// included.
     @Test func decodesTheManifestJSONShapeReleaseScriptWrites() throws {
         let json = """
         {
           "version": "v0.1.0",
           "assetURL": "https://github.com/bruno-rv/freetalker/releases/download/v0.1.0/FreeTalker-v0.1.0.app.zip",
-          "sha256": "c1fc1ebc8e3d3c5194243090ac0f0207f62f880b38ad585d3320a36d1b49f9e7"
+          "sha256": "c1fc1ebc8e3d3c5194243090ac0f0207f62f880b38ad585d3320a36d1b49f9e7",
+          "signature": "R95Iu4vvA7NBlaErnOzHLxRSv4ivw9j1ayzwPVort9bjanHbqUfN/7uqZxEQ3Ju4c2TeKsdpl4LiJ+cMA/gRDQ=="
         }
         """
         let manifest = try JSONDecoder().decode(UpdateManifest.self, from: Data(json.utf8))
@@ -200,5 +273,40 @@ import Testing
                 == "https://github.com/bruno-rv/freetalker/releases/download/v0.1.0/FreeTalker-v0.1.0.app.zip"
         )
         #expect(manifest.sha256 == "c1fc1ebc8e3d3c5194243090ac0f0207f62f880b38ad585d3320a36d1b49f9e7")
+        #expect(manifest.signature == "R95Iu4vvA7NBlaErnOzHLxRSv4ivw9j1ayzwPVort9bjanHbqUfN/7uqZxEQ3Ju4c2TeKsdpl4LiJ+cMA/gRDQ==")
+    }
+
+    /// A manifest published before this feature (or by a broken release) with no `signature`
+    /// field at all must still decode — `SelfUpdater`/`UpdateSignatureVerifier` are what turn a
+    /// missing signature into a specific, legible failure (`.missingSignature`), not a generic
+    /// JSON decode error that would be indistinguishable from a truncated/corrupt manifest.
+    @Test func decodesAManifestWithNoSignatureFieldAsNilRatherThanFailing() throws {
+        let json = """
+        {
+          "version": "v0.1.0",
+          "assetURL": "https://github.com/bruno-rv/freetalker/releases/download/v0.1.0/FreeTalker-v0.1.0.app.zip",
+          "sha256": "c1fc1ebc8e3d3c5194243090ac0f0207f62f880b38ad585d3320a36d1b49f9e7"
+        }
+        """
+        let manifest = try JSONDecoder().decode(UpdateManifest.self, from: Data(json.utf8))
+        #expect(manifest.signature == nil)
+    }
+
+    // MARK: runProcess bounded read (Finding 8 — a descendant inheriting stdout defeats the timeout)
+
+    /// Reproduces Finding 8 exactly: the CHILD forks a descendant (`sleep 5 &`) that inherits the
+    /// stdout pipe and then the child itself exits immediately (`exit 0`). `waitUntilExit()` on
+    /// the direct child returns promptly either way — the bug was that the OLD code's
+    /// `readDataToEndOfFile()` call, made before `waitUntilExit()`, stayed blocked waiting for
+    /// the pipe's write end to close, which only happens when the still-running descendant
+    /// exits ~5s later. `timeout`/`killGracePeriod` here are both short specifically so the
+    /// assertion below distinguishes "bounded by the read deadline" from "bounded by the
+    /// descendant's own 5s sleep" with a wide margin.
+    @Test func runProcessReturnsPromptlyWhenAForkedDescendantInheritsStdoutAndOutlivesTheChild() {
+        let start = Date()
+        let result = SelfUpdater.runProcess("/bin/sh", ["-c", "sleep 5 & exit 0"], timeout: 0.3, killGracePeriod: 0.3)
+        let elapsed = Date().timeIntervalSince(start)
+        #expect(result.status == 0)
+        #expect(elapsed < 2, "runProcess took \(elapsed)s — a descendant holding stdout open defeated the read bound")
     }
 }

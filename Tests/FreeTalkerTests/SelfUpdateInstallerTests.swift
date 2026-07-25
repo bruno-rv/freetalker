@@ -69,13 +69,32 @@ private final class FakeFileSystem {
         #expect(!fs.paths.contains(backup.path))
     }
 
-    @Test func backupFailureLeavesTheOriginalInstallUntouched() {
+    /// Finding 9: the very first move (installed -> backup) failing must be reported distinctly
+    /// from `.rollbackFailed` — nothing was ever backed up here, so `.rollbackFailed`'s
+    /// caller-facing message ("your previous app is preserved at backupPath") would be false. A
+    /// verifier that only checked `fs.paths.contains(installed.path)` (the original form of this
+    /// test) would still pass if `swap` returned the wrong case — only asserting the exact
+    /// result value catches that.
+    @Test func backupFailureIsReportedDistinctlyFromRollbackFailureAndLeavesTheOriginalInstallUntouched() {
         let fs = FakeFileSystem(existingPaths: [installed.path, staged.path])
         fs.failMoveFrom = installed.path
         let result = SelfUpdateInstaller.swap(installedPath: installed, stagedPath: staged, backupPath: backup, ops: fs.ops())
-        #expect(result == .rollbackFailed)
+        #expect(result == .backupFailed)
         // The original was never moved — it's still exactly where it was.
         #expect(fs.paths.contains(installed.path))
+        #expect(!fs.paths.contains(backup.path))
+    }
+
+    /// Finding 9's other half: a FIRST install (nothing to back up, `hadExistingInstall ==
+    /// false`) whose promotion move fails must also report `.backupFailed`, not
+    /// `.rollbackFailed` — no backup was ever attempted in this path either, so claiming one is
+    /// "preserved at backupPath" would be equally false here.
+    @Test func firstInstallPromotionFailureIsReportedAsBackupFailedNotRollbackFailed() {
+        let fs = FakeFileSystem(existingPaths: [staged.path])
+        fs.failMoveFrom = staged.path
+        let result = SelfUpdateInstaller.swap(installedPath: installed, stagedPath: staged, backupPath: backup, ops: fs.ops())
+        #expect(result == .backupFailed)
+        #expect(!fs.paths.contains(installed.path))
         #expect(!fs.paths.contains(backup.path))
     }
 
