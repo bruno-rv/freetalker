@@ -17,6 +17,22 @@ struct InsertionTarget {
     let pid: pid_t
     let focusedElement: AXUIElement?
     let window: AXUIElement?
+    /// Stable per-document discriminator (`kAXDocumentAttribute`), snapshotted alongside
+    /// `focusedElement`/`window` — Codex finding 2: some editors recycle ONE AXUIElement/window
+    /// across multiple open tabs/documents, which defeats the `focusedElement`/`window` CFEqual
+    /// identity check alone (same view instance, different document). `nil` when the app doesn't
+    /// expose the attribute at all — the element/window check is all that's available for those
+    /// apps, unchanged from before this fix; a non-nil snapshot value only ever DOWNGRADES an
+    /// already-`.match` element/window verdict, never upgrades a `.mismatch`/`.unavailable` one.
+    let document: String?
+
+    init(bundleID: String?, pid: pid_t, focusedElement: AXUIElement?, window: AXUIElement?, document: String? = nil) {
+        self.bundleID = bundleID
+        self.pid = pid
+        self.focusedElement = focusedElement
+        self.window = window
+        self.document = document
+    }
 }
 
 /// `Insertion.insert`'s structured failure reason (PLAN.md F2.4). Only `axDenied` is
@@ -65,7 +81,8 @@ enum Insertion {
         guard let app else { return nil }
         let element = focusedElement(for: app)
         let window = element.flatMap(windowElement(for:))
-        return InsertionTarget(bundleID: app.bundleIdentifier, pid: app.processIdentifier, focusedElement: element, window: window)
+        let document = documentDiscriminator(element: element, window: window)
+        return InsertionTarget(bundleID: app.bundleIdentifier, pid: app.processIdentifier, focusedElement: element, window: window, document: document)
     }
 
     /// Returns true if a synthetic ⌘V was posted. Skips posting (leaving the text on the
@@ -108,12 +125,13 @@ enum Insertion {
         let currentBundleID = currentApp?.bundleIdentifier
         let currentElement = currentApp.flatMap(focusedElement(for:))
         let currentWindow = currentElement.flatMap(windowElement(for:))
+        let currentDocument = documentDiscriminator(element: currentElement, window: currentWindow)
         // No target snapshotted at all -> nothing to contradict, stays permissive (matches the
         // hasTarget: false branch of shouldSynthesizePaste below). This is distinct from "a
         // target was snapshotted but its bundleID was nil" — see Round 3 Codex finding: paste-
         // target drift with nil bundle id.
         let pidMatch = target.map { $0.pid == currentApp?.processIdentifier } ?? true
-        let elementComparison = compareElements(snapshot: target, currentElement: currentElement, currentWindow: currentWindow)
+        let elementComparison = compareElements(snapshot: target, currentElement: currentElement, currentWindow: currentWindow, currentDocument: currentDocument)
 
         if let reason = classifyPreflightFailure(
             hasTarget: target != nil,
@@ -268,8 +286,9 @@ enum Insertion {
         let currentApp = NSWorkspace.shared.frontmostApplication
         let currentElement = currentApp.flatMap(focusedElement(for:))
         let currentWindow = currentElement.flatMap(windowElement(for:))
+        let currentDocument = documentDiscriminator(element: currentElement, window: currentWindow)
         let pidMatch = target.pid == currentApp?.processIdentifier
-        let elementComparison = compareElements(snapshot: target, currentElement: currentElement, currentWindow: currentWindow)
+        let elementComparison = compareElements(snapshot: target, currentElement: currentElement, currentWindow: currentWindow, currentDocument: currentDocument)
         guard shouldSynthesizePaste(
             hasTarget: true,
             snapshotBundleID: target.bundleID,
@@ -365,23 +384,78 @@ enum Insertion {
     }
 
     /// Correction Loop signal C (edit-watcher, `EditWatcher`): given the document's CURRENT value
-    /// and the same `(baseline, ledger length, anchor)` triple `documentMatchesBaselinePlusLedger`
-    /// checks, returns whatever now sits BETWEEN the unchanged prefix/suffix — i.e. exactly what
-    /// the user edited the app's own inserted text INTO — or `nil` if anything outside that range
-    /// changed at all. This is the requirement 5 boundary made concrete: "reads only the range the
-    /// app itself inserted... never the rest of the field, never anything typed before or after."
-    /// A change to the prefix or suffix (the user edited something ELSE in the same field) fails
-    /// closed to `nil` rather than guessing which part moved.
+    /// and `baseline` — the field's value immediately BEFORE the insertion (the SAME PRE-insertion
+    /// snapshot `RecentInsertion.baselineValue`/`documentMatchesBaselinePlusLedger` use; it never
+    /// contains the ledger itself) plus the anchor it was spliced in at — returns whatever now
+    /// sits BETWEEN the unchanged prefix/suffix — i.e. exactly what the user edited the app's own
+    /// inserted text INTO — or `nil` if anything outside that range changed at all. This is the
+    /// requirement 5 boundary made concrete: "reads only the range the app itself inserted...
+    /// never the rest of the field, never anything typed before or after." A change to the prefix
+    /// or suffix (the user edited something ELSE in the same field) fails closed to `nil` rather
+    /// than guessing which part moved.
+    ///
+    /// Codex finding 5: `baseline` was previously (incorrectly) treated as POST-insertion here —
+    /// the ONLY caller (`EditWatcher`) always passes the pre-insertion value, so an end-of-field
+    /// insertion always failed `anchor + ledgerLength <= baseline.count` (baseline never contained
+    /// the ledger, so that bound could never hold once `anchor` reached the pre-insertion length),
+    /// and a middle insertion incorrectly absorbed the first `ledgerLength` UTF-16 units of
+    /// pre-existing suffix into the "edited" region. `anchor <= baseline.count` (not
+    /// `anchor + ledgerLength`) and `baseline[anchor...]` as the suffix match what's actually
+    /// stored.
     nonisolated static func extractEditedReplacement(
         current: [UInt16], baseline: [UInt16], ledgerLength: Int, anchor: Int
     ) -> [UInt16]? {
-        guard anchor >= 0, ledgerLength >= 0, anchor + ledgerLength <= baseline.count else { return nil }
+        guard anchor >= 0, ledgerLength >= 0, anchor <= baseline.count else { return nil }
         let prefix = Array(baseline[0..<anchor])
-        let suffix = Array(baseline[(anchor + ledgerLength)...])
+        let suffix = Array(baseline[anchor...])
         guard current.count >= prefix.count + suffix.count else { return nil }
         guard Array(current.prefix(prefix.count)) == prefix else { return nil }
         guard Array(current.suffix(suffix.count)) == suffix else { return nil }
         return Array(current[prefix.count..<(current.count - suffix.count)])
+    }
+
+    /// The ONLY AX read `EditWatcher` performs per poll (Codex finding 4): reads `element`'s
+    /// character COUNT (`kAXNumberOfCharactersAttribute` — a bare `Int`, no content at all) to
+    /// compute where the edited middle region now ends, then reads EXACTLY that middle region via
+    /// `kAXStringForRangeParameterizedAttribute` — never the prefix, never the suffix, never the
+    /// whole field. The pre-fix implementation read the field's entire `kAXValueAttribute` value
+    /// every poll, "materialising the entire field contents" (a confidential document's whole text)
+    /// just to confirm a short edit; this reconstructs the same `(anchor, editedLength)` window
+    /// `extractEditedReplacement` computes from lengths alone, so the round-trip AX request is
+    /// PROVABLY bounded to the range that changed, not merely "current implementation happens not
+    /// to read more." A negative computed `editedLength` (the document shrank more than the
+    /// tracked prefix+suffix allow for — something outside the watched range changed) fails closed
+    /// without reading anything else to find out what. `nil` whenever the parameterized attribute
+    /// isn't supported at all (Electron/most web views) — signal C is simply UNAVAILABLE for that
+    /// poll rather than ever falling back to an unbounded whole-field read.
+    @MainActor
+    static func rangeLimitedEditedReplacement(
+        element: AXUIElement, baseline: [UInt16], ledgerLength: Int, anchor: Int
+    ) -> [UInt16]? {
+        guard anchor >= 0, ledgerLength >= 0, anchor <= baseline.count else { return nil }
+        guard let currentLength = numberOfCharacters(element) else { return nil }
+        let suffixLength = baseline.count - anchor
+        let editedLength = currentLength - anchor - suffixLength
+        guard editedLength >= 0 else { return nil }
+        guard let edited = stringForRange(element, location: anchor, length: editedLength) else { return nil }
+        return Array(edited.utf16)
+    }
+
+    private static func numberOfCharacters(_ element: AXUIElement) -> Int? {
+        var ref: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, kAXNumberOfCharactersAttribute as CFString, &ref) == .success,
+              let number = ref as? NSNumber else { return nil }
+        return number.intValue
+    }
+
+    private static func stringForRange(_ element: AXUIElement, location: Int, length: Int) -> String? {
+        var range = CFRange(location: location, length: length)
+        guard let rangeValue = AXValueCreate(.cfRange, &range) else { return nil }
+        var ref: AnyObject?
+        guard AXUIElementCopyParameterizedAttributeValue(
+            element, kAXStringForRangeParameterizedAttribute as CFString, rangeValue, &ref
+        ) == .success, let text = ref as? String else { return nil }
+        return text
     }
 
     /// One fresh caret+baseline snapshot, taken immediately before a BATCH (non-streaming) paste
@@ -527,18 +601,41 @@ enum Insertion {
     /// Compares the snapshotted focused element/window against what's focused right now.
     /// Prefers the element comparison (finer-grained); falls back to the window only when no
     /// element was snapshotted. Both nil at snapshot time (AX-opaque app) → `.unavailable`.
-    private static func compareElements(snapshot: InsertionTarget?, currentElement: AXUIElement?, currentWindow: AXUIElement?) -> ElementComparison {
+    private static func compareElements(snapshot: InsertionTarget?, currentElement: AXUIElement?, currentWindow: AXUIElement?, currentDocument: String?) -> ElementComparison {
         guard let snapshot else { return .unavailable }
+        let base: ElementComparison
         if let snapshotElement = snapshot.focusedElement {
             guard let currentElement else { return .mismatch }
             // AXUIElement is CFEqual-comparable for identity — see AXUIElement.h.
-            return CFEqual(snapshotElement, currentElement) ? .match : .mismatch
-        }
-        if let snapshotWindow = snapshot.window {
+            base = CFEqual(snapshotElement, currentElement) ? .match : .mismatch
+        } else if let snapshotWindow = snapshot.window {
             guard let currentWindow else { return .mismatch }
-            return CFEqual(snapshotWindow, currentWindow) ? .match : .mismatch
+            base = CFEqual(snapshotWindow, currentWindow) ? .match : .mismatch
+        } else {
+            base = .unavailable
         }
-        return .unavailable
+        // Codex finding 2 (same-window document reuse): element/window identity alone doesn't
+        // prove the same DOCUMENT for editors that recycle one AXUIElement/window across tabs —
+        // only downgrades an already-`.match` verdict, and only when a discriminator WAS captured
+        // at snapshot time; apps that never expose `kAXDocumentAttribute` keep the pre-fix
+        // element/window-only behavior (nothing stronger is available to check for them).
+        guard base == .match, let snapshotDocument = snapshot.document else { return base }
+        return snapshotDocument == currentDocument ? .match : .mismatch
+    }
+
+    /// `kAXDocumentAttribute`, read from whichever of `window`/`element` exposes it (window
+    /// preferred — document identity is generally window-level) — Codex finding 2's stable
+    /// per-document discriminator. `nil` when neither exposes it (most apps).
+    private static func documentDiscriminator(element: AXUIElement?, window: AXUIElement?) -> String? {
+        if let window, let document = stringAttribute(window, kAXDocumentAttribute as CFString) { return document }
+        if let element, let document = stringAttribute(element, kAXDocumentAttribute as CFString) { return document }
+        return nil
+    }
+
+    private static func stringAttribute(_ element: AXUIElement, _ attribute: CFString) -> String? {
+        var ref: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, attribute, &ref) == .success else { return nil }
+        return ref as? String
     }
 
     /// Returns the given app's currently focused UI element via AX, or nil if there is none or
