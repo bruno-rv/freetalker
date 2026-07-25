@@ -37,20 +37,29 @@ mutating `xcode-select`. Override a non-default Xcode location explicitly:
 make test XCODE_DEVELOPER_DIR=/path/to/Xcode.app/Contents/Developer
 ```
 
-`make app` copies the release binary into `FreeTalker.app/Contents/MacOS/`, writes
-`Contents/Info.plist` (from `Info.plist` at the repo root — `LSUIElement=true` so it's
-menu-bar-only, plus the microphone usage string), and ad-hoc codesigns the bundle
+`make app` (via `make bundle`, see below) copies the release binary into
+`FreeTalker.app/Contents/MacOS/`, writes `Contents/Info.plist` (from `Info.plist` at the repo
+root — `LSUIElement=true` so it's menu-bar-only, plus the microphone usage string and the
+version stamped from `git describe --tags`), and ad-hoc codesigns the bundle
 (`codesign --force --deep -s -`).
 
 First launch will download the WhisperKit `large-v3-turbo` model (~1 GB) — the menu bar
-status line shows download progress.
+status line shows download progress, and the first-run walkthrough (see "Permissions
+walkthrough" below) shows it too.
 
-### Stable signing identity (optional)
+`make bundle` does everything `make app` does except the final install into `/Applications` —
+use it for anything that needs a signed, versioned bundle without disturbing an already-running
+installed copy (this is what `scripts/release.sh` uses).
+
+### Stable signing identity (strongly recommended)
 
 Ad-hoc signing (`-s -`) gives every build a different signature, so macOS treats each
 rebuild as a new app and can drop TCC grants (Accessibility, Input Monitoring, Microphone)
-that were previously approved — see "Permissions walkthrough" below. To make grants
-survive rebuilds and self-updates:
+that were previously approved — see "Permissions walkthrough" below. This is purely a TCC-grant
+concern now: self-update verification (see "Updating" below) uses a separate Ed25519 signature
+that doesn't depend on this identity at all, so an ad-hoc build can still self-update fine — it
+just loses its permission grants on every rebuild in the meantime. To make grants survive
+rebuilds:
 
 ```sh
 scripts/make-signing-cert.sh   # once: creates a self-signed "FreeTalker Dev" cert
@@ -63,8 +72,61 @@ steps — macOS requires this GUI confirmation, it can't be scripted). Build wit
 make app CODESIGN_IDENTITY="FreeTalker Dev"
 ```
 
-To have "Check for Updates…" rebuilds use the same identity, record it once at the repo
-root: `echo "FreeTalker Dev" > .codesign-identity`.
+To make plain `make app`/`make bundle` use the same identity by default, record it once at
+the repo root: `echo "FreeTalker Dev" > .codesign-identity` (gitignored — the private key, and
+this file pointing at it, never leave the machine that created them).
+
+## Updating
+
+The menu bar's "Check for Updates…" downloads the latest published release, verifies its
+checksum (corruption check only), verifies its Ed25519 signature against the public key
+compiled into the running app (the actual authenticity boundary — see
+`Sources/FreeTalker/Update/UpdateSignatureVerifier.swift`), launches the downloaded build once
+as a smoke test, and only then swaps it into place and restarts — see
+`Sources/FreeTalker/Update/SelfUpdater.swift`. Any verification failure leaves the
+currently-installed app untouched.
+
+Unlike a codesign-identity pin (which only ever validates against a self-signed certificate's
+own trust chain — something that fails closed on every machine except the one that manually
+marked it "Always Trust" in Keychain Access), the Ed25519 public key has no keychain/trust-store
+dependency at all, so this works identically regardless of how the app itself is codesigned.
+
+## Release signing key (one-time, release-publisher only)
+
+```sh
+scripts/make-release-signing-key.sh   # once: generates the Ed25519 release-signing keypair
+```
+
+Writes the PRIVATE key outside this repo (default `~/.freetalker/release-signing-key.pem`,
+override with `$FREETALKER_RELEASE_SIGNING_KEY`) and the PUBLIC key into
+`keys/release-public-key.base64` — a plain text file holding nothing but that one base64 value,
+which gets committed. `Sources/FreeTalker/Update/UpdatePublicKey.swift` (compiled into every
+build) is **generated automatically from that file on every `swift build`/`swift test`** by the
+`GenerateUpdatePublicKey` SwiftPM build tool plugin (`Plugins/GenerateUpdatePublicKey`) — it is
+gitignored and never hand-edited; if you ever need to change the key, edit
+`keys/release-public-key.base64` (normally only `scripts/make-release-signing-key.sh` does this)
+and rebuild. Back the private key up somewhere safe immediately — if it's lost, no future
+release can ever be verified by an app already built with the current public key; there's no
+recovery path short of shipping a new build with a new public key and telling every existing
+install to manually trust it again.
+
+## Releasing
+
+```sh
+scripts/release.sh vMAJOR.MINOR.PATCH          # tag, build, sign (codesign + Ed25519), zip, checksum, publish
+scripts/release.sh vMAJOR.MINOR.PATCH --dry-run # everything except tag/push/publish
+```
+
+Requires `.codesign-identity` to name a real (non ad-hoc) identity, the release-signing key
+from `scripts/make-release-signing-key.sh` above, and `gh` (GitHub CLI) to be authenticated.
+Every release is signed twice: with the local `FreeTalker Dev` certificate (TCC-grant
+stability only, not a trust boundary — see "Stable signing identity" above) and with the
+Ed25519 release-signing key (the actual update-authenticity boundary) — there's no CI and no
+Apple Developer account involved (see `.claude/sdd/features/BRAINSTORM_INSTALL_AND_UPDATES.md`
+for why). macOS will still block first launch of a downloaded build with "Apple could not
+verify..." — that's expected for a non-notarized app; the person installing it right-clicks (or
+Control-clicks) the app and chooses "Open" once. This is a one-time step per machine, not per
+update.
 
 ## Speech models
 
@@ -85,6 +147,11 @@ under `~/Documents/huggingface`.
 </p>
 
 ## Permissions walkthrough
+
+A "Welcome" window opens automatically the first time FreeTalker launches, showing the same
+three permissions below with live status plus the speech model download's progress, so you're
+never left holding a hotkey that silently does nothing because something isn't granted yet. It
+only appears once; permission status stays visible afterward in Settings → Privacy.
 
 On first launch, grant (System Settings → Privacy & Security):
 

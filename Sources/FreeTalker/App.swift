@@ -8,6 +8,14 @@ struct FreeTalkerApp: App {
     private static var floatingControlsController: FloatingControlsController?
 
     init() {
+        // Self-update smoke test (`SelfUpdater.verifyLaunches`): exits immediately, before any
+        // TCC priming, single-instance claim, or user-visible state — proves only that the
+        // staged binary's dylibs load and Swift code runs. Must stay the very first thing this
+        // initializer does.
+        if CommandLine.arguments.contains("--verify-launch") {
+            exit(0)
+        }
+
         let currentApplication = NSRunningApplication.current
         let claim = AppLifecycleWindowPolicy.claimInstance(
             path: AppLifecycleWindowPolicy.instanceLeasePath,
@@ -86,6 +94,10 @@ struct FreeTalkerApp: App {
         ))
         Self.floatingControlsController = floatingControlsController
         floatingControlsController.start()
+
+        if !AppSettings.shared.hasCompletedFirstRunWalkthrough {
+            FirstRunWalkthroughWindowController.shared.open()
+        }
     }
 
     var body: some Scene {
@@ -127,6 +139,13 @@ private struct MenuBarContentView: View {
     @ObservedObject private var templateStore = TemplateStore.shared
     @Environment(\.openWindow) private var openWindow
     @State private var accessibilityTrusted = Permissions.isAccessibilityTrusted()
+    // UI-level guard against firing a second check-for-updates/update workflow while one is
+    // still running — `SelfUpdater`'s own in-process gate (`UpdateInProgressGate`) is the real
+    // security boundary (it's what actually stops two concurrent `performUpdate` calls from
+    // racing each other through download/verify/swap), but disabling the button too means a
+    // user mashing "Check for Updates…" doesn't even get to see the redundant "already in
+    // progress" failure alert.
+    @State private var isUpdateWorkflowActive = false
 
     var body: some View {
         Group {
@@ -196,11 +215,15 @@ private struct MenuBarContentView: View {
                 openWindow(id: "settings")
             }
             Button("Check for Updates…") {
+                guard !isUpdateWorkflowActive else { return }
+                isUpdateWorkflowActive = true
                 Task {
+                    defer { isUpdateWorkflowActive = false }
                     let report = await SelfUpdater.check()
-                    presentSelfUpdateResult(report)
+                    await presentSelfUpdateResult(report)
                 }
             }
+            .disabled(isUpdateWorkflowActive)
 
             Divider()
 
@@ -224,16 +247,19 @@ private struct MenuBarContentView: View {
 
 /// Activates FreeTalker before presenting — mirrors the "Settings…" button above. Without
 /// this an `LSUIElement` app's alert can appear behind the frontmost app with no focus.
+/// `async` (rather than firing an inner, un-awaited `Task` for the update itself, as this used
+/// to) so the CALLER's own "a workflow is active" guard (`isUpdateWorkflowActive` above) stays
+/// set for the ENTIRE check-then-maybe-update flow, not just the initial check — otherwise the
+/// button would re-enable the instant the check finished, while an update triggered from the
+/// alert above was still silently running underneath.
 @MainActor
-private func presentSelfUpdateResult(_ report: SelfUpdater.CheckReport) {
+private func presentSelfUpdateResult(_ report: SelfUpdater.CheckReport) async {
     NSApplication.shared.activate(ignoringOtherApps: true)
     let alert = NSAlert()
     switch report.availability {
     case .upToDate:
         alert.messageText = "You're up to date"
-        if let hash = report.currentShortHash {
-            alert.informativeText = "Running \(hash)."
-        }
+        alert.informativeText = "Running \(report.currentVersion)."
         alert.addButton(withTitle: "OK")
         alert.runModal()
 
@@ -243,26 +269,32 @@ private func presentSelfUpdateResult(_ report: SelfUpdater.CheckReport) {
         alert.addButton(withTitle: "OK")
         alert.runModal()
 
-    case .blockedByLocalChanges:
-        alert.messageText = "Update skipped"
-        alert.informativeText = "The repo has local changes, update skipped."
-        alert.addButton(withTitle: "OK")
-        alert.runModal()
-
-    case .available(let behindCount):
+    case .available(let manifest):
         alert.messageText = "Update available"
-        let commitWord = behindCount == 1 ? "commit" : "commits"
-        if let hash = report.currentShortHash {
-            alert.informativeText = "You're on \(hash), \(behindCount) \(commitWord) behind."
-        } else {
-            alert.informativeText = "\(behindCount) \(commitWord) behind origin/main."
-        }
+        alert.informativeText = "You're on \(report.currentVersion). \(manifest.version) is available."
         alert.addButton(withTitle: "Update")
         alert.addButton(withTitle: "Later")
-        if alert.runModal() == .alertFirstButtonReturn, let repoPath = report.repoPath {
-            SelfUpdater.performUpdate(repoPath: repoPath)
+        if alert.runModal() == .alertFirstButtonReturn {
+            let outcome = await SelfUpdater.performUpdate(manifest: manifest)
+            switch outcome {
+            case .success:
+                SelfUpdater.relaunchAfterUpdate()
+            case .failed(let reason):
+                presentSelfUpdateFailure(reason)
+            }
         }
     }
+}
+
+@MainActor
+private func presentSelfUpdateFailure(_ reason: String) {
+    NSApplication.shared.activate(ignoringOtherApps: true)
+    let alert = NSAlert()
+    alert.alertStyle = .warning
+    alert.messageText = "Update failed"
+    alert.informativeText = reason
+    alert.addButton(withTitle: "OK")
+    alert.runModal()
 }
 
 private struct SettingsWindowConfigurator: NSViewRepresentable {

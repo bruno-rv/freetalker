@@ -13,6 +13,14 @@ let package = Package(
     ],
     targets: [
         .systemLibrary(name: "CSQLite", pkgConfig: nil),
+        // Regenerates Sources/FreeTalker/Update/UpdatePublicKey.swift from
+        // keys/release-public-key.base64 on every build — see Plugins/GenerateUpdatePublicKey
+        // and scripts/lib/public-key-data-file.sh for why the key lives in a plain data file
+        // instead of being hand-maintained Swift source.
+        .plugin(
+            name: "GenerateUpdatePublicKey",
+            capability: .buildTool()
+        ),
         .executableTarget(
             name: "FreeTalker",
             dependencies: [
@@ -20,7 +28,8 @@ let package = Package(
                 .product(name: "FluidAudio", package: "FluidAudio"),
                 "CSQLite"
             ],
-            resources: [.process("Resources")]
+            resources: [.process("Resources")],
+            plugins: ["GenerateUpdatePublicKey"]
         ),
         .testTarget(
             name: "FreeTalkerTests",
