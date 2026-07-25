@@ -2804,7 +2804,10 @@ final class AppCoordinator: ObservableObject {
     /// snapshot taken here, at selection time, decides both *whether* Cloud is used
     /// (`isCloudLLMConfigured`) and — if so — is threaded straight into the `CloudLLMProcessor`
     /// instance that runs it, so the two can never observe different settings. See Amendment A1.
-    private func resolveActiveProcessor() -> any PostProcessor {
+    /// Not `private` — the automation surface's `clean up` command
+    /// (BRAINSTORM_AUTOMATION_SURFACE.md) calls this exact selection so it runs the same
+    /// processor the UI would, never a parallel implementation.
+    func resolveActiveProcessor() -> any PostProcessor {
         let snapshot = AppSettings.shared.cloudLLMSnapshot
         return Self.isCloudLLMConfigured(snapshot: snapshot) ? CloudLLMProcessor(snapshot: snapshot) : appleFMProcessor
     }

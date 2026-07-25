@@ -66,11 +66,18 @@ final class JobLibraryStore: ObservableObject {
         cancelImport = cancel
     }
 
-    func importMedia(_ url: URL) async throws {
+    /// Returns the created job's id so callers that need to track it to completion (the
+    /// automation surface's `transcribe` command — see BRAINSTORM_AUTOMATION_SURFACE.md) can do
+    /// so through the exact same queue the Imports window itself watches, rather than a parallel
+    /// implementation. `@discardableResult` keeps the Imports window's own fire-and-forget call
+    /// site unchanged.
+    @discardableResult
+    func importMedia(_ url: URL) async throws -> UUID {
         guard let importService else { throw MediaImportError.invalidMedia }
         let id = try await importService.createJob(for: url)
         try await refresh()
         await enqueueImport?(id)
+        return id
     }
 
     func retryImport(id: UUID) async throws {

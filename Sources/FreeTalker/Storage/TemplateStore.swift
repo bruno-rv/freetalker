@@ -227,6 +227,18 @@ final class TemplateStore: ObservableObject {
         templates.first { $0.id == id }
     }
 
+    /// Exact-name lookup for the automation surface (`clean up` — see
+    /// BRAINSTORM_AUTOMATION_SURFACE.md), which resolves a Template by user-facing name rather
+    /// than internal id. Template names aren't enforced unique (the UI never checked this), so a
+    /// collision deterministically returns the first match in `templates`' existing order — the
+    /// same "earliest wins" convention `importTemplates` already uses for dedupe. `nil` means no
+    /// match, which callers must treat as an error, never a silent default (an unknown template
+    /// name is a caller mistake, not something to paper over). Pure/`nonisolated` so it's testable
+    /// without `@MainActor` and reusable by both the real store and tests.
+    nonisolated static func resolveTemplate(named name: String, in templates: [Template]) -> Template? {
+        templates.first { $0.name == name }
+    }
+
     func upsert(_ template: Template) throws {
         guard !Self.isReservedTemplateName(template.name) else {
             throw TemplateStoreError.reservedName
