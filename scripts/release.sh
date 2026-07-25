@@ -32,6 +32,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_SLUG="bruno-rv/freetalker"
 APP_NAME="FreeTalker"
 
+# shellcheck source=lib/public-key-extract.sh
+source "$REPO_ROOT/scripts/lib/public-key-extract.sh"
+
 DRY_RUN=0
 VERSION=""
 for arg in "$@"; do
@@ -116,7 +119,15 @@ fi
 # scripts/make-release-signing-key.sh derived the compiled-in one, and refuse to proceed on any
 # mismatch — before any build work, same as the missing-key check above.
 PUBLIC_KEY_SWIFT="$REPO_ROOT/Sources/FreeTalker/Update/UpdatePublicKey.swift"
-COMPILED_PUBLIC_KEY_BASE64="$(sed -n 's/.*base64 = "\([^"]*\)".*/\1/p' "$PUBLIC_KEY_SWIFT")"
+# extract_compiled_public_key_base64 (scripts/lib/public-key-extract.sh) is anchored to the
+# exact `static let base64 = "..."` declaration, requires exactly one well-formed match on its
+# own line, and sanity-checks the surrounding file's braces are balanced — never a greedy,
+# unanchored sed that a decoy trailing assignment on the same line could fool (round-6 finding
+# 1). A nonzero return means the file exists but couldn't be safely parsed as either "no anchor
+# yet" or "a valid anchor" — fail closed rather than guess (its own stderr explains why).
+if ! COMPILED_PUBLIC_KEY_BASE64="$(extract_compiled_public_key_base64 "$PUBLIC_KEY_SWIFT")"; then
+    exit 1
+fi
 if [[ -z "$COMPILED_PUBLIC_KEY_BASE64" ]]; then
     echo "error: could not read the compiled-in public key from $PUBLIC_KEY_SWIFT." >&2
     exit 1
@@ -236,15 +247,21 @@ SIGNATURE_BASE64="$(openssl base64 -A -in "$SIGNATURE_PATH")"
 # built from BUILD_COMMIT actually trusts.
 echo "==> Verifying the signature against BUILD_COMMIT's own compiled-in public key"
 PRISTINE_PUBLIC_KEY_SWIFT="$WORKTREE_DIR/Sources/FreeTalker/Update/UpdatePublicKey.swift"
-# `|| true` keeps a missing/unreadable BUILD_COMMIT source (e.g. an older commit that predates
-# UpdatePublicKey.swift entirely, reached via --dry-run testing against an old BUILD_COMMIT, or
-# any other checkout that simply lacks the file) from being fatal here under `set -e`: `sed`
-# exits nonzero on ENOENT with no stdout, and since this assignment is a bare simple command,
-# set -e would otherwise abort the whole script on the spot — skipping the -z check right below
-# and, with it, the `rm -rf "$DIST_DIR"` cleanup that check performs. Falling through to that
-# check with an empty value here treats "missing source file" exactly like "empty/unreadable
-# key", which is already handled the same way "does not verify" is: abort AND clean up dist/.
-PRISTINE_PUBLIC_KEY_BASE64="$(sed -n 's/.*base64 = "\([^"]*\)".*/\1/p' "$PRISTINE_PUBLIC_KEY_SWIFT" 2>/dev/null || true)"
+# extract_compiled_public_key_base64 (scripts/lib/public-key-extract.sh) already treats a
+# missing file as "nothing to extract" (exit 0, empty output) rather than a fatal error — e.g.
+# an older BUILD_COMMIT that predates UpdatePublicKey.swift entirely, reached via --dry-run
+# testing against an old commit — so the `if !` guard below only ever trips on a MALFORMED file
+# (exists but couldn't be safely parsed as either state, round-6 finding 1/2), and the -z check
+# right after it catches "missing" exactly as before. Using the same `if !`/command-substitution
+# guard release.sh already uses above keeps this exempt from `set -e` without needing a bare
+# `|| true` to paper over it.
+if ! PRISTINE_PUBLIC_KEY_BASE64="$(extract_compiled_public_key_base64 "$PRISTINE_PUBLIC_KEY_SWIFT")"; then
+    echo "error: BUILD_COMMIT's own source ($PRISTINE_PUBLIC_KEY_SWIFT) exists but its" >&2
+    echo "compiled-in public key could not be safely parsed — see the error above. Refusing to" >&2
+    echo "publish an artifact whose own trust anchor can't be verified." >&2
+    rm -rf "$DIST_DIR"
+    exit 1
+fi
 if [[ -z "$PRISTINE_PUBLIC_KEY_BASE64" ]]; then
     echo "error: could not read the compiled-in public key from BUILD_COMMIT's own source" >&2
     echo "($PRISTINE_PUBLIC_KEY_SWIFT)." >&2

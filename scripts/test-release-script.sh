@@ -26,6 +26,26 @@ log() { echo "==> $*"; }
 fail() { echo "FAIL: $*" >&2; FAILURES=$((FAILURES + 1)); }
 pass() { echo "PASS: $*"; }
 
+# Scans "$1"/freetalker-release-?????? for a directory containing "$1_candidate/$2", deletes the
+# FIRST one found, and returns 0; returns 1 if none was found this pass. Shared by the racer in
+# test_missing_build_commit_key_source_aborts_and_cleans_dist (which loops this until BUILD_COMMIT's
+# own worktree appears) and by test_racer_is_confined_to_its_own_root below (which calls it
+# directly, once, to prove the SAME code that test relies on really is confined to whatever root
+# it's given — round-6 finding 3).
+racer_delete_target_under() {
+    local search_root="$1" relative_target="$2"
+    local candidate target
+    for candidate in "$search_root"/freetalker-release-??????; do
+        [[ -d "$candidate" ]] || continue
+        target="$candidate/$relative_target"
+        if [[ -f "$target" ]]; then
+            rm -f "$target"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Builds a throwaway fixture git repo at $1 with:
 #   - a minimal Makefile whose `bundle` target stamps CFBundleShortVersionString from
 #     VERSION_OVERRIDE and records the CURRENT git commit (of wherever `make bundle` is actually
@@ -45,9 +65,13 @@ make_fixture() {
     git -C "$fixture" config user.email "test@example.com"
     git -C "$fixture" config user.name "Release Script Test"
 
-    mkdir -p "$fixture/scripts" "$fixture/Sources/FreeTalker/Update"
+    mkdir -p "$fixture/scripts/lib" "$fixture/Sources/FreeTalker/Update"
     cp "$REPO_ROOT/scripts/release.sh" "$fixture/scripts/release.sh"
     chmod +x "$fixture/scripts/release.sh"
+    # release.sh sources this relative to its OWN location (REPO_ROOT), so the fixture needs its
+    # own copy too — the REAL file, never a re-derived stand-in, so extraction logic here is
+    # exactly what production uses (round-6 finding 1).
+    cp "$REPO_ROOT/scripts/lib/public-key-extract.sh" "$fixture/scripts/lib/public-key-extract.sh"
 
     # The REAL Makefile, byte-for-byte — never a re-derived stand-in — `include`d so this
     # fixture's `codesign-identity-check` target (and the `export CODESIGN_IDENTITY` /
@@ -341,7 +365,34 @@ test_missing_build_commit_key_source_aborts_and_cleans_dist() {
     local fixture commit_a commit_b
     { read -r fixture; read -r commit_a; read -r commit_b; } < <(make_fixture)
     : "$commit_b" # unused in this test
-    trap 'rm -rf "$fixture"' RETURN
+
+    # Round-6 Finding 3 (REGRESSION): the racer below used to scan the GLOBAL
+    # "${TMPDIR:-/tmp}/freetalker-release-??????" namespace and delete the FIRST match it found —
+    # the exact same naming scheme a real, concurrently running `scripts/release.sh` (or another
+    # invocation of this very harness) uses for its own isolated worktree. That let this test
+    # destroy a worktree it did not create. Give the racer its OWN scoped root — created here,
+    # torn down here, never touched by anything else — and point release.sh's OWN `mktemp -d
+    # "${TMPDIR:-/tmp}/freetalker-release-XXXXXX"` at it via TMPDIR, so the racer's glob can only
+    # ever match a worktree this exact test invocation created.
+    local racer_root
+    racer_root="$(mktemp -d "${TMPDIR:-/tmp}/freetalker-release-test-racer-root-XXXXXX")"
+    trap 'rm -rf "$fixture" "$racer_root" "$decoy_worktree"' RETURN
+
+    # A decoy planted directly in the REAL ambient TMPDIR (never inside $racer_root), using the
+    # exact "freetalker-release-XXXXXX" naming scheme and file layout a real concurrent
+    # release.sh's own isolated worktree would have — standing in for that real worktree. Its
+    # target file exists from the moment it's created (unlike the racer's actual intended
+    # target, which only appears once release.sh's own `git worktree add` finishes), so an
+    # unconfined racer would find and delete THIS on its very first pass, deterministically. A
+    # properly confined racer (scanning only $racer_root) can never even enumerate it. This is
+    # harmless either way — it's this test's own throwaway data, cleaned up above regardless of
+    # outcome — but it directly proves the production racer call site stays confined; reverting
+    # either the racer's glob root or the `TMPDIR=` override below makes this fail.
+    local decoy_worktree decoy_target
+    decoy_worktree="$(mktemp -d "${TMPDIR:-/tmp}/freetalker-release-XXXXXX")"
+    mkdir -p "$decoy_worktree/Sources/FreeTalker/Update"
+    decoy_target="$decoy_worktree/Sources/FreeTalker/Update/UpdatePublicKey.swift"
+    echo "decoy content — must never be touched by a properly confined racer" >"$decoy_target"
 
     log "Round-5 Finding 2: BUILD_COMMIT's own compiled-in public key source going missing (e.g. an"
     log "old commit that predates UpdatePublicKey.swift entirely, reached mid-flight the same way" \
@@ -353,20 +404,15 @@ test_missing_build_commit_key_source_aborts_and_cleans_dist() {
     # fixture's live tree, which must keep a valid, matching UpdatePublicKey.swift throughout so
     # the pre-build key-match check (Round-3 Finding 3) still passes — by deleting the file from
     # the worktree the instant it appears, well before the fake bundle recipe's own 0.5s sleep
-    # completes, let alone the zip/checksum/sign/post-verify steps that follow it. The glob matches
-    # only release.sh's own `mktemp -d ".../freetalker-release-XXXXXX"` worktree, never this
-    # fixture's root (`freetalker-release-test-XXXXXX`) — six wildcard characters then end of
-    # pattern excludes the longer "-test-XXXXXX" suffix.
+    # completes, let alone the zip/checksum/sign/post-verify steps that follow it. The glob is
+    # confined to $racer_root (see above), so even though it still matches release.sh's own
+    # "freetalker-release-XXXXXX" naming scheme by design, it can never see (let alone delete)
+    # anything outside the root this test alone created.
     (
         for _ in $(seq 1 200); do
-            for candidate in "${TMPDIR:-/tmp}"/freetalker-release-??????; do
-                [[ -d "$candidate" ]] || continue
-                target="$candidate/Sources/FreeTalker/Update/UpdatePublicKey.swift"
-                if [[ -f "$target" ]]; then
-                    rm -f "$target"
-                    exit 0
-                fi
-            done
+            if racer_delete_target_under "$racer_root" "Sources/FreeTalker/Update/UpdatePublicKey.swift"; then
+                exit 0
+            fi
             sleep 0.01
         done
     ) &
@@ -374,7 +420,7 @@ test_missing_build_commit_key_source_aborts_and_cleans_dist() {
 
     local output status
     set +e
-    output="$(cd "$fixture" && FREETALKER_RELEASE_SIGNING_KEY="$fixture/release-signing-key.pem" ./scripts/release.sh v0.0.1 --dry-run 2>&1)"
+    output="$(cd "$fixture" && TMPDIR="$racer_root" FREETALKER_RELEASE_SIGNING_KEY="$fixture/release-signing-key.pem" ./scripts/release.sh v0.0.1 --dry-run 2>&1)"
     status=$?
     set -e
     wait "$racer_pid"
@@ -396,6 +442,84 @@ test_missing_build_commit_key_source_aborts_and_cleans_dist() {
         return
     fi
     pass "missing BUILD_COMMIT public-key source aborted with the expected message, and dist/ was cleaned up"
+
+    if [[ ! -f "$decoy_target" ]]; then
+        fail "Round-6 Finding 3 (REGRESSION): the racer deleted the DECOY worktree's file instead" \
+            "of (or in addition to) BUILD_COMMIT's own — it reached outside \$racer_root into the" \
+            "real ambient TMPDIR namespace, exactly what a real concurrent release's isolated" \
+            "worktree would sit in. Confinement is not actually working."
+        return
+    fi
+    pass "the racer never touched the decoy worktree living in the real ambient TMPDIR" \
+        "namespace outside \$racer_root — confinement holds"
+}
+
+test_ambiguous_public_key_declaration_is_rejected_not_silently_misextracted() {
+    local fixture commit_a commit_b
+    { read -r fixture; read -r commit_a; read -r commit_b; } < <(make_fixture)
+    : "$commit_a" "$commit_b" # unused in this test
+    trap 'rm -rf "$fixture"' RETURN
+
+    log "Round-6 Finding 1: a UpdatePublicKey.swift line where a naive greedy sed extraction" \
+        "disagrees with what Swift actually compiles must be rejected outright, never silently" \
+        "signed against the wrong (attacker-controlled) value."
+
+    # The exact shape from the finding. Swift compiles ONLY the first quoted literal (key A) —
+    # everything after it, even text that itself looks like `base64 = "..."`, is just a trailing
+    # comment with no effect on the compiled constant. A naive, unanchored, greedy
+    # `sed 's/.*base64 = "\(...\)".*'` instead matches the LAST occurrence on the line and
+    # silently returns key B. Generating a real PRIVATE key for B (not just a public value) is
+    # what makes this a meaningful demonstration rather than an accidental pass: signing with
+    # key_b_private is exactly what a naive extraction would let through as "matching," even
+    # though every already-built client only trusts key A.
+    local key_a key_b_private key_b
+    key_a="$(openssl genpkey -algorithm ED25519 2>/dev/null | openssl pkey -pubout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | tail -c 32 | openssl base64 -A)"
+    key_b_private="$(mktemp -d)/key-b.pem"
+    openssl genpkey -algorithm ED25519 -out "$key_b_private" 2>/dev/null
+    key_b="$(openssl pkey -in "$key_b_private" -pubout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | tail -c 32 | openssl base64 -A)"
+    local swift_path="$fixture/Sources/FreeTalker/Update/UpdatePublicKey.swift"
+    cat >"$swift_path" <<EOF
+enum UpdatePublicKey {
+    static let base64 = "$key_a" // base64 = "$key_b"
+}
+EOF
+    git -C "$fixture" add -A
+    git -C "$fixture" commit --quiet -m "ambiguous base64 declaration"
+
+    # Sanity-check the fixture really reproduces the finding: the OLD naive sed must disagree
+    # with what Swift compiles (key A) and return key B instead. If this ever stops being true
+    # (e.g. the fixture's shape drifts), the test below would pass for the wrong reason.
+    local naive_extraction
+    naive_extraction="$(sed -n 's/.*base64 = "\([^"]*\)".*/\1/p' "$swift_path")"
+    if [[ "$naive_extraction" != "$key_b" ]]; then
+        fail "test setup invalid: expected the naive greedy sed to disagree with Swift and" \
+            "extract key B ($key_b), got '$naive_extraction' — fixture doesn't reproduce Finding 1"
+        return
+    fi
+
+    # Sign with key B's PRIVATE key — the one a naive extraction would treat as "matching" the
+    # compiled-in value (it isn't; Swift compiles key A). A vulnerable release.sh happily accepts
+    # this and produces dist/; the fix must reject the file outright, before ever looking at
+    # which signing key was supplied.
+    local output status
+    set +e
+    output="$(cd "$fixture" && FREETALKER_RELEASE_SIGNING_KEY="$key_b_private" ./scripts/release.sh v0.0.1 --dry-run 2>&1)"
+    status=$?
+    set -e
+    rm -rf "$(dirname "$key_b_private")"
+    if [[ "$status" -eq 0 ]]; then
+        fail "release.sh --dry-run accepted an ambiguous base64 declaration and signed with key" \
+            "B's private key ($key_b) instead of rejecting the file outright — Swift actually" \
+            "compiles key A ($key_a), so every already-built client would reject this release"
+        echo "$output"
+        return
+    fi
+    if [[ -e "$fixture/dist" ]]; then
+        fail "release.sh created dist/ despite the ambiguous base64 declaration"
+        return
+    fi
+    pass "ambiguous base64 declaration (naive sed disagrees with what Swift compiles) rejected" \
+        "before any build or signing work, instead of being silently misextracted"
 }
 
 test_key_mismatch_rejected_and_matching_key_accepted
@@ -403,6 +527,7 @@ test_artifact_is_immune_to_a_concurrent_checkout_away_and_back
 test_signature_is_rejected_if_the_signing_key_file_is_swapped_mid_build
 test_hostile_codesign_identity_is_rejected_end_to_end
 test_missing_build_commit_key_source_aborts_and_cleans_dist
+test_ambiguous_public_key_declaration_is_rejected_not_silently_misextracted
 
 echo
 if [[ "$FAILURES" -eq 0 ]]; then

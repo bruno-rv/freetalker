@@ -30,9 +30,12 @@ derive_public_key_base64() {
 make_fixture() {
     local fixture
     fixture="$(mktemp -d "${TMPDIR:-/tmp}/freetalker-keygen-test-XXXXXX")"
-    mkdir -p "$fixture/scripts" "$fixture/Sources/FreeTalker/Update" "$fixture/keys"
+    mkdir -p "$fixture/scripts/lib" "$fixture/Sources/FreeTalker/Update" "$fixture/keys"
     cp "$REPO_ROOT/scripts/make-release-signing-key.sh" "$fixture/scripts/make-release-signing-key.sh"
     chmod +x "$fixture/scripts/make-release-signing-key.sh"
+    # make-release-signing-key.sh sources this relative to its OWN location (REPO_ROOT), so the
+    # fixture needs its own copy too — the REAL file, never a re-derived stand-in.
+    cp "$REPO_ROOT/scripts/lib/public-key-extract.sh" "$fixture/scripts/lib/public-key-extract.sh"
     echo "$fixture"
 }
 
@@ -341,12 +344,127 @@ test_missing_pem_with_established_anchor_rotates_with_explicit_override() {
         "configured PEM path didn't exist"
 }
 
+test_malformed_swift_truncated_before_complete_assignment_is_rejected_not_treated_as_absent() {
+    local fixture
+    fixture="$(make_fixture)"
+    trap 'rm -rf "$fixture"' RETURN
+
+    log "Round-6 Finding 2 (direction 1): UpdatePublicKey.swift truncated BEFORE a closed" \
+        "'base64 = \"...\"' assignment must be treated as MALFORMED — not silently treated as" \
+        "'nothing established yet', which would let a brand-new key be generated without" \
+        "--rotate-established-key even though a real anchor may already be deployed."
+
+    local key_path="$fixture/keys/release-signing-key.pem"
+    local swift_path="$fixture/Sources/FreeTalker/Update/UpdatePublicKey.swift"
+
+    # Simulates corruption of an established anchor: a Swift file that cuts off mid-assignment,
+    # never reaching a closing quote — the exact shape the finding describes. No PEM at
+    # $key_path either, the same way a fresh publisher workstation or a lost key looks; the OLD
+    # buggy script treated "extraction returned empty" here as "nothing established yet" and
+    # would go on to generate a brand-new key.
+    cat >"$swift_path" <<'EOF'
+import CryptoKit
+import Foundation
+
+enum UpdatePublicKey {
+    static let base64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+EOF
+
+    local output status
+    set +e
+    output="$(FREETALKER_RELEASE_SIGNING_KEY="$key_path" "$fixture/scripts/make-release-signing-key.sh" 2>&1)"
+    status=$?
+    set -e
+    if [[ "$status" -eq 0 ]]; then
+        fail "the script exited 0 (either generated a key or reported nothing to do) despite" \
+            "\$swift_path being truncated mid-assignment — it must fail closed instead"
+        echo "$output"
+        return
+    fi
+    if [[ -f "$key_path" ]]; then
+        fail "the script generated a NEW private key at $key_path despite the compiled-in" \
+            "source being unparseable — it must never guess based on source it couldn't parse"
+        return
+    fi
+    if [[ "$output" == *"ESTABLISHED public key"* ]]; then
+        fail "the script treated the truncated file as an ESTABLISHED-anchor mismatch rather" \
+            "than reporting it as malformed/unparseable; got:"$'\n'"$output"
+        return
+    fi
+    pass "truncated-before-close Swift source rejected as malformed; no key generated"
+}
+
+test_malformed_swift_truncated_after_complete_assignment_is_rejected_not_nothing_to_do() {
+    local fixture
+    fixture="$(make_fixture)"
+    trap 'rm -rf "$fixture"' RETURN
+
+    log "Round-6 Finding 2 (direction 2): UpdatePublicKey.swift truncated immediately AFTER an" \
+        "otherwise complete, well-formed 'base64 = \"...\"' assignment line must still be" \
+        "treated as MALFORMED — not reported as a true no-op 'Nothing to do', which would leave" \
+        "an invalid Swift file in place with no warning at all."
+
+    local key_a="$fixture/keys/key-a.pem"
+    local swift_path="$fixture/Sources/FreeTalker/Update/UpdatePublicKey.swift"
+
+    # Establish a real anchor with the REAL script first, exactly like a real first-time setup.
+    FREETALKER_RELEASE_SIGNING_KEY="$key_a" "$fixture/scripts/make-release-signing-key.sh" >/dev/null 2>&1
+    local key_a_public
+    key_a_public="$(derive_public_key_base64 "$key_a")"
+
+    # Truncate right after the assignment line — the line itself stays perfectly well-formed and
+    # matches key A exactly, but the rest of the enum body (and its closing brace) is gone. The
+    # OLD buggy script only ever looked at this one line, so it would report "Nothing to do" —
+    # true of the KEY, false of the FILE, which won't even compile.
+    local expected_truncated_content
+    expected_truncated_content="$(cat <<EOF
+import CryptoKit
+import Foundation
+
+enum UpdatePublicKey {
+    static let base64 = "$key_a_public"
+EOF
+)"
+    printf '%s\n' "$expected_truncated_content" >"$swift_path"
+
+    local output status
+    set +e
+    output="$(FREETALKER_RELEASE_SIGNING_KEY="$key_a" "$fixture/scripts/make-release-signing-key.sh" 2>&1)"
+    status=$?
+    set -e
+    if [[ "$status" -eq 0 ]]; then
+        fail "the script exited 0 despite \$swift_path being truncated right after an otherwise" \
+            "complete assignment line — it must not treat this as 'nothing to do'"
+        echo "$output"
+        return
+    fi
+    if [[ "$output" == *"Nothing to do"* ]]; then
+        fail "the script reported 'Nothing to do' over a truncated/invalid Swift file — exactly" \
+            "the bug Finding 2 describes: a broken file left in place with no warning"
+        return
+    fi
+    local swift_content_after
+    swift_content_after="$(cat "$swift_path")"
+    if [[ "$swift_content_after" != "$expected_truncated_content" ]]; then
+        fail "the script modified the truncated/malformed Swift file instead of leaving it" \
+            "untouched for the operator to fix or restore from git"
+        return
+    fi
+    if [[ "$(cat "$key_a")" == "" ]]; then
+        fail "test setup bug: key A's PEM is empty"
+        return
+    fi
+    pass "truncated-after-close Swift source rejected as malformed, not reported as 'Nothing to do'"
+}
+
 test_fresh_generation_produces_a_matching_pair
 test_interrupted_run_resumes_without_regenerating_the_key
 test_established_anchor_mismatch_is_refused_without_override
 test_missing_pem_with_established_anchor_is_refused_without_override
 test_missing_pem_with_established_anchor_rotates_with_explicit_override
 test_established_anchor_mismatch_rotates_with_explicit_override
+test_malformed_swift_truncated_before_complete_assignment_is_rejected_not_treated_as_absent
+test_malformed_swift_truncated_after_complete_assignment_is_rejected_not_nothing_to_do
 
 echo
 if [[ "$FAILURES" -eq 0 ]]; then

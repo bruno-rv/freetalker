@@ -60,6 +60,9 @@ PRIVATE_KEY_PATH="${FREETALKER_RELEASE_SIGNING_KEY:-$KEY_DIR/release-signing-key
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PUBLIC_KEY_SWIFT="$REPO_ROOT/Sources/FreeTalker/Update/UpdatePublicKey.swift"
 
+# shellcheck source=lib/public-key-extract.sh
+source "$REPO_ROOT/scripts/lib/public-key-extract.sh"
+
 # Derives the base64 raw 32-byte Ed25519 public key from a private key PEM, on stdout. Fails
 # (nonzero exit, nothing printed) if the input isn't a readable Ed25519 private key, or if the
 # derived SubjectPublicKeyInfo DER isn't exactly the expected 44 bytes (12-byte algorithm-ID
@@ -79,42 +82,26 @@ derive_public_key_base64() {
     tail -c 32 "$public_key_der" | openssl base64 -A
 }
 
-# The base64 public key currently compiled into UpdatePublicKey.swift, or empty if the file
-# doesn't exist or doesn't match the expected shape.
-compiled_public_key_base64() {
-    [[ -f "$PUBLIC_KEY_SWIFT" ]] || return 0
-    sed -n 's/.*base64 = "\([^"]*\)".*/\1/p' "$PUBLIC_KEY_SWIFT"
-}
-
 write_public_key_swift() {
-    local public_key_base64="$1"
-    cat >"$PUBLIC_KEY_SWIFT" <<EOF
-import CryptoKit
-import Foundation
-
-/// The public half of the Ed25519 release-signing keypair (see
-/// scripts/make-release-signing-key.sh). Compiled into every build — this is the trust anchor
-/// \`UpdateSignatureVerifier\` checks a downloaded release's signature against. It is independent
-/// of any machine-local keychain trust. The matching private key never leaves the release
-/// signer's machine; regenerating this file with a new keypair is a breaking change for every
-/// already-built app, since it can only ever trust the ONE public key it was compiled with.
-enum UpdatePublicKey {
-    static let base64 = "$public_key_base64"
-
-    static var current: Curve25519.Signing.PublicKey? { Self.parse(base64: base64) }
-
-    /// Pulled out of \`current\` so tests can exercise the exact parsing/validation logic
-    /// (length check, \`CryptoKit\` construction) against both this real compiled-in key and
-    /// deliberately invalid inputs, without needing a second compiled-in constant.
-    static func parse(base64: String) -> Curve25519.Signing.PublicKey? {
-        guard let raw = Data(base64Encoded: base64), raw.count == 32,
-            let key = try? Curve25519.Signing.PublicKey(rawRepresentation: raw)
-        else { return nil }
-        return key
-    }
+    write_compiled_public_key_swift "$1" "$PUBLIC_KEY_SWIFT"
 }
-EOF
-}
+
+# Read the compiled-in key ONCE, up front — both branches below (PEM exists / PEM missing) need
+# to know whether $PUBLIC_KEY_SWIFT already holds an ESTABLISHED anchor, and must see EXACTLY
+# the same answer scripts/release.sh's own extraction would (round-6 finding 1: they must
+# agree). A nonzero return here means the file exists but could not be safely parsed as either
+# "nothing established yet" or "a valid anchor" (round-6 finding 2: MALFORMED source) — fail
+# closed immediately, before even checking whether a private key exists, rather than falling
+# through to either "resume" or "nothing to do" on the basis of source that couldn't be parsed.
+if ! CURRENT_COMPILED_PUBLIC_KEY_BASE64="$(extract_compiled_public_key_base64 "$PUBLIC_KEY_SWIFT")"; then
+    echo "error: $PUBLIC_KEY_SWIFT exists but could not be safely parsed as either a genuine" >&2
+    echo "placeholder (nothing established yet) or a valid established anchor — see the error" >&2
+    echo "above. This is NOT treated as either of those states, because doing so could either" >&2
+    echo "skip the established-anchor guard when an anchor really is there, or report" >&2
+    echo "\"nothing to do\" while leaving a broken file in place. Investigate and fix" >&2
+    echo "$PUBLIC_KEY_SWIFT by hand (or restore it from git) before re-running." >&2
+    exit 1
+fi
 
 if [[ -f "$PRIVATE_KEY_PATH" ]]; then
     if ! EXISTING_PUBLIC_KEY_BASE64="$(derive_public_key_base64 "$PRIVATE_KEY_PATH")" || [[ -z "$EXISTING_PUBLIC_KEY_BASE64" ]]; then
@@ -122,7 +109,7 @@ if [[ -f "$PRIVATE_KEY_PATH" ]]; then
         echo "Investigate manually — refusing to touch it or generate a new one over it." >&2
         exit 1
     fi
-    if [[ "$(compiled_public_key_base64)" == "$EXISTING_PUBLIC_KEY_BASE64" ]]; then
+    if [[ "$CURRENT_COMPILED_PUBLIC_KEY_BASE64" == "$EXISTING_PUBLIC_KEY_BASE64" ]]; then
         echo "A release signing key already exists at $PRIVATE_KEY_PATH, and $PUBLIC_KEY_SWIFT"
         echo "already matches it. Nothing to do."
         echo "Delete the PEM manually first if you really want to generate a new one — doing so makes"
@@ -135,8 +122,9 @@ if [[ -f "$PRIVATE_KEY_PATH" ]]; then
     # genuinely interrupted first-time setup — nothing has been established yet, so
     # $PUBLIC_KEY_SWIFT is missing or holds no real key — versus an ESTABLISHED anchor that
     # simply disagrees with this PEM (already-deployed clients trust it). The compiled key's
-    # PRESENCE is what tells them apart.
-    CURRENT_COMPILED_PUBLIC_KEY_BASE64="$(compiled_public_key_base64)"
+    # PRESENCE is what tells them apart. (A file that exists but can't be safely parsed either
+    # way already exited above — CURRENT_COMPILED_PUBLIC_KEY_BASE64 here is only ever a real
+    # extracted value or genuinely empty, never "unparseable.")
     if [[ -z "$CURRENT_COMPILED_PUBLIC_KEY_BASE64" ]]; then
         # Nothing established yet — RESUME by deriving from the EXISTING private key and
         # (re)writing UpdatePublicKey.swift to match. Never generates a new keypair, which would
@@ -186,8 +174,8 @@ fi
 # against. If $PUBLIC_KEY_SWIFT already holds a real anchor, falling through to key generation
 # below would silently mint a brand-new key and overwrite it — exactly the destructive case this
 # guard exists for, and losing the private key does not make it safer to do so silently: there is
-# no way back once an already-deployed anchor is rotated out from under it.
-CURRENT_COMPILED_PUBLIC_KEY_BASE64="$(compiled_public_key_base64)"
+# no way back once an already-deployed anchor is rotated out from under it. (CURRENT_COMPILED_
+# PUBLIC_KEY_BASE64 was already read once, up front, before either branch — see above.)
 if [[ -n "$CURRENT_COMPILED_PUBLIC_KEY_BASE64" && "$ROTATE_ESTABLISHED_KEY" -ne 1 ]]; then
     echo "error: $PRIVATE_KEY_PATH does not exist, but $PUBLIC_KEY_SWIFT already has an" >&2
     echo "ESTABLISHED public key compiled in ($CURRENT_COMPILED_PUBLIC_KEY_BASE64)." >&2
