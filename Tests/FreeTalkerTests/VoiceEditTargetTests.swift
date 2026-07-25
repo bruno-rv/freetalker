@@ -40,6 +40,24 @@ import Testing
         ) == .selectionChanged)
     }
 
+    /// Codex Round 2 finding 2: `revalidationError`'s new `documentMatches` parameter fails closed
+    /// to `.targetChanged` on its own — independent of app/element/window/range/text all still
+    /// agreeing — and its default (`true`) preserves every pre-fix call site that never captured a
+    /// document discriminator at all.
+    @Test func revalidationErrorTreatsADocumentMismatchAsTargetChanged() {
+        let fingerprint = SelectionSnapshot.fingerprint(for: "selected")
+        #expect(SelectionAccess.revalidationError(
+            appMatches: true, elementMatches: true, windowMatches: true, documentMatches: false,
+            expectedRange: NSRange(location: 3, length: 8), currentRange: NSRange(location: 3, length: 8),
+            expectedFingerprint: fingerprint, currentText: "selected"
+        ) == .targetChanged)
+        #expect(SelectionAccess.revalidationError(
+            appMatches: true, elementMatches: true, windowMatches: true,
+            expectedRange: NSRange(location: 3, length: 8), currentRange: NSRange(location: 3, length: 8),
+            expectedFingerprint: fingerprint, currentText: "selected"
+        ) == nil)
+    }
+
     @Test func voiceEditHotkeyDispatchIsSynchronousAndSwallowed() {
         let ptt = HotKeyMatcher(spec: .default)
         let insertLastDictation = HotKeyMatcher(spec: HotKeySpec(modifiers: 0, keyCode: 105))
@@ -272,6 +290,39 @@ import Testing
         }
     }
 
+    /// Codex Round 2 finding 2: Correction Loop signal B's fallback (`CorrectionTargeting.
+    /// selectRecentInsertion`) carries a remembered `document` discriminator into the
+    /// `SelectionSnapshot` it produces, but `replace()`'s revalidation previously compared only
+    /// app/element/window/range/text — never `document`. Concrete failure this closes: the
+    /// remembered dictation lived in document A; the user switches to a DIFFERENT tab reusing the
+    /// same recycled AX element/window with IDENTICAL text at the same range (document B) before
+    /// Replace runs — element/window/range/text all still match, but it's the wrong document.
+    @Test func replaceRejectsADocumentThatChangedEvenWhenElementWindowRangeAndTextStillMatch() {
+        let adapter = ScriptedSelectionAdapter(reads: Self.stableReads + Self.stableReads)
+        // Every live read (before/after, both passes) reports the SAME reused element/window but
+        // a document discriminator that differs from what the snapshot remembered.
+        let access = Self.access(adapter: adapter, targets: Array(repeating: Self.target(document: "doc-B"), count: 4))
+        let snapshot = Self.snapshot(text: "draft", document: "doc-A")
+
+        #expect(throws: SelectionAccessError.targetChanged) {
+            try access.replace(snapshot, with: "replacement")
+        }
+        #expect(adapter.replacements.isEmpty)
+        #expect(adapter.rangesSet.isEmpty)
+    }
+
+    /// A snapshot that never captured a document discriminator (an app that doesn't expose
+    /// `kAXDocumentAttribute` at all) must behave exactly as before this fix — element/window
+    /// identity alone still governs.
+    @Test func replaceStillSucceedsWhenNeitherSnapshotNorLiveTargetHaveADocumentDiscriminator() throws {
+        let adapter = ScriptedSelectionAdapter(reads: Self.stableReads + Self.stableReads)
+        let access = Self.access(adapter: adapter, targetCount: 4)
+
+        try access.replace(Self.snapshot(text: "draft"), with: "replacement")
+
+        #expect(adapter.replacements == ["replacement"])
+    }
+
     @Test func stopStartPreservesSwallowedKeyUpExactlyOnce() {
         var ptt = HotKeyMatcher(spec: .default)
         var insertLastDictation: HotKeyMatcher? = HotKeyMatcher(spec: HotKeySpec(modifiers: 0, keyCode: 105))
@@ -389,13 +440,13 @@ import Testing
     private static let element = AXUIElementCreateSystemWide()
     private static let window = AXUIElementCreateSystemWide()
 
-    private static func target(element: AXUIElement = element, window: AXUIElement = window) -> InsertionTarget {
-        InsertionTarget(bundleID: "test.app", pid: 7, focusedElement: element, window: window)
+    private static func target(element: AXUIElement = element, window: AXUIElement = window, document: String? = nil) -> InsertionTarget {
+        InsertionTarget(bundleID: "test.app", pid: 7, focusedElement: element, window: window, document: document)
     }
 
-    private static func snapshot(text: String) -> SelectionSnapshot {
+    private static func snapshot(text: String, document: String? = nil) -> SelectionSnapshot {
         SelectionSnapshot(
-            target: target(), range: NSRange(location: 0, length: text.utf16.count),
+            target: target(document: document), range: NSRange(location: 0, length: text.utf16.count),
             text: text, fingerprint: SelectionSnapshot.fingerprint(for: text)
         )
     }

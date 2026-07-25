@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import FreeTalker
 
@@ -50,4 +51,51 @@ import Testing
         )
         #expect(pair.rightText == "hi João Silva")
     }
+
+    /// Codex Round 2 finding 7: `close()`'s terminal `generation += 1` used to leave the `Task`'s
+    /// own `defer { if myGeneration == generation { isBusy = false } }` permanently unable to
+    /// fire (the generation it's comparing against was ALREADY bumped by `close()` itself, a few
+    /// lines before the defer ever runs) — so a SUCCESSFUL correction's own `close()` call left
+    /// `isBusy` stuck `true` for the rest of the process, and `open()`'s `!isBusy` guard refused
+    /// every later attempt. `LibraryStore`/`VocabStore` share one real on-disk temp database (see
+    /// `LibraryStore.temporaryWithDatabaseURL`) so `CorrectionRecorder.record`'s dictation-id FK
+    /// resolves for real, end to end — the same path `AppCoordinator`'s panel wiring exercises.
+    @MainActor
+    @Test func panelReopensAfterASuccessfulCorrection() async throws {
+        let (library, databaseURL) = try LibraryStore.temporaryWithDatabaseURL()
+        let id = try library.record(
+            language: "en", template: "Clean", transcript: "hi joao how are you",
+            refined: "hi joao how are you", engine: "local"
+        )
+        let vocabStore = try VocabStore(databaseURL: databaseURL)
+        var decisionApplied = false
+        let controller = CorrectionPanelController(
+            store: { vocabStore }, library: library, selectionAccess: NoopSelectionAccess(),
+            onDecisionApplied: { decisionApplied = true }
+        )
+
+        controller.open()
+        #expect(controller.dictation?.id == id)
+
+        controller.corrected = "hi João how are you"
+        controller.confirm()
+        await controller.waitForCurrentAction()
+        #expect(decisionApplied)
+        #expect(!controller.isBusy)
+
+        // The regression: every later `open()` used to refuse forever once a correction had ever
+        // succeeded once.
+        controller.open()
+        #expect(controller.dictation?.id == id)
+    }
+}
+
+/// No-op stand-in for `SelectionAccessing` — `CorrectionPanelController.confirm()`'s live-document
+/// repair step only runs when `RecentInsertionStore.shared.recent()` names THIS test's dictation,
+/// which it never does here, so `replace`/`capture` are never actually invoked; this only exists
+/// to satisfy the initializer without touching real AX.
+@MainActor
+private final class NoopSelectionAccess: SelectionAccessing {
+    func capture() throws -> SelectionSnapshot { throw SelectionAccessError.noFrontmostApplication }
+    func replace(_ snapshot: SelectionSnapshot, with text: String) throws { throw SelectionAccessError.noFrontmostApplication }
 }

@@ -141,6 +141,36 @@ import Testing
         #expect(result.map(Self.str) == "João Silva")
     }
 
+    // MARK: - Codex Round 2 finding 3: `rangeLimitedEditedReplacement`'s 32-char delta bound
+
+    @Test func boundedEditedLengthAllowsGrowthUpToTheBound() {
+        // A genuine correction growing the inserted text by up to 32 UTF-16 units is still read.
+        #expect(Insertion.boundedEditedLength(currentLength: 132, baselineLength: 100, ledgerLength: 4) == 36)
+        #expect(Insertion.boundedEditedLength(currentLength: 100, baselineLength: 100, ledgerLength: 4) == 4)
+    }
+
+    @Test func boundedEditedLengthFailsClosedPastThePositiveBound() {
+        // Codex Round 2 finding 3's core regression: the user kept typing AFTER the dictation,
+        // never touching the inserted range at all — `delta` keeps growing with every character,
+        // and once it exceeds the bound this must refuse to read rather than reading the
+        // dictation plus everything typed after it.
+        #expect(Insertion.boundedEditedLength(currentLength: 100 + Insertion.editWatcherDeltaBound, baselineLength: 100, ledgerLength: 4) != nil)
+        #expect(Insertion.boundedEditedLength(currentLength: 100 + Insertion.editWatcherDeltaBound + 1, baselineLength: 100, ledgerLength: 4) == nil)
+    }
+
+    @Test func boundedEditedLengthFailsClosedPastTheNegativeBound() {
+        // A shrink past the bound (something well outside the tracked range was deleted) fails
+        // closed exactly the same way growth does.
+        #expect(Insertion.boundedEditedLength(currentLength: 100 - Insertion.editWatcherDeltaBound, baselineLength: 100, ledgerLength: 4) != nil)
+        #expect(Insertion.boundedEditedLength(currentLength: 100 - Insertion.editWatcherDeltaBound - 1, baselineLength: 100, ledgerLength: 4) == nil)
+    }
+
+    @Test func boundedEditedLengthNeverShrinksBelowTheOriginalLedgerLength() {
+        // A negative delta within bounds still requests at least `ledgerLength` characters (never
+        // shrunk below it) — see `boundedEditedLength`'s doc comment for why.
+        #expect(Insertion.boundedEditedLength(currentLength: 95, baselineLength: 100, ledgerLength: 4) == 4)
+    }
+
     @Test func middleInsertionDoesNotAbsorbPreExistingSuffixIntoTheEditedRegion() {
         // Codex finding 5's middle-insertion regression: with the (buggy) post-insertion
         // treatment, `suffix = baseline[(anchor + ledgerLength)...]` sliced INTO the pre-existing

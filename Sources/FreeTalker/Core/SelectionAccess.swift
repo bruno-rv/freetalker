@@ -97,6 +97,13 @@ final class SelectionAccess: SelectionAccessing {
                 && selection.target.bundleID == snapshot.target.bundleID,
             elementMatches: adapter.elementsEqual(selection.target.focusedElement, snapshot.target.focusedElement),
             windowMatches: adapter.elementsEqual(selection.target.window, snapshot.target.window),
+            // Codex Round 2 finding 2: `snapshot.target.document` is the discriminator captured
+            // when this snapshot was taken (e.g. Correction Loop signal B's fallback — see
+            // `CorrectionTargeting.selectRecentInsertion`, which carries `recent.target` straight
+            // through). Element/window identity alone doesn't prove the same DOCUMENT for editors
+            // that recycle one AXUIElement/window across tabs — never checked here before this
+            // fix.
+            documentMatches: Self.documentMatches(expected: snapshot.target.document, current: selection.target.document),
             expectedRange: snapshot.range,
             currentRange: selection.range,
             expectedFingerprint: snapshot.fingerprint,
@@ -108,18 +115,34 @@ final class SelectionAccess: SelectionAccessing {
         lhs.pid == rhs.pid && lhs.bundleID == rhs.bundleID
             && adapter.elementsEqual(lhs.focusedElement, rhs.focusedElement)
             && adapter.elementsEqual(lhs.window, rhs.window)
+            // Codex Round 2 finding 2: the double-read inside `readStableSelection` (`before`/
+            // `after`) is exactly the same kind of window a same-app tab switch could land in —
+            // require the earlier-captured (`lhs`) document discriminator, when present, to still
+            // match.
+            && Self.documentMatches(expected: lhs.document, current: rhs.document)
+    }
+
+    /// `expected` is the EARLIER-captured discriminator (a snapshot's, or `readStableSelection`'s
+    /// `before` read) — `nil` means no discriminator was ever captured (an app that doesn't expose
+    /// `kAXDocumentAttribute` at all), which is exactly as uninformative as before this fix and
+    /// stays permissive. A captured NON-nil `expected` that no longer matches `current` (including
+    /// `current == nil`, e.g. the attribute briefly stopped resolving) fails closed.
+    nonisolated private static func documentMatches(expected: String?, current: String?) -> Bool {
+        guard let expected else { return true }
+        return expected == current
     }
 
     nonisolated static func revalidationError(
         appMatches: Bool,
         elementMatches: Bool,
         windowMatches: Bool,
+        documentMatches: Bool = true,
         expectedRange: NSRange,
         currentRange: NSRange?,
         expectedFingerprint: Data,
         currentText: String?
     ) -> SelectionAccessError? {
-        guard appMatches, elementMatches, windowMatches else { return .targetChanged }
+        guard appMatches, elementMatches, windowMatches, documentMatches else { return .targetChanged }
         guard currentRange == expectedRange,
               let currentText,
               SelectionSnapshot.fingerprint(for: currentText) == expectedFingerprint else {

@@ -74,6 +74,15 @@ enum CorrectionRecorder {
     /// so the dismissed-guard/already-approved/budget-swap logic is directly unit-testable
     /// without a live `VocabStore`/`AppSettings`) — mirrors the `LiveInsertionSession.
     /// finalizeDecision` / `Insertion.classifyPreflightFailure` split of decision from effect.
+    ///
+    /// `expectedSwapNormalizedTerm` (Codex Round 2 finding 4), when non-nil, is the swap candidate
+    /// a caller's FROZEN offer named — the panel's Swap button re-confirms THIS term specifically,
+    /// never whatever `swapCandidateNormalized` recomputes as "currently oldest." If the caller's
+    /// remembered candidate no longer matches what's freshly computed here (e.g. the offered term
+    /// was dismissed via Settings between the offer and the click), the swap+approve is refused —
+    /// this falls through to a NEW `.budgetFull` naming the CURRENT candidate, never silently
+    /// swapping a different term than the one consent named. `nil` (every pre-fix call site,
+    /// including a first-pass `confirmSwap: false` call) skips this check entirely.
     nonisolated static func decide(
         existingStatus: VocabDecisionStatus?,
         confirmDismissedOverride: Bool,
@@ -81,7 +90,8 @@ enum CorrectionRecorder {
         confirmSwap: Bool,
         swapCandidateNormalized: String?,
         swapCandidateSurface: String?,
-        surfaceTerm: String
+        surfaceTerm: String,
+        expectedSwapNormalizedTerm: String? = nil
     ) -> Outcome {
         switch existingStatus {
         case .approved:
@@ -90,18 +100,19 @@ enum CorrectionRecorder {
             return .needsDismissalConfirmation(surfaceTerm: surfaceTerm)
         case .dismissed, nil:
             if fits { return .approved }
-            guard confirmSwap, swapCandidateNormalized != nil, swapCandidateSurface != nil else {
+            let swapStillApplicable = expectedSwapNormalizedTerm == nil || expectedSwapNormalizedTerm == swapCandidateNormalized
+            guard confirmSwap, swapCandidateNormalized != nil, swapCandidateSurface != nil, swapStillApplicable else {
                 return .budgetFull(
                     swapCandidateNormalized: swapCandidateNormalized ?? "",
                     swapCandidateSurface: swapCandidateSurface ?? "",
                     newTermSurface: surfaceTerm
                 )
             }
-            // confirmSwap == true with a named candidate: the caller already showed the swap
-            // offer (built from a PRIOR `.budgetFull` result) and the user agreed — this branch
-            // only reports that a swap+approve is now sanctioned; `record` below is what actually
-            // performs it. Reported as `.approved` since that's the outcome once `record`
-            // executes the swap.
+            // confirmSwap == true with a named candidate that's still the exact one consent named
+            // (or no consent was frozen at all): the caller already showed the swap offer (built
+            // from a PRIOR `.budgetFull` result) and the user agreed — this branch only reports
+            // that a swap+approve is now sanctioned; `record` below is what actually performs it.
+            // Reported as `.approved` since that's the outcome once `record` executes the swap.
             return .approved
         }
     }
@@ -157,13 +168,15 @@ enum CorrectionRecorder {
         store: VocabStore,
         settings: AppSettings = .shared,
         confirmSwap: Bool = false,
-        confirmDismissedOverride: Bool = false
+        confirmDismissedOverride: Bool = false,
+        expectedSwapNormalizedTerm: String? = nil
     ) async throws -> Outcome {
         await recordLock.acquire()
         do {
             let outcome = try await recordLocked(
                 dictationID: dictationID, wrongText: wrongText, rightText: rightText, store: store,
-                settings: settings, confirmSwap: confirmSwap, confirmDismissedOverride: confirmDismissedOverride
+                settings: settings, confirmSwap: confirmSwap, confirmDismissedOverride: confirmDismissedOverride,
+                expectedSwapNormalizedTerm: expectedSwapNormalizedTerm
             )
             recordLock.release()
             return outcome
@@ -181,7 +194,8 @@ enum CorrectionRecorder {
         store: VocabStore,
         settings: AppSettings,
         confirmSwap: Bool,
-        confirmDismissedOverride: Bool
+        confirmDismissedOverride: Bool,
+        expectedSwapNormalizedTerm: String? = nil
     ) async throws -> Outcome {
         guard let candidate = candidate(wrongText: wrongText, rightText: rightText) else { return .noWrongRightPair }
         guard AppSettings.validatedVocabularyTerm(candidate.surfaceTerm) != nil else { return .invalidTerm }
@@ -214,7 +228,8 @@ enum CorrectionRecorder {
             confirmSwap: confirmSwap,
             swapCandidateNormalized: swapNormalized,
             swapCandidateSurface: swapSurface,
-            surfaceTerm: candidate.surfaceTerm
+            surfaceTerm: candidate.surfaceTerm,
+            expectedSwapNormalizedTerm: expectedSwapNormalizedTerm
         )
 
         switch decision {

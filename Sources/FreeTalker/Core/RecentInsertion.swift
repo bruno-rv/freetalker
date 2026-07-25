@@ -74,6 +74,26 @@ final class RecentInsertionStore {
         pending = nil
     }
 
+    /// Atomically discards BOTH `pending` and `current` — cancels any scheduled expiry and stops
+    /// the watcher (Codex Round 2 finding 5). Unlike `attachDictationID`'s own no-pending branch
+    /// (which only ever runs as part of finishing THIS SAME insertion's own handshake),
+    /// `invalidateAll` is the general "nothing about the most recent physical insertion can be
+    /// trusted anymore, and neither can whatever was tracked before it" operation: used when
+    /// `LibraryStore.record` throws AFTER the text has already been pasted. The just-posted text
+    /// has no dictation id to attach to, so clearing `pending` alone isn't enough — the PREVIOUS
+    /// `current` (a different, OLDER dictation) is no longer the most recent thing on screen
+    /// either, and must stop being offered as a correction target, with its watcher stopped rather
+    /// than left polling a document a newer, untracked paste may already have changed underneath
+    /// it.
+    func invalidateAll() {
+        generation += 1
+        expiryTask?.cancel()
+        expiryTask = nil
+        current = nil
+        pending = nil
+        EditWatcher.shared.stopWatching()
+    }
+
     /// Promotes `pending` to `current` now that its dictation has a row id. Codex finding 1: a
     /// no-op `pending` (paste failed, drift prevented a snapshot, or a prior `clearPending()`
     /// already ran for this dictation) must NOT leave `current` pointing at an OLDER, unrelated

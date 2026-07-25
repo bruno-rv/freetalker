@@ -30,22 +30,29 @@ final class EditWatcher {
     /// `RecentInsertionStore` gets its dictation id attached). A no-op unless the setting is on.
     /// Cancels any watcher still running for a PRIOR insertion first — only ever one insertion is
     /// watched at a time, matching "the most recent dictation" everywhere else in this feature.
+    ///
+    /// Codex Round 2 finding 6: the window is a WALL-CLOCK deadline (`ContinuousClock`, immune to
+    /// `Date()`/system-clock adjustment but — unlike a plain poll counter — still advances while
+    /// the Mac sleeps), captured once here at the start. Each resumed iteration used to add
+    /// exactly `pollInterval` regardless of how long the `Task.sleep` continuation was actually
+    /// delayed — if the Mac slept for five minutes between polls, the old counter went from 0 to 2
+    /// and kept the watcher reading well past its intended window.
     func beginWatching(dictationID: Int64) {
         task?.cancel()
         task = nil
         guard AppSettings.shared.correctionLoopEditWatcherEnabled else { return }
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(Self.window))
         task = Task { [weak self] in
-            var elapsed: TimeInterval = 0
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: UInt64(Self.pollInterval * 1_000_000_000))
-                elapsed += Self.pollInterval
                 guard !Task.isCancelled else { return }
                 // Codex finding 12: re-checked after EVERY sleep, not just once at the start —
                 // turning the setting off mid-window must stop the watcher immediately, and the
                 // deadline is re-evaluated AFTER sleeping (not just before), so a poll that starts
                 // just under the deadline can't still run one more cycle past it.
                 guard Self.shouldContinuePolling(
-                    elapsed: elapsed, window: Self.window,
+                    now: clock.now, deadline: deadline,
                     settingEnabled: AppSettings.shared.correctionLoopEditWatcherEnabled
                 ) else {
                     self?.stopWatching()
@@ -61,13 +68,14 @@ final class EditWatcher {
         task = nil
     }
 
-    /// Pure decision (Codex finding 12), factored out of `beginWatching`'s `Task` loop so the
-    /// monotonic-deadline/setting-re-check logic is directly unit-testable without a live
-    /// AX/Task environment — same style as `Insertion.shouldSynthesizePaste`. `elapsed` is a plain
-    /// accumulated-sleep counter, never `Date()`, so it's immune to wall-clock rollback/adjustment
-    /// extending the window.
-    nonisolated static func shouldContinuePolling(elapsed: TimeInterval, window: TimeInterval, settingEnabled: Bool) -> Bool {
-        settingEnabled && elapsed < window
+    /// Pure decision (Codex finding 12; deadline shape fixed by Codex Round 2 finding 6), factored
+    /// out of `beginWatching`'s `Task` loop so the monotonic-deadline/setting-re-check logic is
+    /// directly unit-testable without a live AX/Task environment — same style as `Insertion.
+    /// shouldSynthesizePaste`. `now`/`deadline` are `ContinuousClock.Instant`s — immune to
+    /// wall-clock rollback/adjustment, and (unlike a plain accumulated-poll counter) still
+    /// correctly reflect a long suspension (e.g. system sleep) between polls.
+    nonisolated static func shouldContinuePolling(now: ContinuousClock.Instant, deadline: ContinuousClock.Instant, settingEnabled: Bool) -> Bool {
+        settingEnabled && now < deadline
     }
 
     /// One poll. Returns whether the watcher should keep polling — `false` on anything that

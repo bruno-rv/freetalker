@@ -135,6 +135,33 @@ import Testing
         #expect(outcome == .approved)
     }
 
+    /// Codex Round 2 finding 4: the panel freezes the swap candidate a `.budgetFull` offer NAMED
+    /// (`expectedSwapNormalizedTerm`) — a Swap click re-confirms THAT exact term. If the
+    /// vocabulary state moved on between the offer and the click (e.g. the offered term was
+    /// dismissed via Settings, so `swapCandidateNormalized` now recomputes to a DIFFERENT,
+    /// newer-oldest term), the swap must be refused rather than silently dropping the different
+    /// term — falls through to a fresh `.budgetFull` naming the CURRENT candidate instead.
+    @Test func confirmSwapWhoseExpectedCandidateNoLongerMatchesProducesANewOfferRatherThanDroppingADifferentTerm() {
+        let outcome = CorrectionRecorder.decide(
+            existingStatus: nil, confirmDismissedOverride: false, fits: false, confirmSwap: true,
+            swapCandidateNormalized: "newoldest", swapCandidateSurface: "NewOldest", surfaceTerm: "João",
+            expectedSwapNormalizedTerm: "originallyoffered"
+        )
+        #expect(outcome == .budgetFull(swapCandidateNormalized: "newoldest", swapCandidateSurface: "NewOldest", newTermSurface: "João"))
+    }
+
+    /// The matching case (the frozen candidate is STILL what's currently computed) proceeds
+    /// exactly as `confirmedSwapApproves` above — `expectedSwapNormalizedTerm` only ever refuses a
+    /// MISMATCH, never blocks an unchanged offer.
+    @Test func confirmSwapWhoseExpectedCandidateStillMatchesApproves() {
+        let outcome = CorrectionRecorder.decide(
+            existingStatus: nil, confirmDismissedOverride: false, fits: false, confirmSwap: true,
+            swapCandidateNormalized: "oldterm", swapCandidateSurface: "OldTerm", surfaceTerm: "João",
+            expectedSwapNormalizedTerm: "oldterm"
+        )
+        #expect(outcome == .approved)
+    }
+
     @Test func confirmSwapWithoutANamedCandidateStillRefuses() {
         // `confirmSwap: true` with nothing to swap (race: the swap candidate got dismissed by
         // something else between the offer and this confirmation) must not fall through to an
@@ -229,6 +256,64 @@ import Testing
         #expect(confirmed == .approved)
         // filler1 dismissed (the swap), filler2 untouched, kubernetes newly approved.
         #expect(try await store.approvedTerms().map(\.normalizedTerm) == [filler2.lowercased(), "kubernetes"])
+    }
+
+    /// Codex Round 2 finding 4, end-to-end: the panel offers "Drop filler1 to learn <newTerm>."
+    /// Before the user clicks Swap, filler1 is dismissed via Settings (a completely independent
+    /// write) — the oldest still-ACTIVE approved term is now filler2. The Swap confirmation must
+    /// refuse to drop filler2 (consent never named it) and instead surface a fresh offer for it.
+    ///
+    /// Byte budget arithmetic (`VocabularyFitGate.tokenBudget` ~111 bytes, see that type):
+    /// three 35-byte fillers together cost 3*35 + 4 = 109 bytes (all three fit, so `activeApproved`
+    /// includes all three and the offer names the OLDEST, filler1) but adding the 45-byte new term
+    /// on top costs 109 + 45 + 2 = 156 (never fits, whether all three fillers are present or just
+    /// the two that remain once filler1 is dismissed: 2*35 + 2 + 45 + 2 = 119, still over budget)
+    /// — the new term stays displaced (offered as a swap) in BOTH states, only WHICH term is the
+    /// current oldest changes.
+    @Test func recordRefusesToSwapADifferentTermThanTheOneTheFrozenOfferNamed() async throws {
+        let url = temporaryDatabaseURL()
+        let library = try Database(path: url)
+        let id = try library.insertDictation(makeInsertRequest(transcript: "hi wrongtermxx how are you", refined: "hi rightterm how are you"))
+        let store = try VocabStore(databaseURL: url)
+        let settings = makeSettings()
+
+        let filler1 = String(repeating: "a", count: 35)
+        let filler2 = String(repeating: "b", count: 35)
+        let filler3 = String(repeating: "c", count: 35)
+        _ = try await store.mergeDecisions([
+            VocabDecision(normalizedTerm: filler1.lowercased(), status: .approved, surfaceTerm: filler1, decidedAt: Date(timeIntervalSince1970: 100)),
+            VocabDecision(normalizedTerm: filler2.lowercased(), status: .approved, surfaceTerm: filler2, decidedAt: Date(timeIntervalSince1970: 200)),
+            VocabDecision(normalizedTerm: filler3.lowercased(), status: .approved, surfaceTerm: filler3, decidedAt: Date(timeIntervalSince1970: 300))
+        ])
+        settings.applyApprovedVocabularyCache(try await store.approvedTerms())
+
+        let rightTerm = String(repeating: "d", count: 45)
+        let offer = try await CorrectionRecorder.record(
+            dictationID: id, wrongText: "hi wrongtermxx how are you", rightText: "hi \(rightTerm) how are you", store: store, settings: settings
+        )
+        guard case .budgetFull(let offeredSwap, _, _) = offer else {
+            Issue.record("expected .budgetFull, got \(offer)")
+            return
+        }
+        #expect(offeredSwap == filler1.lowercased())
+
+        // Independent write: filler1 dismissed via Settings between the offer and the Swap click.
+        _ = try await store.dismiss(normalizedTerm: filler1.lowercased())
+        settings.applyApprovedVocabularyCache(try await store.approvedTerms())
+
+        let confirmed = try await CorrectionRecorder.record(
+            dictationID: id, wrongText: "hi wrongtermxx how are you", rightText: "hi \(rightTerm) how are you", store: store, settings: settings,
+            confirmSwap: true, expectedSwapNormalizedTerm: offeredSwap
+        )
+        guard case .budgetFull(let newSwap, _, _) = confirmed else {
+            Issue.record("expected a NEW .budgetFull naming the current candidate, got \(confirmed)")
+            return
+        }
+        #expect(newSwap == filler2.lowercased())
+        // filler2/filler3 must still be approved — never silently dropped for a consent that
+        // named filler1 — and the new term never approved either.
+        #expect(try await store.approvedTerms().map(\.normalizedTerm) == [filler2.lowercased(), filler3.lowercased()])
+        #expect(try await store.decision(normalizedTerm: rightTerm.lowercased()) == nil)
     }
 
     @Test func recordOnAnAlreadyApprovedTermIsANoOp() async throws {

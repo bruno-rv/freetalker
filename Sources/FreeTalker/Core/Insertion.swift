@@ -72,6 +72,37 @@ enum Insertion {
         case match
         case mismatch
         case unavailable
+        /// Element/window identity matched, but the snapshotted `kAXDocumentAttribute` differs
+        /// from what's there now (Codex Round 2 finding 1). Distinct from `.mismatch` so a caller
+        /// that has independent provenance for an ALREADY-established session (streaming's own
+        /// caret+baseline+ledger proof) can attempt to salvage it instead of failing closed
+        /// outright — see `streamingSafeElement`'s `ledgerProvenance` parameter. A caller with no
+        /// such proof (the ordinary paste-time drift check in `insert`, or a session's very FIRST
+        /// write) treats this exactly like `.mismatch` — see `shouldSynthesizePaste` below.
+        case documentMismatch
+    }
+
+    /// Proof that survives a changed `kAXDocumentAttribute` value once a streaming session has
+    /// already typed at least one confirmed partial (Codex Round 2 finding 1): Chromium exposes
+    /// that attribute as the tab's URL, and a single-page app can rewrite it via
+    /// `history.replaceState` purely as a SIDE EFFECT of the text the user is dictating changing
+    /// — no element, window, caret, or actual document switch involved. Treating every such
+    /// mutation as a target switch froze the session on the very next partial. Rather than drop
+    /// the document check entirely (Codex finding 2's original tab-reuse protection would be
+    /// lost), a changed document value is permitted ONLY when the caller already has independent
+    /// proof: the ENTIRE current field content must still reconstruct exactly as `baseline` with
+    /// `ledgerText` spliced in at `anchor` — the same provenance check `readbackMatches`/
+    /// `documentMatchesBaselinePlusLedger` perform at finalize, reused here for the same reason
+    /// (matching text alone proves location, not that THIS session produced it). The very FIRST
+    /// write of a session has no established ledger yet and never receives this struct — see
+    /// `LiveInsertionSession.receivePartial`/`streamingWriteCaret` — so it keeps failing closed on
+    /// any document drift, exactly as before this fix. Plain batch (non-streaming) paste never has
+    /// prior ledger provenance either, so `insert(_:target:strict:)` is unaffected by this
+    /// carve-out and keeps its pre-fix strict document check.
+    struct LedgerProvenance: Equatable {
+        let baseline: String
+        let ledgerText: String
+        let anchor: Int
     }
 
     /// Snapshots the frontmost app's identity for a later paste-time comparison — bundle id,
@@ -223,7 +254,7 @@ enum Insertion {
         guard let currentBundleID, snapshotBundleID == currentBundleID else { return false }
         guard pidMatch else { return false }
         switch elementComparison {
-        case .mismatch: return false
+        case .mismatch, .documentMismatch: return false
         case .match: return true
         // Matching bundle id/pid only proves it's the same APP, not the same focused field — a
         // same-app focus change (e.g. the user tabbed to a different field, or a new window took
@@ -280,15 +311,30 @@ enum Insertion {
     /// paste time (bundle id + pid + best-effort focused element/window comparison, always
     /// `strict`) rather than a second, divergent implementation. `nil` (unsafe) covers: AX
     /// untrusted, identity drifted, no focused element, or the focused element is secure/unreadable.
+    ///
+    /// `ledgerProvenance`, when non-nil (Codex Round 2 finding 1), is consulted ONLY if the
+    /// element/window otherwise match but the document discriminator alone differs: the entire
+    /// current field content is read ONE extra time and checked against `documentMatchesBaseline
+    /// PlusLedger` — a mutable document token (Chromium's URL) is never trusted on its own once a
+    /// session already has stronger proof available. `nil` (the default) preserves the exact
+    /// pre-fix strict document check for every other caller (a session's own first write,
+    /// `captureCorrectionAnchor`'s batch-paste snapshot, `streamingBaselineValue`).
     @MainActor
-    static func streamingSafeElement(target: InsertionTarget) -> AXUIElement? {
+    static func streamingSafeElement(target: InsertionTarget, ledgerProvenance: LedgerProvenance? = nil) -> AXUIElement? {
         guard Permissions.isAccessibilityTrusted() else { return nil }
         let currentApp = NSWorkspace.shared.frontmostApplication
         let currentElement = currentApp.flatMap(focusedElement(for:))
         let currentWindow = currentElement.flatMap(windowElement(for:))
         let currentDocument = documentDiscriminator(element: currentElement, window: currentWindow)
         let pidMatch = target.pid == currentApp?.processIdentifier
-        let elementComparison = compareElements(snapshot: target, currentElement: currentElement, currentWindow: currentWindow, currentDocument: currentDocument)
+        var elementComparison = compareElements(snapshot: target, currentElement: currentElement, currentWindow: currentWindow, currentDocument: currentDocument)
+        if elementComparison == .documentMismatch {
+            if let ledgerProvenance, let currentElement, documentProvenanceHolds(element: currentElement, provenance: ledgerProvenance) {
+                elementComparison = .match
+            } else {
+                elementComparison = .mismatch
+            }
+        }
         guard shouldSynthesizePaste(
             hasTarget: true,
             snapshotBundleID: target.bundleID,
@@ -299,6 +345,21 @@ enum Insertion {
         ), let currentElement else { return nil }
         guard !isSecureForStreaming(currentElement) else { return nil }
         return currentElement
+    }
+
+    /// Whether `element`'s ENTIRE current value still reconstructs as `provenance.baseline` with
+    /// `provenance.ledgerText` spliced in at `provenance.anchor` — the escape hatch
+    /// `streamingSafeElement` uses when only the (mutable, untrustworthy-alone) document
+    /// discriminator changed. One extra `kAXValueAttribute` read, performed ONLY on that rare
+    /// path — never on the fast, common case where the document token still matches.
+    private static func documentProvenanceHolds(element: AXUIElement, provenance: LedgerProvenance) -> Bool {
+        var valueRef: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &valueRef) == .success,
+              let text = valueRef as? String else { return false }
+        return documentMatchesBaselinePlusLedger(
+            current: Array(text.utf16), baseline: Array(provenance.baseline.utf16),
+            ledger: Array(provenance.ledgerText.utf16), anchor: provenance.anchor
+        )
     }
 
     /// One fresh read combining `streamingSafeElement` (identity/security) with a collapsed-
@@ -313,8 +374,8 @@ enum Insertion {
     /// the selection must still be collapsed. Returns the observed caret (to become the anchor on
     /// the caller's first successful post) or nil if anything is unsafe/unreadable/mismatched.
     @MainActor
-    static func streamingWriteCaret(target: InsertionTarget, expectedCaret: Int?) -> Int? {
-        guard let element = streamingSafeElement(target: target) else { return nil }
+    static func streamingWriteCaret(target: InsertionTarget, expectedCaret: Int?, ledgerProvenance: LedgerProvenance? = nil) -> Int? {
+        guard let element = streamingSafeElement(target: target, ledgerProvenance: ledgerProvenance) else { return nil }
         guard let range = selectedRange(of: element), range.length == 0 else { return nil }
         if let expectedCaret, range.location != expectedCaret { return nil }
         return range.location
@@ -428,17 +489,56 @@ enum Insertion {
     /// without reading anything else to find out what. `nil` whenever the parameterized attribute
     /// isn't supported at all (Electron/most web views) — signal C is simply UNAVAILABLE for that
     /// poll rather than ever falling back to an unbounded whole-field read.
+    ///
+    /// Codex Round 2 finding 3: deriving `editedLength` from the field's CURRENT total length
+    /// alone (`currentLength - anchor - suffixLength`) never actually proves the prefix/suffix
+    /// are unchanged — at an end-of-field insertion (`suffixLength == 0`) it degenerates to
+    /// "current length minus anchor," so the user simply CONTINUING TO TYPE after the dictation
+    /// (never touching the inserted range at all) kept inflating `editedLength` forever, and the
+    /// next poll read the dictation plus everything typed after it. `boundedEditedLength` bounds
+    /// how far the document's total length may have moved from `baseline.count` at all — see its
+    /// doc comment — and requests exactly that many characters, never more.
     @MainActor
     static func rangeLimitedEditedReplacement(
         element: AXUIElement, baseline: [UInt16], ledgerLength: Int, anchor: Int
     ) -> [UInt16]? {
         guard anchor >= 0, ledgerLength >= 0, anchor <= baseline.count else { return nil }
         guard let currentLength = numberOfCharacters(element) else { return nil }
-        let suffixLength = baseline.count - anchor
-        let editedLength = currentLength - anchor - suffixLength
-        guard editedLength >= 0 else { return nil }
+        guard let editedLength = boundedEditedLength(
+            currentLength: currentLength, baselineLength: baseline.count, ledgerLength: ledgerLength
+        ) else { return nil }
         guard let edited = stringForRange(element, location: anchor, length: editedLength) else { return nil }
         return Array(edited.utf16)
+    }
+
+    // ponytail: 32-char delta bound keeps the read near the inserted range; a position-stable AX
+    // marker design would remove the bound.
+    static let editWatcherDeltaBound = 32
+
+    /// Pure bound check (Codex Round 2 finding 3), factored out of `rangeLimitedEditedReplacement`
+    /// so the delta-bound arithmetic is directly unit-testable without a live AX session — same
+    /// style as `documentMatchesBaselinePlusLedger`/`extractEditedReplacement` above.
+    ///
+    /// `delta` is how far the document's total length has moved from `baselineLength` since the
+    /// insertion — 0 means nothing outside the tracked range changed length at all. Codex's own
+    /// minimal fix (fail closed whenever `delta != 0`, request exactly `ledgerLength`) is safe but
+    /// restricts signal C to same-length edits only, which rejects most real corrections (a
+    /// misheard name is rarely the exact same length as the right one). Instead: `delta` is
+    /// allowed up to `editWatcherDeltaBound` in either direction, and the read is bounded to
+    /// `ledgerLength + max(0, delta)` — enough to cover the inserted range plus whatever grew it,
+    /// deliberately never shrunk below `ledgerLength` even when `delta` is negative, since a
+    /// shorter document proves nothing about WHERE inside the tracked range the shrink happened
+    /// without reading it. A genuine correction shifts the total length by a handful of
+    /// characters; continued unrelated typing blows past the bound almost immediately and fails
+    /// closed rather than reading arbitrarily far past the range the app itself inserted.
+    nonisolated static func boundedEditedLength(
+        currentLength: Int, baselineLength: Int, ledgerLength: Int
+    ) -> Int? {
+        let delta = currentLength - baselineLength
+        guard abs(delta) <= editWatcherDeltaBound else { return nil }
+        let editedLength = ledgerLength + max(0, delta)
+        guard editedLength >= 0 else { return nil }
+        return editedLength
     }
 
     private static func numberOfCharacters(_ element: AXUIElement) -> Int? {
@@ -620,7 +720,7 @@ enum Insertion {
         // at snapshot time; apps that never expose `kAXDocumentAttribute` keep the pre-fix
         // element/window-only behavior (nothing stronger is available to check for them).
         guard base == .match, let snapshotDocument = snapshot.document else { return base }
-        return snapshotDocument == currentDocument ? .match : .mismatch
+        return snapshotDocument == currentDocument ? .match : .documentMismatch
     }
 
     /// `kAXDocumentAttribute`, read from whichever of `window`/`element` exposes it (window

@@ -54,6 +54,17 @@ final class CorrectionPanelController: ObservableObject {
     /// the in-flight record of an ordinary first-pass `confirm()` call" (used only for the
     /// generation-checked async body below, not re-read elsewhere).
     private var confirmedCorrection: (dictationID: Int64, wrongText: String, rightText: String, wasPending: Bool)?
+    /// Codex Round 2 finding 4: the swap candidate a `.budgetFull` offer NAMED, frozen the moment
+    /// the offer is shown — a Swap click re-confirms THIS exact term, never whatever
+    /// `CorrectionRecorder.record` recomputes as "currently oldest." `nil` when there is no
+    /// pending swap offer (or it named no candidate at all). Cleared alongside `confirmedCorrection`
+    /// every time a fresh proposal is frozen.
+    private var frozenSwapCandidate: String?
+    /// Codex Round 2 finding 4: whether the user has ALREADY agreed to override a dismissal for
+    /// the CURRENT frozen proposal — must survive a SUBSEQUENT swap confirmation for the SAME
+    /// proposal (Approve anyway → budget-full → Swap), or `decide` sends the Swap click right back
+    /// to the dismissal prompt forever (it re-invokes without `confirmDismissedOverride`).
+    private var frozenDismissalConsent = false
     /// Bumped on every fresh `open`/`openForObservedEdit`/`openForPendingOutcome` (Codex finding
     /// 6) — every UI mutation inside `confirm()`'s `Task`, AFTER each `await`, re-checks this so a
     /// stale task from a panel session that's since been superseded can never publish its result
@@ -108,18 +119,37 @@ final class CorrectionPanelController: ObservableObject {
         dictation = latest
         corrected = latest.map { $0.refined.isEmpty ? $0.transcript : $0.refined } ?? ""
         confirmedCorrection = nil
+        frozenSwapCandidate = nil
+        frozenDismissalConsent = false
         statusMessage = nil
         pendingSwap = nil
         pendingDismissalOverride = nil
         showPanel()
     }
 
+    /// Codex Round 2 finding 7: a TERMINAL close — every UI-visible confirmation state this
+    /// controller owns is cleared directly, right here, rather than relying on the generation
+    /// bump below plus `confirm()`'s `Task`'s own `defer` to eventually clear `isBusy`. That defer
+    /// only fires `if myGeneration == generation`, and `generation` is bumped by THIS function a
+    /// few lines up from it — so a successful correction's own `close()` call left `isBusy` stuck
+    /// `true` forever, and every later `open()`/`openForObservedEdit()`/`openForPendingOutcome()`
+    /// refused via its `!isBusy` guard for the rest of the process. Cancelling a PENDING offer
+    /// (the Cancel button on a Swap/Approve-anyway prompt) had the same failure mode via
+    /// `hasPendingConfirmation` — `pendingSwap`/`pendingDismissalOverride` were never cleared
+    /// either. Generation invalidation is kept for what it's actually for: a stale in-flight
+    /// `Task`'s LATER `await`-gated writes (e.g. a `record()` call still running when the user
+    /// hits Escape) must still no-op instead of publishing into a superseded/closed session.
     func close() {
         guard panel != nil else { return }
-        // Codex finding 6: invalidates any in-flight `confirm()` task's remaining generation
-        // checks immediately, on top of `actionTask?.cancel()` below.
         generation += 1
         actionTask?.cancel()
+        actionTask = nil
+        isBusy = false
+        pendingSwap = nil
+        pendingDismissalOverride = nil
+        confirmedCorrection = nil
+        frozenSwapCandidate = nil
+        frozenDismissalConsent = false
         panel?.orderOut(nil)
     }
 
@@ -143,6 +173,8 @@ final class CorrectionPanelController: ObservableObject {
         dictation = latest
         corrected = after
         confirmedCorrection = nil
+        frozenSwapCandidate = nil
+        frozenDismissalConsent = false
         statusMessage = "FreeTalker noticed an edit — confirm to remember it"
         pendingSwap = nil
         pendingDismissalOverride = nil
@@ -169,12 +201,17 @@ final class CorrectionPanelController: ObservableObject {
         dictation = latest
         corrected = rightText
         confirmedCorrection = (dictationID, wrongText, rightText, true)
+        frozenDismissalConsent = false
         statusMessage = nil
         switch outcome {
         case .needsDismissalConfirmation(let surfaceTerm):
+            frozenSwapCandidate = nil
             pendingDismissalOverride = surfaceTerm
             pendingSwap = nil
-        case .budgetFull:
+        case .budgetFull(let swapCandidateNormalized, _, _):
+            // Codex Round 2 finding 4: freeze the exact candidate THIS offer named — never
+            // whatever a later re-check might recompute.
+            frozenSwapCandidate = swapCandidateNormalized.isEmpty ? nil : swapCandidateNormalized
             pendingSwap = outcome
             pendingDismissalOverride = nil
         case .approved, .alreadyApproved, .invalidTerm, .noWrongRightPair:
@@ -202,11 +239,22 @@ final class CorrectionPanelController: ObservableObject {
             close()
             return
         }
+        // Codex Round 2 finding 4: re-invoking an ALREADY-pending frozen offer accumulates
+        // consent/context from the offer that produced it — a Swap click must still carry an
+        // earlier Approve-anyway's dismissal override (never re-derived, since the Swap button
+        // itself never passes `confirmDismissedOverride`), and must re-confirm the EXACT swap
+        // candidate that offer named, not whatever gets recomputed fresh.
+        let isReconfirmingFrozenOffer = confirmedCorrection?.dictationID == dictation.id && confirmedCorrection?.wasPending == true
+        let effectiveDismissedOverride = confirmDismissedOverride || (isReconfirmingFrozenOffer && frozenDismissalConsent)
+        let expectedSwapTerm = (confirmSwap && isReconfirmingFrozenOffer) ? frozenSwapCandidate : nil
+
         let myGeneration = generation
         isBusy = true
         pendingSwap = nil
         pendingDismissalOverride = nil
         confirmedCorrection = (dictation.id, wrongText, rightText, false)
+        frozenDismissalConsent = effectiveDismissedOverride
+        frozenSwapCandidate = nil
         actionTask = Task {
             defer { if myGeneration == generation { isBusy = false } }
             // Repair the live document FIRST (requirement 3: "any correction repairs the text in
@@ -234,7 +282,8 @@ final class CorrectionPanelController: ObservableObject {
             }
             guard let outcome = try? await CorrectionRecorder.record(
                 dictationID: dictation.id, wrongText: wrongText, rightText: rightText, store: store,
-                confirmSwap: confirmSwap, confirmDismissedOverride: confirmDismissedOverride
+                confirmSwap: confirmSwap, confirmDismissedOverride: effectiveDismissedOverride,
+                expectedSwapNormalizedTerm: expectedSwapTerm
             ) else {
                 guard myGeneration == generation else { return }
                 statusMessage = "Could not save the correction"
@@ -254,9 +303,15 @@ final class CorrectionPanelController: ObservableObject {
                 close()
             case .needsDismissalConfirmation(let surfaceTerm):
                 confirmedCorrection = (dictation.id, wrongText, rightText, true)
+                frozenSwapCandidate = nil
                 pendingDismissalOverride = surfaceTerm
-            case .budgetFull:
+            case .budgetFull(let swapCandidateNormalized, _, _):
+                // Codex Round 2 finding 4: a mismatched `expectedSwapTerm` lands right back here
+                // via `decide`'s fall-through — this freezes the NEW offer's own candidate rather
+                // than reusing the stale one, so the panel shows a fresh Drop-this-term prompt
+                // instead of ever silently swapping a different term than the one consent named.
                 confirmedCorrection = (dictation.id, wrongText, rightText, true)
+                frozenSwapCandidate = swapCandidateNormalized.isEmpty ? nil : swapCandidateNormalized
                 pendingSwap = outcome
             }
         }

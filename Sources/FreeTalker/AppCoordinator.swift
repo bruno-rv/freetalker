@@ -3309,7 +3309,13 @@ final class AppCoordinator: ObservableObject {
                             )
                             trackCorrectionForRecordedDictation(dictationID)
                         } catch {
-                            RecentInsertionStore.shared.clearPending()
+                            // Codex Round 2 finding 5: this text already posted with no dictation
+                            // id to attach it to, AND whatever `current` was tracking before this
+                            // call (an older, different dictation) is no longer the most recent
+                            // thing on screen — clearing `pending` alone left that older `current`
+                            // (and its watcher) active, so a correction issued right after this
+                            // failure could still land on stale, unrelated text.
+                            RecentInsertionStore.shared.invalidateAll()
                             throw error
                         }
                     }

@@ -62,14 +62,23 @@ final class LibraryStore: ObservableObject, LibraryTranslationStoring {
     }
 
     static func temporary() throws -> LibraryStore {
+        try temporaryWithDatabaseURL().store
+    }
+
+    /// Test-only: same as `temporary()` but also returns the on-disk database URL, so a caller
+    /// can open a SECOND, independent connection to the exact same file — `VocabStore` shares this
+    /// database (its `recordEvidence` FKs a dictation id to the SAME `dictations` table
+    /// `LibraryStore` writes into), so a test exercising both together (e.g. Codex Round 2 finding
+    /// 7's correction-panel reopen regression) needs them pointed at one file, not two independent
+    /// temporary ones.
+    static func temporaryWithDatabaseURL() throws -> (store: LibraryStore, databaseURL: URL) {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("library-store-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let databaseURL = directory.appendingPathComponent("library.db")
         do {
-            return try LibraryStore(
-                db: Database(path: directory.appendingPathComponent("library.db")),
-                temporaryDirectory: directory
-            )
+            let store = try LibraryStore(db: Database(path: databaseURL), temporaryDirectory: directory)
+            return (store, databaseURL)
         } catch {
             try? FileManager.default.removeItem(at: directory)
             throw error
