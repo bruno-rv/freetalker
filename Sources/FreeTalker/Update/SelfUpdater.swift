@@ -123,14 +123,23 @@ enum SelfUpdater {
     /// Runs entirely off the main actor; safe to `await` from UI code. Stages the download in a
     /// hidden directory right next to `installedBundlePath` (not `/tmp`) so the final swap is a
     /// same-volume, near-atomic `rename(2)` — see `SelfUpdateInstaller`.
+    ///
+    /// **Not** `Task.detached`: a detached task is unstructured — it does not become a child of
+    /// the caller's task, so cancelling the caller (e.g. the menu command's `Task { }` in
+    /// `App.swift`) never reached `runUpdate` at all. The gate (`UpdateInProgressGate`) stayed
+    /// held for as long as `runUpdate` felt like running — including forever, if it was blocked
+    /// on a stalled network response — and a cancelled workflow could still complete its install.
+    /// `async let` instead creates a genuine STRUCTURED child task: Swift automatically cancels
+    /// it when the parent task is cancelled (no manual plumbing needed), while it still runs off
+    /// the main actor exactly as before, because `runUpdate` itself carries no actor isolation —
+    /// nothing here pins it to the caller's (`@MainActor`) executor.
     static func performUpdate(
         manifest: UpdateManifest,
         installedBundlePath: URL = URL(fileURLWithPath: Bundle.main.bundlePath),
         session: URLSession = .shared
     ) async -> UpdateOutcome {
-        await Task.detached(priority: .userInitiated) {
-            await Self.runUpdate(manifest: manifest, installedBundlePath: installedBundlePath, session: session)
-        }.value
+        async let outcome = Self.runUpdate(manifest: manifest, installedBundlePath: installedBundlePath, session: session)
+        return await outcome
     }
 
     /// True when a PRIOR update attempt left the user's original app preserved at
@@ -223,6 +232,17 @@ enum SelfUpdater {
             return .failed("An update is already in progress — try again once it finishes.")
         }
         defer { Self.updateGate.end() }
+
+        // Now a genuine structured child task of whatever caller invoked `performUpdate` (see
+        // its doc comment) — cancelling that caller marks `Task.isCancelled` true here too.
+        // Checked at every major step boundary below, not just here, because a caller can cancel
+        // at any point during a multi-second download/verify/swap sequence; the `defer` above
+        // always releases the gate regardless of which check (if any) fires, but only an
+        // early-enough check also guarantees a cancelled workflow never reaches the destructive
+        // swap in step 7.
+        guard !Task.isCancelled else {
+            return .failed("Update cancelled.")
+        }
 
         let fileManager = FileManager.default
         let updateRoot = installedBundlePath.deletingLastPathComponent()
@@ -377,6 +397,15 @@ enum SelfUpdater {
         // architecture/framework mismatch before it ever touches the installed app).
         guard verifyLaunches(bundlePath: stagedBundle.path) else {
             return .failed("The downloaded update failed to start — refusing to install it.")
+        }
+
+        // Last chance to bail before the one step that actually mutates the installed app.
+        // Download/verify/unzip/smoke-test above can take seconds; a caller (see `performUpdate`)
+        // may have cancelled at any point during that window. Checking here — immediately before
+        // `SelfUpdateInstaller.swap` below — is what guarantees a cancelled workflow never
+        // installs, regardless of how far the verification pipeline had already progressed.
+        guard !Task.isCancelled else {
+            return .failed("Update cancelled.")
         }
 
         // 7. Atomic swap with rollback. `backupPath` here is `workingBackupPath` — private to

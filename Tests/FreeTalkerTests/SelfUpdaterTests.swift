@@ -246,6 +246,109 @@ import Testing
         #expect(!thirdReason.contains("already in progress"))
     }
 
+    // MARK: Cancellation propagation (Round-4 Finding 4 — Task.detached ate caller cancellation)
+
+    /// A second, independent stalling protocol (not `StallingURLProtocol` above) so this test's
+    /// semaphore bookkeeping can't ever be coupled to, or thrown off by, the concurrent-update
+    /// test's use of the shared one.
+    private final class CancellationStallingURLProtocol: URLProtocol, @unchecked Sendable {
+        static let requestStarted = DispatchSemaphore(value: 0)
+        static let releaseResponse = DispatchSemaphore(value: 0)
+
+        override class func canInit(with request: URLRequest) -> Bool { true }
+        override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+        override func startLoading() {
+            Self.requestStarted.signal()
+            Self.releaseResponse.wait()
+            guard let url = request.url, let client else { return }
+            let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            client.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client.urlProtocol(self, didLoad: Data("unreachable — the cancelled call must never see this".utf8))
+            client.urlProtocolDidFinishLoading(self)
+        }
+
+        override func stopLoading() {}
+
+        static func blockUntilRequestStarted() { requestStarted.wait() }
+        static func releaseTheBlockedResponse() { releaseResponse.signal() }
+    }
+
+    /// Reproduces Round-4 Finding 4 exactly: start an update against a genuinely stalled
+    /// response, cancel the CALLING task (not `SelfUpdater` itself — there is no cancel API on
+    /// it), then immediately start a second update. Under the `Task.detached` bug, the detached
+    /// inner task never observes the caller's cancellation, so it keeps running — indefinitely,
+    /// since nothing ever unblocks the stalled response in this test — and keeps holding
+    /// `UpdateInProgressGate` forever, permanently rejecting every subsequent call. With the
+    /// `async let` fix, cancelling the caller automatically cancels the structured child task;
+    /// `URLSession`'s async bridge reacts to that promptly (confirmed against real Foundation,
+    /// not an assumption) even while this fake protocol's `startLoading` is itself still blocked,
+    /// so the gate is released and a second, unrelated call succeeds well within this test's
+    /// bound — which would time out under the bug.
+    @Test func cancellingTheCallingTaskReleasesTheGateAndTheCancelledUpdateNeverInstalls() async throws {
+        let installedRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: installedRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: installedRoot) }
+        let installedBundlePath = installedRoot.appendingPathComponent("FreeTalker.app")
+
+        let manifest = UpdateManifest(
+            version: "v99.0.0", assetURL: URL(string: "https://cancellation-stalling.freetalker.invalid/update.zip")!,
+            sha256: "unused", signature: "unused"
+        )
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [CancellationStallingURLProtocol.self]
+        let session = URLSession(configuration: config)
+
+        // An explicit, cancellable `Task { }` — this is what the real caller in `App.swift`'s
+        // "Check for Updates…" menu command wraps `performUpdate` in, and the exact thing
+        // `Task.detached` inside `performUpdate` used to be immune to.
+        let firstTask = Task {
+            await SelfUpdater.performUpdate(manifest: manifest, installedBundlePath: installedBundlePath, session: session)
+        }
+
+        // Block until the first call has genuinely reached the network before cancelling —
+        // guarantees a real mid-flight cancellation, not a race against `performUpdate` even
+        // having claimed the gate yet.
+        CancellationStallingURLProtocol.blockUntilRequestStarted()
+        firstTask.cancel()
+
+        // Awaited BEFORE issuing the second call, deliberately — not raced against it. Releasing
+        // the gate happens via `runUpdate`'s own `defer`, which only runs once `runUpdate`
+        // actually RETURNS; cancellation stopping the download is necessary but not by itself
+        // instantaneous with the `cancel()` call above. This `await` is exactly the property
+        // under test: under the `Task.detached` bug, `firstTask` (and the gate it holds) would
+        // never return at all — nothing in this test ever unblocks the stalled response — so this
+        // line would hang for as long as Swift Testing's own test timeout allows and fail the
+        // test that way, rather than racing a flaky wall-clock window.
+        let firstOutcome = await firstTask.value
+        #expect(firstOutcome != .success, "a cancelled update must never report success")
+        guard case .failed = firstOutcome else {
+            Issue.record("expected the cancelled first call to report .failed, got \(firstOutcome)")
+            CancellationStallingURLProtocol.releaseTheBlockedResponse()
+            return
+        }
+        // Message content isn't load-bearing here — cancellation can surface as either the
+        // explicit "Update cancelled." check or a URLSession cancellation error, depending on
+        // exactly where the race lands; both are correct, non-installing outcomes.
+
+        // Now deterministic, not a race: `firstTask` has already fully returned above, so its
+        // `defer { Self.updateGate.end() }` has already run.
+        let secondOutcome = await SelfUpdater.performUpdate(
+            manifest: manifest, installedBundlePath: installedBundlePath, session: .shared
+        )
+        guard case .failed(let secondReason) = secondOutcome else {
+            Issue.record("expected the second call to fail (unreachable host), got \(secondOutcome)")
+            CancellationStallingURLProtocol.releaseTheBlockedResponse()
+            return
+        }
+        #expect(
+            !secondReason.contains("already in progress"),
+            "the gate was still held after the cancelled first call fully returned — cancellation did not release it"
+        )
+
+        CancellationStallingURLProtocol.releaseTheBlockedResponse()
+    }
+
     // MARK: elevatePreservedBackup (Round-3 Finding 2 — a successful update wedging the next one)
 
     /// The genuine-rollback-failure path: `elevatePreservedBackup` must move the per-invocation
