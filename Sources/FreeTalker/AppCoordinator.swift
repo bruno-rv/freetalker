@@ -785,18 +785,13 @@ final class AppCoordinator: ObservableObject {
         window.title = "Voice Edit Preview"
         window.isReleasedWhenClosed = false
         // Correction Loop signal B: this Voice Edit session targeted `RecentInsertion` (rather
-        // than a plain manual selection) only if `selection` is EXACTLY what `CorrectionTargeting.
-        // selectRecentInsertion` would have produced from the store's CURRENT recent insertion —
-        // re-derived here rather than threaded through the whole capture→transcribe→present
-        // pipeline as extra mutable state. A newer dictation completing while the user spoke
-        // their instruction naturally fails this match (different text/anchor), which correctly
-        // means no vocabulary write, not a mismatched one.
-        let correctionDictationID: Int64? = {
-            guard let recent = RecentInsertionStore.shared.recent(),
-                  recent.text == selection.text, recent.anchor == selection.range.location
-            else { return nil }
-            return recent.dictationID
-        }()
+        // than a plain manual selection) only if `selection.correctionDictationID` is set — carried
+        // straight from `CorrectionTargeting.selectRecentInsertion` at the moment THIS selection
+        // was captured (Codex finding 14). Previously re-derived here by comparing `text`/
+        // `range.location` against the store's CURRENT state, which a manual Voice Edit selection
+        // in a DIFFERENT document with identical text at the same offset could satisfy just as
+        // well, recording correction evidence against the wrong row.
+        let correctionDictationID = selection.correctionDictationID
         window.contentView = NSHostingView(rootView: VoiceEditPreviewView(
             coordinator: coordinator,
             onReplaced: { [weak self] original, replaced in
@@ -806,7 +801,7 @@ final class AppCoordinator: ObservableObject {
                         dictationID: dictationID, wrongText: original, rightText: replaced, store: vocabStore
                     ) {
                         await self.refreshApprovedVocabularyCache()
-                        self.flashCorrectionOutcome(outcome)
+                        self.presentCorrectionOutcome(dictationID: dictationID, wrongText: original, rightText: replaced, outcome: outcome)
                     }
                 }
             }
@@ -827,24 +822,26 @@ final class AppCoordinator: ObservableObject {
         Task { await coordinator.begin() }
     }
 
-    /// Shared informational surface for `CorrectionRecorder.record(...)` results (Correction Loop
-    /// signals B and C — signal A's panel shows its own interactive confirm/swap UI instead, since
-    /// it already has a window open to put one in). `.approved`/`.alreadyApproved`/
-    /// `.invalidTerm`/`.noWrongRightPair` need no user action, so they stay silent — only the two
-    /// outcomes that require an explicit follow-up decision (requirements 5, 10: never evict or
-    /// resurrect silently) get a HUD flash naming what to do next.
-    func flashCorrectionOutcome(_ outcome: CorrectionRecorder.Outcome) {
+    /// Shared outcome handling for `CorrectionRecorder.record(...)` results from Correction Loop
+    /// signal B (spoken correction) — signal A's panel shows its own interactive confirm/swap UI
+    /// instead, since it already has a window open to put one in, and signal C's `EditWatcher`
+    /// routes through that same panel via `openForObservedEdit`. `.approved`/`.alreadyApproved`/
+    /// `.invalidTerm`/`.noWrongRightPair` need no user action, so they stay silent. Codex finding
+    /// 9: `.needsDismissalConfirmation`/`.budgetFull` previously just flashed a HUD message
+    /// directing the user to open Settings — an UNREACHABLE dead end, since Settings excludes
+    /// dismissed terms from its suggestions list and a single correction sits below the mining
+    /// recurrence threshold, so neither confirmation could ever actually be completed there. Both
+    /// now reopen the correction panel, pre-loaded with the immutable already-replaced correction,
+    /// so the SAME interactive Swap/Approve-anyway flow signals A/C already offer is reachable
+    /// here too.
+    func presentCorrectionOutcome(dictationID: Int64, wrongText: String, rightText: String, outcome: CorrectionRecorder.Outcome) {
         switch outcome {
         case .approved, .alreadyApproved, .invalidTerm, .noWrongRightPair:
             break
-        case .needsDismissalConfirmation(let surfaceTerm):
-            hud.flash("\"\(surfaceTerm)\" was previously dismissed — open Settings > Vocabulary to approve it again")
-        case .budgetFull(_, let swapSurface, let newTerm):
-            if swapSurface.isEmpty {
-                hud.flash("\"\(newTerm)\" doesn't fit your vocabulary budget — trim it in Settings")
-            } else {
-                hud.flash("\"\(newTerm)\" doesn't fit — open Settings > Vocabulary to swap out \"\(swapSurface)\"")
-            }
+        case .needsDismissalConfirmation, .budgetFull:
+            CorrectionPanelController.shared.openForPendingOutcome(
+                dictationID: dictationID, wrongText: wrongText, rightText: rightText, outcome: outcome
+            )
         }
     }
 
@@ -3285,24 +3282,36 @@ final class AppCoordinator: ObservableObject {
                     processor: processor, localContext: localContext,
                     insert: liveInsert ?? { Insertion.insertTrackingCorrection($0, target: $1) },
                     record: { result in
-                        try LibraryStore.shared.record(
-                            language: result.sourceLanguage.rawValue,
-                            requestedOutputLanguage: result.requestedOutputLanguage,
-                            template: result.templateName,
-                            transcript: result.rawTranscript,
-                            refined: result.finalOutput,
-                            engine: result.engineName,
-                            captureID: recovery.captureID,
-                            bundleID: bundleID,
-                            durationSecs: durationSecs,
-                            // PLAN.md PR A, item 1b: skipped post-processing (Raw) and translation
-                            // never ran the command-interpreting LLM pass regardless of policy.
-                            voiceCommandsActive: Self.derivedVoiceCommandsActive(
-                                policyEnabled: voiceCommands.enabled,
-                                ranCommandEligiblePass: !skipPostProcessing && outputLanguage == .sameAsSpoken,
-                                template: template
+                        // Codex finding 3: attach the Correction Loop pending snapshot using the
+                        // id THIS EXACT call returns — see `trackCorrectionForRecordedDictation`.
+                        // A throw here must also clear it (rather than leaving it to be
+                        // misattached by a LATER, unrelated `record()` call for a different
+                        // dictation) — see the `catch` below.
+                        do {
+                            let dictationID = try LibraryStore.shared.record(
+                                language: result.sourceLanguage.rawValue,
+                                requestedOutputLanguage: result.requestedOutputLanguage,
+                                template: result.templateName,
+                                transcript: result.rawTranscript,
+                                refined: result.finalOutput,
+                                engine: result.engineName,
+                                captureID: recovery.captureID,
+                                bundleID: bundleID,
+                                durationSecs: durationSecs,
+                                // PLAN.md PR A, item 1b: skipped post-processing (Raw) and
+                                // translation never ran the command-interpreting LLM pass
+                                // regardless of policy.
+                                voiceCommandsActive: Self.derivedVoiceCommandsActive(
+                                    policyEnabled: voiceCommands.enabled,
+                                    ranCommandEligiblePass: !skipPostProcessing && outputLanguage == .sameAsSpoken,
+                                    template: template
+                                )
                             )
-                        )
+                            trackCorrectionForRecordedDictation(dictationID)
+                        } catch {
+                            RecentInsertionStore.shared.clearPending()
+                            throw error
+                        }
                     }
                 )
             },
@@ -3906,22 +3915,6 @@ final class AppCoordinator: ObservableObject {
     private func wireVocabularyMining() {
         guard let vocabStore else { return }
         LibraryStore.shared.onDictationRecorded = { dictation in
-            // Correction Loop (BRAINSTORM_CORRECTION_LOOP.md): promotes whatever `RecentInsertionStore`
-            // pending snapshot this dictation's paste noted (see `processDictation`'s `external:`
-            // closure and `liveStreamingInsertClosure`) to `current`, now that the row has an id. A
-            // no-op when nothing is pending (paste failed, drift prevented a snapshot, or this
-            // dictation came through `reprocess`, which sets `suppressMining` and never reaches
-            // here at all — correcting a reprocessed dictation is out of scope, same as re-running
-            // it through a different template). Runs synchronously, before the mining `Task` below,
-            // so it never races a later dictation's own pending snapshot.
-            RecentInsertionStore.shared.attachDictationID(dictation.id)
-            // Correction Loop signal C: a no-op unless AppSettings.correctionLoopEditWatcherEnabled
-            // is on. Only starts watching when RecentInsertionStore actually promoted a pending
-            // snapshot for THIS dictation (attachDictationID above is a no-op otherwise, but
-            // RecentInsertionStore.shared.recent() below re-confirms rather than assuming).
-            if RecentInsertionStore.shared.recent()?.dictationID == dictation.id {
-                EditWatcher.shared.beginWatching(dictationID: dictation.id)
-            }
             Task {
                 let row = VocabMiningRow(
                     id: dictation.id, transcript: dictation.transcript, refined: dictation.refined,
@@ -3931,6 +3924,28 @@ final class AppCoordinator: ObservableObject {
                 try? await VocabularyScanService.mineRow(row, into: vocabStore)
             }
         }
+    }
+
+    /// Correction Loop (BRAINSTORM_CORRECTION_LOOP.md): promotes whatever `RecentInsertionStore`
+    /// pending snapshot THIS insertion noted (see `Insertion.insertTrackingCorrection`/
+    /// `liveStreamingInsertClosure`) to `current`, using the id THIS EXACT `LibraryStore.record`
+    /// call returned. Called directly at the ONE call site whose `insert:`/`record:` pair actually
+    /// tracks a pasted insertion (`runPipeline`) — NOT from the process-wide `LibraryStore.
+    /// onDictationRecorded` hook, which fires for EVERY insert path (scratchpad, reprocess,
+    /// recovery-persist, translation-recovery — none of which ever call `notePending`) and isn't
+    /// wired until the async `setUpVocabularyStore()` completes. Relying on that hook meant an
+    /// early insertion — before the hook was wired, or one followed by a `record()` throw — left a
+    /// pending AX target that a LATER, completely unrelated Library row's `onDictationRecorded`
+    /// firing would receive and misattach. See Codex finding 3.
+    @MainActor
+    private func trackCorrectionForRecordedDictation(_ dictationID: Int64) {
+        RecentInsertionStore.shared.attachDictationID(dictationID)
+        guard RecentInsertionStore.shared.recent()?.dictationID == dictationID else { return }
+        // Correction Loop signal C: a no-op unless AppSettings.correctionLoopEditWatcherEnabled is
+        // on. Only starts watching when RecentInsertionStore actually promoted a pending snapshot
+        // for THIS dictation (`attachDictationID` above is a no-op otherwise, but `recent()` here
+        // re-confirms rather than assuming).
+        EditWatcher.shared.beginWatching(dictationID: dictationID)
     }
 
     /// Monotonic generation counter guarding `refreshApprovedVocabularyCache` against a stale slow
