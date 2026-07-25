@@ -32,7 +32,12 @@ enum CorrectionTargeting {
 
         return SelectionSnapshot(
             target: recent.target, range: NSRange(location: recent.anchor, length: ledger.count),
-            text: recent.text, fingerprint: SelectionSnapshot.fingerprint(for: recent.text)
+            text: recent.text, fingerprint: SelectionSnapshot.fingerprint(for: recent.text),
+            // Codex finding 14: carried straight from `recent` — the dictation this selection
+            // was actually derived from — rather than left for a later caller to re-derive by
+            // comparing `text`/`range.location` against whatever `RecentInsertionStore` holds at
+            // that later moment.
+            correctionDictationID: recent.dictationID
         )
     }
 }
