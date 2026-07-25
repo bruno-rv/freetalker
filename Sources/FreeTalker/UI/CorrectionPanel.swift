@@ -33,12 +33,51 @@ final class CorrectionPanelController: ObservableObject {
     @Published private(set) var pendingDismissalOverride: String?
     @Published private(set) var isBusy = false
 
+    /// Codex finding 6: whether a Swap/Approve-anyway confirmation is awaiting the user — the text
+    /// field is disabled and `open`/`openForObservedEdit`/`openForPendingOutcome` all refuse to
+    /// reopen the panel while this holds, so a fresh trigger can never publish a DIFFERENT
+    /// correction's result into an offer that's still awaiting the user's answer.
+    var hasPendingConfirmation: Bool { pendingSwap != nil || pendingDismissalOverride != nil }
+
     private let store: () -> VocabStore?
     private let library: LibraryStore
     private let selectionAccess: any SelectionAccessing
     private let onDecisionApplied: () async -> Void
     private var panel: CorrectionQuickPanel?
     private var actionTask: Task<Void, Never>?
+    /// Codex finding 6: the EXACT wrong/right pair a `pendingSwap`/`pendingDismissalOverride`
+    /// offer was computed from. The text field stays live-editable while a confirmation is
+    /// pending is disabled via `hasPendingConfirmation`, but as extra defense this is what the
+    /// interactive Swap/Approve-anyway buttons re-confirm — never whatever `corrected`/`dictation`
+    /// happen to hold at click time — so "Drop A for X" can never end up authorising "drop B for
+    /// Y". `wasPending` distinguishes "this is a frozen offer being re-confirmed" from "this is
+    /// the in-flight record of an ordinary first-pass `confirm()` call" (used only for the
+    /// generation-checked async body below, not re-read elsewhere).
+    private var confirmedCorrection: (dictationID: Int64, wrongText: String, rightText: String, wasPending: Bool)?
+    /// Bumped on every fresh `open`/`openForObservedEdit`/`openForPendingOutcome` (Codex finding
+    /// 6) — every UI mutation inside `confirm()`'s `Task`, AFTER each `await`, re-checks this so a
+    /// stale task from a panel session that's since been superseded can never publish its result
+    /// into the new one.
+    private var generation = 0
+
+    /// Pure decision (Codex finding 6), factored out of `confirm()` so "consent is bound to the
+    /// exact candidate a Swap/Approve-anyway offer was computed from, not whatever `corrected`
+    /// holds at click time" is directly unit-testable without a live panel/AX/store environment —
+    /// same style as `Insertion.shouldSynthesizePaste`/`CorrectionRecorder.decide`. When `pending`
+    /// names an offer that's ALREADY awaiting confirmation for THIS dictation, its frozen pair
+    /// wins outright — `editedText` (the live, still-editable text field) is never consulted, so
+    /// editing it between the offer appearing and the user clicking Swap/Approve-anyway cannot
+    /// change what gets confirmed. Otherwise (an ordinary first-pass `confirm()`, or a pending
+    /// offer that belongs to a DIFFERENT dictation) uses the live `heardText`/`editedText` pair.
+    nonisolated static func resolveConfirmationPair(
+        dictationID: Int64, heardText: String, editedText: String,
+        pending: (dictationID: Int64, wrongText: String, rightText: String, wasPending: Bool)?
+    ) -> (wrongText: String, rightText: String) {
+        if let pending, pending.dictationID == dictationID, pending.wasPending {
+            return (pending.wrongText, pending.rightText)
+        }
+        return (heardText, editedText)
+    }
 
     init(
         store: @escaping () -> VocabStore? = { AppCoordinator.shared.vocabStore },
@@ -56,14 +95,19 @@ final class CorrectionPanelController: ObservableObject {
     func waitForCurrentAction() async { await actionTask?.value }
 
     func open() {
+        // Codex finding 6: refuse to reopen (and silently overwrite `dictation`/`corrected`)
+        // while an earlier confirmation is still awaiting the user's answer.
+        guard !isBusy, !hasPendingConfirmation else { return }
         guard !HistoryPanelController.isBlockedByRecording(
             isRecording: AppCoordinator.shared.isRecording,
             isProcessing: AppCoordinator.shared.isProcessing,
             isCaptureLifecycleActive: AppCoordinator.shared.isCaptureLifecycleActive
         ) else { return }
+        generation += 1
         let latest = try? library.latestDictation()
         dictation = latest
         corrected = latest.map { $0.refined.isEmpty ? $0.transcript : $0.refined } ?? ""
+        confirmedCorrection = nil
         statusMessage = nil
         pendingSwap = nil
         pendingDismissalOverride = nil
@@ -72,6 +116,9 @@ final class CorrectionPanelController: ObservableObject {
 
     func close() {
         guard panel != nil else { return }
+        // Codex finding 6: invalidates any in-flight `confirm()` task's remaining generation
+        // checks immediately, on top of `actionTask?.cancel()` below.
+        generation += 1
         actionTask?.cancel()
         panel?.orderOut(nil)
     }
@@ -85,58 +132,119 @@ final class CorrectionPanelController: ObservableObject {
     /// if the dictation no longer matches (deleted, or a newer one has since become "most
     /// recent") or recording is active — same gates `open()` uses.
     func openForObservedEdit(dictationID: Int64, after: String) {
+        guard !isBusy, !hasPendingConfirmation else { return }
         guard !HistoryPanelController.isBlockedByRecording(
             isRecording: AppCoordinator.shared.isRecording,
             isProcessing: AppCoordinator.shared.isProcessing,
             isCaptureLifecycleActive: AppCoordinator.shared.isCaptureLifecycleActive
         ) else { return }
         guard let latest = try? library.latestDictation(), latest.id == dictationID else { return }
+        generation += 1
         dictation = latest
         corrected = after
+        confirmedCorrection = nil
         statusMessage = "FreeTalker noticed an edit — confirm to remember it"
         pendingSwap = nil
         pendingDismissalOverride = nil
         showPanel()
     }
 
+    /// Correction Loop signals B/C's `.needsDismissalConfirmation`/`.budgetFull` outcomes (Codex
+    /// finding 9): those results name a follow-up decision only THIS interactive panel can
+    /// complete — Settings can't (dismissed terms are excluded from its suggestions list, and a
+    /// single correction sits below the mining recurrence threshold), so directing the user there
+    /// was an unreachable dead end. Opens the SAME panel signals A/C already use, pre-loaded with
+    /// the immutable wrong/right pair that already produced this outcome — `confirm()` re-confirms
+    /// exactly that pair (see `confirmedCorrection`), never re-deriving it from `dictation`/
+    /// `corrected`.
+    func openForPendingOutcome(dictationID: Int64, wrongText: String, rightText: String, outcome: CorrectionRecorder.Outcome) {
+        guard !isBusy, !hasPendingConfirmation else { return }
+        guard !HistoryPanelController.isBlockedByRecording(
+            isRecording: AppCoordinator.shared.isRecording,
+            isProcessing: AppCoordinator.shared.isProcessing,
+            isCaptureLifecycleActive: AppCoordinator.shared.isCaptureLifecycleActive
+        ) else { return }
+        guard let latest = try? library.latestDictation(), latest.id == dictationID else { return }
+        generation += 1
+        dictation = latest
+        corrected = rightText
+        confirmedCorrection = (dictationID, wrongText, rightText, true)
+        statusMessage = nil
+        switch outcome {
+        case .needsDismissalConfirmation(let surfaceTerm):
+            pendingDismissalOverride = surfaceTerm
+            pendingSwap = nil
+        case .budgetFull:
+            pendingSwap = outcome
+            pendingDismissalOverride = nil
+        case .approved, .alreadyApproved, .invalidTerm, .noWrongRightPair:
+            return
+        }
+        showPanel()
+    }
+
     /// `confirmSwap`/`confirmDismissedOverride` are re-invocations after the user explicitly
     /// agreed to `pendingSwap`/`pendingDismissalOverride` — never inferred automatically.
+    ///
+    /// Codex finding 6: when re-confirming an ALREADY-pending offer (`confirmedCorrection.
+    /// wasPending`), the wrong/right pair that produced it is reused verbatim — never re-derived
+    /// from `dictation.refined`/`corrected`, which may have drifted since (the text field stays
+    /// live-editable) — so "Drop A for X" can never end up authorising "drop B for Y." Every UI
+    /// mutation inside the `Task` below, after each `await`, re-checks `generation` so a stale
+    /// task from a superseded panel session can never publish into this one.
     func confirm(confirmSwap: Bool = false, confirmDismissedOverride: Bool = false) {
-        guard let dictation, let store = store() else { return }
+        guard let dictation else { return }
         let heard = dictation.refined.isEmpty ? dictation.transcript : dictation.refined
-        let corrected = self.corrected
-        guard heard != corrected else {
+        let (wrongText, rightText) = Self.resolveConfirmationPair(
+            dictationID: dictation.id, heardText: heard, editedText: corrected, pending: confirmedCorrection
+        )
+        guard wrongText != rightText else {
             close()
             return
         }
+        let myGeneration = generation
         isBusy = true
         pendingSwap = nil
         pendingDismissalOverride = nil
+        confirmedCorrection = (dictation.id, wrongText, rightText, false)
         actionTask = Task {
-            defer { isBusy = false }
+            defer { if myGeneration == generation { isBusy = false } }
             // Repair the live document FIRST (requirement 3: "any correction repairs the text in
             // place... never silently editing the wrong thing") — reuses the exact same
             // remembered-insertion verification + live-AX-select + SelectionAccess.replace path
             // signal B uses, not a parallel implementation. A drifted/expired/unavailable
             // RecentInsertion just means the live document isn't touched; the vocabulary write
             // below still runs independently — the correction is still real knowledge even when
-            // this particular window has closed.
+            // this particular window has closed. Attempted regardless of vocabulary-store
+            // availability (Codex finding 15) — the repair and the remembering are independent.
             if let recent = RecentInsertionStore.shared.recent(),
-               recent.dictationID == dictation.id, recent.text == heard,
+               recent.dictationID == dictation.id, recent.text == wrongText,
                let snapshot = CorrectionTargeting.selectRecentInsertion(recent) {
-                try? selectionAccess.replace(snapshot, with: corrected)
+                try? selectionAccess.replace(snapshot, with: rightText)
             }
+            guard myGeneration == generation else { return }
 
+            guard let store = store() else {
+                // Codex finding 15: previously returned silently before even attempting the
+                // repair above (the whole body was gated on `store()` up front) — no document
+                // repair, no error shown. The repair now runs unconditionally; only remembering
+                // the term is unavailable.
+                statusMessage = "Text updated — remembering this term is unavailable right now"
+                return
+            }
             guard let outcome = try? await CorrectionRecorder.record(
-                dictationID: dictation.id, wrongText: heard, rightText: corrected, store: store,
+                dictationID: dictation.id, wrongText: wrongText, rightText: rightText, store: store,
                 confirmSwap: confirmSwap, confirmDismissedOverride: confirmDismissedOverride
             ) else {
+                guard myGeneration == generation else { return }
                 statusMessage = "Could not save the correction"
                 return
             }
+            guard myGeneration == generation else { return }
             switch outcome {
             case .approved:
                 await onDecisionApplied()
+                guard myGeneration == generation else { return }
                 close()
             case .alreadyApproved:
                 close()
@@ -145,8 +253,10 @@ final class CorrectionPanelController: ObservableObject {
                 // — still a successful correction from the user's point of view.
                 close()
             case .needsDismissalConfirmation(let surfaceTerm):
+                confirmedCorrection = (dictation.id, wrongText, rightText, true)
                 pendingDismissalOverride = surfaceTerm
             case .budgetFull:
+                confirmedCorrection = (dictation.id, wrongText, rightText, true)
                 pendingSwap = outcome
             }
         }
@@ -203,6 +313,9 @@ private struct CorrectionPanelContentView: View {
                 TextField("Corrected text", text: $controller.corrected, axis: .vertical)
                     .textFieldStyle(.roundedBorder)
                     .lineLimit(3...6)
+                    // Codex finding 6: editing must not change what a Swap/Approve-anyway click
+                    // authorises while that offer is pending.
+                    .disabled(controller.hasPendingConfirmation || controller.isBusy)
 
                 if let surfaceTerm = controller.pendingDismissalOverride {
                     Text("\"\(surfaceTerm)\" was previously dismissed as a suggestion.")
