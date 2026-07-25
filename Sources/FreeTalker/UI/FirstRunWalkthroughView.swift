@@ -78,6 +78,21 @@ struct FirstRunWalkthroughView: View {
         let presentation = SpeechModelRowPresentation.make(
             state: state, selected: false, activeDownloadVariant: speechModelStore.activeDownloadVariant
         )
+        // The walkthrough's model IS the active one by definition — `SpeechModelStore.init`
+        // marks `settings.whisperModel` active immediately, before it has ever downloaded (see
+        // SpeechModelStore.swift:147-149) — so a failed first download leaves `state.active ==
+        // true`. `SpeechModelRowPresentation.make`'s `.download` action requires `!state.active`
+        // (SettingsView.swift), which is the right call there (you don't manually download an
+        // already-active, already-downloaded model) but leaves this specific case — active AND
+        // failed — with a status of "Failed — …" and no way to retry. Detect that case here
+        // instead of changing the shared Settings presentation, which must stay untouched.
+        let isFailed: Bool = {
+            if case .failed = state.phase { return true }
+            return false
+        }()
+        let canRetry = isFailed
+            && SpeechModelStore.canStartManualDownload(phase: state.phase, reserved: false)
+        let waitingOnAnotherDownload = speechModelStore.activeDownloadVariant != nil
         VStack(alignment: .leading, spacing: 6) {
             Text("Speech model").font(.headline)
             HStack {
@@ -95,6 +110,11 @@ struct FirstRunWalkthroughView: View {
                     Task { await speechModelStore.download(variant) }
                 }
                 .disabled(!presentation.actionEnabled)
+            } else if canRetry {
+                Button("Retry Download") {
+                    Task { await speechModelStore.download(variant) }
+                }
+                .disabled(waitingOnAnotherDownload)
             }
         }
     }

@@ -1,5 +1,42 @@
 # Deferred Findings (Codex adversarial review)
 
+## Install & Updates (round 1) — Finding 7
+
+### Finding 7 — MEDIUM — PRE-EXISTING — the backup-then-promote swap is not transactional across a crash or power loss
+
+**Where:** `Sources/FreeTalker/Update/SelfUpdateInstaller.swift` (`swap`) — the two sequential
+`moveItem` calls (`installedPath -> backupPath`, then `stagedPath -> installedPath`) that
+implement the atomic-per-step swap with rollback.
+
+**Why real, and why not fixed here:** each individual `moveItem` is a single `rename(2)` (both
+paths are same-volume, staged right next to `installedPath` — see `SelfUpdater.runUpdate`'s
+staging-root comment), so *each step* is atomic. But the two-step sequence as a whole is not: if
+the process is killed, the machine crashes, or power is lost in the narrow window between the
+first `rename(2)` (original moved to `backupPath`) and the second (`stagedPath` moved into
+`installedPath`), the *next* launch finds `installedPath` simply absent — the original is sitting
+at `backupPath` and nothing has been promoted into its place. This risk is not introduced by this
+branch: it already existed on `main` in a *wider* form — `943fb44`'s `Makefile` `install` target
+runs `rm -rf $(INSTALLED_BUNDLE)` and then `cp -R $(BUNDLE) $(INSTALLED_BUNDLE)` (two separate,
+non-atomic steps with no backup at all in between), and the old `scripts/self-update.sh` this
+branch's `SelfUpdater.swift` replaces invoked exactly that `make install` path for self-updates
+too. This branch strictly narrows the hazard (the old path had a window with the app deleted and
+*no* backup to recover from at all; this path's window instead leaves a recoverable backup one
+`mv` away at a path the failure message now names explicitly — see Finding 5's fix) but does not
+eliminate it, so it's recorded here as improved-not-eliminated rather than closed.
+
+**What closing it would take (follow-up PR):** Make the whole sequence resumable/idempotent
+across a crash instead of merely narrowing the window — for example, write a small marker file
+into the staging root *before* the first move recording "about to promote `<stagedPath>` over
+`<installedPath>`, backup will be at `<backupPath>`," and have `SelfUpdater`/`AppRelaunch` check
+for that marker on next launch (before anything else runs) and finish or roll back the
+interrupted swap deterministically from the marker's recorded state, rather than relying on the
+happy-path both-moves-succeeded assumption the current code makes silently. A more involved
+alternative would swap via a single `rename(2)` of a *parent directory level* (keep both the old
+and new bundle on disk under stable names, and atomically flip which name `/Applications/
+FreeTalker.app` resolves to via a symlink-based indirection) — but that changes the on-disk
+layout `SelfUpdateInstaller`'s tests and `Makefile`'s `install` target both currently assume, so
+it's a larger, separate design change rather than a drop-in fix.
+
 ## Correction Loop — F16
 
 ### F16 — LOW — `kAXDocumentAttribute` can't distinguish two tabs sharing a URL, so the correction-fallback document check fails closed in browsers instead of succeeding

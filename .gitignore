@@ -6,6 +6,9 @@ FreeTalker.app/
 # Machine-local stable signing identity (see scripts/make-signing-cert.sh, README) — the
 # private key backing it never leaves this machine, so this file can't either.
 /.codesign-identity
+# Recorded leaf-certificate fingerprint behind .codesign-identity (scripts/release.sh) — used
+# to detect a same-named-but-different certificate before publishing under it.
+/.codesign-identity-fingerprint
 # scripts/release.sh build output (signed zip, checksum, manifest) — regenerated per release,
 # never committed.
 /dist/

@@ -982,7 +982,15 @@ final class AppCoordinator: ObservableObject {
     /// for Accessibility above).
     func primeMicrophonePermission() {
         guard AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined else { return }
-        Permissions.requestMicrophoneAccess { _ in }
+        // The authorization result itself used to be discarded (`{ _ in }`): denying the
+        // system prompt left `permissionDiagnosis` exactly as it was computed at launch —
+        // "Not yet requested" — since nothing ever asked the coordinator to look again. The
+        // completion handler can fire on a background thread (`AVCaptureDevice.requestAccess`
+        // makes no main-thread guarantee), so hop back to the main actor before touching
+        // `@Published` state.
+        Permissions.requestMicrophoneAccess { [weak self] _ in
+            Task { @MainActor in self?.refreshPermissionDiagnosis() }
+        }
     }
 
     // MARK: - Hands-free gesture (Amendment B)
