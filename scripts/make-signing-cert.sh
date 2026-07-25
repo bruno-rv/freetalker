@@ -43,7 +43,15 @@ openssl req -x509 -newkey rsa:2048 -keyout "$KEY_FILE" -out "$CERT_FILE" \
     -addext "basicConstraints=critical,CA:false" \
     -addext "keyUsage=critical,digitalSignature"
 
-openssl pkcs12 -export -out "$P12_FILE" -inkey "$KEY_FILE" -in "$CERT_FILE" \
+# OpenSSL 3.x defaults to AES/SHA-2 PKCS12 encryption that macOS `security import`
+# rejects ("MAC verification failed"). -legacy restores the compatible format;
+# LibreSSL (macOS stock openssl) lacks the flag and doesn't need it.
+P12_LEGACY=""
+if openssl pkcs12 -export -help 2>&1 | grep -q -- -legacy; then
+    P12_LEGACY="-legacy"
+fi
+
+openssl pkcs12 -export $P12_LEGACY -out "$P12_FILE" -inkey "$KEY_FILE" -in "$CERT_FILE" \
     -name "$IDENTITY_NAME" -passout "pass:$P12_PASSWORD"
 
 # -T /usr/bin/codesign lets codesign use the private key without a per-invocation keychain

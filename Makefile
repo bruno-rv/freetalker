@@ -9,8 +9,16 @@ XCODE_DEVELOPER_DIR ?= /Applications/Xcode.app/Contents/Developer
 # scripts/make-signing-cert.sh) so TCC grants survive rebuilds instead of being orphaned by
 # ad-hoc signing's per-build signature.
 CODESIGN_IDENTITY ?= -
+# If scripts/make-signing-cert.sh recorded a stable identity at the repo root, use it by
+# default so TCC grants survive rebuilds. An explicit CODESIGN_IDENTITY=... on the command
+# line still wins (command-line assignments override file assignments).
+ifneq ($(wildcard .codesign-identity),)
+CODESIGN_IDENTITY = $(shell cat .codesign-identity)
+endif
 
-.PHONY: build test test-preflight app run clean
+INSTALLED_BUNDLE := /Applications/$(BUNDLE)
+
+.PHONY: build test test-preflight app install run clean
 
 build:
 	swift build -c $(CONFIG)
@@ -45,9 +53,18 @@ ifeq ($(CODESIGN_IDENTITY),-)
 	@echo "after this rebuild, remove FreeTalker from System Settings > Privacy & Security >"
 	@echo "Accessibility (and Input Monitoring) and re-add it, even if it still shows as on."
 endif
+	$(MAKE) install
+
+# Copies the freshly built bundle into /Applications, replacing any previous install.
+# Quits a running instance first so the overwrite doesn't clobber an open app.
+install:
+	@pkill -x $(APP_NAME) 2>/dev/null || true
+	rm -rf $(INSTALLED_BUNDLE)
+	cp -R $(BUNDLE) $(INSTALLED_BUNDLE)
+	@echo "Installed $(INSTALLED_BUNDLE)."
 
 run: app
-	open $(BUNDLE)
+	open $(INSTALLED_BUNDLE)
 
 clean:
 	rm -rf .build $(BUNDLE)
