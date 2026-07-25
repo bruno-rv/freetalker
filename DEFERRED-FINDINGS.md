@@ -1,5 +1,121 @@
 # Deferred Findings (Codex adversarial review)
 
+## Automation Surface (round 3) — accepted structural limitations
+
+Round 3's review stopped converging (7 → 5 → 6 findings across rounds 1-3) for a structural
+reason, not a diminishing-returns one: **FreeTalker is unsandboxed.** Any process running as the
+same macOS user can forge, read, or swap whatever file-based authority the app holds, because
+nothing on this Mac stops it from doing so at the OS level. Each round closed one *encoding* of
+that authority — a path string (round 1), then a bookmark that could itself be forged via
+`defaults write` (round 2, closed by round 3 Finding 1's move to the Keychain) — and the next
+round found the next encoding defeatable the same way. Round 3's Findings 1/3/6 and the two
+non-verdict notes close every *bounded* problem in that space (see the commits on this branch).
+The three findings below are explicitly **accepted, not fixed**: closing them requires either
+threading file descriptors through the entire media pipeline, or sandboxing the app outright —
+both larger changes than this PR's scope, and orthogonal to "does automation add a new way to
+reach something the user didn't already implicitly trust a same-user process with."
+
+**The honest residual threat model, stated plainly:** a process already running as the user,
+**without** the TCC grants FreeTalker itself holds (Documents/Desktop/removable-volume access,
+etc.), can use FreeTalker as a confused deputy to read a TCC-protected file — but only one inside
+the single folder the user explicitly chose in Settings → Privacy → Automation, and only once
+`automationEnabled` is explicitly turned on (**off by default**, and per-file authority is granted
+to nothing until a folder is chosen). A process that already has those TCC grants itself gains
+nothing from any of this — it could just read the file directly.
+
+### A — Post-staging pathname swap (the descriptor-to-pathname handoff)
+
+**Where:** `Sources/FreeTalker/Automation/AutomationService.swift` (`performTranscription`, which
+hands `stagedURL` — a plain `URL`, not the pinned file descriptor `AutomationMediaStaging.stage`
+verified — to `AVURLAsset` and `MediaImportService`/`JobLibraryStore.importMedia`).
+
+**Why real:** `AutomationMediaStaging.stage` closes the caller-controlled-symlink TOCTOU window
+(round-2 Finding 2) by pinning the *authorized source* with an `O_NOFOLLOW` descriptor and copying
+its verified bytes into an app-owned staging file — but from that point on, every consumer of the
+staged copy (`AVURLAsset(url:)`'s duration probe, `AVAudioDecoder`'s eventual read,
+`MediaImportService.createJob`'s security-scoped-bookmark creation) reopens `stagedURL` **by
+pathname**, not by descriptor. Nothing stops a same-UID process from renaming the staging file
+aside and substituting a symlink to an unauthorized file at that exact path in the gap between
+`stage()` returning and each of those reopens — the staging directory is `0700`/files `0600`
+(process-owned), but POSIX file permissions separate *users*, not *processes sharing a UID*; a
+same-user process can still rename/unlink/create at that path regardless of mode bits.
+
+**Why deferred:** Closing this fully requires threading an open file descriptor (not a `URL`)
+through `AVFoundation`'s asset-loading APIs and `MediaImportService`'s decode pipeline end to
+end — both are designed around URLs/pathnames, not descriptors, so this is a genuine pipeline
+redesign, not a local fix. The alternative — sandboxing FreeTalker so a hostile same-UID process
+can no longer touch the app's own container at all — is the actual structural fix, and is a
+much larger, product-level change (App Sandbox entitlements, security-scoped bookmarks for every
+existing file-access path, TCC re-prompting) outside a security-hardening PR's scope.
+
+**Suggested fix (follow-up PR):** Either (a) rewrite the media-import pipeline to carry an open
+descriptor from staging through decode (largest lift, closes this fully), or (b) re-verify the
+staged file's identity (`fstat` device+inode, same pattern as this PR's `AutomationMediaStaging`
+and `AutomationFileAuthorization.FileIdentity`) immediately before each reopen and reject a
+mismatch — narrows the window without eliminating it, since a swap can still land between the
+re-verification and the reopen. (c), the actual structural fix: sandbox the app.
+
+### B — A long automation import monopolizes the shared serial WhisperKit transcription gate
+
+**Where:** The shared serial transcription gate itself (unchanged by this branch) and
+`AutomationService.transcribe`'s `importMedia` call, which enqueues onto the exact same
+`LocalJobRunner`/pipeline ordinary Dictation and the Imports window already share.
+
+**Why real:** The gate and the media-import pipeline are byte-for-byte identical to `main` here —
+this PR does not touch WhisperKit's admission model at all. What round 3's review correctly points
+out is that automation is a **new, unattended, externally-triggered** way to reach that
+already-shared gate: a Shortcut or `osascript` can now submit an hours-long recording that holds
+the gate for its entire (`AutomationMediaGuard.maximumMediaDurationSeconds` — 4 hours) duration,
+during which ordinary interactive dictation queues behind it and simply waits — until the import
+finishes, is cancelled from the Imports window, or the 2-hour automation deadline
+(`AutomationService.automationDeadline`) cancels the automation request itself (which does NOT
+free the gate any faster than the import pipeline's own cancellation path already does for any
+other long-running import).
+
+**Why deferred:** Closing this means giving foreground/interactive dictation priority over queued
+media-import transcription in the shared gate — a scheduling-policy change to a subsystem this PR
+doesn't otherwise touch, with its own correctness surface (starvation of media imports if
+interactive dictation is frequent, priority-inversion edge cases, UI for communicating "your import
+is paused because you're dictating"). That's real product/scheduling design work, not a targeted
+security fix, and belongs in its own reviewed change.
+
+**Suggested fix (follow-up PR):** Give the gate a priority tier (interactive dictation preempts or
+is admitted ahead of queued media-import work), or at minimum let a new interactive dictation
+request cut ahead of an already-queued (not yet started) media-import job at the gate.
+
+### C — Apple Event argument decoding allocates before any cap can run
+
+**Where:** Outside this codebase's control — Apple's own Apple Event Manager / Cocoa Scripting
+argument-coercion machinery, which decodes `FrTk`/`clup` (the `transcribe`/`clean up` commands'
+direct-parameter and `templateName`/`format` keyword-argument descriptors) into Foundation
+`String`/`URL` values *before* `TranscribeFileCommand`/`CleanUpTextCommand.performDefaultImplementation()`
+ever runs — i.e. before `AutomationTextValidation.validateCleanUpText`/`validateTemplateName`
+(round-1/round-2 Findings 3) or anything else this PR added gets a chance to reject an oversized
+argument.
+
+**Why real:** A caller that controls Apple Event construction directly (bypassing AppleScript/
+Shortcuts' own descriptor-size conventions) can send a very large string descriptor as an
+argument; the OS decodes and allocates it into a full Foundation string during dispatch,
+regardless of what FreeTalker's own command implementation would have rejected once it got
+control. This PR's existing text/template-name byte caps (`AutomationTextValidation`) run
+strictly AFTER that allocation already happened — they bound what FreeTalker does with the string
+once it has one, not the allocation itself.
+
+**Why deferred:** There is no application-level hook between Apple Event descriptor arrival and
+Cocoa Scripting's own argument coercion — bounding this requires a pre-coercion ingress guard
+that inspects raw descriptor sizes on `FrTk`/`clup` before Cocoa Scripting decodes them into
+Swift values at all, which means intercepting Apple Events beneath `NSScriptCommand`'s own
+dispatch (a custom `NSAppleEventManager` handler that peeks at `AEDesc` sizes and only then hands
+off to the normal Cocoa Scripting path) — a different, lower-level integration point than
+anything else this PR touches, and a meaningfully larger, riskier change to get right (Apple
+Event handling is notoriously easy to break silently).
+
+**Suggested fix (follow-up PR):** Register a custom handler for the `FrTk`/`clup` Apple Event
+class/ID pair via `NSAppleEventManager.setEventHandler(...)` ahead of Cocoa Scripting's own
+dispatch, inspect the raw descriptor's byte size (`AEGetDescData`/`AESizeOfFlattenedDesc`-style
+inspection) before any coercion to a Swift type runs, and reply with an error immediately for
+anything past a generous ceiling — never let oversized descriptor decoding run unbounded.
+
 ## Automation Surface (round 1) — pre-existing provider-preference rewrite exposed by Finding 1
 
 ### Any same-user process can rewrite FreeTalker's cloud provider preferences and harvest the API key on the user's next ordinary dictation, no automation involved
