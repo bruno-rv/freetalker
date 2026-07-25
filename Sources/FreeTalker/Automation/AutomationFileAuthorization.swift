@@ -6,23 +6,67 @@ import Foundation
 /// `automationEnabled` toggle grants no per-file authority — only a file inside the user's
 /// explicitly chosen Automation folder (Settings → Privacy → Automation) may be read.
 ///
+/// Codex round-2 Finding 1 (HIGH): a path STRING in `UserDefaults` is not a stable authority.
+/// Two concrete defeats of the round-1 design: (a) after the folder is chosen, anything can rename
+/// it away and drop a symlink to e.g. `~/Documents` at the same path — both sides canonicalize to
+/// Documents and containment succeeds; (b) before FreeTalker even launches,
+/// `defaults write org.freetalker.app automationFolderPath /` authorizes the entire disk. The
+/// authority is now a bookmark (`AppSettings.automationFolderBookmark`) captured from the actual
+/// directory the folder picker returned — bookmark resolution follows the real filesystem object
+/// (its volume + file identity), not a mutable path string, so a rename/symlink swap at the old
+/// path never redirects it. `AppSettings.automationFolderPath` is DISPLAY ONLY from here on; it is
+/// never read for authorization.
+///
 /// Pure and `nonisolated` so it's testable without `AppSettings`'s `@MainActor` isolation or a
 /// running app.
 enum AutomationFileAuthorization {
-    /// Resolves `requested` to its canonical (symlink-free, standardized) path and verifies that
-    /// path is contained within `automationFolderPath`, itself canonicalized the same way — so a
-    /// symlink planted *inside* the folder that points outside it is refused, and so is a symlink
-    /// standing in for the configured folder itself. Symlinks are resolved BEFORE the containment
-    /// comparison, never after.
+    /// The canonical requested file and the canonical folder it was authorized against — the
+    /// caller (`AutomationService`) needs both so `AutomationMediaStaging` can pin a file
+    /// descriptor to the real, bookmark-resolved directory rather than re-deriving it from a path.
+    struct AuthorizedFile {
+        let url: URL
+        let folder: URL
+    }
+
+    /// Resolves `automationFolderBookmark` to the real directory it was created from — rejecting a
+    /// missing, unreadable, stale, or no-longer-a-directory bookmark outright (Codex round-2
+    /// Finding 1: "reject a stale or replaced identity") — then resolves `requested` to its
+    /// canonical (symlink-free, standardized) path and verifies that path is contained within the
+    /// resolved folder, itself canonicalized the same way — so a symlink planted *inside* the
+    /// folder that points outside it is refused, and so is a symlink standing in for the folder
+    /// itself. Symlinks are resolved BEFORE the containment comparison, never after.
     ///
-    /// Returns the canonical URL to use for every check downstream of this one (regular-file,
-    /// size, `MediaImportService.isSupported`, and the actual import) — never the caller-supplied
-    /// URL, so nothing downstream re-introduces the symlink this function just resolved away.
-    static func authorize(_ requested: URL, automationFolderPath: String?) throws -> URL {
-        guard let automationFolderPath, !automationFolderPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+    /// Returns the canonical URL to use for every check downstream of this one — never the
+    /// caller-supplied URL, so nothing downstream re-introduces the symlink this function just
+    /// resolved away — alongside the canonical folder, so a caller can pin a file descriptor to it
+    /// without re-resolving a path (Codex round-2 Finding 2).
+    static func authorize(_ requested: URL, automationFolderBookmark: Data?) throws -> AuthorizedFile {
+        guard let automationFolderBookmark else {
             throw AutomationError.automationFolderNotConfigured
         }
-        let canonicalFolder = URL(fileURLWithPath: automationFolderPath)
+
+        var isStale = false
+        let resolvedFolder: URL
+        do {
+            resolvedFolder = try URL(
+                resolvingBookmarkData: automationFolderBookmark,
+                options: [],
+                relativeTo: nil,
+                bookmarkDataIsStale: &isStale
+            )
+        } catch {
+            throw AutomationError.automationFolderUnavailable
+        }
+        guard !isStale else {
+            throw AutomationError.automationFolderUnavailable
+        }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: resolvedFolder.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            throw AutomationError.automationFolderUnavailable
+        }
+
+        let canonicalFolder = resolvedFolder
             .resolvingSymlinksInPath()
             .standardizedFileURL
         let canonicalRequested = requested
@@ -34,6 +78,6 @@ enum AutomationFileAuthorization {
         guard canonicalRequested.path.hasPrefix(folderPath) else {
             throw AutomationError.fileNotAuthorized
         }
-        return canonicalRequested
+        return AuthorizedFile(url: canonicalRequested, folder: canonicalFolder)
     }
 }

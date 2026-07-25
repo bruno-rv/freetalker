@@ -407,13 +407,24 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(automationEnabled, forKey: Keys.automationEnabled) }
     }
 
-    /// The single folder `transcribe` may read files from (Codex round-1 Finding 2). `nil` until
-    /// the user explicitly chooses one in Settings → Privacy → Automation — `automationEnabled`
-    /// alone grants no per-file authority, so `transcribe` refuses every file until this is set.
-    /// A plain absolute path (FreeTalker is unsandboxed; no security-scoped bookmark needed) —
-    /// see `AutomationFileAuthorization`, which resolves and canonicalizes it before every check.
+    /// DISPLAY ONLY (Codex round-2 Finding 1): the folder path shown in Settings → Privacy →
+    /// Automation. Never read for authorization — a path string in `UserDefaults` is trivially
+    /// replaceable (`defaults write`, or a rename-and-symlink swap at the same path) and is not a
+    /// stable authority. The real authority is `automationFolderBookmark`, below.
     @Published var automationFolderPath: String? {
         didSet { defaults.set(automationFolderPath, forKey: Keys.automationFolderPath) }
+    }
+
+    /// The single folder `transcribe` may read files from (Codex round-1 Finding 2), as a
+    /// bookmark captured from the actual directory the folder picker returned. `nil` until the
+    /// user explicitly chooses one — `automationEnabled` alone grants no per-file authority, so
+    /// `transcribe` refuses every file until this is set. Codex round-2 Finding 1: bookmark
+    /// resolution follows the real filesystem object (volume + file identity), not a mutable path
+    /// string, so it survives a rename and is never redirected by a symlink later placed at the
+    /// old path — see `AutomationFileAuthorization`, which resolves and validates it before every
+    /// check.
+    @Published var automationFolderBookmark: Data? {
+        didSet { defaults.set(automationFolderBookmark, forKey: Keys.automationFolderBookmark) }
     }
 
     /// Streaming ASR master switch (BRAINSTORM_STREAMING_ASR.md): types confirmed partial
@@ -961,6 +972,7 @@ final class AppSettings: ObservableObject {
         static let automaticStyleEnabled = "automaticStyleEnabled"
         static let automationEnabled = "automationEnabled"
         static let automationFolderPath = "automationFolderPath"
+        static let automationFolderBookmark = "automationFolderBookmark"
         static let voiceCommandsEnabled = "voiceCommandsEnabled"
         static let streamingASREnabled = "streamingASREnabled"
         static let commandKeywords = "commandKeywords"
@@ -1104,6 +1116,7 @@ final class AppSettings: ObservableObject {
         // resolves an unset key to `false`, matching "off until switched on in Settings."
         automationEnabled = defaults.bool(forKey: Keys.automationEnabled)
         automationFolderPath = defaults.string(forKey: Keys.automationFolderPath)
+        automationFolderBookmark = defaults.data(forKey: Keys.automationFolderBookmark)
         // Default OFF — plain `.bool(forKey:)` is correct here (unlike the `.object(forKey:) as?
         // Bool` idiom used for default-ON flags above): an unset key and an explicit `false` both
         // correctly resolve to `false`. See PLAN.md PR A, item 1.

@@ -24,18 +24,24 @@ final class CleanUpTextCommand: NSScriptCommand, @unchecked Sendable {
             fail(.invalidInput("Provide the text to clean up."))
             return nil
         }
-        guard let templateName = (evaluatedArguments?["templateName"] as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines), !templateName.isEmpty else {
+        guard let rawTemplateName = evaluatedArguments?["templateName"] as? String else {
             fail(.invalidInput("Provide the name of the Template to apply, using template."))
             return nil
         }
+        // Codex round-2 Finding 3: check the RAW (untrimmed) byte count before trimming — an
+        // enormous template name must never reach `trimmingCharacters(in:)`'s scan/allocation.
         do {
-            try AutomationTextValidation.validateTemplateName(templateName)
+            try AutomationTextValidation.validateTemplateName(rawTemplateName)
         } catch let error as AutomationError {
             fail(error)
             return nil
         } catch {
             fail(.invalidInput("The template name is too long."))
+            return nil
+        }
+        let templateName = rawTemplateName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !templateName.isEmpty else {
+            fail(.invalidInput("Provide the name of the Template to apply, using template."))
             return nil
         }
 

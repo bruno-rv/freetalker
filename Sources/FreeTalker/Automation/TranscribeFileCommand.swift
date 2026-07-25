@@ -21,6 +21,14 @@ final class TranscribeFileCommand: NSScriptCommand, @unchecked Sendable {
         let format = AutomationTranscriptFormat.parse(evaluatedArguments?["format"] as? String)
         let includeSpeakerLabels = (evaluatedArguments?["withSpeakerLabels"] as? Bool) ?? true
 
+        // Codex round-2 Finding 4: claim the single in-flight `transcribe` slot BEFORE
+        // suspending, same as `CleanUpTextCommand` already does — a busy rejection never suspends
+        // and never starts an import job or polling task.
+        guard AutomationConcurrencyGate.beginTranscribe() else {
+            fail(.busy)
+            return nil
+        }
+
         suspendExecution()
         // `self` is only ever touched by the Apple Event Manager's own serialized dispatch, and
         // this method never reads it again after `return nil` below. The `@unchecked Sendable`
@@ -31,6 +39,7 @@ final class TranscribeFileCommand: NSScriptCommand, @unchecked Sendable {
         // is for.
         nonisolated(unsafe) let command = self
         Task {
+            defer { AutomationConcurrencyGate.endTranscribe() }
             do {
                 let output = try await AutomationService.transcribe(
                     fileURL: fileURL,

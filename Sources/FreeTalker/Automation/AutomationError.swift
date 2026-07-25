@@ -35,6 +35,11 @@ enum AutomationError: LocalizedError, Equatable {
     /// automation folder. Codex round-1 Finding 2 — the automation toggle alone grants no
     /// per-file authority.
     case fileNotAuthorized
+    /// The configured Automation folder's security-scoped bookmark is missing, unreadable, stale,
+    /// or no longer resolves to a real directory — Codex round-2 Finding 1. A `UserDefaults` path
+    /// string is never re-trusted as the authority in this case; the user must choose the folder
+    /// again so a fresh bookmark is created.
+    case automationFolderUnavailable
     /// The path isn't a regular file (a FIFO, device node, directory, or symlink) — Codex round-1
     /// Finding 4.
     case unsupportedMediaFile
@@ -73,6 +78,8 @@ enum AutomationError: LocalizedError, Equatable {
             return "Choose an Automation folder in FreeTalker → Settings → Privacy → Automation before transcribing files."
         case .fileNotAuthorized:
             return "FreeTalker can only transcribe files inside the folder chosen in Settings → Privacy → Automation."
+        case .automationFolderUnavailable:
+            return "The Automation folder chosen in Settings → Privacy → Automation is missing or was replaced. Choose it again."
         case .unsupportedMediaFile:
             return "FreeTalker can only transcribe a regular audio or video file — not a special file, device, or symbolic link."
         case .mediaTooLarge:
@@ -109,6 +116,7 @@ enum AutomationError: LocalizedError, Equatable {
         case .textTooLarge: return 20014
         case .busy: return 20015
         case .timedOut: return 20016
+        case .automationFolderUnavailable: return 20017
         }
     }
 }

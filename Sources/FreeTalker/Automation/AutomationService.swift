@@ -44,16 +44,30 @@ enum AutomationService {
     ) async throws -> String {
         try AutomationGate.checkEnabled(AppSettings.shared.automationEnabled)
 
-        // Codex round-1 Finding 2: the automation toggle alone grants no per-file authority — only
-        // a file inside the user's chosen Automation folder may be read. Every check downstream
-        // uses the CANONICAL (symlink-resolved) URL this returns, never the caller-supplied one.
-        let canonicalURL = try AutomationFileAuthorization.authorize(
-            fileURL, automationFolderPath: AppSettings.shared.automationFolderPath
+        // Codex round-1 Finding 2 / round-2 Finding 1: the automation toggle alone grants no
+        // per-file authority — only a file inside the user's chosen Automation folder may be
+        // read, and that folder's identity comes from a bookmark bound to the real directory,
+        // never the mutable `automationFolderPath` string. Every check downstream uses the
+        // CANONICAL (symlink-resolved) URL this returns, never the caller-supplied one.
+        let authorized = try AutomationFileAuthorization.authorize(
+            fileURL, automationFolderBookmark: AppSettings.shared.automationFolderBookmark
         )
-        guard MediaImportService.isSupported(canonicalURL) else { throw AutomationError.unsupportedFileType }
-        // Codex round-1 Finding 4: reject FIFOs/device nodes/symlinks and oversized files BEFORE
-        // any AVFoundation call ever touches the file.
-        try AutomationMediaGuard.requireRegularFile(at: canonicalURL)
+        guard MediaImportService.isSupported(authorized.url) else { throw AutomationError.unsupportedFileType }
+
+        // Codex round-2 Finding 2: no `await` occurs between `authorize` above and `stage` here —
+        // `stage` pins the real file via an `O_NOFOLLOW` file descriptor and copies its verified
+        // bytes into app-owned staging BEFORE any AVFoundation or import call ever runs, so the
+        // async duration probe and `importMedia` below can never reopen a caller-swapped path.
+        let staged = try AutomationMediaStaging.stage(
+            canonicalFolder: authorized.folder,
+            canonicalFile: authorized.url,
+            maximumBytes: AutomationMediaGuard.maximumSourceFileBytes
+        )
+        defer { staged.cleanup() }
+        // Captured by the task group's child task below instead of `staged` itself: `URL` is
+        // `Sendable`, so this avoids requiring `AutomationMediaStaging.StagedFile` (whose cleanup
+        // closure isn't) to cross the child task's concurrency domain.
+        let stagedURL = staged.url
 
         await AppCoordinator.shared.launchMediaImportWorkflows()
         guard let jobLibraryStore = AppCoordinator.shared.jobLibraryStore else {
@@ -67,7 +81,7 @@ enum AutomationService {
             return try await withThrowingTaskGroup(of: String.self) { group in
                 group.addTask {
                     try await performTranscription(
-                        canonicalURL: canonicalURL,
+                        stagedURL: stagedURL,
                         format: format,
                         includeSpeakerLabels: includeSpeakerLabels,
                         store: jobLibraryStore,
@@ -91,23 +105,23 @@ enum AutomationService {
     }
 
     private static func performTranscription(
-        canonicalURL: URL,
+        stagedURL: URL,
         format: TranscriptFormat,
         includeSpeakerLabels: Bool,
         store: JobLibraryStore,
         handle: JobHandle
     ) async throws -> String {
-        // Codex round-1 Finding 4: a small, compressed file can still decode to a multi-hour
-        // asset. This header-only probe rejects it before `importMedia` ever starts a decode.
-        let asset = AVURLAsset(url: canonicalURL)
-        if let duration = try? await asset.load(.duration), duration.isValid,
-           AutomationMediaGuard.exceedsMaximumDuration(seconds: duration.seconds) {
-            throw AutomationError.mediaTooLarge
-        }
+        // Codex round-1 Finding 4 / round-2 Finding 5: a small, compressed file can still decode
+        // to a multi-hour asset, and a thrown load or an indefinite/NaN/infinite duration must be
+        // REJECTED, never silently skipped — a failed or non-finite probe is not evidence the file
+        // is short. This runs against the STAGING copy (round-2 Finding 2), never the
+        // caller-supplied path.
+        let asset = AVURLAsset(url: stagedURL)
+        try await AutomationMediaGuard.validateDuration { try await asset.load(.duration) }
 
         let jobID: UUID
         do {
-            jobID = try await store.importMedia(canonicalURL)
+            jobID = try await store.importMedia(stagedURL)
         } catch let error as MediaImportError {
             if error == .unsupportedType { throw AutomationError.unsupportedFileType }
             throw AutomationErrorSanitizer.processingFailure(error, context: "transcribe (import)")
