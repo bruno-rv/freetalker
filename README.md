@@ -468,6 +468,26 @@ OpenAI-compatible BYOK provider with `http://localhost:11434/v1`. Ollama's local
 doesn't require an API key; FreeTalker omits the Authorization header when the key is empty.
 This local endpoint applies to Cloud processing (LLM) only, not Cloud STT.
 
+## Automation (Shortcuts, AppleScript)
+
+Settings → Privacy → Automation exposes two Cocoa Scripting commands — `transcribe` and
+`clean up` — to Shortcuts, `osascript`, Raycast, and similar tools (see the FreeTalker
+dictionary in Script Editor, File → Open Dictionary, for exact syntax). Off by default; no
+request is accepted until it's turned on. A brief security summary (full docs pass to follow):
+
+- **`transcribe` is folder-scoped.** Turning Automation on does not by itself grant access to
+  your files — `transcribe` only reads files inside the Automation folder you choose in
+  Settings, checked by canonical (symlink-resolved) path.
+- **`clean up` never uses cloud, ever.** It always runs on FreeTalker's on-device model
+  (Apple's Foundation Models), regardless of what's configured for interactive dictation, so
+  your cloud API key is never read and no cloud endpoint is ever contacted by this command. A
+  capability with no on-device equivalent (for example, output-language translation) is simply
+  unavailable through automation and returns a distinct error rather than a silent fallback.
+- **Custom Template prompts are exposed.** Once Automation is on, `clean up`'s `using template`
+  parameter can invoke any of your Templates, and the text you pass in shares a prompt with that
+  Template's own instructions — treat every enabled Template's prompt as readable by an
+  automation caller.
+
 ## Manual end-to-end checklist
 
 1. `make run`. Confirm the menu bar waveform icon appears (no Dock icon — it's
