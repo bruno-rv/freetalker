@@ -4270,6 +4270,23 @@ final class AppCoordinator: ObservableObject {
             lastError = "Could not prepare local media imports: \(error.localizedDescription)"
             return
         }
+        // Codex round-3 Finding 6 (startup reconciliation): a crash or SIGKILL between staging a
+        // file and either checkpointing its job's decode or cleaning it up on failure leaves that
+        // staged copy behind forever — nothing else ever revisits it once the process is gone.
+        // Runs once, guarded by the same `mediaImportRunner == nil` gate as the rest of this
+        // function's one-time setup. Keeps only the sources of import jobs whose decode hasn't
+        // checkpointed yet (`MediaImportPipeline.execute` deletes a staged source itself the
+        // moment decode succeeds — see its doc comment); everything else under the staging
+        // directory is orphaned.
+        if let imports = try? await recoveryStore.jobs(kind: .mediaImport) {
+            var pendingDecodeSources: Set<String> = []
+            for job in imports where AutomationMediaStaging.isStagingPath(job.source.reference) {
+                let completedStages = (try? await recoveryStore.completedMediaStages(jobID: job.id)) ?? []
+                guard !completedStages.contains(.decode) else { continue }
+                pendingDecodeSources.insert(job.source.reference)
+            }
+            AutomationMediaStaging.purgeOrphans(keeping: pendingDecodeSources)
+        }
         let service = MediaImportService(store: recoveryStore)
         // `resolveLanguageSettings` is called by the pipeline at each job's start, not once here
         // at pipeline construction — see `MediaImportPipeline`'s doc comment. Settings changes

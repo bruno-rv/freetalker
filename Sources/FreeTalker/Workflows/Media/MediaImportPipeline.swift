@@ -168,6 +168,16 @@ struct MediaImportPipeline: Sendable {
             completed.insert(.decode)
         }
 
+        // Codex round-3 Finding 6: once decode is durably checkpointed, `audio.wav` (the derived,
+        // permanent copy) exists and is registered — an automation-staged source (see
+        // `AutomationMediaStaging`) is no longer needed from this point on. Runs every time
+        // execution reaches here, including a resumed job whose decode was already complete
+        // before a restart, so a crash between `persistDecodedMedia` and cleanup on THAT prior run
+        // is also closed here rather than only by startup reconciliation
+        // (`AppCoordinator.launchMediaImportWorkflows`). A no-op for a regular (non-automation)
+        // import: `job.source.reference` is the user's own file, never inside the staging
+        // directory, so `removeIfStaged` never touches it.
+        AutomationMediaStaging.removeIfStaged(atPath: job.source.reference)
 
         let inferenceAudio = try ownedDirectory.openExisting("audio.wav")
         defer { ownedDirectory.close(inferenceAudio) }

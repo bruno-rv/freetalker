@@ -101,7 +101,18 @@ final class JobLibraryStore: ObservableObject {
 
     func deleteImport(id: UUID) async throws {
         guard let importsDirectory else { throw JobStoreError.invalidTransition }
+        // Codex round-3 Finding 6: capture the source reference BEFORE the job row is deleted —
+        // `deleteMediaImport` below removes it from the database, so this is the last point this
+        // job's `source.reference` (an automation-staged source, or a regular import's own file —
+        // see `AutomationMediaStaging.removeIfStaged`) is still reachable. A job whose decode
+        // already checkpointed has nothing left to clean up here (`MediaImportPipeline.execute`
+        // already did); this is what covers deleting a job BEFORE that point (e.g. a failed or
+        // cancelled `transcribe` the user discards from the Imports window instead of retrying).
+        let sourceReference = try? await store.job(id: id)?.source.reference
         try await store.deleteMediaImport(jobID: id, jobsDirectory: importsDirectory)
+        if let sourceReference {
+            AutomationMediaStaging.removeIfStaged(atPath: sourceReference)
+        }
         try await refresh()
     }
 
