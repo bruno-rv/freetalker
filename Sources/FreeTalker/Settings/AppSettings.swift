@@ -260,6 +260,12 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(notchpadEnabled, forKey: Keys.notchpadEnabled) }
     }
 
+    /// Gates the one-time first-run walkthrough (`FirstRunWalkthroughWindowController`) — set
+    /// once the user dismisses it, whether by finishing it or by closing the window.
+    @Published var hasCompletedFirstRunWalkthrough: Bool {
+        didSet { defaults.set(hasCompletedFirstRunWalkthrough, forKey: Keys.hasCompletedFirstRunWalkthrough) }
+    }
+
     @Published var edgeLauncherEdge: LauncherEdge {
         didSet {
             defaults.set(edgeLauncherEdge.rawValue, forKey: Keys.edgeLauncherEdge)
@@ -924,6 +930,7 @@ final class AppSettings: ObservableObject {
         static let noiseSuppressionEnabled = "noiseSuppressionEnabled"
         static let edgeLauncherEnabled = "edgeLauncherEnabled"
         static let notchpadEnabled = "notchpadEnabled"
+        static let hasCompletedFirstRunWalkthrough = "hasCompletedFirstRunWalkthrough"
         static let edgeLauncherEdge = "edgeLauncherEdge"
         static let edgeLauncherPosition = "edgeLauncherPosition"
         static let launcherPanelPosition = "launcherPanelPosition"
@@ -1033,6 +1040,7 @@ final class AppSettings: ObservableObject {
         noiseSuppressionEnabled = defaults.object(forKey: Keys.noiseSuppressionEnabled) as? Bool ?? true
         edgeLauncherEnabled = defaults.object(forKey: Keys.edgeLauncherEnabled) as? Bool ?? false
         notchpadEnabled = defaults.object(forKey: Keys.notchpadEnabled) as? Bool ?? false
+        hasCompletedFirstRunWalkthrough = defaults.object(forKey: Keys.hasCompletedFirstRunWalkthrough) as? Bool ?? false
         edgeLauncherEdge = LauncherEdge(rawValue: defaults.string(forKey: Keys.edgeLauncherEdge) ?? "") ?? .right
         let storedEdgeLauncherPosition = defaults.object(forKey: Keys.edgeLauncherPosition) as? Double ?? 0.5
         edgeLauncherPosition = Self.clampNormalizedPosition(storedEdgeLauncherPosition)

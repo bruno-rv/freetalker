@@ -1,133 +1,227 @@
 import AppKit
+import CryptoKit
 import Foundation
 
-/// The app bundle is assembled by `make app` at the root of the cloned repo (see README),
-/// so the repo is always the bundle's parent directory. `SelfUpdater` checks that repo for
-/// commits ahead of `origin/main` and, on request, relaunches `scripts/self-update.sh` to
-/// pull, rebuild, and reopen the app.
+/// Downloads a newer signed release, verifies it end-to-end, and swaps it into the install
+/// location — replacing the old git-pull-and-rebuild path.
+///
+/// **Root cause of the bug this replaces:** the previous `SelfUpdater` resolved the running
+/// bundle's parent directory (`Bundle.main.bundleURL.deletingLastPathComponent()`) and required
+/// it to be a git working tree (`git rev-parse --show-toplevel`). That held only while
+/// `FreeTalker.app` lived inside its own source clone. Once the `Makefile`'s `install` target
+/// made `/Applications` the canonical install location, the bundle's parent became
+/// `/Applications` — not a git repo — so every check failed with "app not running from its
+/// repo." Self-update was broken for the app anyone actually runs.
+///
+/// Every step below fails closed: any verification failure or swap failure leaves the
+/// currently-installed app exactly as it was (see `SelfUpdateInstaller`).
 enum SelfUpdater {
-    /// Outcome of a `check()` call, pure enough to drive UI without any git access.
     enum Availability: Equatable {
         case upToDate
-        case available(behindCount: Int)
-        case blockedByLocalChanges
+        case available(manifest: UpdateManifest)
         case unavailable(String)
     }
 
     struct CheckReport: Equatable {
         let availability: Availability
-        let repoPath: String?
-        let currentShortHash: String?
+        let currentVersion: String
     }
 
-    // MARK: Pure decision logic (unit-tested without git — see SelfUpdaterTests)
-
-    /// Behind==0 wins regardless of dirty state: there is nothing to pull, so local changes
-    /// don't block anything. Only a dirty tree with commits actually available blocks.
-    static func evaluate(behindCount: Int, isDirty: Bool) -> Availability {
-        guard behindCount > 0 else { return .upToDate }
-        guard !isDirty else { return .blockedByLocalChanges }
-        return .available(behindCount: behindCount)
+    enum UpdateOutcome: Equatable {
+        case success
+        case failed(String)
     }
 
-    static func parseBehindCount(_ output: String) -> Int? {
-        Int(output.trimmingCharacters(in: .whitespacesAndNewlines))
+    /// GitHub always resolves `.../releases/latest/download/<name>` to the matching asset on
+    /// the most recently published (non-draft, non-prerelease) release — a stable URL that
+    /// doesn't need to know the tag name in advance. Published by `scripts/release.sh`.
+    static let manifestURL = URL(string: "https://github.com/bruno-rv/freetalker/releases/latest/download/latest.json")!
+
+    // MARK: Pure decision logic (unit-tested without any network/process access)
+
+    static func evaluate(current: SemanticVersion, manifest: UpdateManifest) -> Availability {
+        guard let latest = SemanticVersion(string: manifest.version) else {
+            return .unavailable("Could not parse the published release version.")
+        }
+        guard latest > current else { return .upToDate }
+        return .available(manifest: manifest)
     }
 
-    static func isDirty(porcelainOutput: String) -> Bool {
-        !porcelainOutput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    static func sha256Hex(of data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
-    // MARK: Git-backed check
+    // MARK: Check
 
-    /// Runs the git subprocesses off the main thread; safe to `await` from `@MainActor` code
-    /// — the caller resumes on its own actor once this returns.
-    static func check() async -> CheckReport {
-        await Task.detached(priority: .userInitiated) {
-            let bundleParent = Bundle.main.bundleURL.deletingLastPathComponent()
-            guard let repoPath = resolveRepoToplevel(from: bundleParent) else {
+    static func check(session: URLSession = .shared) async -> CheckReport {
+        let currentVersion = AppVersion.currentString
+        do {
+            let (data, response) = try await session.data(from: manifestURL)
+            guard let http = response as? HTTPURLResponse, 200..<300 ~= http.statusCode else {
                 return CheckReport(
-                    availability: .unavailable("Updates unavailable (app not running from its repo)."),
-                    repoPath: nil,
-                    currentShortHash: nil
+                    availability: .unavailable("Could not reach the release server."),
+                    currentVersion: currentVersion
                 )
             }
-
-            guard runGit(["fetch", "origin"], in: repoPath) != nil else {
-                return CheckReport(
-                    availability: .unavailable("Could not reach the git remote."),
-                    repoPath: repoPath,
-                    currentShortHash: nil
-                )
-            }
-
-            guard
-                let behindOutput = runGit(["rev-list", "--count", "HEAD..origin/main"], in: repoPath),
-                let behindCount = parseBehindCount(behindOutput)
-            else {
-                return CheckReport(
-                    availability: .unavailable("Could not determine update status."),
-                    repoPath: repoPath,
-                    currentShortHash: nil
-                )
-            }
-
-            let statusOutput = runGit(["status", "--porcelain"], in: repoPath) ?? ""
-            let shortHash = runGit(["rev-parse", "--short", "HEAD"], in: repoPath)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-
+            let manifest = try JSONDecoder().decode(UpdateManifest.self, from: data)
             return CheckReport(
-                availability: evaluate(behindCount: behindCount, isDirty: isDirty(porcelainOutput: statusOutput)),
-                repoPath: repoPath,
-                currentShortHash: shortHash
+                availability: evaluate(current: AppVersion.current, manifest: manifest),
+                currentVersion: currentVersion
             )
+        } catch {
+            return CheckReport(
+                availability: .unavailable("Could not check for updates."),
+                currentVersion: currentVersion
+            )
+        }
+    }
+
+    // MARK: Download, verify, swap
+
+    /// Runs entirely off the main actor; safe to `await` from UI code. Stages the download in a
+    /// hidden directory right next to `installedBundlePath` (not `/tmp`) so the final swap is a
+    /// same-volume, near-atomic `rename(2)` — see `SelfUpdateInstaller`.
+    static func performUpdate(
+        manifest: UpdateManifest,
+        installedBundlePath: URL = URL(fileURLWithPath: Bundle.main.bundlePath),
+        session: URLSession = .shared
+    ) async -> UpdateOutcome {
+        await Task.detached(priority: .userInitiated) {
+            await Self.runUpdate(manifest: manifest, installedBundlePath: installedBundlePath, session: session)
         }.value
     }
 
-    /// Spawns `scripts/self-update.sh` detached (not awaited) and terminates the app so the
-    /// script's PID-wait unblocks. There is no return path — the script relaunches the app.
-    @MainActor
-    static func performUpdate(repoPath: String) {
-        let scriptPath = repoPath + "/scripts/self-update.sh"
+    private static func runUpdate(
+        manifest: UpdateManifest, installedBundlePath: URL, session: URLSession
+    ) async -> UpdateOutcome {
+        let fileManager = FileManager.default
+        let stagingRoot = installedBundlePath.deletingLastPathComponent()
+            .appendingPathComponent(".freetalker-update", isDirectory: true)
+        try? fileManager.removeItem(at: stagingRoot)
+        do {
+            try fileManager.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
+        } catch {
+            return .failed("Could not create a staging directory next to the installed app.")
+        }
+        defer { try? fileManager.removeItem(at: stagingRoot) }
+
+        // 1. Download.
+        let zipPath = stagingRoot.appendingPathComponent("update.zip")
+        let downloadedData: Data
+        do {
+            let (data, response) = try await session.data(from: manifest.assetURL)
+            guard let http = response as? HTTPURLResponse, 200..<300 ~= http.statusCode else {
+                return .failed("Download failed (bad response from the release server).")
+            }
+            downloadedData = data
+            try data.write(to: zipPath)
+        } catch {
+            return .failed("Download failed: \(error.localizedDescription)")
+        }
+
+        // 2. Integrity: published checksum (transport corruption, not authenticity — see
+        // UpdateManifest).
+        guard sha256Hex(of: downloadedData).caseInsensitiveCompare(manifest.sha256) == .orderedSame else {
+            return .failed("The downloaded file's checksum didn't match the published release — discarded.")
+        }
+
+        // 3. Unzip (ditto preserves the code signature's resource fork / extended attributes;
+        // `unzip` does not, and would break step 4 below).
+        let extractedRoot = stagingRoot.appendingPathComponent("extracted", isDirectory: true)
+        guard runProcess("/usr/bin/ditto", ["-x", "-k", zipPath.path, extractedRoot.path]).status == 0 else {
+            return .failed("Could not unpack the downloaded update.")
+        }
+        guard
+            let contents = try? fileManager.contentsOfDirectory(at: extractedRoot, includingPropertiesForKeys: nil),
+            let stagedBundle = contents.first(where: { $0.pathExtension == "app" })
+        else {
+            return .failed("The downloaded update didn't contain an app bundle.")
+        }
+
+        // 4. Code signature: internal validity + pinned fingerprint against the running app.
+        let signatureValid = CodeSignatureVerifier.verifySignature(bundlePath: stagedBundle.path)
+        let downloadedFingerprint = CodeSignatureVerifier.leafCertificateFingerprint(
+            bundlePath: stagedBundle.path, workingDirectory: stagingRoot
+        )
+        let runningFingerprint = CodeSignatureVerifier.leafCertificateFingerprint(
+            bundlePath: installedBundlePath.path, workingDirectory: stagingRoot
+        )
+        guard CodeSignatureVerifier.isTrusted(
+            signatureValid: signatureValid,
+            downloadedFingerprint: downloadedFingerprint,
+            runningFingerprint: runningFingerprint
+        ) else {
+            return .failed("The downloaded update's signature didn't match this app's signing identity — refusing to install it.")
+        }
+
+        // 5. Smoke test: the staged binary actually starts (catches a corrupt build or an
+        // architecture/framework mismatch before it ever touches the installed app).
+        guard verifyLaunches(bundlePath: stagedBundle.path) else {
+            return .failed("The downloaded update failed to start — refusing to install it.")
+        }
+
+        // 6. Atomic swap with rollback.
+        let backupPath = stagingRoot.appendingPathComponent("backup.app")
+        let result = SelfUpdateInstaller.swap(
+            installedPath: installedBundlePath,
+            stagedPath: stagedBundle,
+            backupPath: backupPath,
+            ops: SelfUpdateInstaller.FileOps(
+                moveItem: { try fileManager.moveItem(at: $0, to: $1) },
+                removeItem: { try fileManager.removeItem(at: $0) },
+                fileExists: { fileManager.fileExists(atPath: $0.path) }
+            )
+        )
+        switch result {
+        case .success:
+            return .success
+        case .rolledBack:
+            return .failed("The update couldn't be installed — your previous version is unchanged.")
+        case .rollbackFailed:
+            return .failed(
+                "The update failed partway and the previous app couldn't be restored automatically — "
+                    + "check \(installedBundlePath.path)."
+            )
+        }
+    }
+
+    /// Launches the staged binary with `--verify-launch`, which exits immediately (see
+    /// `FreeTalkerApp.init`) before touching TCC, the single-instance lease, or any user state.
+    /// A crash (missing/incompatible framework, corrupt binary) reports a non-zero/aborted
+    /// status just as reliably as an explicit failure would.
+    private static func verifyLaunches(bundlePath: String, timeout: TimeInterval = 10) -> Bool {
+        let executable = URL(fileURLWithPath: bundlePath).appendingPathComponent("Contents/MacOS/FreeTalker")
+        return runProcess(executable.path, ["--verify-launch"], timeout: timeout).status == 0
+    }
+
+    private static func runProcess(
+        _ executable: String, _ arguments: [String], timeout: TimeInterval = 30
+    ) -> (status: Int32, stdout: String) {
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: scriptPath)
-        process.arguments = [String(ProcessInfo.processInfo.processIdentifier), repoPath]
-        process.standardInput = FileHandle.nullDevice
-        process.standardOutput = FileHandle.nullDevice
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
         do {
             try process.run()
         } catch {
-            return
+            return (-1, "")
         }
-        NSApp.terminate(nil)
-    }
-
-    // MARK: Process plumbing
-
-    private static func resolveRepoToplevel(from directory: URL) -> String? {
-        guard let output = runGit(["rev-parse", "--show-toplevel"], in: directory.path) else { return nil }
-        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
-    /// Runs `git -C <directory> <arguments>`, discarding stderr. `nil` on spawn failure or
-    /// non-zero exit — callers treat that as "couldn't determine," never as untrusted input.
-    private static func runGit(_ arguments: [String], in directory: String) -> String? {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        process.arguments = ["-C", directory] + arguments
-        let outputPipe = Pipe()
-        process.standardOutput = outputPipe
-        process.standardError = FileHandle.nullDevice
-        do {
-            try process.run()
-        } catch {
-            return nil
-        }
-        let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
+        let timeoutWorkItem = DispatchWorkItem { if process.isRunning { process.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: timeoutWorkItem)
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
-        guard process.terminationStatus == 0 else { return nil }
-        return String(data: data, encoding: .utf8)
+        timeoutWorkItem.cancel()
+        return (process.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+    }
+
+    // MARK: Relaunch
+
+    /// The swap above replaces the bundle's contents in place at the same path — relaunching
+    /// `Bundle.main.bundlePath` opens whatever is now there, i.e. the newly-installed version.
+    @MainActor
+    static func relaunchAfterUpdate(bundlePath: String = Bundle.main.bundlePath) {
+        AppRelaunch.relaunch(bundlePath: bundlePath)
     }
 }

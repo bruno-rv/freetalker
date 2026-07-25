@@ -613,7 +613,7 @@ private struct GeneralSettingsView: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Circle()
-                    .fill(Self.diagnosisColor(for: item.state))
+                    .fill(PermissionDiagnosisPresentation.color(for: item.state))
                     .frame(width: 8, height: 8)
                 Text(item.title)
                 Spacer()
@@ -621,7 +621,7 @@ private struct GeneralSettingsView: View {
                     Button("Relaunch FreeTalker") { AppRelaunch.relaunch() }
                 }
                 if item.showsOpenSystemSettings {
-                    Button("Open System Settings") { Self.openSystemSettings(for: item.kind) }
+                    Button("Open System Settings") { PermissionDiagnosisPresentation.openSystemSettings(for: item.kind) }
                 }
             }
             Text(item.detail)
@@ -631,22 +631,6 @@ private struct GeneralSettingsView: View {
         .padding(.vertical, 8)
     }
 
-    private static func diagnosisColor(for state: PermissionState) -> Color {
-        switch state {
-        case .granted: return .green
-        case .denied: return .red
-        case .staleGranted: return .orange
-        case .notDetermined, .unknown: return .gray
-        }
-    }
-
-    private static func openSystemSettings(for kind: PermissionKind) {
-        switch kind {
-        case .accessibility: Permissions.openAccessibilitySettings()
-        case .microphone: Permissions.openMicrophoneSettings()
-        case .inputMonitoring: Permissions.openInputMonitoringSettings()
-        }
-    }
 
     @ViewBuilder
     private var contextAndAutomationCard: some View {

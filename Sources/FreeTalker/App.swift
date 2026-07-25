@@ -8,6 +8,14 @@ struct FreeTalkerApp: App {
     private static var floatingControlsController: FloatingControlsController?
 
     init() {
+        // Self-update smoke test (`SelfUpdater.verifyLaunches`): exits immediately, before any
+        // TCC priming, single-instance claim, or user-visible state — proves only that the
+        // staged binary's dylibs load and Swift code runs. Must stay the very first thing this
+        // initializer does.
+        if CommandLine.arguments.contains("--verify-launch") {
+            exit(0)
+        }
+
         let currentApplication = NSRunningApplication.current
         let claim = AppLifecycleWindowPolicy.claimInstance(
             path: AppLifecycleWindowPolicy.instanceLeasePath,
@@ -86,6 +94,10 @@ struct FreeTalkerApp: App {
         ))
         Self.floatingControlsController = floatingControlsController
         floatingControlsController.start()
+
+        if !AppSettings.shared.hasCompletedFirstRunWalkthrough {
+            FirstRunWalkthroughWindowController.shared.open()
+        }
     }
 
     var body: some Scene {
@@ -231,9 +243,7 @@ private func presentSelfUpdateResult(_ report: SelfUpdater.CheckReport) {
     switch report.availability {
     case .upToDate:
         alert.messageText = "You're up to date"
-        if let hash = report.currentShortHash {
-            alert.informativeText = "Running \(hash)."
-        }
+        alert.informativeText = "Running \(report.currentVersion)."
         alert.addButton(withTitle: "OK")
         alert.runModal()
 
@@ -243,26 +253,34 @@ private func presentSelfUpdateResult(_ report: SelfUpdater.CheckReport) {
         alert.addButton(withTitle: "OK")
         alert.runModal()
 
-    case .blockedByLocalChanges:
-        alert.messageText = "Update skipped"
-        alert.informativeText = "The repo has local changes, update skipped."
-        alert.addButton(withTitle: "OK")
-        alert.runModal()
-
-    case .available(let behindCount):
+    case .available(let manifest):
         alert.messageText = "Update available"
-        let commitWord = behindCount == 1 ? "commit" : "commits"
-        if let hash = report.currentShortHash {
-            alert.informativeText = "You're on \(hash), \(behindCount) \(commitWord) behind."
-        } else {
-            alert.informativeText = "\(behindCount) \(commitWord) behind origin/main."
-        }
+        alert.informativeText = "You're on \(report.currentVersion). \(manifest.version) is available."
         alert.addButton(withTitle: "Update")
         alert.addButton(withTitle: "Later")
-        if alert.runModal() == .alertFirstButtonReturn, let repoPath = report.repoPath {
-            SelfUpdater.performUpdate(repoPath: repoPath)
+        if alert.runModal() == .alertFirstButtonReturn {
+            Task {
+                let outcome = await SelfUpdater.performUpdate(manifest: manifest)
+                switch outcome {
+                case .success:
+                    SelfUpdater.relaunchAfterUpdate()
+                case .failed(let reason):
+                    presentSelfUpdateFailure(reason)
+                }
+            }
         }
     }
+}
+
+@MainActor
+private func presentSelfUpdateFailure(_ reason: String) {
+    NSApplication.shared.activate(ignoringOtherApps: true)
+    let alert = NSAlert()
+    alert.alertStyle = .warning
+    alert.messageText = "Update failed"
+    alert.informativeText = reason
+    alert.addButton(withTitle: "OK")
+    alert.runModal()
 }
 
 private struct SettingsWindowConfigurator: NSViewRepresentable {

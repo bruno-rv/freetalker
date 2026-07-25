@@ -18,7 +18,13 @@ endif
 
 INSTALLED_BUNDLE := /Applications/$(BUNDLE)
 
-.PHONY: build test test-preflight app install run clean
+# The app's version, baked into the bundle's Info.plist by `bundle` below (see Update/AppVersion.swift
+# and SemanticVersion.swift, which parse this same `git describe` shape). A tagged release (see
+# scripts/release.sh) always builds at an exact tag, so CI-free local dev builds between tags
+# (with a "-N-gHASH[-dirty]" suffix) never get published — only clean tags do.
+VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo 0.0.0)
+
+.PHONY: build test test-preflight bundle app install run clean
 
 build:
 	swift build -c $(CONFIG)
@@ -33,9 +39,11 @@ test-preflight:
 	@test -d "$(XCODE_DEVELOPER_DIR)/Platforms/MacOSX.platform/Developer/Library/Frameworks/Testing.framework" || \
 		( echo "error: Swift Testing framework not found under $(XCODE_DEVELOPER_DIR)" >&2; exit 1 )
 
-# Assembles FreeTalker.app from the built executable — no .xcodeproj available (CLT only),
-# see README.md.
-app: build
+# Assembles FreeTalker.app from the built executable and stamps it with $(VERSION) — no
+# .xcodeproj available (CLT only), see README.md. Does NOT touch /Applications — see `app`
+# below for that. This split exists so scripts/release.sh (and anything else that needs a
+# signed, versioned bundle without disturbing the installed copy) can depend on `bundle` alone.
+bundle: build
 	rm -rf $(BUNDLE)
 	mkdir -p $(BUNDLE)/Contents/MacOS
 	mkdir -p $(BUNDLE)/Contents/Resources
@@ -44,9 +52,15 @@ app: build
 	cp -R $(RESOURCE_BUNDLE)/. $(BUNDLE)/Contents/Resources/$(RESOURCE_BUNDLE_NAME)/Contents/Resources/
 	cp Assets/SettingsIconsInfo.plist $(BUNDLE)/Contents/Resources/$(RESOURCE_BUNDLE_NAME)/Contents/Info.plist
 	cp Info.plist $(BUNDLE)/Contents/Info.plist
+	plutil -replace CFBundleShortVersionString -string "$(VERSION)" $(BUNDLE)/Contents/Info.plist
+	plutil -replace CFBundleVersion -string "$(VERSION)" $(BUNDLE)/Contents/Info.plist
 	cp Assets/AppIcon.icns $(BUNDLE)/Contents/Resources/AppIcon.icns
 	codesign --force --deep -s "$(CODESIGN_IDENTITY)" $(BUNDLE)
-	@echo "Built $(BUNDLE). Launch with: open $(BUNDLE)"
+	@echo "Built $(BUNDLE) ($(VERSION))."
+
+# Assembles the bundle (see `bundle` above) and installs it into /Applications.
+app: bundle
+	@echo "Launch with: open $(BUNDLE)"
 ifeq ($(CODESIGN_IDENTITY),-)
 	@echo "NOTE: ad-hoc signing (-s -) gives this build a signature that differs from the"
 	@echo "previous one whenever the binary changed. If PTT or hotkey capture stop responding"
