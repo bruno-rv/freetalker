@@ -55,6 +55,21 @@ if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     exit 1
 fi
 
+# Reconstructs a PEM Ed25519 public key from the raw 32-byte base64 value UpdatePublicKey.swift
+# stores (see scripts/make-release-signing-key.sh's `derive_public_key_base64`, which goes the
+# other direction). `302a300506032b6570032100` is the fixed 12-byte SubjectPublicKeyInfo header
+# for Ed25519 (RFC 8410: SEQUENCE(AlgorithmIdentifier(OID 1.3.101.112), BIT STRING(32 bytes))) —
+# confirmed byte-for-byte against `openssl pkey -pubout`'s own DER output for a real generated
+# key, not assumed. Used by the post-sign verification below (Round-4 Finding 2) to turn
+# BUILD_COMMIT's own compiled-in public key into something `openssl pkeyutl -verify` can check
+# a signature against, without needing the PRIVATE key at all.
+reconstruct_public_key_pem() {
+    local base64_raw_key="$1" out_pem="$2"
+    local der_hex
+    der_hex="302a300506032b6570032100$(printf '%s' "$base64_raw_key" | openssl base64 -A -d 2>/dev/null | xxd -p | tr -d '\n')"
+    printf '%s' "$der_hex" | xxd -r -p | openssl pkey -pubin -inform DER -pubout -out "$out_pem" 2>/dev/null
+}
+
 cd "$REPO_ROOT"
 
 # `git status --porcelain` can itself fail (e.g. a broken/misconfigured git environment) and
@@ -203,6 +218,51 @@ echo "==> Signing with the release Ed25519 key"
 SIGNATURE_PATH="$ASSET_PATH.sig"
 openssl pkeyutl -sign -inkey "$RELEASE_SIGNING_KEY" -rawin -in "$ASSET_PATH" -out "$SIGNATURE_PATH"
 SIGNATURE_BASE64="$(openssl base64 -A -in "$SIGNATURE_PATH")"
+
+# The pre-build check above (COMPILED_PUBLIC_KEY_BASE64 vs DERIVED_PUBLIC_KEY_BASE64) validates
+# that $RELEASE_SIGNING_KEY matches the LIVE tree's UpdatePublicKey.swift — read BEFORE the build,
+# from a path nothing here holds any lock on. Two live sequences can still slip a mismatched
+# signature past that alone: (a) $RELEASE_SIGNING_KEY's PEM path gets atomically replaced with a
+# different (but validly Ed25519) key partway through the multi-second `make bundle` above —
+# `openssl pkeyutl -sign` just reopened the path and signed with whatever's there NOW, which may
+# no longer be what was validated; (b) commit B's public key gets validated in the live tree,
+# then the live tree is checked out to commit A before $BUILD_COMMIT is captured, so `make bundle`
+# builds A's source (in the isolated worktree) while still signing with the key that matches B.
+# Neither is caught by re-checking the LIVE tree afterward (a compromised/racing actor can just as
+# easily have restored it to look clean by then) — verifying the signature just produced against
+# BUILD_COMMIT's OWN compiled-in public key, read from the pristine worktree `make bundle` itself
+# built from (never the live tree), closes both regardless of what changed mid-flight or when:
+# whatever key the artifact ends up verifying against IS, by construction, the one every client
+# built from BUILD_COMMIT actually trusts.
+echo "==> Verifying the signature against BUILD_COMMIT's own compiled-in public key"
+PRISTINE_PUBLIC_KEY_SWIFT="$WORKTREE_DIR/Sources/FreeTalker/Update/UpdatePublicKey.swift"
+PRISTINE_PUBLIC_KEY_BASE64="$(sed -n 's/.*base64 = "\([^"]*\)".*/\1/p' "$PRISTINE_PUBLIC_KEY_SWIFT")"
+if [[ -z "$PRISTINE_PUBLIC_KEY_BASE64" ]]; then
+    echo "error: could not read the compiled-in public key from BUILD_COMMIT's own source" >&2
+    echo "($PRISTINE_PUBLIC_KEY_SWIFT)." >&2
+    rm -rf "$DIST_DIR"
+    exit 1
+fi
+PRISTINE_PUBLIC_KEY_PEM="$WORKTREE_DIR/.build-verify-pubkey.pem"
+if ! reconstruct_public_key_pem "$PRISTINE_PUBLIC_KEY_BASE64" "$PRISTINE_PUBLIC_KEY_PEM" || [[ ! -s "$PRISTINE_PUBLIC_KEY_PEM" ]]; then
+    echo "error: could not reconstruct a public key from BUILD_COMMIT's compiled-in base64" >&2
+    echo "($PRISTINE_PUBLIC_KEY_SWIFT) — is it a valid 32-byte raw Ed25519 public key?" >&2
+    rm -rf "$DIST_DIR"
+    exit 1
+fi
+if ! openssl pkeyutl -verify -pubin -inkey "$PRISTINE_PUBLIC_KEY_PEM" -rawin -in "$ASSET_PATH" -sigfile "$SIGNATURE_PATH" >/dev/null 2>&1; then
+    echo "error: the signature just produced does NOT verify against BUILD_COMMIT's own" >&2
+    echo "compiled-in public key ($PRISTINE_PUBLIC_KEY_SWIFT). The key actually used to sign no" >&2
+    echo "longer matches what was validated before the build, or BUILD_COMMIT's own public key" >&2
+    echo "differs from what was validated — refusing to publish an artifact that every client" >&2
+    echo "built from BUILD_COMMIT would reject." >&2
+    # Removed, not left behind for someone to accidentally hand-publish: this is a real, validly
+    # zipped/checksummed artifact, just signed with (or compiled against) the wrong key — nothing
+    # about its own shape looks obviously broken.
+    rm -rf "$DIST_DIR"
+    exit 1
+fi
+echo "==> Signature verified against BUILD_COMMIT's own compiled-in public key"
 
 MANIFEST_PATH="$DIST_DIR/latest.json"
 ASSET_URL="https://github.com/$REPO_SLUG/releases/download/$VERSION/$ASSET_NAME"
