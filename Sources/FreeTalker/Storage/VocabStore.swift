@@ -122,9 +122,15 @@ actor VocabStore {
 
     // MARK: - Evidence (mining writes)
 
-    /// Idempotent PK upsert (`ON CONFLICT DO NOTHING`) — re-mining the same dictation never
-    /// changes `first_seen` or duplicates a row. A dictation deleted concurrently with a scan (the
-    /// row this evidence would FK to no longer exists) fails the `FOREIGN KEY` check inside this
+    /// Idempotent PK upsert on `(dictation_id, normalized_term)` — re-mining the same dictation
+    /// never changes `first_seen` or duplicates a row. Codex finding 8: a conflicting row is
+    /// UPGRADED (`surface_term`/`source` overwritten) only when the INCOMING candidate is
+    /// `.userSupplied` and the EXISTING row is not — so a deliberate correction (Correction Loop)
+    /// always wins over an earlier mined sighting for the same dictation, but a later mining pass
+    /// can never downgrade/overwrite an existing user-supplied row. Any other combination (mined-
+    /// over-mined, or incoming mined vs. existing user) leaves the row untouched, matching the
+    /// pre-fix `DO NOTHING` behavior. A dictation deleted concurrently with a scan (the row this
+    /// evidence would FK to no longer exists) fails the `FOREIGN KEY` check inside this
     /// transaction; that failure is a BENIGN SKIP — caught here and swallowed, never surfaced as
     /// an error — since the row's own deletion already retracted any evidence that used to exist
     /// for it. See PLAN.md PR B, item 2.
@@ -138,7 +144,9 @@ actor VocabStore {
                         """
                         INSERT INTO vocab_evidence (dictation_id, normalized_term, surface_term, first_seen, source)
                         VALUES (?, ?, ?, ?, ?)
-                        ON CONFLICT(dictation_id, normalized_term) DO NOTHING;
+                        ON CONFLICT(dictation_id, normalized_term) DO UPDATE SET
+                            surface_term = excluded.surface_term, source = excluded.source
+                        WHERE excluded.source = 'user' AND vocab_evidence.source != 'user';
                         """,
                         bindings: [.int64(dictationID), .text(candidate.normalizedTerm),
                                    .text(candidate.surfaceTerm), .double(now.timeIntervalSince1970),
@@ -263,6 +271,26 @@ actor VocabStore {
         }
     }
 
+    /// Approves `normalizedTerm` with an EXPLICIT surface spelling, bypassing `canonicalSurfaceTerm`'s
+    /// mined-evidence tie-break entirely (Codex finding 8) — used by Correction Loop
+    /// (`CorrectionRecorder`), which already knows the authoritative spelling from the user's own
+    /// deliberate correction. Without this, `approve(normalizedTerm:)`'s frequency-ranked tie-break
+    /// could resurface a HIGHER-FREQUENCY MINED misspelling (e.g. five "Github" mined sightings)
+    /// over the user's own single corrected spelling ("GitHub"), even after `recordEvidence`
+    /// upgraded THIS dictation's own evidence row. Still requires at least one evidence row to
+    /// exist for `normalizedTerm` (same `noEvidence` race-safety contract as `approve`), just
+    /// doesn't let evidence volume decide which spelling wins.
+    @discardableResult
+    func approve(normalizedTerm: String, surfaceTerm: String, now: Date = Date()) throws -> VocabDecision {
+        try transaction {
+            guard try canonicalSurfaceTerm(normalizedTerm: normalizedTerm) != nil else {
+                throw VocabStoreError.noEvidence(normalizedTerm)
+            }
+            let decidedAt = try upsertDecision(normalizedTerm: normalizedTerm, status: .approved, surfaceTerm: surfaceTerm, decidedAt: now)
+            return VocabDecision(normalizedTerm: normalizedTerm, status: .approved, surfaceTerm: surfaceTerm, decidedAt: decidedAt)
+        }
+    }
+
     /// Records an explicit `dismissed` decision — also the "evict a displaced approved term"
     /// action (PLAN.md PR B, item 2e): dismissing an already-approved term removes it from
     /// `approvedTerms()` the same way as dismissing a fresh suggestion.
@@ -270,6 +298,25 @@ actor VocabStore {
     func dismiss(normalizedTerm: String, now: Date = Date()) throws -> VocabDecision {
         let decidedAt = try upsertDecision(normalizedTerm: normalizedTerm, status: .dismissed, surfaceTerm: nil, decidedAt: now)
         return VocabDecision(normalizedTerm: normalizedTerm, status: .dismissed, surfaceTerm: nil, decidedAt: decidedAt)
+    }
+
+    /// A confirmed Correction Loop vocabulary swap (Codex finding 11): dismisses the offered term
+    /// and approves the confirmed one — with the confirmed term's EXPLICIT validated surface
+    /// spelling (finding 8), not a mined-evidence-derived one — in ONE `BEGIN IMMEDIATE`
+    /// transaction. Previously two separate `VocabStore` writes: if `approve` failed AFTER
+    /// `dismiss` had already committed (e.g. a `noEvidence` race, or the connection going away
+    /// between the two), the offered term stayed dismissed while the confirmed one was never
+    /// approved — losing both. All-or-nothing here closes that gap.
+    @discardableResult
+    func swapApprove(dismissNormalizedTerm: String, approveNormalizedTerm: String, approveSurfaceTerm: String, now: Date = Date()) throws -> VocabDecision {
+        try transaction {
+            _ = try upsertDecision(normalizedTerm: dismissNormalizedTerm, status: .dismissed, surfaceTerm: nil, decidedAt: now)
+            guard try canonicalSurfaceTerm(normalizedTerm: approveNormalizedTerm) != nil else {
+                throw VocabStoreError.noEvidence(approveNormalizedTerm)
+            }
+            let decidedAt = try upsertDecision(normalizedTerm: approveNormalizedTerm, status: .approved, surfaceTerm: approveSurfaceTerm, decidedAt: now)
+            return VocabDecision(normalizedTerm: approveNormalizedTerm, status: .approved, surfaceTerm: approveSurfaceTerm, decidedAt: decidedAt)
+        }
     }
 
     /// Direct user action (approve/dismiss) — unlike `mergeDecisions` (restore), which already

@@ -288,6 +288,74 @@ import Testing
         #expect(try await store.approvedTerms().map(\.surfaceTerm) == ["Brand New"])
     }
 
+    // MARK: - recordEvidence upgrade semantics (Codex finding 8)
+
+    /// A user correction landing on a dictation the miner already scanned UPGRADES that row's
+    /// spelling/source rather than being silently dropped by the pre-fix `ON CONFLICT DO NOTHING`
+    /// — otherwise BOTH the user's spelling and `source = user` were lost, and an already-approved
+    /// decision could preserve the mined misspelling forever.
+    @Test func userEvidenceUpgradesAConflictingMinedRowForTheSameDictation() async throws {
+        let url = temporaryDatabaseURL()
+        let library = try Database(path: url)
+        let id = try library.insertDictation(makeInsertRequest(transcript: "deploy to github", refined: "deploy to Github"))
+        let store = try VocabStore(databaseURL: url)
+
+        try await store.recordEvidence(dictationID: id, candidates: [
+            VocabEvidenceCandidate(normalizedTerm: "github", surfaceTerm: "Github", source: .mined)
+        ])
+        try await store.recordEvidence(dictationID: id, candidates: [
+            VocabEvidenceCandidate(normalizedTerm: "github", surfaceTerm: "GitHub", source: .userSupplied)
+        ])
+
+        // One row, upgraded in place — not a second row (still the same PK).
+        #expect(try await store.evidenceSources(normalizedTerm: "github") == [.userSupplied])
+        _ = try await store.approve(normalizedTerm: "github", surfaceTerm: "GitHub")
+        #expect(try await store.approvedTerms().map(\.surfaceTerm) == ["GitHub"])
+    }
+
+    /// A LATER mined sighting for the SAME dictation must never overwrite/downgrade an existing
+    /// user-supplied row back to the mined spelling.
+    @Test func minedEvidenceNeverOverwritesAnExistingUserSuppliedRow() async throws {
+        let url = temporaryDatabaseURL()
+        let library = try Database(path: url)
+        let id = try library.insertDictation(makeInsertRequest(transcript: "deploy to github", refined: "deploy to GitHub"))
+        let store = try VocabStore(databaseURL: url)
+
+        try await store.recordEvidence(dictationID: id, candidates: [
+            VocabEvidenceCandidate(normalizedTerm: "github", surfaceTerm: "GitHub", source: .userSupplied)
+        ])
+        try await store.recordEvidence(dictationID: id, candidates: [
+            VocabEvidenceCandidate(normalizedTerm: "github", surfaceTerm: "Github", source: .mined)
+        ])
+
+        #expect(try await store.evidenceSources(normalizedTerm: "github") == [.userSupplied])
+    }
+
+    /// Codex finding 8's second half: `approve(normalizedTerm:surfaceTerm:)` uses the caller's
+    /// EXPLICIT surface spelling, not `canonicalSurfaceTerm`'s frequency-ranked tie-break — so a
+    /// single user-supplied correction wins over several higher-frequency mined sightings of a
+    /// DIFFERENT dictation using the misspelling (a scenario `recordEvidence`'s per-dictation
+    /// upgrade alone can't fix, since those other rows have different dictation ids).
+    @Test func approveWithExplicitSurfaceTermWinsOverAHigherFrequencyMinedSpelling() async throws {
+        let url = temporaryDatabaseURL()
+        let library = try Database(path: url)
+        let store = try VocabStore(databaseURL: url)
+
+        for _ in 0..<3 {
+            let id = try library.insertDictation(makeInsertRequest(transcript: "x", refined: "x"))
+            try await store.recordEvidence(dictationID: id, candidates: [
+                VocabEvidenceCandidate(normalizedTerm: "github", surfaceTerm: "Github", source: .mined)
+            ])
+        }
+        let userID = try library.insertDictation(makeInsertRequest(transcript: "x", refined: "x"))
+        try await store.recordEvidence(dictationID: userID, candidates: [
+            VocabEvidenceCandidate(normalizedTerm: "github", surfaceTerm: "GitHub", source: .userSupplied)
+        ])
+
+        _ = try await store.approve(normalizedTerm: "github", surfaceTerm: "GitHub")
+        #expect(try await store.approvedTerms().map(\.surfaceTerm) == ["GitHub"])
+    }
+
     // MARK: - Helpers
 
     /// Seeds an `approved` decision directly (via the same PK-upsert `mergeDecisions` write path
