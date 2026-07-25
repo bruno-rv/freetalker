@@ -470,23 +470,118 @@ This local endpoint applies to Cloud processing (LLM) only, not Cloud STT.
 
 ## Automation (Shortcuts, AppleScript)
 
-Settings → Privacy → Automation exposes two Cocoa Scripting commands — `transcribe` and
-`clean up` — to Shortcuts, `osascript`, Raycast, and similar tools (see the FreeTalker
-dictionary in Script Editor, File → Open Dictionary, for exact syntax). Off by default; no
-request is accepted until it's turned on. A brief security summary (full docs pass to follow):
+Other apps on the Mac — Shortcuts, `osascript`, Raycast, Alfred, Keyboard Maestro — can ask
+FreeTalker to do two things: **transcribe a media file** and **clean up a piece of text** with
+one of your own Templates. Nothing else is exposed; there's no way to start a dictation, read
+your Library, or touch your settings from automation.
 
-- **`transcribe` is folder-scoped.** Turning Automation on does not by itself grant access to
-  your files — `transcribe` only reads files inside the Automation folder you choose in
-  Settings, checked by canonical (symlink-resolved) path.
-- **`clean up` never uses cloud, ever.** It always runs on FreeTalker's on-device model
-  (Apple's Foundation Models), regardless of what's configured for interactive dictation, so
-  your cloud API key is never read and no cloud endpoint is ever contacted by this command. A
-  capability with no on-device equivalent (for example, output-language translation) is simply
-  unavailable through automation and returns a distinct error rather than a silent fallback.
-- **Custom Template prompts are exposed.** Once Automation is on, `clean up`'s `using template`
-  parameter can invoke any of your Templates, and the text you pass in shares a prompt with that
-  Template's own instructions — treat every enabled Template's prompt as readable by an
-  automation caller.
+It's off by default. To turn it on:
+
+1. Settings → Privacy → **Automation**, toggle **"Allow automation (Shortcuts, AppleScript)"**.
+2. Under **Automation folder**, click **Choose…** and pick the folder `transcribe` is allowed to
+   read files from.
+
+Turning the toggle on by itself grants no file access — `transcribe` only ever reads a file
+whose canonical (symlink-resolved) path is inside the folder you chose in step 2. Everything
+else on disk stays off-limits to automation regardless of the toggle.
+
+The exact command syntax lives in FreeTalker's own AppleScript dictionary — open it from Script
+Editor via File → Open Dictionary → FreeTalker — and it's reproduced below verbatim from
+`Assets/FreeTalker.sdef`.
+
+### `transcribe`
+
+Transcribes an audio or video file — the same formats the Imports window accepts (WAV, M4A,
+MP3, MP4, MOV) — and returns the transcript as text.
+
+| Parameter | AppleScript keyword | Type | Required | Default |
+|---|---|---|---|---|
+| direct parameter | *(none, positional)* | `file` | yes | — |
+| `format` | `format` | `format style` (`plain text`, `markdown`, `SRT`, `VTT`) | no | `plain text` |
+| `with speaker labels` | `with speaker labels` | `boolean` | no | `true` |
+
+```sh
+osascript <<'EOF'
+tell application "FreeTalker"
+    with timeout of 7200
+        transcribe (POSIX file "/Users/you/FreeTalkerAutomation/meeting.m4a") format markdown with speaker labels false
+    end timeout
+end tell
+EOF
+```
+
+Set an explicit sender timeout for long media, as above — `with timeout of 7200` (2 hours). The
+default AppleScript sender timeout (about 2 minutes) only stops the caller's *wait* for a reply;
+it does not stop FreeTalker's own transcription work, which keeps running either way.
+
+### `clean up`
+
+Runs any text you already have through one of your own Templates and returns the result.
+
+| Parameter | AppleScript keyword | Type | Required | Default |
+|---|---|---|---|---|
+| direct parameter | *(none, positional)* | `text` | yes | — |
+| `using template` | `using template` | `text` (exact Template name) | yes | — |
+
+```sh
+osascript <<'EOF'
+tell application "FreeTalker"
+    clean up "so basically what we need is uh three things by friday" using template "Email"
+end tell
+EOF
+```
+
+An unknown Template name is an error, never a silently-substituted default.
+
+*(Neither example above has been executed — the first automation call to FreeTalker triggers a
+one-time macOS Automation consent dialog that only an interactive user, not a script, can
+accept; see below.)*
+
+### What the caller sees
+
+- Both commands **block until the result is ready** — like any other slow step in a Shortcut or
+  AppleScript.
+- `transcribe`'s job appears in the **Imports window** at the same time, with progress, and can
+  be watched or cancelled from there while the `osascript`/Shortcuts call is still waiting.
+- Failures come back as AppleScript errors the caller can branch on, not silent empty results —
+  for example: automation turned off, no Automation folder configured, the file isn't inside
+  that folder, an unsupported file type, media that's too large or too long, an unknown Template
+  name, another automation request already in flight (`busy`), or the request exceeding
+  FreeTalker's own 2-hour deadline (`timedOut`).
+- **The first automation call triggers a one-time macOS Automation consent dialog** — macOS
+  asking whether the calling app (Script Editor, Terminal, Shortcuts, …) may control FreeTalker.
+  Someone has to be at the Mac to click Allow; this can't be granted unattended or from a
+  headless/non-interactive session. Once granted, it's remembered for that calling app.
+
+### `clean up` and on-device processing
+
+`clean up` **always** runs on FreeTalker's on-device model — Apple's Foundation Models
+framework — never a cloud provider, regardless of what's configured for interactive dictation.
+That means no API key is ever read, no cloud endpoint is ever contacted, and no cloud tokens are
+ever spent by this command. It also **never applies your learned/custom vocabulary** — text
+handed to `clean up` from outside FreeTalker has no legitimate reason to see the words FreeTalker
+has learned from your own dictations, so that list is never threaded into the prompt for this
+path. A capability that has no on-device equivalent — output-language translation, for
+instance — is simply unavailable through `clean up` and returns a distinct error rather than
+silently falling back to a different result.
+
+Once Automation is on, `clean up`'s `using template` parameter can invoke any of your Templates,
+and the text you pass in shares a prompt with that Template's own instructions — treat every
+enabled Template's prompt as readable by an automation caller.
+
+### Limitations
+
+- **A long file transcription occupies FreeTalker's transcription engine.** `transcribe` runs on
+  the same shared, serial transcription gate as ordinary push-to-talk dictation. While a large
+  automation job is transcribing, an ordinary dictation started in the meantime simply waits —
+  until the automation job finishes, is cancelled from the Imports window, or hits FreeTalker's
+  own 2-hour app-side limit, whichever comes first.
+- **The security boundary is the chosen folder plus the macOS Automation consent prompt — not a
+  sandbox.** FreeTalker itself isn't sandboxed. A program already running as the same Mac user
+  account as FreeTalker can, in principle, defeat the folder restriction (for example, by
+  swapping a file at a path FreeTalker is about to read). Automation is not a defense against
+  malicious software that is already running on your Mac under your own account — it only
+  restricts what a well-behaved calling app can reach.
 
 ## Manual end-to-end checklist
 
