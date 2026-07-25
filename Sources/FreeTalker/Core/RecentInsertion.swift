@@ -60,6 +60,11 @@ final class RecentInsertionStore {
 
     private(set) var current: RecentInsertion?
     private var pending: Pending?
+    /// Bumped on every `attachDictationID`/`reset` — lets a scheduled expiry (see
+    /// `scheduleExpiry`) recognize it's been superseded by a NEWER `current` and no-op instead of
+    /// clobbering it. See Codex finding 13.
+    private var generation = 0
+    private var expiryTask: Task<Void, Never>?
 
     func notePending(_ pending: Pending) {
         self.pending = pending
@@ -69,17 +74,28 @@ final class RecentInsertionStore {
         pending = nil
     }
 
-    /// Promotes `pending` to `current` now that its dictation has a row id. A no-op if nothing is
-    /// pending (paste failed, drift prevented a snapshot, or a prior `clearPending()` already ran
-    /// for this dictation) — `onDictationRecorded` still fires in that case, but there is nothing
-    /// to attach.
+    /// Promotes `pending` to `current` now that its dictation has a row id. Codex finding 1: a
+    /// no-op `pending` (paste failed, drift prevented a snapshot, or a prior `clearPending()`
+    /// already ran for this dictation) must NOT leave `current` pointing at an OLDER, unrelated
+    /// dictation — a spoken correction issued after a newer, untracked dictation would otherwise
+    /// select and replace text in that stale, wrong document. Invalidates `current` and stops
+    /// whatever watcher was running for it instead.
     func attachDictationID(_ dictationID: Int64, now: Date = Date()) {
-        guard let pending else { return }
+        generation += 1
+        let myGeneration = generation
+        expiryTask?.cancel()
+        expiryTask = nil
+        guard let pending else {
+            current = nil
+            EditWatcher.shared.stopWatching()
+            return
+        }
         current = RecentInsertion(
             dictationID: dictationID, target: pending.target, text: pending.text,
             baselineValue: pending.baselineValue, anchor: pending.anchor, insertedAt: now
         )
         self.pending = nil
+        scheduleExpiry(generation: myGeneration)
     }
 
     /// The current insertion, only if still inside the bounded window. `now:` is injectable for
@@ -89,9 +105,27 @@ final class RecentInsertionStore {
         return current
     }
 
+    /// Codex finding 13: `recent()` alone only ever went PASSIVE past expiry (returning `nil`
+    /// forever) while `current` — the complete pre-insertion field value plus AX element/window
+    /// references — stayed retained indefinitely until another tracked insertion replaced it or
+    /// the process exited. This proactively clears `current`/stops its watcher once `Self.window`
+    /// has actually elapsed. `generation`-checked so a stale scheduled expiry (from an insertion
+    /// that's already been superseded by a newer one) can never clobber that newer `current`.
+    private func scheduleExpiry(generation: Int) {
+        expiryTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(Self.window * 1_000_000_000))
+            guard !Task.isCancelled, let self, self.generation == generation else { return }
+            self.current = nil
+            EditWatcher.shared.stopWatching()
+        }
+    }
+
     /// Test-only reset — production code never needs to clear `current` directly (a new
     /// insertion simply replaces it).
     func reset() {
+        generation += 1
+        expiryTask?.cancel()
+        expiryTask = nil
         current = nil
         pending = nil
     }
