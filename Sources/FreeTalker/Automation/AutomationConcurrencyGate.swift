@@ -14,24 +14,35 @@ import Foundation
 ///
 /// Checked synchronously in `CleanUpTextCommand`/`TranscribeFileCommand`'s
 /// `performDefaultImplementation()`, BEFORE `suspendExecution()` — a rejected call never suspends,
-/// and never starts the expensive work. `nonisolated(unsafe)` for the same reason
-/// `TranscribeFileCommand`/`CleanUpTextCommand` already use it elsewhere in this feature: the
-/// Apple Event Manager serializes command dispatch on the main thread, so this plain
-/// check-then-set has no concurrent writer to race with.
+/// and never starts the expensive work.
+///
+/// Codex round-3 additional finding: the OLD reasoning for `nonisolated(unsafe)` with no lock —
+/// "the Apple Event Manager serializes command dispatch on the main thread, so this plain
+/// check-then-set has no concurrent writer to race with" — covered `beginCleanUp`/`beginTranscribe`
+/// (called synchronously from `performDefaultImplementation()`, on the Apple Event Manager's main
+/// thread) but NOT `endCleanUp`/`endTranscribe`: those used to run inside each command's `Task {
+/// defer { ... } }`, whose body executes off `@MainActor` for parts of its lifetime (see
+/// `AutomationService.authorizeStageAndTranscribe`) — a real cross-executor race against a new
+/// incoming Apple Event's `beginTranscribe()` on the main thread. A lock removes the need to
+/// reason about which caller runs on which thread at all.
 enum AutomationConcurrencyGate {
+    private static let lock = NSLock()
     nonisolated(unsafe) private static var cleanUpInFlight = false
     nonisolated(unsafe) private static var transcribeInFlight = false
 
     /// Returns `true` and claims the single slot if it was free; returns `false` (claims nothing)
     /// if a `clean up` is already running. Callers that get `true` MUST call `endCleanUp()` when
-    /// the request finishes, success or failure.
+    /// the request finishes, success or failure — and, per the additional finding above, BEFORE
+    /// resuming the Apple Event reply, never after (see `CleanUpTextCommand`).
     static func beginCleanUp() -> Bool {
+        lock.lock(); defer { lock.unlock() }
         guard !cleanUpInFlight else { return false }
         cleanUpInFlight = true
         return true
     }
 
     static func endCleanUp() {
+        lock.lock(); defer { lock.unlock() }
         cleanUpInFlight = false
     }
 
@@ -40,12 +51,14 @@ enum AutomationConcurrencyGate {
     /// profiles (import queue + WhisperKit vs. on-device prompt processing) and neither needing to
     /// wait on the other's slot is strictly more permissive without reopening either finding.
     static func beginTranscribe() -> Bool {
+        lock.lock(); defer { lock.unlock() }
         guard !transcribeInFlight else { return false }
         transcribeInFlight = true
         return true
     }
 
     static func endTranscribe() {
+        lock.lock(); defer { lock.unlock() }
         transcribeInFlight = false
     }
 }

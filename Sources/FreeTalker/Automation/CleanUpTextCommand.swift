@@ -58,16 +58,20 @@ final class CleanUpTextCommand: NSScriptCommand, @unchecked Sendable {
         // here despite the class-level `@unchecked Sendable`.
         nonisolated(unsafe) let command = self
         Task {
-            defer { AutomationConcurrencyGate.endCleanUp() }
+            // Codex round-3 additional finding: release the slot BEFORE `resumeExecution`, never
+            // in a `defer` that ran after it — see `TranscribeFileCommand`'s matching comment.
             do {
                 let output = try await AutomationService.cleanUpText(text, templateName: templateName)
+                AutomationConcurrencyGate.endCleanUp()
                 command.resumeExecution(withResult: output as NSString)
             } catch let error as AutomationError {
+                AutomationConcurrencyGate.endCleanUp()
                 command.fail(error)
                 command.resumeExecution(withResult: nil)
             } catch {
                 // Codex round-1 Finding 6: never surface a raw error's `localizedDescription` —
                 // sanitize it (and log the real one privately) even for this catch-all case.
+                AutomationConcurrencyGate.endCleanUp()
                 command.fail(AutomationErrorSanitizer.processingFailure(error, context: "clean up"))
                 command.resumeExecution(withResult: nil)
             }

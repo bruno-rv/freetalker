@@ -39,20 +39,29 @@ final class TranscribeFileCommand: NSScriptCommand, @unchecked Sendable {
         // is for.
         nonisolated(unsafe) let command = self
         Task {
-            defer { AutomationConcurrencyGate.endTranscribe() }
+            // Codex round-3 additional finding: release the slot BEFORE `resumeExecution`, never
+            // in a `defer` that ran after it — the old ordering could let a new Apple Event see a
+            // stale `.busy` for a moment after this one had already replied, and released the slot
+            // from whatever (possibly non-main) executor this task's body happened to be running
+            // on when the `defer` fired, racing a new `beginTranscribe()` on the main thread
+            // without a lock. `AutomationConcurrencyGate` is now lock-protected regardless, but
+            // the ordering fix is what actually keeps `.busy` truthful.
             do {
                 let output = try await AutomationService.transcribe(
                     fileURL: fileURL,
                     format: format,
                     includeSpeakerLabels: includeSpeakerLabels
                 )
+                AutomationConcurrencyGate.endTranscribe()
                 command.resumeExecution(withResult: output as NSString)
             } catch let error as AutomationError {
+                AutomationConcurrencyGate.endTranscribe()
                 command.fail(error)
                 command.resumeExecution(withResult: nil)
             } catch {
                 // Codex round-1 Finding 6: never surface a raw error's `localizedDescription` —
                 // sanitize it (and log the real one privately) even for this catch-all case.
+                AutomationConcurrencyGate.endTranscribe()
                 command.fail(AutomationErrorSanitizer.processingFailure(error, context: "transcribe"))
                 command.resumeExecution(withResult: nil)
             }
