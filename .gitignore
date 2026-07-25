@@ -17,3 +17,5 @@ FreeTalker.app/
 /.superpowers/sdd/
 .codex/sdd/features/
 graphify-out/
+# Agent working-session heartbeat log — never committed, regenerated per session.
+.build-progress.log
