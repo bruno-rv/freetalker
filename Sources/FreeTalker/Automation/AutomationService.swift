@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 
 /// The real work behind `FreeTalker.sdef`'s two commands (BRAINSTORM_AUTOMATION_SURFACE.md).
@@ -5,9 +6,11 @@ import Foundation
 /// inspectable) without any Apple Event/Cocoa Scripting machinery, and so the command classes
 /// stay thin adapters over it.
 ///
-/// Both capabilities call the exact pipelines the UI uses — `MediaImportService`/`LocalJobRunner`
-/// via `JobLibraryStore` for `transcribe`, `AppCoordinator.resolveActiveProcessor()` +
-/// `PostProcessor.process(_:)` for `cleanUpText` — never a parallel implementation.
+/// `transcribe` calls the exact pipeline the UI uses — `MediaImportService`/`LocalJobRunner` via
+/// `JobLibraryStore` — never a parallel implementation. `cleanUpText` calls the same
+/// `PostProcessor.process(_:)` contract the UI uses, but ALWAYS through `AppleFMProcessor` (Apple's
+/// on-device Foundation Models), never `AppCoordinator.resolveActiveProcessor()`'s cloud/on-device
+/// selection — see the doc comment on `cleanUpText` for why.
 @MainActor
 enum AutomationService {
     /// How often `transcribe` re-checks the job's state while waiting for it to finish. Short
@@ -15,31 +18,103 @@ enum AutomationService {
     /// the transcription itself; long enough not to spin the main actor.
     private static let pollInterval: Duration = .milliseconds(200)
 
+    // ponytail: fixed 2-hour app-side deadline for `transcribe` (Codex round-1 Finding 7).
+    // AppleScript's default sender timeout is ~2 minutes and ScriptingBridge's is ~1, but neither
+    // cancels FreeTalker's own work — Cocoa gives no sender-death callback, so the bound has to be
+    // app-side. Two hours is generous for any legitimate recording at WhisperKit's typical
+    // faster-than-real-time throughput; a caller transcribing long media should set an explicit
+    // `with timeout of 7200` (AppleScript) / `SBApplication.timeout` (ScriptingBridge) — see
+    // `FreeTalker.sdef`'s `transcribe` command comment. Upgrade path: derive this from the
+    // probed media duration instead of one fixed ceiling for every call.
+    private static let automationDeadline: Duration = .seconds(7_200)
+
+    /// Tracks the in-flight import job across the deadline race below so a timeout can cancel it
+    /// instead of leaving it running forever. An `actor` (not a plain `@MainActor` class) so it's
+    /// unconditionally `Sendable` across the task-group's child tasks without fighting Swift 6's
+    /// region-based isolation checker over a value used both inside a child task and after it.
+    private actor JobHandle {
+        private(set) var jobID: UUID?
+        func record(_ id: UUID) { jobID = id }
+    }
+
     static func transcribe(
         fileURL: URL,
         format: TranscriptFormat,
         includeSpeakerLabels: Bool
     ) async throws -> String {
         try AutomationGate.checkEnabled(AppSettings.shared.automationEnabled)
-        guard MediaImportService.isSupported(fileURL) else { throw AutomationError.unsupportedFileType }
 
-        // Idempotent — a no-op if the app's normal launch sequence already wired this up, which
-        // it always will have by the time a user can reach a running FreeTalker to script it.
-        // Guards the (unlikely, but not impossible) case automation runs before that finishes.
+        // Codex round-1 Finding 2: the automation toggle alone grants no per-file authority — only
+        // a file inside the user's chosen Automation folder may be read. Every check downstream
+        // uses the CANONICAL (symlink-resolved) URL this returns, never the caller-supplied one.
+        let canonicalURL = try AutomationFileAuthorization.authorize(
+            fileURL, automationFolderPath: AppSettings.shared.automationFolderPath
+        )
+        guard MediaImportService.isSupported(canonicalURL) else { throw AutomationError.unsupportedFileType }
+        // Codex round-1 Finding 4: reject FIFOs/device nodes/symlinks and oversized files BEFORE
+        // any AVFoundation call ever touches the file.
+        try AutomationMediaGuard.requireRegularFile(at: canonicalURL)
+
         await AppCoordinator.shared.launchMediaImportWorkflows()
         guard let jobLibraryStore = AppCoordinator.shared.jobLibraryStore else {
-            throw AutomationError.pipelineFailed("FreeTalker's import queue isn't ready yet. Try again in a moment.")
+            throw AutomationErrorSanitizer.processingFailure(
+                message: "import queue not ready", context: "transcribe"
+            )
+        }
+
+        let handle = JobHandle()
+        do {
+            return try await withThrowingTaskGroup(of: String.self) { group in
+                group.addTask {
+                    try await performTranscription(
+                        canonicalURL: canonicalURL,
+                        format: format,
+                        includeSpeakerLabels: includeSpeakerLabels,
+                        store: jobLibraryStore,
+                        handle: handle
+                    )
+                }
+                group.addTask {
+                    try await Task.sleep(for: automationDeadline)
+                    throw AutomationError.timedOut
+                }
+                guard let result = try await group.next() else { throw AutomationError.timedOut }
+                group.cancelAll()
+                return result
+            }
+        } catch AutomationError.timedOut {
+            if let jobID = await handle.jobID {
+                _ = try? await jobLibraryStore.cancelImport(id: jobID)
+            }
+            throw AutomationError.timedOut
+        }
+    }
+
+    private static func performTranscription(
+        canonicalURL: URL,
+        format: TranscriptFormat,
+        includeSpeakerLabels: Bool,
+        store: JobLibraryStore,
+        handle: JobHandle
+    ) async throws -> String {
+        // Codex round-1 Finding 4: a small, compressed file can still decode to a multi-hour
+        // asset. This header-only probe rejects it before `importMedia` ever starts a decode.
+        let asset = AVURLAsset(url: canonicalURL)
+        if let duration = try? await asset.load(.duration), duration.isValid,
+           AutomationMediaGuard.exceedsMaximumDuration(seconds: duration.seconds) {
+            throw AutomationError.mediaTooLarge
         }
 
         let jobID: UUID
         do {
-            jobID = try await jobLibraryStore.importMedia(fileURL)
+            jobID = try await store.importMedia(canonicalURL)
         } catch let error as MediaImportError {
             if error == .unsupportedType { throw AutomationError.unsupportedFileType }
-            throw AutomationError.pipelineFailed(error.localizedDescription)
+            throw AutomationErrorSanitizer.processingFailure(error, context: "transcribe (import)")
         }
+        await handle.record(jobID)
 
-        let detail = try await waitForCompletion(jobID: jobID, store: jobLibraryStore)
+        let detail = try await waitForCompletion(jobID: jobID, store: store)
         return TranscriptExporter().export(
             detail.attributedTranscript,
             format: format,
@@ -48,13 +123,29 @@ enum AutomationService {
         )
     }
 
+    /// Always routes through `AppleFMProcessor` — Apple's on-device Foundation Models — never
+    /// `AppCoordinator.resolveActiveProcessor()`'s cloud/on-device selection.
+    ///
+    /// Codex round-1 Finding 1 (CRITICAL, confused-deputy API-key exfiltration): a same-user
+    /// process could otherwise flip `automationEnabled` on via `defaults`, repoint the
+    /// provider/base-URL/model preferences at an attacker endpoint, and have `clean up` read the
+    /// protected Keychain key and send it there. Routing `clean up` at the on-device processor
+    /// UNCONDITIONALLY — regardless of what the user has configured for interactive dictation —
+    /// removes the vector entirely: no provider key is ever read, no endpoint is ever contacted,
+    /// no cloud tokens are ever spent, by automation.
+    ///
+    /// Consequence, stated honestly: cloud-only capabilities have no automation path. Today that's
+    /// output-language translation (`AppleFMProcessor` throws `FMError.translationUnsupported` for
+    /// any `languagePolicy` other than `.preserveSource`, which is unreachable from `clean up`
+    /// today — this sdef exposes no language parameter). If cloud-only capabilities are ever added
+    /// to the sdef, they surface `AutomationError.cloudCapabilityUnavailable` here — a clear,
+    /// distinct error, never a silent fallback to a different result.
     static func cleanUpText(_ text: String, templateName: String) async throws -> String {
         try AutomationGate.checkEnabled(AppSettings.shared.automationEnabled)
         guard let template = TemplateStore.resolveTemplate(named: templateName, in: TemplateStore.shared.templates) else {
             throw AutomationError.unknownTemplate(templateName)
         }
 
-        let snapshot = AppSettings.shared.cloudLLMSnapshot
         let request = PostProcessingRequest(
             transcript: text,
             template: template,
@@ -63,12 +154,16 @@ enum AutomationService {
             // No spoken audio exists in this path, so voice commands can never apply — same
             // reasoning as translation/Scratchpad transformations (PLAN.md PR A, item 2).
             voiceCommandPolicy: .disabled,
-            vocabulary: snapshot.vocabulary
+            // Codex round-1 Finding 5: `clean up` puts attacker-supplied `text` in the same
+            // user-role prompt as everything else. Never thread the user's real vocabulary in —
+            // externally supplied text has no legitimate reason to see it, and this closes the
+            // "ask the model to echo the vocabulary back" leak.
+            vocabulary: []
         )
         do {
-            return try await AppCoordinator.shared.resolveActiveProcessor().process(request)
+            return try await AppleFMProcessor().process(request)
         } catch {
-            throw AutomationError.pipelineFailed(error.localizedDescription)
+            throw AutomationErrorSanitizer.processorFailure(error)
         }
     }
 
@@ -86,7 +181,9 @@ enum AutomationService {
             case .ready:
                 return detail
             case .failed(let failure):
-                throw AutomationError.pipelineFailed(failure.message)
+                throw AutomationErrorSanitizer.processingFailure(
+                    message: failure.message, context: "transcribe"
+                )
             case .cancelled:
                 throw AutomationError.cancelled
             case .queued, .processing:

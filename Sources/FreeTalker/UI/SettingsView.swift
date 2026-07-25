@@ -704,15 +704,40 @@ private struct GeneralSettingsView: View {
                 Toggle("Allow automation (Shortcuts, AppleScript)", isOn: $settings.automationEnabled)
                 SettingsHelpButton(
                     title: "Automation",
-                    message: "Lets Shortcuts, osascript, Raycast, and similar tools ask FreeTalker to transcribe a file or clean up text using your existing Templates and speech engine. Off by default — no automation request is accepted until this is on. Your API keys, provider endpoints, and model names are never readable or writable through automation."
+                    message: "Lets Shortcuts, osascript, Raycast, and similar tools ask FreeTalker to transcribe a file or clean up text using your existing Templates. \"clean up\" always runs on-device — it never reads your API keys, contacts your cloud provider, or spends cloud tokens, regardless of what's configured for interactive dictation. Off by default — no automation request is accepted until this is on."
                 )
             }
-            Text("Off by default. When on, other apps on this Mac can run FreeTalker's \"transcribe\" and \"clean up\" commands — see the FreeTalker dictionary in Script Editor (File > Open Dictionary) for the exact syntax.")
+            Text("Off by default. When on, other apps on this Mac can run FreeTalker's \"transcribe\" and \"clean up\" commands — see the FreeTalker dictionary in Script Editor (File > Open Dictionary) for the exact syntax. Custom Template prompts are readable by any automation caller once this is on.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            HStack {
+                Text("Automation folder:")
+                Text(settings.automationFolderPath ?? "Not configured")
+                    .foregroundStyle(settings.automationFolderPath == nil ? .secondary : .primary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Button("Choose…") { chooseAutomationFolder() }
+                if settings.automationFolderPath != nil {
+                    Button("Clear") { settings.automationFolderPath = nil }
+                }
+            }
+            Text("\"transcribe\" can only read files inside this folder — turning automation on does not by itself grant access to the rest of your files.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
         .padding(.vertical, 12)
         .help("Turn on to let Shortcuts, AppleScript, and similar tools ask FreeTalker to transcribe a file or clean up text. Off by default.")
+    }
+
+    private func chooseAutomationFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        panel.message = "Choose the folder \"transcribe\" is allowed to read files from."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        settings.automationFolderPath = url.resolvingSymlinksInPath().standardizedFileURL.path
     }
 
     @ViewBuilder

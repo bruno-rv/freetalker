@@ -407,6 +407,15 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(automationEnabled, forKey: Keys.automationEnabled) }
     }
 
+    /// The single folder `transcribe` may read files from (Codex round-1 Finding 2). `nil` until
+    /// the user explicitly chooses one in Settings → Privacy → Automation — `automationEnabled`
+    /// alone grants no per-file authority, so `transcribe` refuses every file until this is set.
+    /// A plain absolute path (FreeTalker is unsandboxed; no security-scoped bookmark needed) —
+    /// see `AutomationFileAuthorization`, which resolves and canonicalizes it before every check.
+    @Published var automationFolderPath: String? {
+        didSet { defaults.set(automationFolderPath, forKey: Keys.automationFolderPath) }
+    }
+
     /// Streaming ASR master switch (BRAINSTORM_STREAMING_ASR.md): types confirmed partial
     /// transcripts live into the focused field while the user is still speaking, for explicit
     /// supported-language Recordings (see `StreamingASRLanguageSupport`). **Default OFF** for the
@@ -951,6 +960,7 @@ final class AppSettings: ObservableObject {
         static let localContextScope = "localContextScope"
         static let automaticStyleEnabled = "automaticStyleEnabled"
         static let automationEnabled = "automationEnabled"
+        static let automationFolderPath = "automationFolderPath"
         static let voiceCommandsEnabled = "voiceCommandsEnabled"
         static let streamingASREnabled = "streamingASREnabled"
         static let commandKeywords = "commandKeywords"
@@ -1093,6 +1103,7 @@ final class AppSettings: ObservableObject {
         // Default OFF, same reasoning as `voiceCommandsEnabled` below — plain `.bool(forKey:)`
         // resolves an unset key to `false`, matching "off until switched on in Settings."
         automationEnabled = defaults.bool(forKey: Keys.automationEnabled)
+        automationFolderPath = defaults.string(forKey: Keys.automationFolderPath)
         // Default OFF — plain `.bool(forKey:)` is correct here (unlike the `.object(forKey:) as?
         // Bool` idiom used for default-ON flags above): an unset key and an explicit `false` both
         // correctly resolve to `false`. See PLAN.md PR A, item 1.

@@ -3,12 +3,24 @@ import Foundation
 /// Cocoa Scripting entry point for `FreeTalker.sdef`'s `clean up` command
 /// (BRAINSTORM_AUTOMATION_SURFACE.md capability 2). No microphone, no recording, no permissions —
 /// a direct call into `AutomationService.cleanUpText`, which resolves the named Template from
-/// `TemplateStore` and calls `PostProcessor.process(_:)` exactly as the rest of the app does. See
-/// `TranscribeFileCommand`'s doc comment for why this suspends the AppleEvent reply instead of
-/// blocking a thread.
+/// `TemplateStore` and always runs it through FreeTalker's on-device processor (never cloud — see
+/// `AutomationService.cleanUpText`'s doc comment). See `TranscribeFileCommand`'s doc comment for
+/// why this suspends the AppleEvent reply instead of blocking a thread.
 final class CleanUpTextCommand: NSScriptCommand, @unchecked Sendable {
     override func performDefaultImplementation() -> Any? {
         guard let text = directParameter as? String else {
+            fail(.invalidInput("Provide the text to clean up."))
+            return nil
+        }
+        // Codex round-1 Finding 3: reject empty/oversized text and an oversized template name
+        // BEFORE `suspendExecution()` — cheap, synchronous checks that never let a bad call start
+        // the expensive (suspended, reentrant) work below.
+        do {
+            try AutomationTextValidation.validateCleanUpText(text)
+        } catch let error as AutomationError {
+            fail(error)
+            return nil
+        } catch {
             fail(.invalidInput("Provide the text to clean up."))
             return nil
         }
@@ -17,12 +29,30 @@ final class CleanUpTextCommand: NSScriptCommand, @unchecked Sendable {
             fail(.invalidInput("Provide the name of the Template to apply, using template."))
             return nil
         }
+        do {
+            try AutomationTextValidation.validateTemplateName(templateName)
+        } catch let error as AutomationError {
+            fail(error)
+            return nil
+        } catch {
+            fail(.invalidInput("The template name is too long."))
+            return nil
+        }
+
+        // Codex round-1 Finding 3: Cocoa Scripting suspended commands are explicitly reentrant —
+        // claim the single in-flight slot BEFORE suspending, so a busy rejection never suspends
+        // and never runs concurrent prompt construction/network work.
+        guard AutomationConcurrencyGate.beginCleanUp() else {
+            fail(.busy)
+            return nil
+        }
 
         suspendExecution()
         // See `TranscribeFileCommand`'s matching comment for why `nonisolated(unsafe)` is needed
         // here despite the class-level `@unchecked Sendable`.
         nonisolated(unsafe) let command = self
         Task {
+            defer { AutomationConcurrencyGate.endCleanUp() }
             do {
                 let output = try await AutomationService.cleanUpText(text, templateName: templateName)
                 command.resumeExecution(withResult: output as NSString)
@@ -30,7 +60,9 @@ final class CleanUpTextCommand: NSScriptCommand, @unchecked Sendable {
                 command.fail(error)
                 command.resumeExecution(withResult: nil)
             } catch {
-                command.fail(.pipelineFailed(error.localizedDescription))
+                // Codex round-1 Finding 6: never surface a raw error's `localizedDescription` —
+                // sanitize it (and log the real one privately) even for this catch-all case.
+                command.fail(AutomationErrorSanitizer.processingFailure(error, context: "clean up"))
                 command.resumeExecution(withResult: nil)
             }
         }

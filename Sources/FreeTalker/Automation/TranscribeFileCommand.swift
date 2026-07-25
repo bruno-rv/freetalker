@@ -42,7 +42,9 @@ final class TranscribeFileCommand: NSScriptCommand, @unchecked Sendable {
                 command.fail(error)
                 command.resumeExecution(withResult: nil)
             } catch {
-                command.fail(.pipelineFailed(error.localizedDescription))
+                // Codex round-1 Finding 6: never surface a raw error's `localizedDescription` —
+                // sanitize it (and log the real one privately) even for this catch-all case.
+                command.fail(AutomationErrorSanitizer.processingFailure(error, context: "transcribe"))
                 command.resumeExecution(withResult: nil)
             }
         }
@@ -50,12 +52,14 @@ final class TranscribeFileCommand: NSScriptCommand, @unchecked Sendable {
     }
 
     /// The sdef declares the direct parameter as `type="file"`; Cocoa Scripting bridges that to
-    /// an `NSURL` for a file-system path, but accepts a plain path string from some callers too
-    /// (e.g. certain `osascript -e` invocations), so both are handled.
+    /// an `NSURL`/`URL` file reference. Codex round-1 Finding 2: a bare path STRING is a weaker
+    /// authority signal than a transferred file reference (it never went through the sender's own
+    /// file-specifier resolution), so it's deliberately no longer accepted here — only an actual
+    /// file reference is. `AutomationFileAuthorization`'s canonical-path containment check is the
+    /// real authority boundary regardless, but this keeps the input itself as strong as possible.
     nonisolated static func resolveFileURL(_ directParameter: Any?) -> URL? {
         if let url = directParameter as? URL { return url }
         if let nsURL = directParameter as? NSURL { return nsURL as URL }
-        if let path = directParameter as? String, !path.isEmpty { return URL(fileURLWithPath: path) }
         return nil
     }
 
