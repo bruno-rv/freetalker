@@ -84,3 +84,8 @@ insets.
 Selecting **Bottom** moves the launcher to the bottom immediately regardless of
 its prior saved position. The same rule holds for every edge and the along-edge
 slider, while manual dragging and relaunch persistence continue to work.
+
+Note: as of the true-bottom-edge fix, **Bottom** places the launcher at the
+screen's true bottom edge (`NSScreen.frame.minY`, over the Dock) rather than
+the Dock-inset `visibleFrame.minY`. Every other edge still uses the visible
+frame, unchanged.

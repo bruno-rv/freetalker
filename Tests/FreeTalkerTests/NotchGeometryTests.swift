@@ -267,15 +267,69 @@ struct NotchGeometryTests {
         #expect(panelFrame.maxY <= macBookFrame.maxY - safeAreaTop)
     }
 
-    @Test func connectorMatchesNotchWidthInSafeAreaStrip() throws {
+    @Test func connectorMatchesPanelWidthAndSitsFlushInSafeAreaStrip() throws {
         let geometry = try #require(NotchGeometryResolver.resolve(screens: [validBuiltin()]))
-        let connector = geometry.connectorFrame
+        let panelHeight: CGFloat = 44
+        // Wide recording row (~460pt), centered under the notch.
+        let panelFrame = CGRect(
+            x: geometry.notchFrame.midX - 230,
+            y: geometry.contentOriginY(panelHeight: panelHeight),
+            width: 460,
+            height: panelHeight
+        )
+        let connector = geometry.connectorFrame(panelFrame: panelFrame)
 
-        #expect(connector.width == geometry.notchFrame.width)
-        #expect(connector.minX == geometry.notchFrame.minX)
+        #expect(connector.width == panelFrame.width)
+        #expect(connector.minX == panelFrame.minX)
         #expect(connector.height == safeAreaTop)
         #expect(connector.minY == geometry.contentMaxY)
         #expect(connector.maxY == macBookFrame.maxY)
+        #expect(connector.maxY == geometry.screenFrame.maxY)
+        // Flush fusion: connector's bottom edge sits exactly at the panel's top edge, no gap.
+        #expect(connector.minY == panelFrame.maxY)
+    }
+
+    /// Regression guard: `connectorFrame(panelFrame:)` must be a pure function of its inputs —
+    /// repeated calls with the same panel frame produce a bit-identical result, and a later call
+    /// with a *different* panel frame (e.g. the recording row growing/shrinking across re-renders)
+    /// must depend only on that new frame, never on any previously-returned connector frame. This
+    /// guards against a feedback loop where each render's geometry accumulates the prior render's
+    /// output instead of recomputing from scratch.
+    @Test func connectorFrameIsPureAndDoesNotAccumulateAcrossRepeatedCalls() throws {
+        let geometry = try #require(NotchGeometryResolver.resolve(screens: [validBuiltin()]))
+        let panelHeight: CGFloat = 44
+        let narrowPanel = CGRect(
+            x: geometry.notchFrame.midX - 100,
+            y: geometry.contentOriginY(panelHeight: panelHeight),
+            width: 200,
+            height: panelHeight
+        )
+        let widePanel = CGRect(
+            x: geometry.notchFrame.midX - 230,
+            y: geometry.contentOriginY(panelHeight: panelHeight),
+            width: 460,
+            height: panelHeight
+        )
+
+        // Same input, called repeatedly (simulates several re-renders with unchanged content):
+        // output must be identical every time, not drift.
+        let first = geometry.connectorFrame(panelFrame: narrowPanel)
+        let second = geometry.connectorFrame(panelFrame: narrowPanel)
+        let third = geometry.connectorFrame(panelFrame: narrowPanel)
+        #expect(first == second)
+        #expect(second == third)
+
+        // A later call with a different (wider) panel frame must land exactly where a *fresh*
+        // resolution would — not offset by however many prior calls happened.
+        let afterGrowth = geometry.connectorFrame(panelFrame: widePanel)
+        let freshFromScratch = NotchGeometryResolver
+            .resolve(screens: [validBuiltin()])!
+            .connectorFrame(panelFrame: widePanel)
+        #expect(afterGrowth == freshFromScratch)
+
+        // And shrinking back must land exactly back on the original narrow-panel result.
+        let afterShrinkBack = geometry.connectorFrame(panelFrame: narrowPanel)
+        #expect(afterShrinkBack == first)
     }
 
     // MARK: - No width fallback
