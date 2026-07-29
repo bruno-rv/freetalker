@@ -107,18 +107,19 @@ enum Insertion {
     /// paste anyway." Every existing caller keeps the permissive default (`false`) — this is
     /// opt-in per call site, not a global behavior change. See Codex finding: unverified panel
     /// paste reaching the permissive nil-target branch.
+    ///
+    /// `restoresPasteboard: false` suppresses the timed restore below. Only the two-phase
+    /// insertion path passes it: its two pastes can land less than the restore delay apart, so
+    /// phase 2 would otherwise snapshot phase 1's raw transcript and "restore" *that* over the
+    /// user's clipboard. Those callers snapshot once, before phase 1, and restore once, after
+    /// phase 2.
     @discardableResult
-    static func insert(_ text: String, target: InsertionTarget? = nil, strict: Bool = false) -> InsertionOutcome {
+    static func insert(
+        _ text: String, target: InsertionTarget? = nil, strict: Bool = false,
+        restoresPasteboard: Bool = true
+    ) -> InsertionOutcome {
         let pasteboard = NSPasteboard.general
-        let savedItems: [[NSPasteboard.PasteboardType: Data]] = pasteboard.pasteboardItems?.map { item in
-            var dict: [NSPasteboard.PasteboardType: Data] = [:]
-            for type in item.types {
-                if let data = item.data(forType: type) {
-                    dict[type] = data
-                }
-            }
-            return dict
-        } ?? []
+        let savedItems = pasteboardSnapshot(pasteboard)
 
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
@@ -153,20 +154,43 @@ enum Insertion {
 
         let posted = postCommandV()
 
-        if posted {
-            // Timed restore: deliberate, logged decision — a residual race remains if the target
-            // app is slow to read the pasteboard, but a completion signal isn't available via
-            // public API. 1.0s (up from 0.3s) narrows the window; changeCount guard still skips
-            // the restore if anything else wrote to the pasteboard first. See Round 1 Codex
-            // finding 5 / Round 2 Codex finding 2.
-            // ponytail: timed restore, residual race accepted for personal use + upgrade path:
-            // skip restore option in Settings.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                guard pasteboard.changeCount == changeCountAfterWrite else { return }
-                restore(savedItems, to: pasteboard)
-            }
+        if posted, restoresPasteboard {
+            schedulePasteboardRestore(savedItems, changeCountAfterWrite: changeCountAfterWrite)
         }
         return posted ? .success : .failure(.pasteFailed)
+    }
+
+    private static func pasteboardSnapshot(_ pasteboard: NSPasteboard) -> [[NSPasteboard.PasteboardType: Data]] {
+        pasteboard.pasteboardItems?.map { item in
+            var dict: [NSPasteboard.PasteboardType: Data] = [:]
+            for type in item.types {
+                if let data = item.data(forType: type) {
+                    dict[type] = data
+                }
+            }
+            return dict
+        } ?? []
+    }
+
+    /// Timed restore: deliberate, logged decision — a residual race remains if the target app is
+    /// slow to read the pasteboard, but a completion signal isn't available via public API. 1.0s
+    /// (up from 0.3s) narrows the window; the changeCount guard still skips the restore if
+    /// anything else wrote to the pasteboard first. See Round 1 Codex finding 5 / Round 2 Codex
+    /// finding 2.
+    /// ponytail: timed restore, residual race accepted for personal use + upgrade path: skip
+    /// restore option in Settings.
+    private static func schedulePasteboardRestore(
+        _ savedItems: [[NSPasteboard.PasteboardType: Data]],
+        changeCountAfterWrite: Int
+    ) {
+        // `NSPasteboard.general` is re-read inside the closure rather than captured: it's the same
+        // single system pasteboard either way, and capturing the object would send a
+        // task-isolated reference into a main-actor closure.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            let pasteboard = NSPasteboard.general
+            guard pasteboard.changeCount == changeCountAfterWrite else { return }
+            restore(savedItems, to: pasteboard)
+        }
     }
 
     /// Pure classification of `insert`'s pre-paste failure reason (PLAN.md F2.4), factored out of
@@ -551,6 +575,106 @@ enum Insertion {
             RecentInsertionStore.shared.clearPending()
         }
         return posted
+    }
+
+    /// What a two-phase insertion (`AppCoordinator.EarlyInsertionHandler`) needs to find the raw
+    /// transcript again once post-processing returns: the same (target, baseline, anchor, text)
+    /// shape `RecentInsertion` already uses, minus the dictation id — the row doesn't exist yet at
+    /// early-insert time. Carried by value through the pipeline rather than re-read from
+    /// `RecentInsertionStore`, which a concurrent dictation could have overwritten.
+    struct EarlyInsertionReceipt {
+        let target: InsertionTarget
+        let text: String
+        let baselineValue: String
+        let anchor: Int
+        /// The user's clipboard as it was before phase 1 wrote to it. Both phases suppress
+        /// `insert`'s own timed restore (see `restoresPasteboard`) and phase 2 restores this
+        /// instead, so a fast post-processing round trip can't leave the raw transcript behind on
+        /// the clipboard.
+        let savedPasteboard: [[NSPasteboard.PasteboardType: Data]]
+    }
+
+    /// Phase 1 of a two-phase insertion: pastes the raw transcript and returns the receipt phase 2
+    /// needs. `nil` — the paste didn't post, or the target isn't trackable enough to prove a later
+    /// replacement is safe — means the caller must fall back to the ordinary single paste of the
+    /// refined text, since without a receipt nothing could ever replace what was typed here.
+    @MainActor
+    static func insertEarlyTrackingCorrection(_ text: String, target: InsertionTarget) -> EarlyInsertionReceipt? {
+        guard let snapshot = captureCorrectionAnchor(target: target) else {
+            RecentInsertionStore.shared.clearPending()
+            return nil
+        }
+        let pasteboard = NSPasteboard.general
+        let savedPasteboard = pasteboardSnapshot(pasteboard)
+        guard insert(text, target: target, restoresPasteboard: false).posted else {
+            // Nothing landed in the document, and the caller is about to fall back to the ordinary
+            // single paste of the refined text — so put the clipboard back now rather than leaving
+            // the raw transcript on it with no phase 2 coming to restore it.
+            restore(savedPasteboard, to: pasteboard)
+            RecentInsertionStore.shared.clearPending()
+            return nil
+        }
+        RecentInsertionStore.shared.notePending(
+            .init(target: target, baselineValue: snapshot.baseline, anchor: snapshot.anchor, text: text)
+        )
+        return EarlyInsertionReceipt(
+            target: target, text: text, baselineValue: snapshot.baseline, anchor: snapshot.anchor,
+            savedPasteboard: savedPasteboard
+        )
+    }
+
+    /// Phase 2: replaces a receipted early insertion with the refined text, through the Correction
+    /// Loop's existing select-then-paste path (`CorrectionTargeting.selectRecentInsertion` proves
+    /// the document still reads `baseline` with `receipt.text` spliced in at `anchor`, then
+    /// live-selects exactly that range) rather than a second replace implementation. `false` means
+    /// the document was left holding the raw transcript — drift, a user edit, or a failed paste —
+    /// and the refined text is on the pasteboard for a manual paste.
+    ///
+    /// The pending Correction Loop snapshot is re-noted with the refined text on success:
+    /// `RecentInsertion.text` is documented as exactly what is in the document, and after this the
+    /// document reads `baseline` + refined at the same anchor.
+    @MainActor
+    static func replaceEarlyInsertion(_ text: String, receipt: EarlyInsertionReceipt) -> Bool {
+        // The id is never read: `selectRecentInsertion` only carries it into the returned
+        // `SelectionSnapshot`, which this path discards (no Voice Edit preview/confirm is
+        // involved — the replacement is the app's own, already-decided post-processing output).
+        let tracked = RecentInsertion(
+            dictationID: 0, target: receipt.target, text: receipt.text,
+            baselineValue: receipt.baselineValue, anchor: receipt.anchor, insertedAt: Date()
+        )
+        let pasteboard = NSPasteboard.general
+        guard CorrectionTargeting.selectRecentInsertion(tracked) != nil else {
+            // The selection failed before anything was written anywhere, so the refined text would
+            // otherwise be unreachable outside the library. Put it on the pasteboard here, which is
+            // what the `.rawLeftInPlace` HUD promises — `insert`'s own failure path below already
+            // leaves it there.
+            pasteboard.clearContents()
+            pasteboard.setString(text, forType: .string)
+            return false
+        }
+        guard insert(text, target: receipt.target, restoresPasteboard: false).posted else { return false }
+        RecentInsertionStore.shared.notePending(
+            .init(target: receipt.target, baselineValue: receipt.baselineValue, anchor: receipt.anchor, text: text)
+        )
+        restoreEarlyInsertionClipboard(receipt)
+        return true
+    }
+
+    /// Puts back the clipboard phase 1 took over, for every two-phase ending that isn't a
+    /// successful `replaceEarlyInsertion` — the refinement coming back byte-identical (so phase 2
+    /// is skipped), and any throw between the two phases. Without this, `restoresPasteboard:
+    /// false` would leave the raw transcript on the user's clipboard forever.
+    ///
+    /// Deliberately NOT called from `replaceEarlyInsertion`'s two failure branches: those are the
+    /// `.rawLeftInPlace` outcome, whose HUD promises the refined text is on the clipboard.
+    ///
+    /// Delayed rather than immediate for the same reason `insert`'s own restore is: post-
+    /// processing can return while the target app is still reading phase 1's paste.
+    @MainActor
+    static func restoreEarlyInsertionClipboard(_ receipt: EarlyInsertionReceipt) {
+        schedulePasteboardRestore(
+            receipt.savedPasteboard, changeCountAfterWrite: NSPasteboard.general.changeCount
+        )
     }
 
     /// One AX attribute read, classified into whether the value was affirmatively present, is

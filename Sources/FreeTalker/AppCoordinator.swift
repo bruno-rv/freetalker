@@ -3267,6 +3267,14 @@ final class AppCoordinator: ObservableObject {
         return Template.containsUnrecognizedLegacyCommandRuleVariant(template.prompt) ? nil : false
     }
 
+    /// Whether a two-phase insertion's phase 1 reached the document, shared by reference between
+    /// `runPipeline`'s early-insertion closure and its terminal handlers (which run after the
+    /// pipeline returns, so they can't read a `let` written inside it).
+    @MainActor
+    final class EarlyInsertionLandedFlag {
+        var landed = false
+    }
+
     private func runPipeline(samples: [Float], engine: any TranscriptionEngine, engineName: String, template: Template, appName: String?, target: InsertionTarget?, forcedLanguage: String?, candidateLanguages: [String], outputLanguage: OutputLanguage, cloudSnapshot: CloudLLMSettingsSnapshot, voiceCommands: VoiceCommandSnapshot, vocabularySnapshot: [String], skipPostProcessing: Bool, processor: (any PostProcessor)? = nil, localContext: LocalProcessingContext? = nil, recovery: ForegroundRecovery, bundleID: String?, durationSecs: Double?, hudGeneration: UUID) async {
         defer {
             isProcessing = false
@@ -3278,6 +3286,36 @@ final class AppCoordinator: ObservableObject {
         // pipeline's `insert` closure only ever runs once per stop.
         let liveInsert = liveStreamingInsertClosure()
 
+        // Two-phase insertion (docs/perf-dictation-latency-2026-07-29.md, fix 1) — see
+        // `shouldUseTwoPhaseInsertion` for why this is only ever the cloud-post-processed
+        // external paste.
+        // Set once phase 1's paste actually lands, so the failure/cancellation handlers below can
+        // tell "nothing reached the document" from "the raw transcript is already on screen" —
+        // their messages differ, and only the latter can end up with the retry pasting a second
+        // copy next to it (see the two-phase note in
+        // docs/perf-dictation-latency-2026-07-29.md).
+        let earlyInsertionLanded = EarlyInsertionLandedFlag()
+        let earlyInsertion: EarlyInsertionHandler? = target.flatMap { target -> EarlyInsertionHandler? in
+            guard Self.shouldUseTwoPhaseInsertion(
+                hasLiveStreamingSession: liveInsert != nil,
+                skipPostProcessing: skipPostProcessing,
+                outputLanguage: outputLanguage,
+                voiceCommandsEnabled: voiceCommands.enabled,
+                hasTarget: true,
+                processor: processor
+            ) else { return nil }
+            let handler = EarlyInsertionHandler.production(target: target)
+            return EarlyInsertionHandler(
+                insertRaw: { text in
+                    let receipt = handler.insertRaw(text)
+                    if receipt != nil { earlyInsertionLanded.landed = true }
+                    return receipt
+                },
+                replace: handler.replace,
+                restoreClipboard: handler.restoreClipboard
+            )
+        }
+
         await Self.runExternalPipelineTask(
             operation: {
                 try await processDictation(
@@ -3288,6 +3326,7 @@ final class AppCoordinator: ObservableObject {
                     cloudSnapshot: cloudSnapshot.eligibility.isEligible ? cloudSnapshot : nil,
                     voiceCommands: voiceCommands, vocabularySnapshot: vocabularySnapshot,
                     processor: processor, localContext: localContext,
+                    earlyInsertion: earlyInsertion,
                     insert: liveInsert ?? { Insertion.insertTrackingCorrection($0, target: $1) },
                     record: { result in
                         // Codex finding 3: attach the Correction Loop pending snapshot using the
@@ -3337,7 +3376,11 @@ final class AppCoordinator: ObservableObject {
                 if let fallbackReason = result.fallbackReason {
                     logPostProcessingFallback(fallbackReason)
                 }
-                if !result.posted, result.fallbackReason != nil {
+                if result.refinementDelivery == .rawLeftInPlace {
+                    // The words are in the document, just un-refined — a different situation from
+                    // "nothing was pasted", so it gets its own message rather than "Copied".
+                    hud.flash("Raw transcript left in place — refined text copied")
+                } else if !result.posted, result.fallbackReason != nil {
                     hud.flash("Post-processing failed — raw transcript copied, paste manually (check API key/model in Settings)")
                 } else if !result.posted {
                     hud.flash(skipPostProcessing ? "Copied (raw) — paste manually" : "Copied — paste manually")
@@ -3364,7 +3407,11 @@ final class AppCoordinator: ObservableObject {
                     stage: .transcribing,
                     message: "Processing was interrupted"
                 ))
-                hud.flash("Processing interrupted — audio saved")
+                hud.flash(
+                    earlyInsertionLanded.landed
+                        ? "Processing interrupted — raw transcript left in place, audio saved"
+                        : "Processing interrupted — audio saved"
+                )
             },
             onEmptyTranscript: {
                 cancelLiveStreaming()
@@ -3392,7 +3439,11 @@ final class AppCoordinator: ObservableObject {
                 cancelLiveStreaming()
                 lastError = "Transcription failed: \(error.localizedDescription)"
                 await failForegroundRecovery(recovery, failure: JobFailure(stage: .transcribing, message: error.localizedDescription))
-                hud.flash("Transcription failed — audio saved")
+                hud.flash(
+                    earlyInsertionLanded.landed
+                        ? "Processing failed — raw transcript left in place, audio saved"
+                        : "Transcription failed — audio saved"
+                )
             }
         )
     }
@@ -3489,7 +3540,8 @@ final class AppCoordinator: ObservableObject {
                                             samples: samples, engine: engine, engineName: engineName,
                                             context: context, appName: nil,
                                             skipPostProcessing: skipPostProcessing, processor: processor,
-                                            translator: TranslationService(), localContext: nil
+                                            translator: TranslationService(), localContext: nil,
+                                            earlyInsertion: nil
                                         )
                                     },
                                     text: { $0.refined },
@@ -3607,6 +3659,30 @@ final class AppCoordinator: ObservableObject {
         let recordedTemplateName: String
         let engineName: String
         let fallbackReason: PostProcessingFallbackReason?
+        var refinementDelivery: RefinementDelivery = .notApplicable
+    }
+
+    /// Whether this stop should insert the raw transcript up front and replace it once
+    /// post-processing returns (docs/perf-dictation-latency-2026-07-29.md, fix 1). Deliberately
+    /// narrow: the only path that pays a variable-latency network call between "we have the words"
+    /// and "the user has text" is a cloud post-processor on an external paste. Everything else —
+    /// Raw, local Apple FM, translation, streaming ASR — keeps its single insertion, so no dictation
+    /// that doesn't already talk to a cloud LLM changes behavior at all.
+    ///
+    /// Voice commands are excluded for correctness, not latency: the raw transcript still contains
+    /// the literal spoken keywords and post-processing is what applies/strips them, so a failed
+    /// replacement would strand them in the document.
+    nonisolated static func shouldUseTwoPhaseInsertion(
+        hasLiveStreamingSession: Bool,
+        skipPostProcessing: Bool,
+        outputLanguage: OutputLanguage,
+        voiceCommandsEnabled: Bool,
+        hasTarget: Bool,
+        processor: (any PostProcessor)?
+    ) -> Bool {
+        guard !hasLiveStreamingSession, !skipPostProcessing, !voiceCommandsEnabled, hasTarget else { return false }
+        guard outputLanguage == .sameAsSpoken else { return false }
+        return processor is CloudLLMProcessor
     }
 
     private func logPostProcessingFallback(_ reason: PostProcessingFallbackReason) {
@@ -3649,6 +3725,7 @@ final class AppCoordinator: ObservableObject {
         processor: (any PostProcessor)? = nil,
         translator: any Translating = TranslationService(),
         localContext: LocalProcessingContext? = nil,
+        earlyInsertion: EarlyInsertionHandler? = nil,
         insert: (String, InsertionTarget?) -> Bool = { Insertion.insertTrackingCorrection($0, target: $1) },
         record: (RecordingProcessingResult) throws -> Void = { result in
             try LibraryStore.shared.record(
@@ -3675,7 +3752,7 @@ final class AppCoordinator: ObservableObject {
             samples: samples, engine: engine, engineName: engineName, context: context,
             appName: appName, target: target, skipPostProcessing: skipPostProcessing,
             processor: processor, translator: translator, localContext: localContext,
-            insert: insert, record: record
+            earlyInsertion: earlyInsertion, insert: insert, record: record
         )
     }
 
@@ -3691,6 +3768,7 @@ final class AppCoordinator: ObservableObject {
         processor: (any PostProcessor)? = nil,
         translator: any Translating = TranslationService(),
         localContext: LocalProcessingContext? = nil,
+        earlyInsertion: EarlyInsertionHandler? = nil,
         insert: (String, InsertionTarget?) -> Bool = { Insertion.insertTrackingCorrection($0, target: $1) },
         record: (RecordingProcessingResult) throws -> Void = { result in
             try LibraryStore.shared.record(
@@ -3710,18 +3788,24 @@ final class AppCoordinator: ObservableObject {
                 try await transcribeAndRefine(
                     samples: samples, engine: engine, engineName: engineName,
                     context: context, appName: appName, skipPostProcessing: skipPostProcessing,
-                    processor: processor, translator: translator, localContext: localContext
+                    processor: processor, translator: translator, localContext: localContext,
+                    earlyInsertion: earlyInsertion
                 )
             },
             text: { $0.refined },
             external: { result in
-                posted = insert(result.refined, target)
+                // A two-phase insertion has already put text in the document — inserting again
+                // here would append a second copy next to it, not replace it.
+                posted = result.refinementDelivery == .notApplicable
+                    ? insert(result.refined, target)
+                    : true
                 let delivered = RecordingProcessingResult(
                     rawTranscript: result.transcript, finalOutput: result.refined,
                     sourceLanguage: SourceLanguage(result.language),
                     requestedOutputLanguage: context.outputLanguage,
                     templateName: result.recordedTemplateName, engineName: result.engineName,
-                    posted: posted, fallbackReason: result.fallbackReason
+                    posted: posted, fallbackReason: result.fallbackReason,
+                    refinementDelivery: result.refinementDelivery
                 )
                 do { try record(delivered) }
                 catch { throw PipelineError.recordFailed(error) }
@@ -3732,7 +3816,8 @@ final class AppCoordinator: ObservableObject {
             sourceLanguage: SourceLanguage(result.language),
             requestedOutputLanguage: context.outputLanguage,
             templateName: result.recordedTemplateName, engineName: result.engineName,
-            posted: posted, fallbackReason: result.fallbackReason
+            posted: posted, fallbackReason: result.fallbackReason,
+            refinementDelivery: result.refinementDelivery
         )
     }
 
@@ -3780,7 +3865,8 @@ final class AppCoordinator: ObservableObject {
         skipPostProcessing: Bool,
         processor: (any PostProcessor)?,
         translator: any Translating,
-        localContext: LocalProcessingContext?
+        localContext: LocalProcessingContext?,
+        earlyInsertion: EarlyInsertionHandler?
     ) async throws -> DictationProcessingResult {
         let transcription = try await engine.transcribe(samples: samples, forcedLanguage: context.transcriptionLanguage, candidateLanguages: context.candidateLanguages, vocabulary: context.vocabularySnapshot)
         guard !transcription.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -3790,6 +3876,7 @@ final class AppCoordinator: ObservableObject {
         let refined: String
         var fallbackReason: PostProcessingFallbackReason?
         let recordedTemplateName: String
+        var delivery: RefinementDelivery = .notApplicable
         if skipPostProcessing {
             refined = transcription.text
             recordedTemplateName = TemplateStore.rawTranscriptTemplateName
@@ -3829,6 +3916,11 @@ final class AppCoordinator: ObservableObject {
             }
             recordedTemplateName = context.template.name
         } else {
+            // Two-phase insertion (fix 1): the words are already final here — only the refinement
+            // is still outstanding — so put them in the document now rather than after a 2–33 s
+            // cloud call. `nil` receipt (untrackable target or a paste that didn't post) simply
+            // falls through to the single insertion the caller performs at the end.
+            let earlyReceipt = earlyInsertion?.insertRaw(transcription.text)
             let activeProcessor: any PostProcessor = processor ?? resolveActiveProcessor()
             let request = PostProcessingRequest(
                 transcript: transcription.text,
@@ -3844,17 +3936,47 @@ final class AppCoordinator: ObservableObject {
             if case .enabled = request.voiceCommandPolicy {
                 Self.logger.notice("post-processing request: voice command policy enabled")
             }
-            let (refinedText, fallback) = try await applyPostProcessing(
-                transcript: transcription.text, voiceCommandPolicy: request.voiceCommandPolicy
-            ) {
-                if let localProcessor = activeProcessor as? AppleFMProcessor, let localContext {
-                    return try await localProcessor.process(request: request, context: localContext)
+            let (refinedText, fallback): (String, PostProcessingFallbackReason?)
+            do {
+                (refinedText, fallback) = try await applyPostProcessing(
+                    transcript: transcription.text, voiceCommandPolicy: request.voiceCommandPolicy
+                ) {
+                    if let localProcessor = activeProcessor as? AppleFMProcessor, let localContext {
+                        return try await localProcessor.process(request: request, context: localContext)
+                    }
+                    return try await activeProcessor.process(request)
                 }
-                return try await activeProcessor.process(request)
+            } catch {
+                // Cancelled or failed between the two phases: phase 2 will never run, so nothing
+                // else would ever give the clipboard back. The raw transcript stays in the
+                // document — see the cancellation HUD in `runPipeline`.
+                if let earlyReceipt, let earlyInsertion {
+                    earlyInsertion.restoreClipboard(earlyReceipt)
+                    // `record()` never runs on this path, so phase 1's pending Correction Loop
+                    // snapshot would never be consumed by `trackCorrectionForRecordedDictation` —
+                    // it would survive into the NEXT dictation and be promoted under that
+                    // dictation's id. Same reasoning (and same remedy) as the `record` catch in
+                    // `runPipeline`: phase 1's paste also means any older `current` is no longer
+                    // the most recent thing on screen.
+                    RecentInsertionStore.shared.invalidateAll()
+                }
+                throw error
             }
             refined = refinedText
             fallbackReason = fallback
             recordedTemplateName = context.template.name
+            if let earlyReceipt, let earlyInsertion {
+                if refinedText == earlyReceipt.text {
+                    // Post-processing fell back to the transcript verbatim (`applyPostProcessing`'s
+                    // never-lose-the-user's-words path): the document already reads exactly this,
+                    // so re-pasting it would only risk drift for no change — but the clipboard
+                    // still has to come back, since no phase 2 paste will do it.
+                    earlyInsertion.restoreClipboard(earlyReceipt)
+                    delivery = .replaced
+                } else {
+                    delivery = earlyInsertion.replace(refinedText, earlyReceipt) ? .replaced : .rawLeftInPlace
+                }
+            }
         }
 
         return DictationProcessingResult(
@@ -3863,7 +3985,8 @@ final class AppCoordinator: ObservableObject {
             language: transcription.language,
             recordedTemplateName: recordedTemplateName,
             engineName: engineName,
-            fallbackReason: fallbackReason
+            fallbackReason: fallbackReason,
+            refinementDelivery: delivery
         )
     }
 
