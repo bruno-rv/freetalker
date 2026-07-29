@@ -70,6 +70,19 @@ struct RecordingProcessingContext: Equatable, Sendable {
     }
 }
 
+/// How a two-phase insertion ended (docs/perf-dictation-latency-2026-07-29.md, fix 1). Only the
+/// cloud-post-processed external paste ever leaves `.notApplicable` — every other path (Raw, local
+/// Apple FM, translation, streaming ASR) still inserts exactly once, at the end.
+enum RefinementDelivery: Equatable, Sendable {
+    /// Single-phase: the refined text was inserted once, as before.
+    case notApplicable
+    /// The raw transcript was inserted early and successfully upgraded to the refined text.
+    case replaced
+    /// The early raw transcript could not be replaced (drift, a user edit, or a failed paste), so
+    /// it is still what the document shows; the refined text is on the pasteboard.
+    case rawLeftInPlace
+}
+
 struct RecordingProcessingResult {
     let rawTranscript: String
     let finalOutput: String
@@ -79,6 +92,31 @@ struct RecordingProcessingResult {
     let engineName: String
     let posted: Bool
     let fallbackReason: AppCoordinator.PostProcessingFallbackReason?
+    var refinementDelivery: RefinementDelivery = .notApplicable
+}
+
+/// The two-phase insertion seam (docs/perf-dictation-latency-2026-07-29.md, fix 1). Injected as a
+/// pair of closures rather than called directly so the pipeline stays testable without a live AX
+/// session, exactly like `processDictation`'s existing `insert:`/`record:` closures.
+@MainActor
+struct EarlyInsertionHandler {
+    /// Pastes the raw transcript as soon as STT finishes. `nil` = nothing trackable landed, so the
+    /// caller must fall back to the ordinary single paste of the refined text.
+    let insertRaw: (String) -> Insertion.EarlyInsertionReceipt?
+    /// Upgrades a receipted early insertion to the refined text. `false` = the raw transcript is
+    /// still what the document shows.
+    let replace: (String, Insertion.EarlyInsertionReceipt) -> Bool
+    /// Gives the user back the clipboard phase 1 took over, on every ending `replace` doesn't
+    /// handle itself — see `Insertion.restoreEarlyInsertionClipboard`.
+    let restoreClipboard: (Insertion.EarlyInsertionReceipt) -> Void
+
+    static func production(target: InsertionTarget) -> EarlyInsertionHandler {
+        EarlyInsertionHandler(
+            insertRaw: { Insertion.insertEarlyTrackingCorrection($0, target: target) },
+            replace: { text, receipt in Insertion.replaceEarlyInsertion(text, receipt: receipt) },
+            restoreClipboard: { Insertion.restoreEarlyInsertionClipboard($0) }
+        )
+    }
 }
 
 struct OutputTranslationFailure: Error, LocalizedError {
