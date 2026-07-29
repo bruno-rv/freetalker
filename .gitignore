@@ -25,3 +25,6 @@ FreeTalker.app/
 graphify-out/
 # Agent working-session heartbeat log — never committed, regenerated per session.
 .build-progress.log
+# Brainstorm-server working directory (superpowers): generated HTML plus per-session runtime
+# state (port, token, pid, instance id). Regenerated per session, never worth committing.
+/.superpowers/brainstorm/
