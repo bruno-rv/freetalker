@@ -53,8 +53,8 @@ struct Template: Identifiable, Equatable, Codable, Sendable {
         ),
         Template(
             id: "prompt-engineer-opus-4-8",
-            name: "Prompt Engineer (Opus 4.8)",
-            prompt: "Treat this raw speech transcript as a rough prompt, task description, or underperforming prompt, in the same language as the transcript. Rewrite it into an optimized prompt for Claude Opus 4.8 following Anthropic's guidance for that model: open with a focused role sentence; state the task, output format, and every constraint explicitly, attaching the \"why\" behind non-obvious ones; Opus 4.8 follows instructions literally and does not silently generalize, so spell out scope explicitly (e.g. \"apply this to every section, not just the first\"); specify the full task, intent, and constraints up front rather than progressively across turns; phrase instructions as what to do, with 3-5 diverse examples in <example> tags for format- or tone-sensitive tasks, rather than lists of don'ts; separate instructions, context, and input with descriptive XML tags, long documents first and the request last; avoid aggressive emphasis like \"CRITICAL: you MUST\" — a plain \"use X when...\" suffices; drop forced interim-status scaffolding such as \"summarize after every 3 steps\"; its default tone is direct and opinionated, so request a warmer voice explicitly if wanted; for review or evaluation tasks, define a concrete severity bar instead of vague words like \"important\"; for design work, specify a concrete visual direction rather than generic negatives; mark variable content with {{PLACEHOLDERS}}. Output exactly two sections: <optimized_prompt> with the complete rewritten prompt, then <design_notes> with 3-5 bullets on the rules applied and any assumptions made. No other commentary."
+            name: "Prompt Engineer (Opus 5)",
+            prompt: "Treat this raw speech transcript as a rough prompt, task description, or underperforming prompt, in the same language as the transcript. Rewrite it into an optimized prompt for Claude Opus 5 following Anthropic's guidance for that model: open with a focused role sentence; state the task, output format, and every constraint explicitly, attaching the \"why\" behind non-obvious ones; separate instructions, context, and input with descriptive XML tags, long documents first and the request last, giving the full task specification up front rather than revealing it across turns; ask explicitly for concise responses — effort controls how much the model thinks, not how much it writes — and repeat a short reminder near the end of a long prompt; for agentic work, describe the narration cadence you want with positive examples rather than a list of prohibitions; calibrate the length of written deliverables explicitly, since files it writes to disk run long by default; omit verification and self-check scaffolding entirely — Opus 5 verifies its own work, and instructions to \"double-check\" or \"re-verify before responding\" only cause over-verification, as does delegating verification to a subagent; state the scope of narrow tasks explicitly, asking it to deliver what was requested and not to widen the work; give explicit criteria or a cap for spawning subagents, which it reaches for readily; limit self-correction narration to corrections that change the user's decisions; for review or evaluation tasks, ask for every finding with confidence and severity attached and filter in a separate pass, since \"only report high-severity issues\" is followed literally and suppresses real findings; keep thinking enabled and match effort to the task — start at high, use low or medium liberally for routine work, xhigh for demanding agentic runs; mark variable content with {{PLACEHOLDERS}}. Output exactly two sections: <optimized_prompt> with the complete rewritten prompt, then <design_notes> with 3-5 bullets on the rules applied and any assumptions made. No other commentary."
         ),
         Template(
             id: "prompt-engineer-sonnet-5",
@@ -110,7 +110,17 @@ struct Template: Identifiable, Equatable, Codable, Sendable {
             """,
             "Rewrite this raw speech transcript as a professional email body, in the same language as the transcript. Remove filler words, hesitations, and accidental repetitions; when the speaker revises themselves, keep only the final intent. Fix grammar and add appropriate structure (greeting/body/sign-off only if implied by content). Preserve names and quoted text. Output only the email body, no commentary.",
             "Rewrite this raw speech transcript as a professional email body, in the same language as the transcript. Remove filler words, hesitations, and accidental repetitions. When the speaker corrects or contradicts something they said earlier — even in a previous sentence (e.g. \"it didn't work… actually, it works\"), keep only the corrected intent and drop the superseded statement entirely. Fix grammar and add appropriate structure (greeting/body/sign-off only if implied by content). Preserve names and quoted text. Output only the email body, no commentary."
+        ],
+        "prompt-engineer-opus-4-8": [
+            "Treat this raw speech transcript as a rough prompt, task description, or underperforming prompt, in the same language as the transcript. Rewrite it into an optimized prompt for Claude Opus 4.8 following Anthropic's guidance for that model: open with a focused role sentence; state the task, output format, and every constraint explicitly, attaching the \"why\" behind non-obvious ones; Opus 4.8 follows instructions literally and does not silently generalize, so spell out scope explicitly (e.g. \"apply this to every section, not just the first\"); specify the full task, intent, and constraints up front rather than progressively across turns; phrase instructions as what to do, with 3-5 diverse examples in <example> tags for format- or tone-sensitive tasks, rather than lists of don'ts; separate instructions, context, and input with descriptive XML tags, long documents first and the request last; avoid aggressive emphasis like \"CRITICAL: you MUST\" — a plain \"use X when...\" suffices; drop forced interim-status scaffolding such as \"summarize after every 3 steps\"; its default tone is direct and opinionated, so request a warmer voice explicitly if wanted; for review or evaluation tasks, define a concrete severity bar instead of vague words like \"important\"; for design work, specify a concrete visual direction rather than generic negatives; mark variable content with {{PLACEHOLDERS}}. Output exactly two sections: <optimized_prompt> with the complete rewritten prompt, then <design_notes> with 3-5 bullets on the rules applied and any assumptions made. No other commentary."
         ]
+    ]
+
+    /// Built-in names we have shipped in the past, keyed by id — the name-side counterpart of
+    /// `legacyPrompts`, used by `upgradingBuiltIns` to relabel a stored built-in whose name we
+    /// changed (`prompt-engineer-opus-4-8` kept its id when its model target moved to Opus 5).
+    static let legacyNames: [String: [String]] = [
+        "prompt-engineer-opus-4-8": ["Prompt Engineer (Opus 4.8)"]
     ]
 
     /// PLAN.md PR A, item 5 — version-bumped migration (`TemplateStore`) that removes the legacy
@@ -175,19 +185,32 @@ struct Template: Identifiable, Equatable, Codable, Sendable {
     }
 
     static func upgradingBuiltIns(_ templates: [Template]) -> (templates: [Template], changed: Bool) {
-        let currentPromptByID = Dictionary(uniqueKeysWithValues: builtIns.map { ($0.id, $0.prompt) })
+        let currentByID = Dictionary(uniqueKeysWithValues: builtIns.map { ($0.id, $0) })
         var changed = false
         let upgraded = templates.map { template -> Template in
-            guard let currentPrompt = currentPromptByID[template.id],
-                  let legacyPromptsForID = legacyPrompts[template.id] else { return template }
-            let trimmedPrompt = template.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard trimmedPrompt != currentPrompt.trimmingCharacters(in: .whitespacesAndNewlines),
-                  legacyPromptsForID.contains(where: { $0.trimmingCharacters(in: .whitespacesAndNewlines) == trimmedPrompt }) else {
-                return template
-            }
-            changed = true
+            guard let current = currentByID[template.id] else { return template }
             var upgradedTemplate = template
-            upgradedTemplate.prompt = currentPrompt
+
+            let trimmedPrompt = template.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmedPrompt != current.prompt.trimmingCharacters(in: .whitespacesAndNewlines),
+               let legacyPromptsForID = legacyPrompts[template.id],
+               legacyPromptsForID.contains(where: { $0.trimmingCharacters(in: .whitespacesAndNewlines) == trimmedPrompt }) {
+                changed = true
+                upgradedTemplate.prompt = current.prompt
+            }
+
+            // Same rule for the name: only a name we ourselves shipped is replaced, so a template
+            // the user renamed keeps that name. Needed when a built-in's label names a model that
+            // was superseded (Opus 4.8 → Opus 5), since the prompt upgrade alone would leave the
+            // new text under the old label.
+            let trimmedName = template.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmedName != current.name.trimmingCharacters(in: .whitespacesAndNewlines),
+               let legacyNamesForID = legacyNames[template.id],
+               legacyNamesForID.contains(where: { $0.trimmingCharacters(in: .whitespacesAndNewlines) == trimmedName }) {
+                changed = true
+                upgradedTemplate.name = current.name
+            }
+
             return upgradedTemplate
         }
         return (upgraded, changed)

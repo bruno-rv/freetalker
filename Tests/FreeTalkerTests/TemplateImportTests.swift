@@ -214,7 +214,7 @@ struct TemplateImportTests {
             #expect(store.templates.contains { $0.id == id })
         }
         #expect(store.templates.contains { $0.id == "prompt-engineer-fable-5" && $0.name == "Prompt Engineer (Fable 5)" })
-        #expect(store.templates.contains { $0.id == "prompt-engineer-opus-4-8" && $0.name == "Prompt Engineer (Opus 4.8)" })
+        #expect(store.templates.contains { $0.id == "prompt-engineer-opus-4-8" && $0.name == "Prompt Engineer (Opus 5)" })
         #expect(store.templates.contains { $0.id == "prompt-engineer-sonnet-5" && $0.name == "Prompt Engineer (Sonnet 5)" })
     }
 
@@ -265,6 +265,40 @@ struct TemplateImportTests {
         // The two IDs still missing get appended, the customized one is left untouched.
         #expect(store.template(id: "prompt-engineer-fable-5") == Template.builtIns.first { $0.id == "prompt-engineer-fable-5" })
         #expect(store.template(id: "prompt-engineer-opus-4-8") == Template.builtIns.first { $0.id == "prompt-engineer-opus-4-8" })
+    }
+
+    @Test func upgradesTheOpusPromptEngineerNameAndPromptFromTheShippedOpus48Version() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("template-upgrade-opus-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let fileURL = directory.appendingPathComponent("templates.json")
+        let legacyPrompt = try #require(Template.legacyPrompts["prompt-engineer-opus-4-8"]?.last)
+        let legacyName = try #require(Template.legacyNames["prompt-engineer-opus-4-8"]?.last)
+        let stored = Template(id: "prompt-engineer-opus-4-8", name: legacyName, prompt: legacyPrompt)
+        try encode([stored]).write(to: fileURL)
+        let defaults = try isolatedDefaults()
+
+        let store = TemplateStore(fileURL: fileURL, defaults: defaults)
+
+        #expect(store.template(id: "prompt-engineer-opus-4-8") == Template.builtIns.first { $0.id == "prompt-engineer-opus-4-8" })
+    }
+
+    @Test func keepsAUserRenamedOpusPromptEngineerNameWhileUpgradingItsPrompt() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("template-upgrade-opus-renamed-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let fileURL = directory.appendingPathComponent("templates.json")
+        let legacyPrompt = try #require(Template.legacyPrompts["prompt-engineer-opus-4-8"]?.last)
+        let current = try #require(Template.builtIns.first { $0.id == "prompt-engineer-opus-4-8" })
+        let stored = Template(id: "prompt-engineer-opus-4-8", name: "My Opus Prompter", prompt: legacyPrompt)
+        try encode([stored]).write(to: fileURL)
+        let defaults = try isolatedDefaults()
+
+        let store = TemplateStore(fileURL: fileURL, defaults: defaults)
+
+        let upgraded = try #require(store.template(id: "prompt-engineer-opus-4-8"))
+        #expect(upgraded.name == "My Opus Prompter")
+        #expect(upgraded.prompt == current.prompt)
     }
 
     @Test func preservesAValidEmptyLibraryInsteadOfReseedingBuiltIns() throws {
