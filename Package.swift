@@ -13,6 +13,13 @@ let package = Package(
     ],
     targets: [
         .systemLibrary(name: "CSQLite", pkgConfig: nil),
+        // Objective-C `@try`/`@catch` around the AVAudioEngine graph calls that raise an
+        // NSException instead of returning an error — see
+        // Sources/ObjCExceptionBridge/include/ObjCExceptionBridge.h.
+        .target(
+            name: "ObjCExceptionBridge",
+            linkerSettings: [.linkedFramework("AVFAudio")]
+        ),
         // Regenerates Sources/FreeTalker/Update/UpdatePublicKey.swift from
         // keys/release-public-key.base64 on every build — see Plugins/GenerateUpdatePublicKey
         // and scripts/lib/public-key-data-file.sh for why the key lives in a plain data file
@@ -26,14 +33,15 @@ let package = Package(
             dependencies: [
                 .product(name: "WhisperKit", package: "WhisperKit"),
                 .product(name: "FluidAudio", package: "FluidAudio"),
-                "CSQLite"
+                "CSQLite",
+                "ObjCExceptionBridge"
             ],
             resources: [.process("Resources")],
             plugins: ["GenerateUpdatePublicKey"]
         ),
         .testTarget(
             name: "FreeTalkerTests",
-            dependencies: ["FreeTalker"],
+            dependencies: ["FreeTalker", "ObjCExceptionBridge"],
             resources: [.copy("Fixtures")]
         )
     ]

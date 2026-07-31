@@ -288,6 +288,10 @@ final class AppCoordinator: ObservableObject {
         let vocabularySnapshot: [String]
     }
     private var pendingStopRequest: PendingStopRequest?
+    /// Why the in-flight stop was forced, when a microphone route abort forced it — see
+    /// `silentCaptureMessage`. Cleared as soon as the terminal message consumes it, and by
+    /// `beginCapture` so it can never explain a later recording.
+    private var routeAbortMessage: String?
     private struct PendingCaptureCleanup {
         enum Completion {
             case cancellation
@@ -942,6 +946,19 @@ final class AppCoordinator: ObservableObject {
         "Could not start recording: \(errorDescription)"
     }
 
+    /// Monotonic elapsed seconds — `ContinuousClock` keeps stage timings honest across a clock
+    /// adjustment or a sleep/wake in the middle of a long dictation.
+    nonisolated static func elapsedSeconds(since start: ContinuousClock.Instant) -> Double {
+        let duration = ContinuousClock.now - start
+        return Double(duration.components.seconds)
+            + Double(duration.components.attoseconds) / 1e18
+    }
+
+    nonisolated static func stageDurationText(_ seconds: Double?) -> String {
+        guard let seconds else { return "n/a" }
+        return String(format: "%.2f", seconds)
+    }
+
     private func beginHotKeyRetryPollIfNeeded() {
         guard permissionPollTimer == nil else { return }
         permissionPollTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
@@ -1474,6 +1491,7 @@ final class AppCoordinator: ObservableObject {
             return false
         }
         recordingDestination = nil
+        routeAbortMessage = nil
         oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .clear)
         let languageSnapshot = Self.captureRecordingLanguageSnapshot(from: AppSettings.shared)
         recordingLanguageSnapshot = languageSnapshot.candidateLanguages
@@ -2031,6 +2049,26 @@ final class AppCoordinator: ObservableObject {
                     result: .failed("\(message): \(error.localizedDescription)")
                 )
             }
+        case .abortForRouteFailure(let message):
+            // The capture graph is not running and the restart budget is spent, so end the
+            // recording rather than leave a dead engine under a live-looking HUD — the failure
+            // reported on 2026-07-31.
+            //
+            // Finalized like a duration cap, NOT through `handleJournalConsumerFailure`: the
+            // journal writer is healthy here, so the normal stop drains whatever was captured
+            // before the route died and runs the usual silence/health classification. The
+            // journal-failure path would instead discard the writer's pending tail and mark
+            // recovery storage unavailable, which blocks every later recording over a fault that
+            // was never about storage.
+            //
+            // A terminal flash, not `.captureRouteRestart`'s restore-base one: restore-base puts
+            // the recording panel back after 2.5 s, so a journal drain slower than that would
+            // replace the error with a recording panel over a capture that has stopped.
+            lastError = message
+            routeAbortMessage = message
+            hud.flash("Recording stopped — \(message)")
+            recordingState = .idle
+            stopAndTranscribe()
         }
     }
 
@@ -2171,6 +2209,15 @@ final class AppCoordinator: ObservableObject {
         diagnostics.indicatesSilence ? .noSignal(route: diagnostics.routeFailure) : .ok
     }
 
+    /// A route abort ends in the silent-capture path — there is no audio to transcribe — but "no
+    /// speech was detected" is the wrong explanation when the microphone route died under the
+    /// recording. The route reason replaces it for the user-facing error; the recovery entry keeps
+    /// its own `.silent` wording, which is what the Library is keyed on.
+    nonisolated static func silentCaptureMessage(routeAbortMessage: String?) -> String {
+        guard let routeAbortMessage else { return SilentCapturePresentation.message }
+        return "\(routeAbortMessage) The recording was saved for recovery."
+    }
+
     /// Applies a completed capture's silence classification to `microphoneCaptureHealth` — shared
     /// by `stopAndTranscribe` (normal dictation) and `finishVoiceEditInstructionRecording` (Voice
     /// Edit) so a silent capture on either path updates the signal and refreshes
@@ -2246,7 +2293,11 @@ final class AppCoordinator: ObservableObject {
                         pendingStopRequest = nil
                         _ = destinationLifecycle.take()
                         recordingOutputSelection.resolveTerminal()
-                        lastError = SilentCapturePresentation.message
+                        let silentMessage = Self.silentCaptureMessage(
+                            routeAbortMessage: routeAbortMessage
+                        )
+                        routeAbortMessage = nil
+                        lastError = silentMessage
                         do {
                             try await jobLibraryStore?.refresh()
                         } catch {
@@ -2261,7 +2312,7 @@ final class AppCoordinator: ObservableObject {
                                 router: scratchpadRecordingRouter
                             ) {}
                         }
-                        hud.flash(SilentCapturePresentation.message)
+                        hud.flash(silentMessage)
                         recordingHUDDidReachTerminalState()
                         return
                     }
@@ -3868,7 +3919,29 @@ final class AppCoordinator: ObservableObject {
         localContext: LocalProcessingContext?,
         earlyInsertion: EarlyInsertionHandler?
     ) async throws -> DictationProcessingResult {
+        // docs/perf-dictation-latency-2026-07-29.md could not attribute 19–50 s of the measured
+        // stop→text wait because the pipeline records no stage duration anywhere. One notice per
+        // dictation closes that on whichever machine is slow, without changing any behaviour.
+        // Durations and the engine name only — never transcript text.
+        let stageStart = ContinuousClock.now
+        var transcribeSeconds: Double?
+        var refineSeconds: Double?
+        defer {
+            let audioSeconds = Double(samples.count) / Double(CaptureSegmentCodec.sampleRate)
+            Self.logger.notice(
+                """
+                stage timings: engine=\(engineName, privacy: .public) \
+                audio=\(Self.stageDurationText(audioSeconds), privacy: .public)s \
+                transcribe=\(Self.stageDurationText(transcribeSeconds), privacy: .public)s \
+                refine=\(Self.stageDurationText(refineSeconds), privacy: .public)s \
+                total=\(Self.stageDurationText(Self.elapsedSeconds(since: stageStart)), privacy: .public)s
+                """
+            )
+        }
+
+        let transcribeStart = ContinuousClock.now
         let transcription = try await engine.transcribe(samples: samples, forcedLanguage: context.transcriptionLanguage, candidateLanguages: context.candidateLanguages, vocabulary: context.vocabularySnapshot)
+        transcribeSeconds = Self.elapsedSeconds(since: transcribeStart)
         guard !transcription.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw PipelineError.emptyTranscript
         }
@@ -3898,6 +3971,8 @@ final class AppCoordinator: ObservableObject {
                     underlyingError: TranslationService.Error.unavailable(.invalidConfiguration)
                 )
             }
+            let translateStart = ContinuousClock.now
+            defer { refineSeconds = Self.elapsedSeconds(since: translateStart) }
             do {
                 refined = try await translator.process(
                     source: transcription.text,
@@ -3937,6 +4012,8 @@ final class AppCoordinator: ObservableObject {
                 Self.logger.notice("post-processing request: voice command policy enabled")
             }
             let (refinedText, fallback): (String, PostProcessingFallbackReason?)
+            let refineStart = ContinuousClock.now
+            defer { refineSeconds = Self.elapsedSeconds(since: refineStart) }
             do {
                 (refinedText, fallback) = try await applyPostProcessing(
                     transcript: transcription.text, voiceCommandPolicy: request.voiceCommandPolicy

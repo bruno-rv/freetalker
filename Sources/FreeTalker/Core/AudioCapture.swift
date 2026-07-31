@@ -1,6 +1,7 @@
 import AudioToolbox
 @preconcurrency import AVFoundation
 import Foundation
+import ObjCExceptionBridge
 import OSLog
 
 enum AudioCaptureFault: Equatable, Sendable {
@@ -25,6 +26,9 @@ struct MicrophoneSignalWatchdog: Sendable {
         case continueRecording
         case warnNoSignal
         case restartForRouteFailure(String)
+        /// The capture graph is not running and the restart budget is spent — stop the recording
+        /// with a visible error instead of leaving a live-looking HUD over a dead engine.
+        case abortForRouteFailure(String)
     }
 
     static let signalFloor: Float = 1e-7
@@ -61,6 +65,12 @@ struct MicrophoneSignalWatchdog: Sendable {
         sampleCount += samples.count
         rms = sampleCount == 0 ? 0 : Float((sumSquares / Double(sampleCount)).squareRoot())
         return decide(peak: localPeak, rms: samples.isEmpty ? 0 : Float((localSquares / Double(samples.count)).squareRoot()), fault: fault)
+    }
+
+    /// Records the failure text surfaced at stop time. The restart/abort verdict itself is
+    /// `AudioCapture.routeFaultAction`'s, not this type's — see `AudioCapture.deliver`.
+    mutating func recordRouteFailure(_ message: String) {
+        if routeFailure == nil { routeFailure = message }
     }
 
     mutating func observe(peak: Float, rms: Float, fault: AudioCaptureFault?) -> Decision {
@@ -175,6 +185,38 @@ final class AudioCapture: @unchecked Sendable {
         case abort
     }
 
+    enum ConverterCacheAction: Equatable {
+        case reuse
+        case rebuild
+    }
+
+    enum RouteFaultAction: Equatable {
+        case restart
+        case abort
+        case ignore
+    }
+
+    enum ConvertedBufferAction: Equatable {
+        case accept
+        case unusable
+    }
+
+    enum FaultKind: Equatable {
+        /// The graph reported it is no longer running (configuration change, conversion collapse).
+        case routeChange
+        /// The tap produced no usable audio by its deadline — see `armFirstBufferDeadline`.
+        case starvedTap
+    }
+
+    /// What a fault report should do, and the state it leaves behind. Returned as a whole so the
+    /// verdict, the restart budget and the duplicate latch are decided in one place — computing
+    /// them separately is how two faults for one attempt each managed to spend a restart.
+    struct FaultResolution: Equatable {
+        var decision: MicrophoneSignalWatchdog.Decision?
+        var restartsUsed: Int
+        var faultedGeneration: UUID?
+    }
+
     enum ConfiguredDeviceVerificationAction: Equatable {
         case accept
         case abortMismatch
@@ -190,6 +232,31 @@ final class AudioCapture: @unchecked Sendable {
     private let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false)!
     private var isCapturing = false
     private var conversionFailureCount = 0
+    /// Converter from the tap's *live* input format to `targetFormat`, built lazily from the first
+    /// buffer and rebuilt whenever the bus renegotiates mid-capture. Pinning a converter to a
+    /// format read before the graph settled is what broke capture — see `startCaptureAttempt`.
+    /// Both guarded by `samplesLock`.
+    private var tapConverter: AVAudioConverter?
+    private var tapConverterFormat: AVAudioFormat?
+    /// Tap callbacks delivered by the CURRENT attempt, counted before any conversion work so a
+    /// conversion failure is never mistaken for a tap that never fired. Reset per attempt;
+    /// `MicrophoneSignalWatchdog.observationCount` cannot serve here because it is capture-wide
+    /// and is also incremented by out-of-band fault reports. Guarded by `samplesLock`.
+    private var tapCallbackCount = 0
+    /// Whether the current attempt has converted any usable audio at all — the predicate the
+    /// first-usable-frame deadline is built on. Per attempt, not per capture: a replacement attempt
+    /// must be able to be found dead on its own. Guarded by `samplesLock`.
+    private var attemptConvertedAnything = false
+    /// Route faults already answered with a restart, for the whole capture. Guarded by `samplesLock`.
+    private var routeRestartCount = 0
+    /// The attempt a route-fault decision has already been emitted for. A configuration
+    /// notification and the first-buffer deadline can both fire for the same dead attempt;
+    /// without this each would charge the restart budget and enqueue its own decision, and the
+    /// second could land on the attempt that had already replaced the faulted one. Guarded by
+    /// `samplesLock`.
+    private var faultedGeneration: UUID?
+    /// Voice-processing state of the attempt in progress — see the `catch` in `start`.
+    private var attemptVoiceProcessing = false
     private var sampleConsumer: (@Sendable ([Float]) -> CaptureJournalWriter.EnqueueResult)?
     /// Optional live-tap fan-out (Streaming ASR): receives each converted buffer's samples
     /// alongside `sampleConsumer`, purely additively — `samples` accumulation and
@@ -261,6 +328,123 @@ final class AudioCapture: @unchecked Sendable {
         return usingReplacementEngine ? .abort : .replaceEngine
     }
 
+    /// How long after `engine.start()` an attempt that has produced no usable audio is treated as
+    /// starved rather than merely quiet. A heuristic tuned for a USB microphone's cold start, not a
+    /// documented guarantee — `armFirstBufferDeadline` logs when it fires so the value can be
+    /// revisited against real hardware.
+    static let firstBufferDeadline: TimeInterval = 2
+
+    /// Route faults answered with a restart before the capture is given up on.
+    static let maximumRouteRestarts = 2
+
+    static let noAudioDeliveredMessage = "The microphone delivered no audio."
+
+    static let unusableAudioMessage = "The microphone audio could not be processed."
+
+    /// An attempt that has produced no journalable audio by the deadline is dead, whatever the tap
+    /// did. `MicrophoneSignalWatchdog` cannot see this: it only ever observes buffers that arrive
+    /// AND convert, while AVAudioEngine can accept `installTap`, deliver nothing at all ("Failed to
+    /// create tap, config change pending!"), and still let `engine.start()` succeed — which is how
+    /// a whole dictation was recorded as zero frames with no error anywhere.
+    ///
+    /// The predicate is "nothing usable converted", not "no callback arrived": a single callback
+    /// that converts to nothing and is followed by silence would otherwise pass as a live capture
+    /// forever. `tapCallbackCount` only decides which failure the user is told about.
+    nonisolated static func starvedCaptureAction(
+        isCapturing: Bool,
+        convertedAnything: Bool,
+        restartsUsed: Int
+    ) -> RouteFaultAction {
+        guard isCapturing, !convertedAnything else { return .ignore }
+        return routeFaultAction(isCapturing: isCapturing, restartsUsed: restartsUsed)
+    }
+
+    /// Which starvation the user is told about: nothing arrived at all, or audio arrived and could
+    /// not be used.
+    nonisolated static func starvedCaptureMessage(tapCallbackCount: Int) -> String {
+        tapCallbackCount == 0 ? noAudioDeliveredMessage : unusableAudioMessage
+    }
+
+    /// Whether a converted buffer carries usable audio. Zero frames from a non-error conversion
+    /// counts as unusable input — see `consume`.
+    nonisolated static func convertedBufferAction(frameCount: Int) -> ConvertedBufferAction {
+        frameCount > 0 ? .accept : .unusable
+    }
+
+    /// One fault report resolved against the capture's current state. At most one decision is
+    /// produced per attempt (`generation`): a configuration notification and the first-usable-frame
+    /// deadline can both fire for the same dead attempt, and charging the restart budget twice
+    /// for one failure would burn it before the capture has really been retried.
+    nonisolated static func resolveFault(
+        kind: FaultKind,
+        message: String,
+        generation: UUID,
+        faultedGeneration: UUID?,
+        isCapturing: Bool,
+        convertedAnything: Bool,
+        restartsUsed: Int
+    ) -> FaultResolution {
+        let unchanged = FaultResolution(
+            decision: nil, restartsUsed: restartsUsed, faultedGeneration: faultedGeneration
+        )
+        guard faultedGeneration != generation else { return unchanged }
+        let action: RouteFaultAction
+        switch kind {
+        case .routeChange:
+            action = routeFaultAction(isCapturing: isCapturing, restartsUsed: restartsUsed)
+        case .starvedTap:
+            action = starvedCaptureAction(
+                isCapturing: isCapturing,
+                convertedAnything: convertedAnything,
+                restartsUsed: restartsUsed
+            )
+        }
+        switch action {
+        case .ignore:
+            return unchanged
+        case .restart:
+            return FaultResolution(
+                decision: .restartForRouteFailure(message),
+                restartsUsed: restartsUsed + 1,
+                faultedGeneration: generation
+            )
+        case .abort:
+            return FaultResolution(
+                decision: .abortForRouteFailure(message),
+                restartsUsed: restartsUsed,
+                faultedGeneration: generation
+            )
+        }
+    }
+
+    /// What to do about a fault that means the capture graph is no longer running: restart while
+    /// restarts remain, then give up visibly.
+    ///
+    /// Deliberately independent of whether signal was already observed. An
+    /// `AVAudioEngineConfigurationChange` is posted after the engine has been stopped and
+    /// uninitialized, so "we heard audio a moment ago" says nothing about whether audio is still
+    /// being captured — treating that as a reason to ignore the fault leaves a recording that
+    /// looks live and records nothing.
+    nonisolated static func routeFaultAction(
+        isCapturing: Bool,
+        restartsUsed: Int
+    ) -> RouteFaultAction {
+        guard isCapturing else { return .ignore }
+        return restartsUsed < maximumRouteRestarts ? .restart : .abort
+    }
+
+    /// Whether the cached tap converter still matches what the tap is delivering. The tap follows
+    /// the input bus's live format (`installTap(format: nil)`), and that format can change
+    /// mid-capture — a device switch or a voice-processing transition renegotiates the bus — so a
+    /// converter pinned to an earlier format would silently resample against the wrong input rate.
+    nonisolated static func converterCacheAction(
+        cachedFormat: AVAudioFormat?,
+        incomingFormat: AVAudioFormat
+    ) -> ConverterCacheAction {
+        guard let cachedFormat else { return .rebuild }
+        return cachedFormat == incomingFormat ? .reuse : .rebuild
+    }
+
     nonisolated static func configuredDeviceVerificationAction(
         expectedDeviceID: AudioDeviceID,
         effectiveDeviceID: AudioDeviceID?
@@ -289,6 +473,8 @@ final class AudioCapture: @unchecked Sendable {
         self.onSignalDecision = onSignalDecision
         self.liveSampleConsumer = liveSampleConsumer
         signalWatchdog = MicrophoneSignalWatchdog(captureID: captureID)
+        tapCallbackCount = 0
+        routeRestartCount = 0
         activeDeviceUID = deviceUID
         activeNoiseSuppression = noiseSuppression
         didReportConsumerFailure = false
@@ -309,8 +495,11 @@ final class AudioCapture: @unchecked Sendable {
             )
             installConfigurationObserver(captureID: captureID, generation: generation)
         } catch {
+            // The failed attempt's voice-processing state, not the current engine's: a graph that
+            // raised has already been discarded by `startCaptureAttempt`, and a fresh
+            // `AVAudioEngine` reports voice processing off, which would suppress the raw retry.
             guard Self.captureFailureAction(
-                effectiveVoiceProcessing: engine.inputNode.isVoiceProcessingEnabled
+                effectiveVoiceProcessing: attemptVoiceProcessing
             ) == .retryRaw else {
                 throw error
             }
@@ -375,6 +564,9 @@ final class AudioCapture: @unchecked Sendable {
             let attemptInput = try reconcileVoiceProcessing(requested: requestedVoiceProcessing)
             input = attemptInput
             let effectiveVoiceProcessing = attemptInput.isVoiceProcessingEnabled
+            // Remembered because the engine this attempt used may be discarded below: `start`'s
+            // fallback decision is about the attempt that failed, not about its replacement.
+            attemptVoiceProcessing = effectiveVoiceProcessing
 
             switch Self.deviceApplicationPolicy(effectiveVoiceProcessing: effectiveVoiceProcessing) {
             case .systemManaged:
@@ -383,26 +575,59 @@ final class AudioCapture: @unchecked Sendable {
                 try applyConfiguredInputDevice(uid: deviceUID, to: attemptInput)
             }
 
-            let inputFormat = attemptInput.outputFormat(forBus: 0)
-            Self.logger.info("Negotiated input format: \(inputFormat.description, privacy: .public)")
-            guard let negotiatedConverter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
-                throw CaptureError.converterUnavailable(inputFormat.description)
+            // `format: nil` — the tap follows the input bus's live format instead of one read
+            // here. A non-nil format is a request to APPLY that format to the tapped bus, and
+            // applying the configured device above (or the voice-processing transition before it)
+            // renegotiates the bus asynchronously, so a format read here can be forced onto a
+            // graph that has already moved. Observed on a 16 kHz USB mic: 48 kHz forced, 16 kHz
+            // hardware input scope, and AVAudioEngine then either installs nothing at all
+            // ("Failed to create tap, config change pending!" — capture runs to completion with
+            // zero frames, which is what left recovery jobs stuck at `preparing` with progress 0)
+            // or raises an NSException ("Failed to create tap due to format mismatch"), after
+            // which the process crashed at an unrelated MainActor isolation check. See
+            // docs/dictation-zero-audio-crash-2026-07-31.md.
+            samplesLock.withLock {
+                tapConverter = nil
+                tapConverterFormat = nil
+                tapCallbackCount = 0
+                attemptConvertedAnything = false
             }
-            attemptInput.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
-                self?.consume(
-                    buffer: buffer, inputFormat: inputFormat,
-                    converter: negotiatedConverter, generation: generation
+            // Contained in Objective-C: Swift cannot catch the NSException this raises, and an
+            // uncaught one unwinding out of here is what preceded the crash.
+            var tapException: NSError?
+            let installed = FTInstallTapCatchingException(
+                attemptInput, 0, 4096, nil,
+                { [weak self] buffer, _ in self?.consume(buffer: buffer, generation: generation) },
+                &tapException
+            )
+            guard installed else {
+                throw CaptureError.graphExceptionRaised(
+                    tapException?.localizedDescription ?? "the audio graph rejected the microphone tap"
                 )
             }
+            Self.logger.info(
+                "Installed tap; bus format: \(attemptInput.outputFormat(forBus: 0).description, privacy: .public)"
+            )
             tapInstalled = true
             engine.prepare()
             try engine.start()
+            armFirstBufferDeadline(generation: generation)
             return generation
         } catch {
-            if tapInstalled {
-                input?.removeTap(onBus: 0)
+            // A graph that raised is in an unknown state: it gets discarded WITHOUT another call
+            // on it — not even `stop()`/`removeTap` — and the next attempt starts from a fresh
+            // engine. Every other failure unwinds normally and is cleaned up in place.
+            if let captureError = error as? CaptureError, case .graphExceptionRaised = captureError {
+                engine = AVAudioEngine()
+                Self.logger.error(
+                    "Audio graph raised an exception; discarded the engine: \(error.localizedDescription, privacy: .public)"
+                )
+            } else {
+                if tapInstalled {
+                    input?.removeTap(onBus: 0)
+                }
+                engine.stop()
             }
-            engine.stop()
             generationGate.deactivateAndWait()
             samplesLock.withLock { isCapturing = false }
             throw error
@@ -470,6 +695,29 @@ final class AudioCapture: @unchecked Sendable {
         }
     }
 
+    /// Escalates an attempt that produced no usable audio — see `starvedCaptureAction`. Reported through
+    /// the same path as a configuration change, so it shares the capture-wide restart budget and
+    /// ends in `.abortForRouteFailure` once that budget is spent.
+    private func armFirstBufferDeadline(generation: UUID) {
+        guard let captureID = samplesLock.withLock({ signalWatchdog.captureID }) else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.firstBufferDeadline) { [weak self] in
+            guard let self else { return }
+            let message = Self.starvedCaptureMessage(
+                tapCallbackCount: self.samplesLock.withLock { self.tapCallbackCount }
+            )
+            let escalated = self.emitFault(
+                .engine(captureID: captureID, message: message),
+                kind: .starvedTap,
+                generation: generation
+            )
+            if escalated {
+                Self.logger.error(
+                    "No usable audio within \(Self.firstBufferDeadline, privacy: .public)s of engine start: \(message, privacy: .public)"
+                )
+            }
+        }
+    }
+
     private func installConfigurationObserver(captureID: UUID?, generation: UUID) {
         removeConfigurationObserver()
         guard let captureID else { return }
@@ -502,13 +750,48 @@ final class AudioCapture: @unchecked Sendable {
     }
 
     private func reportFault(_ fault: AudioCaptureFault, generation: UUID) {
-        guard generationGate.isCurrent(generation) else { return }
-        let payload = samplesLock.withLock { () -> ((@Sendable (MicrophoneSignalWatchdog.Decision) -> Void)?, MicrophoneSignalWatchdog.Decision)? in
-            guard isCapturing, generationGate.isCurrent(generation) else { return nil }
-            let decision = signalWatchdog.observe(peak: 0, rms: 0, fault: fault)
+        emitFault(fault, kind: .routeChange, generation: generation)
+    }
+
+    /// Turns a fault into the decision the coordinator acts on, recording the failure text on the
+    /// watchdog for the stop-time diagnostics either way. The verdict comes from
+    /// `routeFaultAction`/`starvedCaptureAction`, not from `MicrophoneSignalWatchdog.observe`,
+    /// because the watchdog answers "is this capture silent?" while this answers "is this capture
+    /// still running?" — and a capture that has already heard signal can still have had its
+    /// engine stopped.
+    ///
+    /// Verdict, budget and latch are decided under one lock: computing the action separately from
+    /// charging the budget lets two faults for the same attempt each spend a restart.
+    ///
+    /// Returns whether a decision was emitted.
+    @discardableResult
+    private func emitFault(
+        _ fault: AudioCaptureFault, kind: FaultKind, generation: UUID
+    ) -> Bool {
+        guard generationGate.isCurrent(generation) else { return false }
+        let payload = samplesLock.withLock {
+            () -> ((@Sendable (MicrophoneSignalWatchdog.Decision) -> Void)?, MicrophoneSignalWatchdog.Decision)? in
+            guard isCapturing, generationGate.isCurrent(generation),
+                  signalWatchdog.captureID == nil || fault.captureID == signalWatchdog.captureID
+            else { return nil }
+            let resolution = Self.resolveFault(
+                kind: kind,
+                message: fault.message,
+                generation: generation,
+                faultedGeneration: faultedGeneration,
+                isCapturing: isCapturing,
+                convertedAnything: attemptConvertedAnything,
+                restartsUsed: routeRestartCount
+            )
+            routeRestartCount = resolution.restartsUsed
+            faultedGeneration = resolution.faultedGeneration
+            guard let decision = resolution.decision else { return nil }
+            signalWatchdog.recordRouteFailure(fault.message)
             return (onSignalDecision, decision)
         }
-        if let payload { payload.0?(payload.1) }
+        guard let payload else { return false }
+        payload.0?(payload.1)
+        return true
     }
 
     private func reconcileVoiceProcessing(requested: Bool) throws -> AVAudioInputNode {
@@ -690,14 +973,44 @@ final class AudioCapture: @unchecked Sendable {
         return deviceID
     }
 
-    private func consume(
-        buffer: AVAudioPCMBuffer,
-        inputFormat: AVAudioFormat,
-        converter: AVAudioConverter,
-        generation: UUID
-    ) {
+    /// Converter for the format the tap is actually delivering, cached across buffers and rebuilt
+    /// when the bus renegotiates. Returns nil only when CoreAudio cannot convert that format at
+    /// all, which `consume` treats as a conversion failure.
+    private func converter(for inputFormat: AVAudioFormat) -> AVAudioConverter? {
+        samplesLock.withLock {
+            if let tapConverter, Self.converterCacheAction(
+                cachedFormat: tapConverterFormat, incomingFormat: inputFormat
+            ) == .reuse {
+                return tapConverter
+            }
+            guard let converter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
+                return nil
+            }
+            tapConverter = converter
+            tapConverterFormat = inputFormat
+            return converter
+        }
+    }
+
+    private func consume(buffer: AVAudioPCMBuffer, generation: UUID) {
         guard generationGate.begin(generation) else { return }
         defer { generationGate.finish(generation) }
+        // Counted here, before any conversion work: the tap fired, which is what the first-buffer
+        // deadline asks about. A conversion failure is a different fault and must not read as
+        // "the tap never fired".
+        samplesLock.withLock { tapCallbackCount += 1 }
+        // The buffer's own format is authoritative — see `installTap(format: nil)` above.
+        let inputFormat = buffer.format
+        let inputSeconds = inputFormat.sampleRate > 0
+            ? Double(buffer.frameLength) / inputFormat.sampleRate
+            : 0
+        guard let converter = converter(for: inputFormat) else {
+            Self.logger.error(
+                "No converter available for tap format \(inputFormat.description, privacy: .public)"
+            )
+            recordConversionFailure(generation: generation)
+            return
+        }
         let ratio = targetFormat.sampleRate / inputFormat.sampleRate
         let outCapacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 16
         guard let outBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outCapacity) else {
@@ -728,12 +1041,21 @@ final class AudioCapture: @unchecked Sendable {
             return
         }
         let frameCount = Int(outBuffer.frameLength)
+        // A conversion that did not error can still produce nothing — `.inputRanDry` returns as
+        // much as could be converted, which may be zero frames. That is unusable input, not a
+        // healthy attempt: counting it as healthy would satisfy both deadlines while the journal
+        // stays empty, which is the failure they exist to catch.
+        guard Self.convertedBufferAction(frameCount: frameCount) == .accept else {
+            recordConversionFailure(generation: generation)
+            return
+        }
         let convertedSamples = Array(
             UnsafeBufferPointer(start: channelData[0], count: frameCount)
         )
         guard generationGate.isCurrent(generation) else { return }
         samplesLock.lock()
         samples.append(contentsOf: convertedSamples)
+        attemptConvertedAnything = true
         let consumer = sampleConsumer
         let liveConsumer = liveSampleConsumer
         let failureHandler = onConsumerFailure
@@ -763,24 +1085,26 @@ final class AudioCapture: @unchecked Sendable {
         liveConsumer?(convertedSamples)
     }
 
+    /// Buffers that arrive and cannot be used are not escalated from here. The
+    /// first-usable-frame deadline already covers it: its predicate is "this attempt has converted
+    /// nothing", so an attempt whose callbacks all fail to convert is found dead by wall clock,
+    /// which is strictly earlier than any per-buffer accounting could be.
     private func recordConversionFailure(generation: UUID) {
         guard generationGate.isCurrent(generation) else { return }
-        samplesLock.lock()
-        conversionFailureCount += 1
-        samplesLock.unlock()
+        samplesLock.withLock { conversionFailureCount += 1 }
     }
 }
 
 private enum CaptureError: LocalizedError {
-    case converterUnavailable(String)
+    case graphExceptionRaised(String)
     case rawFallbackUnavailable(String)
     case configuredDeviceUnavailable(String)
     case engineStartFailed(String)
 
     var errorDescription: String? {
         switch self {
-        case let .converterUnavailable(format):
-            "Could not convert microphone format \(format) to 16 kHz mono audio"
+        case let .graphExceptionRaised(reason):
+            "The audio system rejected the microphone tap: \(reason)"
         case let .rawFallbackUnavailable(reason):
             "Could not establish raw microphone capture after voice-processing failure: \(reason)"
         case let .configuredDeviceUnavailable(reason):
