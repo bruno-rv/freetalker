@@ -12,6 +12,28 @@ struct AudioCaptureDecisionTests {
         )!
     }
 
+    /// A tap that is accepted but never fires delivers no observations at all, so the watchdog's
+    /// silent-buffer warning can never trigger — the zero-frame dictation in
+    /// docs/dictation-zero-audio-crash-2026-07-31.md went unreported for exactly that reason.
+    @Test func captureWithoutASingleTapCallbackIsEscalated() {
+        #expect(
+            AudioCapture.starvedCaptureAction(isCapturing: true, observationCount: 0) == .escalate
+        )
+    }
+
+    @Test func captureDeliveringBuffersIsNotEscalated() {
+        #expect(
+            AudioCapture.starvedCaptureAction(isCapturing: true, observationCount: 1) == .ignore
+        )
+    }
+
+    /// The deadline fires after the recording already stopped — nothing to escalate.
+    @Test func finishedCaptureIsNotEscalated() {
+        #expect(
+            AudioCapture.starvedCaptureAction(isCapturing: false, observationCount: 0) == .ignore
+        )
+    }
+
     @Test func firstTapBufferBuildsAConverter() {
         #expect(
             AudioCapture.converterCacheAction(

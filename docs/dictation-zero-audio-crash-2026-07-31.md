@@ -50,8 +50,8 @@ Every `recovery` job in `jobs.db` since 07-30 18:57 has the identical
 
 ## Root cause
 
-`AudioCapture.startCaptureAttempt` (`Sources/FreeTalker/Core/AudioCapture.swift:386`)
-reads the input format once and passes it to `installTap`:
+`AudioCapture.startCaptureAttempt` (`Sources/FreeTalker/Core/AudioCapture.swift:386`
+at `a8446a8`) read the input format once and passed it to `installTap`:
 
 ```swift
 let inputFormat = attemptInput.outputFormat(forBus: 0)
@@ -59,9 +59,14 @@ let inputFormat = attemptInput.outputFormat(forBus: 0)
 attemptInput.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { ... }
 ```
 
-With voice processing enabled, the VPIO unit renegotiates the input bus to 16 kHz
-asynchronously. `outputFormat(forBus:)` still reports the pre-negotiation
-48 kHz, so the format handed to `installTap` does not match the hardware format:
+A non-nil tap format is a request to *apply* that format to the tapped output bus.
+The app therefore forces a client format while the graph is still reconfiguring —
+`setVoiceProcessingEnabled` and the `kAudioOutputUnitProperty_CurrentDevice` switch
+both renegotiate it asynchronously — and the forced 48 kHz value is rejected
+against the 16 kHz hardware input scope. (Which component picked 16 kHz, the
+webcam's active mode or VPIO policy, is not established from these logs; VPIO is
+allowed to expose differing hardware-input and client-output formats, so the two
+scopes disagreeing is not by itself proof of a stale read.) Consequences:
 
 1. **First call → silent no-op.** AVAudioEngine logs `Failed to create tap, config
    change pending!` and installs nothing. `engine.start()` then succeeds, so the app
@@ -73,20 +78,48 @@ asynchronously. `outputFormat(forBus:)` still reports the pre-negotiation
    `NSInternalInconsistencyException` ("Failed to create tap due to format
    mismatch"). AppKit catches it at the run-loop boundary and the process keeps
    running.
-3. **The exception unwinds Swift frames without running their cleanup.** The main
-   thread's `ExecutorTrackingInfo` (stack-allocated, pushed/popped by the MainActor
-   executor around each job) is left dangling in thread-local storage. From that
-   moment every MainActor isolation check calls
-   `swift_task_isCurrentExecutorWithFlags`, which dereferences the stale record's
-   active executor and does `objc_msgSend` on freed stack memory → `SIGSEGV` at an
-   arbitrary later moment (a SwiftUI timer tick, a view body, a `mouseEntered`).
-   **This is symptom 2**, and it explains 07-30's findings verbatim: `swift_task_getCurrent()`
-   null at launch, non-null after the first key press, crash sites unrelated to each other.
+3. **The process continues after a foreign exception unwound Swift frames.**
+   `swift_task_isCurrentExecutorWithFlags` then reaches
+   `SerialExecutorRef::isMainExecutor()` with an executor pointer that is not a valid
+   object, and `objc_msgSend`es a low address → `SIGSEGV` at an arbitrary later moment
+   (a SwiftUI timer tick, a view body, a `mouseEntered`). **This is symptom 2.**
+
+   *Confidence:* steps 1 and 2 are proven by the logs and the code. Step 3's exact
+   mechanism is **not proven** — the specific claim that a stack-allocated
+   `ExecutorTrackingInfo` is stranded in thread-local storage is the best-fitting
+   hypothesis, not a measurement (Objective-C exceptions do participate in native
+   unwinding, so "no cleanup ran" cannot be assumed). Adjacent current-task TLS, or
+   unrelated memory corrupted during the unwind, fit the same stack. What is
+   established: the crash is not an ordinary isolation violation (that traps, it does
+   not `objc_msgSend` through an invalid pointer), and it starts only after the
+   exception. Proving the exact record requires breaking on `objc_exception_throw`,
+   sampling `swift_task_getCurrent()` and the executor-tracking TLS pointer before the
+   throw and again inside `-[NSApplication reportException:]`, and showing the retained
+   pointer is the invalid executor used later. 07-30's "null at launch, non-null after
+   the first key press" is suggestive but not sufficient: a non-null current task while
+   a MainActor task runs is normal.
 
 The event-tap callback's `MainActor.assumeIsolated`
-(`Sources/FreeTalker/Core/HotKeyManager.swift:249`) is where the corrupted TLS was
-first observed, not where it is created; it is a read site like every other
-isolation check.
+(`Sources/FreeTalker/Core/HotKeyManager.swift:249`) is a read site, not the cause. It
+performs an isolation check without establishing a task or pushing an executor-tracking
+context, and it returns before capture starts — the tap callback only enqueues
+`Task { @MainActor … }`, so the AVFoundation exception cannot unwind through its frame.
+
+## The fix
+
+| Change | Why |
+|---|---|
+| `installTap(format: nil)`, converter built from each buffer's own format and rebuilt when the bus renegotiates | Stops forcing a client format onto a reconfiguring graph — the exception and the silent no-op both disappear |
+| `FTRunCatchingObjCException` around `installTap`, engine discarded and recreated on catch | Any future raise is contained in Objective-C frames instead of unwinding through Swift; a graph that raised is never reused |
+| First-buffer deadline (`starvedCaptureAction`, 2 s) | `MicrophoneSignalWatchdog` only ever observes buffers that *arrive*, so "the tap never fired" was invisible to it — distinct diagnosis from "buffers arrived containing silence" |
+| Per-dictation stage timings | The only way to attribute the latency on the other Mac (see below) |
+| Makefile resolves `.codesign-identity` from the git common dir | Stops worktree builds silently ad-hoc signing and orphaning TCC grants |
+
+Reviewed by Codex over two rounds; its round-1 verdict `REVISE` is what downgraded
+the step-3 claim above from mechanism to hypothesis, rejected a proposed
+`inputFormat` vs `outputFormat` equality gate (legitimately different under VPIO, and
+it would have forced raw-capture fallback and silently disabled noise suppression),
+and asked for the containment shim.
 
 ## Symptom 3 — "slow even for small dictations" on another Mac
 

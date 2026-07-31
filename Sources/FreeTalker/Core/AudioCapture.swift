@@ -1,6 +1,7 @@
 import AudioToolbox
 @preconcurrency import AVFoundation
 import Foundation
+import ObjCExceptionBridge
 import OSLog
 
 enum AudioCaptureFault: Equatable, Sendable {
@@ -180,6 +181,11 @@ final class AudioCapture: @unchecked Sendable {
         case rebuild
     }
 
+    enum StarvedCaptureAction: Equatable {
+        case escalate
+        case ignore
+    }
+
     enum ConfiguredDeviceVerificationAction: Equatable {
         case accept
         case abortMismatch
@@ -270,6 +276,25 @@ final class AudioCapture: @unchecked Sendable {
     ) -> RawCapturePostconditionAction {
         guard effectiveVoiceProcessing else { return .accept }
         return usingReplacementEngine ? .abort : .replaceEngine
+    }
+
+    /// How long after `engine.start()` a capture that has received no tap callback at all is
+    /// treated as starved rather than merely quiet.
+    static let firstBufferDeadline: TimeInterval = 2
+
+    static let noAudioDeliveredMessage = "The microphone delivered no audio."
+
+    /// A tap that never fires is invisible to `MicrophoneSignalWatchdog`, which only ever observes
+    /// buffers that actually arrive: AVAudioEngine can accept `installTap` and still deliver
+    /// nothing ("Failed to create tap, config change pending!"), and `engine.start()` succeeds
+    /// either way — which is how a whole dictation was recorded as zero frames with no error
+    /// anywhere. Zero callbacks is a different failure from zero amplitude and needs its own
+    /// deadline.
+    nonisolated static func starvedCaptureAction(
+        isCapturing: Bool,
+        observationCount: Int
+    ) -> StarvedCaptureAction {
+        isCapturing && observationCount == 0 ? .escalate : .ignore
     }
 
     /// Whether the cached tap converter still matches what the tap is delivering. The tap follows
@@ -422,8 +447,20 @@ final class AudioCapture: @unchecked Sendable {
                 tapConverter = nil
                 tapConverterFormat = nil
             }
-            attemptInput.installTap(onBus: 0, bufferSize: 4096, format: nil) { [weak self] buffer, _ in
-                self?.consume(buffer: buffer, generation: generation)
+            // `installTap` is a void API that raises an NSException rather than returning an
+            // error. Swift cannot catch that, and letting it unwind through these frames is what
+            // corrupted the process before — so it is contained in Objective-C and surfaced as a
+            // Swift error, which the `catch` below turns into a discarded engine.
+            var tapException: NSError?
+            let installed = FTRunCatchingObjCException({
+                attemptInput.installTap(onBus: 0, bufferSize: 4096, format: nil) { [weak self] buffer, _ in
+                    self?.consume(buffer: buffer, generation: generation)
+                }
+            }, &tapException)
+            guard installed else {
+                throw CaptureError.graphExceptionRaised(
+                    tapException?.localizedDescription ?? "the audio graph rejected the microphone tap"
+                )
             }
             Self.logger.info(
                 "Installed tap; bus format: \(attemptInput.outputFormat(forBus: 0).description, privacy: .public)"
@@ -431,12 +468,21 @@ final class AudioCapture: @unchecked Sendable {
             tapInstalled = true
             engine.prepare()
             try engine.start()
+            armFirstBufferDeadline(generation: generation)
             return generation
         } catch {
             if tapInstalled {
                 input?.removeTap(onBus: 0)
             }
             engine.stop()
+            // A raised graph exception leaves the engine in an unknown state — the next attempt
+            // gets a fresh one rather than resuming a half-configured graph.
+            if let captureError = error as? CaptureError, case .graphExceptionRaised = captureError {
+                engine = AVAudioEngine()
+                Self.logger.error(
+                    "Audio graph raised an exception; recreated the engine: \(error.localizedDescription, privacy: .public)"
+                )
+            }
             generationGate.deactivateAndWait()
             samplesLock.withLock { isCapturing = false }
             throw error
@@ -500,6 +546,31 @@ final class AudioCapture: @unchecked Sendable {
             (
                 signalWatchdog.peak, signalWatchdog.rms,
                 signalWatchdog.hasObservedSignal, signalWatchdog.routeFailure
+            )
+        }
+    }
+
+    /// Escalates a capture whose tap never fired — see `starvedCaptureAction`. Reported through
+    /// the same route-fault path as a configuration change, so it inherits the existing
+    /// single restart and, if that restart is starved too, the terminal error the stop path
+    /// already raises for a capture with a recorded route failure.
+    private func armFirstBufferDeadline(generation: UUID) {
+        guard let captureID = samplesLock.withLock({ signalWatchdog.captureID }) else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.firstBufferDeadline) { [weak self] in
+            guard let self, self.generationGate.isCurrent(generation) else { return }
+            let action = self.samplesLock.withLock {
+                Self.starvedCaptureAction(
+                    isCapturing: self.isCapturing,
+                    observationCount: self.signalWatchdog.observationCount
+                )
+            }
+            guard action == .escalate else { return }
+            Self.logger.error(
+                "No audio buffers arrived within \(Self.firstBufferDeadline, privacy: .public)s of engine start"
+            )
+            self.reportFault(
+                .engine(captureID: captureID, message: Self.noAudioDeliveredMessage),
+                generation: generation
             )
         }
     }
@@ -829,15 +900,15 @@ final class AudioCapture: @unchecked Sendable {
 }
 
 private enum CaptureError: LocalizedError {
-    case converterUnavailable(String)
+    case graphExceptionRaised(String)
     case rawFallbackUnavailable(String)
     case configuredDeviceUnavailable(String)
     case engineStartFailed(String)
 
     var errorDescription: String? {
         switch self {
-        case let .converterUnavailable(format):
-            "Could not convert microphone format \(format) to 16 kHz mono audio"
+        case let .graphExceptionRaised(reason):
+            "The audio system rejected the microphone tap: \(reason)"
         case let .rawFallbackUnavailable(reason):
             "Could not establish raw microphone capture after voice-processing failure: \(reason)"
         case let .configuredDeviceUnavailable(reason):
