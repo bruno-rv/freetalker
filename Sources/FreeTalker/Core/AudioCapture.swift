@@ -196,6 +196,16 @@ final class AudioCapture: @unchecked Sendable {
         case ignore
     }
 
+    enum ConvertedBufferAction: Equatable {
+        case accept
+        case unusable
+    }
+
+    enum UnusableAudioAction: Equatable {
+        case escalate
+        case ignore
+    }
+
     enum FaultKind: Equatable {
         /// The graph reported it is no longer running (configuration change, conversion collapse).
         case routeChange
@@ -358,6 +368,25 @@ final class AudioCapture: @unchecked Sendable {
     ) -> RouteFaultAction {
         guard isCapturing, tapCallbackCount == 0 else { return .ignore }
         return routeFaultAction(isCapturing: isCapturing, restartsUsed: restartsUsed)
+    }
+
+    /// Whether a converted buffer carries usable audio. Zero frames from a non-error conversion
+    /// counts as unusable input — see `consume`.
+    nonisolated static func convertedBufferAction(frameCount: Int) -> ConvertedBufferAction {
+        frameCount > 0 ? .accept : .unusable
+    }
+
+    /// Whether an attempt that has converted nothing has now accumulated enough unusable input to
+    /// be given up on. Fires at most once per attempt; `alreadyEscalated` is what makes it once.
+    nonisolated static func unusableAudioAction(
+        convertedAnything: Bool,
+        alreadyEscalated: Bool,
+        unusableSeconds: TimeInterval
+    ) -> UnusableAudioAction {
+        guard !convertedAnything, !alreadyEscalated,
+              unusableSeconds >= unusableAudioDeadline
+        else { return .ignore }
+        return .escalate
     }
 
     /// One fault report resolved against the capture's current state. At most one decision is
@@ -1029,6 +1058,14 @@ final class AudioCapture: @unchecked Sendable {
             return
         }
         let frameCount = Int(outBuffer.frameLength)
+        // A conversion that did not error can still produce nothing — `.inputRanDry` returns as
+        // much as could be converted, which may be zero frames. That is unusable input, not a
+        // healthy attempt: counting it as healthy would satisfy both deadlines while the journal
+        // stays empty, which is the failure they exist to catch.
+        guard Self.convertedBufferAction(frameCount: frameCount) == .accept else {
+            recordConversionFailure(generation: generation, inputSeconds: inputSeconds)
+            return
+        }
         let convertedSamples = Array(
             UnsafeBufferPointer(start: channelData[0], count: frameCount)
         )
@@ -1074,9 +1111,11 @@ final class AudioCapture: @unchecked Sendable {
         let escalation = samplesLock.withLock { () -> UUID? in
             conversionFailureCount += 1
             attemptUnusableSeconds += inputSeconds
-            guard !attemptConvertedAnything, !attemptUnusableEscalated,
-                  attemptUnusableSeconds >= Self.unusableAudioDeadline
-            else { return nil }
+            guard Self.unusableAudioAction(
+                convertedAnything: attemptConvertedAnything,
+                alreadyEscalated: attemptUnusableEscalated,
+                unusableSeconds: attemptUnusableSeconds
+            ) == .escalate else { return nil }
             attemptUnusableEscalated = true
             return signalWatchdog.captureID
         }

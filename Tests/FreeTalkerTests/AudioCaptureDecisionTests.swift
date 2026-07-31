@@ -128,6 +128,59 @@ struct AudioCaptureDecisionTests {
         #expect(restartsUsed == AudioCapture.maximumRouteRestarts)
     }
 
+    /// A conversion that returns no frames without erroring (`.inputRanDry`) is unusable input, not
+    /// a healthy attempt. Treating it as healthy satisfied both the first-buffer deadline (the tap
+    /// did fire) and the unusable-audio deadline (something "converted"), leaving a capture that
+    /// journals nothing under a live HUD.
+    @Test func aZeroFrameConversionIsUnusable() {
+        #expect(AudioCapture.convertedBufferAction(frameCount: 0) == .unusable)
+        #expect(AudioCapture.convertedBufferAction(frameCount: 1) == .accept)
+    }
+
+    /// Repeated zero-frame conversions must advance the per-attempt deadline to an escalation, and
+    /// escalate exactly once.
+    @Test func repeatedUnusableBuffersEscalateOnce() {
+        let bufferSeconds = 4096.0 / 48_000
+        var unusableSeconds: TimeInterval = 0
+        var escalated = false
+        var escalations = 0
+        for _ in 0..<Int((AudioCapture.unusableAudioDeadline / bufferSeconds).rounded(.up) + 5) {
+            unusableSeconds += bufferSeconds
+            if AudioCapture.unusableAudioAction(
+                convertedAnything: false,
+                alreadyEscalated: escalated,
+                unusableSeconds: unusableSeconds
+            ) == .escalate {
+                escalations += 1
+                escalated = true
+            }
+        }
+        #expect(escalations == 1)
+        #expect(unusableSeconds >= AudioCapture.unusableAudioDeadline)
+    }
+
+    /// An attempt that converted real audio earlier is not escalated by later failures — that is a
+    /// degraded capture, not a dead one, and it still has audio worth keeping.
+    @Test func failuresAfterUsableAudioAreNotEscalated() {
+        #expect(
+            AudioCapture.unusableAudioAction(
+                convertedAnything: true,
+                alreadyEscalated: false,
+                unusableSeconds: AudioCapture.unusableAudioDeadline * 10
+            ) == .ignore
+        )
+    }
+
+    @Test func briefUnusableAudioIsToleratedBeforeTheDeadline() {
+        #expect(
+            AudioCapture.unusableAudioAction(
+                convertedAnything: false,
+                alreadyEscalated: false,
+                unusableSeconds: AudioCapture.unusableAudioDeadline / 2
+            ) == .ignore
+        )
+    }
+
     /// An attempt that is delivering buffers is not starved, whatever the budget says.
     @Test func aLiveAttemptIsNeverFaulted() {
         let resolution = AudioCapture.resolveFault(
