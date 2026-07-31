@@ -117,6 +117,56 @@ context, and it returns before capture starts — the tap callback only enqueues
 | Per-dictation stage timings | The only way to attribute the latency on the other Mac (see below) |
 | Makefile resolves `.codesign-identity` from the git common dir | Stops worktree builds silently ad-hoc signing and orphaning TCC grants |
 
+## The half the first fix missed — device pinning (19:00, same day)
+
+The changes above stopped the crash but dictation still failed, now loudly:
+
+```
+Installed tap; bus format: <1 ch, 48000 Hz, Float32>
+Error, formats don't match! Input HW format: <1 ch, 16000 Hz>, tap format: <1 ch, 48000 Hz>
+Engine@0x1064f2dd0: could not initialize, error = -10868
+```
+
+`format: nil` does not read the hardware — it adopts the input node's **client** format, and
+that value is a 48 kHz default rather than a reading of any device. Measured directly
+(`AVAudioEngine` + `AudioUnitSetProperty`, C615 as the system default input at 16 kHz):
+
+| Step | hardware scope | client scope | `engine.start()` |
+|---|---|---|---|
+| Fresh engine, no device pinned | 48 kHz | 48 kHz | OK — buffers at 48 kHz |
+| After `kAudioOutputUnitProperty_CurrentDevice` = 86 | **16 kHz** | 48 kHz | **fails, -10868**, zero callbacks |
+| …then 0.5 s to settle | 16 kHz | 48 kHz | still fails |
+| …then client scope set to the hardware format | 16 kHz | 16 kHz | OK — buffers at 16 kHz |
+
+So pinning a device moves only the hardware scope. The input node converts nothing of its own,
+so a 16 kHz microphone under a 48 kHz client scope cannot initialize
+(`kAudioUnitErr_FormatNotSupported`). Any configured microphone not running at 48 kHz failed this
+way, every attempt, and row 1 explains why the same mic worked before the app pinned devices.
+
+Fixed by `alignClientFormatWithHardware`: after the device is pinned and verified, the input
+unit's output scope (AUHAL element 1) is set to the hardware format. It runs only with voice
+processing off, where the scopes must agree — a voice-processing graph converts internally and is
+expected to differ, which is why the same alignment must never be applied there.
+
+Two smaller things came with it: a failed attempt's engine is now always discarded (a graph keeps
+the scope formats its failed initialization left behind, which is how one bad start made five
+consecutive presses fail identically until relaunch), and the tap-install log reports both scopes
+instead of only the client one — logging half of a mismatch is what let a graph that could never
+initialize read as a successful tap install.
+
+**Verified on the hardware**, F13 driven through System Events on build `de85001`:
+
+```
+Aligned client format to hardware: 48000.000000 Hz -> 16000.000000 Hz
+Installed tap; hardware format: <1 ch, 16000 Hz>; client format: <1 ch, 16000 Hz>
+capture stopped: samples=303104 peak=0.312653 rms=0.027841
+Capture stopped with 0 conversion failures
+stage timings: engine=WhisperKit audio=18.94s transcribe=38.76s refine=0.55s total=39.32s
+```
+
+18.94 s of real audio captured, transcribed and post-processed, no `-10868`, no starvation abort,
+no crash report. One configuration change arrived mid-start and the bounded restart absorbed it.
+
 ### Known-remaining, deliberately out of scope
 
 Both predate this branch and neither is on the reported failure's path:
@@ -162,6 +212,13 @@ log show --predicate 'subsystem == "org.freetalker.app" AND category == "capture
   --last 1h --info | grep 'stage timings'
 stage timings: engine=WhisperKit audio=12.40s transcribe=2.61s refine=1.88s total=4.52s
 ```
+
+First local measurement, from the verification run above: `audio=18.94s transcribe=38.76s
+refine=0.55s` — RTF **2.05**, ten times worse than the 0.20 measured on 07-29, with
+post-processing contributing 0.55 s. That was the first transcription after a relaunch, so it
+carries model load plus ANE compilation; a second dictation on the same launch separates that
+one-off from steady state. It does establish that the cloud LLM is not what makes a small
+dictation slow here — `transcribe` is 98% of the wall clock.
 
 `audio` is the recording's length, so `transcribe`/`audio` is the effective RTF on that
 machine, and `total − transcribe − refine` is what remains unaccounted for. That
