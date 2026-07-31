@@ -137,8 +137,19 @@ that existing logs cannot attribute at all** because no stage duration is record
 anywhere. On a fresh install the first run additionally pays WhisperKit model
 download plus per-model ANE compilation.
 
-Closing this needs per-stage timings captured *on the affected machine*, which the
-app does not currently emit.
+Closing this needs per-stage timings captured *on the affected machine*, which the app
+had no way to produce. It does now — one `notice` per dictation:
+
+```
+log show --predicate 'subsystem == "org.freetalker.app" AND category == "capture"' \
+  --last 1h --info | grep 'stage timings'
+stage timings: engine=WhisperKit audio=12.40s transcribe=2.61s refine=1.88s total=4.52s
+```
+
+`audio` is the recording's length, so `transcribe`/`audio` is the effective RTF on that
+machine, and `total − transcribe − refine` is what remains unaccounted for. That
+splits the three candidates — a slow model on slow silicon, the cloud LLM's tail, or
+the still-unattributed remainder — which cannot be told apart from the outside.
 
 ## Non-issue found on the way
 

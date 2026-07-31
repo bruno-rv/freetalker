@@ -2045,11 +2045,23 @@ final class AppCoordinator: ObservableObject {
                 )
             }
         case .abortForRouteFailure(let message):
-            // The capture graph is not running and the restart budget is spent. Ending the
-            // recording here through the same preservation path a journal failure uses is what
-            // keeps a dead engine from sitting under a live-looking HUD until the user gives up
-            // — the failure reported at 2026-07-31.
-            handleJournalConsumerFailure(captureID: captureID, result: .failed(message))
+            // The capture graph is not running and the restart budget is spent, so end the
+            // recording rather than leave a dead engine under a live-looking HUD — the failure
+            // reported on 2026-07-31.
+            //
+            // Finalized like a duration cap, NOT through `handleJournalConsumerFailure`: the
+            // journal writer is healthy here, so the normal stop drains whatever was captured
+            // before the route died and runs the usual silence/health classification. The
+            // journal-failure path would instead discard the writer's pending tail and mark
+            // recovery storage unavailable, which blocks every later recording over a fault that
+            // was never about storage.
+            lastError = message
+            hud.flash(
+                "Recording stopped — \(message)",
+                lifetime: Self.hudFlashLifetime(for: .captureRouteRestart)
+            )
+            recordingState = .idle
+            stopAndTranscribe()
         }
     }
 

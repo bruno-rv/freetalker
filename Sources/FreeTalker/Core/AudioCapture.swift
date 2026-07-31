@@ -196,6 +196,13 @@ final class AudioCapture: @unchecked Sendable {
         case ignore
     }
 
+    private enum FaultKind {
+        /// The graph reported it is no longer running (configuration change, conversion collapse).
+        case routeChange
+        /// The tap was installed but has delivered nothing — see `armFirstBufferDeadline`.
+        case starvedTap
+    }
+
     enum ConfiguredDeviceVerificationAction: Equatable {
         case accept
         case abortMismatch
@@ -224,6 +231,12 @@ final class AudioCapture: @unchecked Sendable {
     private var tapCallbackCount = 0
     /// Route faults already answered with a restart, for the whole capture. Guarded by `samplesLock`.
     private var routeRestartCount = 0
+    /// The attempt a route-fault decision has already been emitted for. A configuration
+    /// notification and the first-buffer deadline can both fire for the same dead attempt;
+    /// without this each would charge the restart budget and enqueue its own decision, and the
+    /// second could land on the attempt that had already replaced the faulted one. Guarded by
+    /// `samplesLock`.
+    private var faultedGeneration: UUID?
     /// Voice-processing state of the attempt in progress — see the `catch` in `start`.
     private var attemptVoiceProcessing = false
     private var sampleConsumer: (@Sendable ([Float]) -> CaptureJournalWriter.EnqueueResult)?
@@ -306,7 +319,14 @@ final class AudioCapture: @unchecked Sendable {
     /// Route faults answered with a restart before the capture is given up on.
     static let maximumRouteRestarts = 2
 
+    /// Failed conversions tolerated, with nothing captured yet, before the capture is treated as
+    /// dead. At the 4096-frame tap buffer size this is roughly two seconds of arriving-but-
+    /// unusable audio.
+    static let conversionFailureEscalationThreshold = 25
+
     static let noAudioDeliveredMessage = "The microphone delivered no audio."
+
+    static let unusableAudioMessage = "The microphone audio could not be processed."
 
     /// A tap that never fires is invisible to `MicrophoneSignalWatchdog`, which only ever observes
     /// buffers that actually arrive: AVAudioEngine can accept `installTap` and still deliver
@@ -600,30 +620,23 @@ final class AudioCapture: @unchecked Sendable {
         }
     }
 
-    /// Escalates a capture whose tap never fired — see `starvedCaptureAction`. Reported through
-    /// the same route-fault path as a configuration change, so it inherits the existing
-    /// single restart and, if that restart is starved too, the terminal error the stop path
-    /// already raises for a capture with a recorded route failure.
+    /// Escalates an attempt whose tap never fired — see `starvedCaptureAction`. Reported through
+    /// the same path as a configuration change, so it shares the capture-wide restart budget and
+    /// ends in `.abortForRouteFailure` once that budget is spent.
     private func armFirstBufferDeadline(generation: UUID) {
         guard let captureID = samplesLock.withLock({ signalWatchdog.captureID }) else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.firstBufferDeadline) { [weak self] in
-            guard let self, self.generationGate.isCurrent(generation) else { return }
-            let action = self.samplesLock.withLock {
-                Self.starvedCaptureAction(
-                    isCapturing: self.isCapturing,
-                    tapCallbackCount: self.tapCallbackCount,
-                    restartsUsed: self.routeRestartCount
-                )
-            }
-            guard action != .ignore else { return }
-            Self.logger.error(
-                "No audio buffers arrived within \(Self.firstBufferDeadline, privacy: .public)s of engine start"
-            )
-            self.deliver(
-                action: action,
-                fault: .engine(captureID: captureID, message: Self.noAudioDeliveredMessage),
+            guard let self else { return }
+            let escalated = self.emitFault(
+                .engine(captureID: captureID, message: Self.noAudioDeliveredMessage),
+                kind: .starvedTap,
                 generation: generation
             )
+            if escalated {
+                Self.logger.error(
+                    "No audio buffers arrived within \(Self.firstBufferDeadline, privacy: .public)s of engine start"
+                )
+            }
         }
     }
 
@@ -659,25 +672,46 @@ final class AudioCapture: @unchecked Sendable {
     }
 
     private func reportFault(_ fault: AudioCaptureFault, generation: UUID) {
-        guard generationGate.isCurrent(generation) else { return }
-        let action = samplesLock.withLock {
-            Self.routeFaultAction(isCapturing: isCapturing, restartsUsed: routeRestartCount)
-        }
-        deliver(action: action, fault: fault, generation: generation)
+        emitFault(fault, kind: .routeChange, generation: generation)
     }
 
-    /// Turns a route-fault verdict into the decision the coordinator acts on, recording the
-    /// failure text on the watchdog for the stop-time diagnostics either way. The verdict comes
-    /// from `routeFaultAction`, not from `MicrophoneSignalWatchdog.observe`, because the watchdog
-    /// answers "is this capture silent?" while this answers "is this capture still running?" —
-    /// and a capture that has already heard signal can still have had its engine stopped.
-    private func deliver(action: RouteFaultAction, fault: AudioCaptureFault, generation: UUID) {
-        guard action != .ignore else { return }
+    /// Turns a fault into the decision the coordinator acts on, recording the failure text on the
+    /// watchdog for the stop-time diagnostics either way. The verdict comes from
+    /// `routeFaultAction`/`starvedCaptureAction`, not from `MicrophoneSignalWatchdog.observe`,
+    /// because the watchdog answers "is this capture silent?" while this answers "is this capture
+    /// still running?" — and a capture that has already heard signal can still have had its
+    /// engine stopped.
+    ///
+    /// Verdict, budget and latch are decided under one lock: computing the action separately from
+    /// charging the budget lets two faults for the same attempt each spend a restart.
+    ///
+    /// Returns whether a decision was emitted.
+    @discardableResult
+    private func emitFault(
+        _ fault: AudioCaptureFault, kind: FaultKind, generation: UUID
+    ) -> Bool {
+        guard generationGate.isCurrent(generation) else { return false }
         let payload = samplesLock.withLock {
             () -> ((@Sendable (MicrophoneSignalWatchdog.Decision) -> Void)?, MicrophoneSignalWatchdog.Decision)? in
             guard isCapturing, generationGate.isCurrent(generation),
-                  signalWatchdog.captureID == nil || fault.captureID == signalWatchdog.captureID
+                  signalWatchdog.captureID == nil || fault.captureID == signalWatchdog.captureID,
+                  faultedGeneration != generation
             else { return nil }
+            let action: RouteFaultAction
+            switch kind {
+            case .routeChange:
+                action = Self.routeFaultAction(
+                    isCapturing: isCapturing, restartsUsed: routeRestartCount
+                )
+            case .starvedTap:
+                action = Self.starvedCaptureAction(
+                    isCapturing: isCapturing,
+                    tapCallbackCount: tapCallbackCount,
+                    restartsUsed: routeRestartCount
+                )
+            }
+            guard action != .ignore else { return nil }
+            faultedGeneration = generation
             signalWatchdog.recordRouteFailure(fault.message)
             switch action {
             case .restart:
@@ -689,7 +723,9 @@ final class AudioCapture: @unchecked Sendable {
                 return nil
             }
         }
-        if let payload { payload.0?(payload.1) }
+        guard let payload else { return false }
+        payload.0?(payload.1)
+        return true
     }
 
     private func reconcileVoiceProcessing(requested: Bool) throws -> AVAudioInputNode {
@@ -973,9 +1009,25 @@ final class AudioCapture: @unchecked Sendable {
 
     private func recordConversionFailure(generation: UUID) {
         guard generationGate.isCurrent(generation) else { return }
-        samplesLock.lock()
-        conversionFailureCount += 1
-        samplesLock.unlock()
+        // Callbacks that arrive but never convert are as silent as callbacks that never arrive:
+        // the deadline above is satisfied, the journal stays empty, and the HUD keeps saying the
+        // recording is live. Escalated once, when nothing at all has been converted yet.
+        let escalation = samplesLock.withLock { () -> UUID? in
+            conversionFailureCount += 1
+            guard samples.isEmpty,
+                  conversionFailureCount == Self.conversionFailureEscalationThreshold
+            else { return nil }
+            return signalWatchdog.captureID
+        }
+        guard let captureID = escalation else { return }
+        Self.logger.error(
+            "\(Self.conversionFailureEscalationThreshold, privacy: .public) tap buffers failed to convert with nothing captured"
+        )
+        emitFault(
+            .engine(captureID: captureID, message: Self.unusableAudioMessage),
+            kind: .routeChange,
+            generation: generation
+        )
     }
 }
 

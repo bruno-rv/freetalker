@@ -26,8 +26,7 @@ struct ObjCExceptionBridgeTests {
     @Test func raisedExceptionBecomesAnErrorInsteadOfEscaping() {
         let engine = AVAudioEngine()
         let node = engine.mainMixerNode
-        var firstError: NSError?
-        #expect(FTInstallTapCatchingException(node, 0, 1024, nil, { _, _ in }, &firstError))
+        #expect(FTInstallTapCatchingException(node, 0, 1024, nil, { _, _ in }, nil))
 
         var error: NSError?
         let installed = FTInstallTapCatchingException(node, 0, 1024, nil, { _, _ in }, &error)
@@ -35,23 +34,27 @@ struct ObjCExceptionBridgeTests {
         #expect(error?.domain == FTObjCExceptionErrorDomain)
         #expect(error?.localizedDescription.isEmpty == false)
         #expect(error?.userInfo["FTExceptionName"] as? String != nil)
-        node.removeTap(onBus: 0)
+        // The graph that raised is abandoned here, per the bridge's contract — no `removeTap`,
+        // no reuse. `AudioCapture` does the same thing with the engine it was using.
     }
 
-    /// The reason the containment matters: the process carries on normally afterwards.
-    @Test func executionContinuesAfterAContainedException() {
-        let engine = AVAudioEngine()
-        let node = engine.mainMixerNode
+    /// The reason the containment matters: the process carries on normally afterwards. A caught
+    /// exception says nothing good about the engine that raised, so recovery means a fresh one —
+    /// which is exactly what `AudioCapture.startCaptureAttempt`'s `catch` does.
+    @Test func aFreshEngineWorksAfterAContainedException() {
+        let raisedEngine = AVAudioEngine()
         var error: NSError?
-        _ = FTInstallTapCatchingException(node, 0, 1024, nil, { _, _ in }, nil)
-        _ = FTInstallTapCatchingException(node, 0, 1024, nil, { _, _ in }, &error)
+        _ = FTInstallTapCatchingException(raisedEngine.mainMixerNode, 0, 1024, nil, { _, _ in }, nil)
+        _ = FTInstallTapCatchingException(raisedEngine.mainMixerNode, 0, 1024, nil, { _, _ in }, &error)
         #expect(error != nil)
 
-        node.removeTap(onBus: 0)
+        let replacement = AVAudioEngine()
         var secondError: NSError?
-        let installed = FTInstallTapCatchingException(node, 0, 1024, nil, { _, _ in }, &secondError)
+        let installed = FTInstallTapCatchingException(
+            replacement.mainMixerNode, 0, 1024, nil, { _, _ in }, &secondError
+        )
         #expect(installed)
         #expect(secondError == nil)
-        node.removeTap(onBus: 0)
+        replacement.mainMixerNode.removeTap(onBus: 0)
     }
 }

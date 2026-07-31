@@ -75,6 +75,24 @@ struct AudioCaptureDecisionTests {
         #expect(AudioCapture.routeFaultAction(isCapturing: false, restartsUsed: 0) == .ignore)
     }
 
+    /// The restart budget has to survive two faults landing on the same attempt — a configuration
+    /// notification and the first-buffer deadline both fire for one dead attempt. Charging both
+    /// would spend the whole budget on a single failure; the second is dropped by the
+    /// per-generation latch in `emitFault`, so only the accepted restarts are counted here.
+    @Test func budgetIsSpentPerAcceptedRestartNotPerFault() {
+        var restartsUsed = 0
+        for _ in 0..<(AudioCapture.maximumRouteRestarts + 3) {
+            switch AudioCapture.routeFaultAction(isCapturing: true, restartsUsed: restartsUsed) {
+            case .restart: restartsUsed += 1
+            case .abort, .ignore: break
+            }
+        }
+        #expect(restartsUsed == AudioCapture.maximumRouteRestarts)
+        #expect(
+            AudioCapture.routeFaultAction(isCapturing: true, restartsUsed: restartsUsed) == .abort
+        )
+    }
+
     @Test func firstTapBufferBuildsAConverter() {
         #expect(
             AudioCapture.converterCacheAction(
