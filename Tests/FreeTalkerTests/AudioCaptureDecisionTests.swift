@@ -129,9 +129,8 @@ struct AudioCaptureDecisionTests {
     }
 
     /// A conversion that returns no frames without erroring (`.inputRanDry`) is unusable input, not
-    /// a healthy attempt. Treating it as healthy satisfied both the first-buffer deadline (the tap
-    /// did fire) and the unusable-audio deadline (something "converted"), leaving a capture that
-    /// journals nothing under a live HUD.
+    /// a healthy attempt. Counting it as usable would satisfy the deadline's predicate, leaving a
+    /// capture that journals nothing under a live HUD.
     @Test func aZeroFrameConversionIsUnusable() {
         #expect(AudioCapture.convertedBufferAction(frameCount: 0) == .unusable)
         #expect(AudioCapture.convertedBufferAction(frameCount: 1) == .accept)

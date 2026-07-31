@@ -111,14 +111,24 @@ context, and it returns before capture starts — the tap callback only enqueues
 |---|---|
 | `installTap(format: nil)`, converter built from each buffer's own format and rebuilt when the bus renegotiates | Stops forcing a client format onto a reconfiguring graph — the exception and the silent no-op both disappear |
 | `FTInstallTapCatchingException` — an Objective-C wrapper that calls `installTapOnBus:` itself, inside `@try` | A raise is contained with no Swift frame between it and the `@catch`. The engine that raised is then discarded untouched (no `stop()`, no `removeTap`) and the next attempt starts from a fresh one |
-| First-buffer deadline (`starvedCaptureAction`, 2 s), counting tap callbacks per attempt before any conversion work | `MicrophoneSignalWatchdog` only ever observes buffers that *arrive*, so "the tap never fired" was invisible to it — and it must not be confused with "buffers arrived but failed to convert" |
-| Unusable-audio deadline (`unusableAudioDeadline`, 2 input seconds, per attempt) | Buffers that arrive and never convert satisfy the deadline above while the journal stays empty — the same live-looking dead capture by another route |
+| Per-attempt usable-audio deadline (`starvedCaptureAction`, 2 s from `engine.start()`) | `MicrophoneSignalWatchdog` only ever observes buffers that arrive *and* convert, so nothing in the app noticed a capture that produced no audio at all. The predicate is "this attempt converted nothing usable", which covers no callback, callbacks that never convert, and one unusable callback then silence; a zero-frame conversion counts as unusable (`convertedBufferAction`), which is what let the last of those hide |
 | One decision per attempt (`resolveFault`), restart twice, then `abortForRouteFailure` | A configuration change is posted *after* the engine has stopped, so having heard audio a moment ago is no reason to ignore the fault — that path left a live-looking HUD over a dead engine. Two faults for one attempt must not each spend a restart |
 | The abort finalizes like a duration cap, keeping its own reason | The healthy journal writer drains (partial audio survives), `recoveryHealth` is untouched — it was never a storage fault — and the terminal message says the microphone route died rather than "no speech was detected" |
 | Per-dictation stage timings | The only way to attribute the latency on the other Mac (see below) |
 | Makefile resolves `.codesign-identity` from the git common dir | Stops worktree builds silently ad-hoc signing and orphaning TCC grants |
 
-Reviewed by Codex. Round 1 (`REVISE`) downgraded the step-3 claim above from
+### Known-remaining, deliberately out of scope
+
+Both predate this branch and neither is on the reported failure's path:
+
+- An attempt that produced usable audio and *then* stalls is not escalated. The journal
+  keeps what it got, so the recording can come back truncated rather than empty.
+- A corroborated restart that itself throws is still classified as a journal-storage
+  failure, which marks recovery storage unavailable.
+
+### Review
+
+Reviewed by Codex over seven rounds, ending `VERDICT: APPROVED`. Round 1 (`REVISE`) downgraded the step-3 claim above from
 mechanism to hypothesis, rejected a proposed `inputFormat` vs `outputFormat` equality
 gate (the two are legitimately different under VPIO, so the gate would have forced
 raw-capture fallback and silently disabled noise suppression), and asked for the
@@ -128,7 +138,12 @@ point — that the deadline keyed off a capture-wide counter the fault report it
 incremented, so a restarted attempt could never be found starved, that a route fault
 arriving *after* signal had been heard was ignored even though the engine had already
 stopped, and that the `catch` called `stop()` on a graph its own contract says must
-not be touched.
+not be touched. Rounds 3-6 (`REVISE` each) fixed a restart budget two faults for one
+attempt could each spend, an abort that marked recovery storage unavailable over a
+fault that was never about storage, a conversion-failure escalation that could not fire
+after a restart, a zero-frame conversion counted as a healthy one, and finally a single
+unusable callback followed by silence — which is what turned the deadline's predicate
+from "a callback arrived" into "usable audio was produced". Round 7 approved.
 
 ## Symptom 3 — "slow even for small dictations" on another Mac
 
