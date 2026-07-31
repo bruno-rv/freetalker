@@ -241,17 +241,21 @@ suspects were eliminated by measurement rather than by reading:
 The engine now logs WhisperKit's own decode timings, which name the mechanism outright:
 
 ```
-fast: fallbacks=0 windows=1 loops=52  logmel=0.00s encode=0.26s decodeLoop=2.41s  fallbackTime=0.00s
-slow: fallbacks=5 windows=1 loops=832 logmel=0.01s encode=0.26s decodeLoop=35.10s fallbackTime=34.83s
+fast: fallbacks=0 windows=1 loops=52  logmel=0.00s encode=0.26s decodeLoop=2.41s
+slow: fallbacks=5 windows=1 loops=832 logmel=0.01s encode=0.26s decodeLoop=35.10s
 ```
 
 Mel and encode are constant at 0.27 s. All of it is the decode loop, re-run **five extra times**
 — WhisperKit's `DecodingOptions.temperatureFallbackCount` default — because its quality
-heuristics rejected each pass. 832 loops for six seconds of speech is the decoder repeating
-itself: the compression-ratio threshold (2.4) is what rejects, and a higher sampling temperature
-does not fix a repetition, so the retries pay full price and return the same text. Bruno's own
-slow dictation is the visible case — its stored transcript is `"Hello, that's 123456, Hello,
-that's 123456 6 6 6,"`.
+heuristics rejected each pass. 832 loops for six seconds of audio is the decoder running away,
+and each retry pays a full pass to be rejected again. Both thresholds have been seen doing the
+rejecting: a `fallbacks=2` storm on the capped build reported `compressionRatio=1.14
+avgLogprob=-2.74`, i.e. rejected by `logProbThreshold` (-1.0) rather than by compression ratio.
+Bruno's own slow dictation is the repetition case — its stored transcript is `"Hello, that's
+123456, Hello, that's 123456 6 6 6,"`.
+
+(WhisperKit's `timings.decodingFallback` is *not* time spent in retries — it reads 2.18 s on
+runs with `fallbacks=0` — so it isn't logged. `loops` and `decodeLoop` are the honest numbers.)
 
 With real speech (driven through `say` into the same microphone) the storm doesn't happen at
 all: `fallbacks=0`, `compressionRatio` 1.00–1.11, `transcribe` 3.06–3.11 s for ~6 s clips. So
@@ -263,6 +267,13 @@ after, same driven clips: worst case **9.15 s** (`fallbacks=2 decodeLoop=8.83s`)
 If a real transcript is ever seen to need pass four or five, the upgrade path is to keep
 retrying only while `DecodingResult.fallback.fallbackReason` is one temperature can move —
 not to raise the number again.
+
+Found while verifying, unrelated and unfixed: the app can hang at launch with no window, no log
+line and no hotkey, blocked on a synchronous keychain read on the main thread —
+`FreeTalkerApp.init()` (`App.swift:46`) calls `CloudLLMKeyMigration.migrateIfNeeded` →
+`Keychain.get` → `SecItemCopyMatching`. When macOS decides to prompt for keychain access (it did
+after one reinstall, `SecurityAgent` waiting on a dialog), the app is dead until someone answers
+it. A locked keychain would do the same. Worth moving off the startup path.
 
 Still open: the app happily transcribes and inserts hallucinated text from a silent capture
 (`"Closed Captioning by Stagetext, www.stagetext.com"` from six seconds of room noise). That's a

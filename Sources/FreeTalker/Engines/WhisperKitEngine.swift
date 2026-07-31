@@ -621,12 +621,12 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, WhisperFile
     /// whole wall clock (`fallbacks=5 loops=832 decodeLoop=35.10s` against `fallbacks=0 loops=52
     /// decodeLoop=2.41s` for the same length of audio).
     ///
-    /// Retries only help when a pass failed for a reason a higher sampling temperature can change.
-    /// The rejection this app actually hits is the compression-ratio threshold — the decoder
-    /// repeating itself, either hallucinating on near-silence or echoing genuinely repetitive
-    /// speech ("Hello, that's 123456, Hello, that's 123456 6 6 6") — and the retries return the
-    /// same rejected text after paying for all five. Two keeps the passes that fix a merely unsure
-    /// decode and drops the tail that only ever spends time.
+    /// A storm needs audio the heuristics keep rejecting, and both thresholds have been seen doing
+    /// the rejecting (`compressionRatio` for a decode that repeated itself, `avgLogprob` for one
+    /// that stayed unsure) — see the `decode quality` log line. What the retries buy is capped
+    /// either way: 800-odd decode loops for six seconds of audio is the decoder running away, and
+    /// the extra passes returned the same rejected text after paying for all five. Two keeps the
+    /// passes that fix a merely unsure decode and drops the tail that only ever spends time.
     ///
     /// A budget, not a quality judgement: if a real transcript is ever seen to need pass four or
     /// five, the upgrade path is to keep retrying only while the rejection reason is one
@@ -655,22 +655,28 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, WhisperFile
             loops=\(timings.totalDecodingLoops, format: .fixed(precision: 0)) \
             logmel=\(timings.logmels, format: .fixed(precision: 2))s \
             encode=\(timings.encoding, format: .fixed(precision: 2))s \
-            decodeLoop=\(timings.decodingLoop, format: .fixed(precision: 2))s \
-            fallbackTime=\(timings.decodingFallback, format: .fixed(precision: 2))s
+            decodeLoop=\(timings.decodingLoop, format: .fixed(precision: 2))s
             """
         )
-        // Which threshold rejected the pass: compression ratio > 2.4 means the decode repeated
-        // itself, avgLogprob < -1.0 means it was unsure, noSpeechProb > 0.6 means silence.
-        guard let segment = results.first?.segments.first else { return }
-        logger.info(
-            """
-            decode quality: temperature=\(segment.temperature, format: .fixed(precision: 2)) \
-            compressionRatio=\(segment.compressionRatio, format: .fixed(precision: 2)) \
-            avgLogprob=\(segment.avgLogprob, format: .fixed(precision: 2)) \
-            noSpeechProb=\(segment.noSpeechProb, format: .fixed(precision: 2)) \
-            tokens=\(segment.tokens.count)
-            """
-        )
+        // Every segment, not just the first: which threshold rejected a pass is only readable from
+        // the segment that carries the figures, and a result can lead with an unpopulated one.
+        // compressionRatio > 2.4 means the decode repeated itself, avgLogprob < -1.0 means it was
+        // unsure, noSpeechProb > 0.6 means silence. `temperature` above 0 marks a retried pass.
+        for (index, segment) in results.flatMap(\.segments).enumerated() {
+            // An all-zero segment is one WhisperKit never filled in; printing it would read as a
+            // measurement of a perfect decode.
+            guard segment.compressionRatio != 0 || segment.avgLogprob != 0 else { continue }
+            logger.info(
+                """
+                decode quality [\(index)]: \
+                temperature=\(segment.temperature, format: .fixed(precision: 2)) \
+                compressionRatio=\(segment.compressionRatio, format: .fixed(precision: 2)) \
+                avgLogprob=\(segment.avgLogprob, format: .fixed(precision: 2)) \
+                noSpeechProb=\(segment.noSpeechProb, format: .fixed(precision: 2)) \
+                tokens=\(segment.tokens.count)
+                """
+            )
+        }
     }
 
     private func kitForTranscription() async throws -> WhisperKit {
