@@ -224,6 +224,9 @@ final class AudioCapture: @unchecked Sendable {
     }
 
     private static let logger = Logger(subsystem: "org.freetalker.app", category: "audio-capture")
+    /// The audio unit element behind `AVAudioInputNode`'s bus 0: AUHAL numbers its input element
+    /// 1, and AVAudioEngine maps input bus 0 onto it.
+    private static let inputUnitElement: AudioUnitElement = 1
     private var engine = AVAudioEngine()
     private let generationGate = AudioCaptureGenerationGate()
     private var samples: [Float] = []
@@ -318,6 +321,30 @@ final class AudioCapture: @unchecked Sendable {
         effectiveVoiceProcessing: Bool
     ) -> CaptureFailureAction {
         effectiveVoiceProcessing ? .retryRaw : .propagate
+    }
+
+    /// Why `engine.start()` failed, in words. `-10868` (`kAudioUnitErr_FormatNotSupported`) is
+    /// named because it is precisely what a client scope that disagrees with the hardware
+    /// produces, and its own message — "the operation couldn't be completed, error -10868" — told
+    /// nobody anything. Both rates go in the text: they are the whole diagnosis.
+    nonisolated static func engineStartFailureReason(
+        _ error: Error, hardware: AVAudioFormat, client: AVAudioFormat
+    ) -> String {
+        guard (error as NSError).code == Int(kAudioUnitErr_FormatNotSupported) else {
+            return error.localizedDescription
+        }
+        return """
+            macOS refused the microphone's audio format \
+            (microphone \(rateText(hardware.sampleRate)), app \(rateText(client.sampleRate)))
+            """
+    }
+
+    nonisolated static func rateText(_ sampleRate: Double) -> String {
+        guard sampleRate >= 1000 else { return "\(Int(sampleRate.rounded())) Hz" }
+        let kilohertz = sampleRate / 1000
+        return kilohertz == kilohertz.rounded()
+            ? "\(Int(kilohertz)) kHz"
+            : String(format: "%.1f kHz", kilohertz)
     }
 
     nonisolated static func rawCapturePostconditionAction(
@@ -605,20 +632,35 @@ final class AudioCapture: @unchecked Sendable {
                     tapException?.localizedDescription ?? "the audio graph rejected the microphone tap"
                 )
             }
+            // Both scopes, because logging only the client format is what let a graph that could
+            // never initialize read as a successful tap install.
             Self.logger.info(
-                "Installed tap; bus format: \(attemptInput.outputFormat(forBus: 0).description, privacy: .public)"
+                """
+                Installed tap; hardware format: \
+                \(attemptInput.inputFormat(forBus: 0).description, privacy: .public); \
+                client format: \(attemptInput.outputFormat(forBus: 0).description, privacy: .public)
+                """
             )
             tapInstalled = true
             engine.prepare()
-            try engine.start()
+            do {
+                try engine.start()
+            } catch {
+                throw CaptureError.engineStartFailed(
+                    Self.engineStartFailureReason(
+                        error,
+                        hardware: attemptInput.inputFormat(forBus: 0),
+                        client: attemptInput.outputFormat(forBus: 0)
+                    )
+                )
+            }
             armFirstBufferDeadline(generation: generation)
             return generation
         } catch {
             // A graph that raised is in an unknown state: it gets discarded WITHOUT another call
-            // on it — not even `stop()`/`removeTap` — and the next attempt starts from a fresh
-            // engine. Every other failure unwinds normally and is cleaned up in place.
+            // on it — not even `stop()`/`removeTap`. Every other failure unwinds normally and is
+            // cleaned up in place first.
             if let captureError = error as? CaptureError, case .graphExceptionRaised = captureError {
-                engine = AVAudioEngine()
                 Self.logger.error(
                     "Audio graph raised an exception; discarded the engine: \(error.localizedDescription, privacy: .public)"
                 )
@@ -628,6 +670,10 @@ final class AudioCapture: @unchecked Sendable {
                 }
                 engine.stop()
             }
+            // Either way the engine itself goes. A graph keeps the scope formats its failed
+            // initialization left behind, so reusing one is how a single bad start turned into
+            // five consecutive presses failing identically until the app was relaunched.
+            engine = AVAudioEngine()
             generationGate.deactivateAndWait()
             samplesLock.withLock { isCapturing = false }
             throw error
@@ -907,6 +953,50 @@ final class AudioCapture: @unchecked Sendable {
                 "the selected microphone could not be verified"
             )
         }
+
+        try alignClientFormatWithHardware(of: input, audioUnit: audioUnit)
+    }
+
+    /// Makes the input unit's client-side format follow the pinned device's hardware format.
+    ///
+    /// Pinning a device moves only the *hardware* scope. The unit keeps the client-side rate it
+    /// was created with — 48 kHz, which is a default and not a reading of any device — so a
+    /// 16 kHz microphone leaves the input chain with 16 kHz hardware feeding a 48 kHz client
+    /// scope. The input node does no conversion of its own, so graph initialization then fails
+    /// with `-10868` (`kAudioUnitErr_FormatNotSupported`), `engine.start()` throws, and no tap
+    /// callback ever fires. Measured on the HD Webcam C615 (16 kHz): pinning alone fails every
+    /// attempt; aligning the client scope afterwards starts the engine and delivers 16 kHz
+    /// buffers. A device already running at 48 kHz never enters this path.
+    ///
+    /// Only reached with voice processing OFF (`deviceApplicationPolicy`). A voice-processing
+    /// graph converts internally and is *expected* to show differing scopes, which is why this
+    /// alignment must not be applied there.
+    private func alignClientFormatWithHardware(
+        of input: AVAudioInputNode, audioUnit: AudioUnit
+    ) throws {
+        let hardware = input.inputFormat(forBus: 0)
+        let client = input.outputFormat(forBus: 0)
+        guard hardware.sampleRate > 0, hardware.sampleRate != client.sampleRate else { return }
+
+        var description = hardware.streamDescription.pointee
+        let status = AudioUnitSetProperty(
+            audioUnit,
+            kAudioUnitProperty_StreamFormat,
+            kAudioUnitScope_Output,
+            Self.inputUnitElement,
+            &description,
+            UInt32(MemoryLayout<AudioStreamBasicDescription>.size))
+        guard status == noErr else {
+            Self.logger.error(
+                "Could not align client format to \(hardware.sampleRate) Hz hardware: status \(status)"
+            )
+            throw CaptureError.configuredDeviceUnavailable(
+                "macOS rejected its own audio format (status \(status))"
+            )
+        }
+        Self.logger.info(
+            "Aligned client format to hardware: \(client.sampleRate) Hz -> \(hardware.sampleRate) Hz"
+        )
     }
 
     private func recordWarning(_ warning: String) {
@@ -1110,7 +1200,7 @@ private enum CaptureError: LocalizedError {
         case let .configuredDeviceUnavailable(reason):
             "Could not use the configured microphone because \(reason). Recording was not started."
         case let .engineStartFailed(reason):
-            "Could not restart microphone capture: \(reason)"
+            "Could not start microphone capture: \(reason)"
         }
     }
 }
