@@ -396,4 +396,49 @@ struct AudioCaptureDecisionTests {
             "Configured microphone not found — using system default",
         ])
     }
+
+    /// The failure Bruno hit on the HD Webcam C615: pinning a 16 kHz device leaves the app's
+    /// client scope at 48 kHz and the graph refuses to initialize. Its own message is
+    /// "error -10868", so the reason has to name both rates.
+    @Test func formatMismatchStartFailureNamesBothRates() {
+        let error = NSError(
+            domain: "com.apple.coreaudio.avfaudio",
+            code: Int(kAudioUnitErr_FormatNotSupported)
+        )
+
+        let reason = AudioCapture.engineStartFailureReason(
+            error,
+            hardware: Self.format(sampleRate: 16_000),
+            client: Self.format(sampleRate: 48_000)
+        )
+
+        #expect(reason == "macOS refused the microphone's audio format (microphone 16 kHz, app 48 kHz)")
+    }
+
+    @Test func otherStartFailuresKeepTheirOwnMessage() {
+        let error = NSError(
+            domain: "com.apple.coreaudio.avfaudio",
+            code: -10875,
+            userInfo: [NSLocalizedDescriptionKey: "The audio device was removed."]
+        )
+
+        let reason = AudioCapture.engineStartFailureReason(
+            error,
+            hardware: Self.format(sampleRate: 48_000),
+            client: Self.format(sampleRate: 48_000)
+        )
+
+        #expect(reason == "The audio device was removed.")
+    }
+
+    @Test(arguments: [
+        (44_100.0, "44.1 kHz"),
+        (48_000.0, "48 kHz"),
+        (16_000.0, "16 kHz"),
+        (8_000.0, "8 kHz"),
+        (960.0, "960 Hz"),
+    ])
+    func sampleRatesReadAsRates(sampleRate: Double, expected: String) {
+        #expect(AudioCapture.rateText(sampleRate) == expected)
+    }
 }
