@@ -110,16 +110,23 @@ context, and it returns before capture starts — the tap callback only enqueues
 | Change | Why |
 |---|---|
 | `installTap(format: nil)`, converter built from each buffer's own format and rebuilt when the bus renegotiates | Stops forcing a client format onto a reconfiguring graph — the exception and the silent no-op both disappear |
-| `FTRunCatchingObjCException` around `installTap`, engine discarded and recreated on catch | Any future raise is contained in Objective-C frames instead of unwinding through Swift; a graph that raised is never reused |
-| First-buffer deadline (`starvedCaptureAction`, 2 s) | `MicrophoneSignalWatchdog` only ever observes buffers that *arrive*, so "the tap never fired" was invisible to it — distinct diagnosis from "buffers arrived containing silence" |
+| `FTInstallTapCatchingException` — an Objective-C wrapper that calls `installTapOnBus:` itself, inside `@try` | A raise is contained with no Swift frame between it and the `@catch`. The engine that raised is then discarded untouched (no `stop()`, no `removeTap`) and the next attempt starts from a fresh one |
+| First-buffer deadline (`starvedCaptureAction`, 2 s), counting tap callbacks per attempt before any conversion work | `MicrophoneSignalWatchdog` only ever observes buffers that *arrive*, so "the tap never fired" was invisible to it — and it must not be confused with "buffers arrived but failed to convert" |
+| Route faults answered by `routeFaultAction`: restart twice, then `abortForRouteFailure` | A configuration change is posted *after* the engine has stopped, so having heard audio a moment ago is no reason to ignore it — that path left a live-looking HUD over a dead engine. The abort ends the recording through the same preservation path a journal failure uses |
 | Per-dictation stage timings | The only way to attribute the latency on the other Mac (see below) |
 | Makefile resolves `.codesign-identity` from the git common dir | Stops worktree builds silently ad-hoc signing and orphaning TCC grants |
 
-Reviewed by Codex over two rounds; its round-1 verdict `REVISE` is what downgraded
-the step-3 claim above from mechanism to hypothesis, rejected a proposed
-`inputFormat` vs `outputFormat` equality gate (legitimately different under VPIO, and
-it would have forced raw-capture fallback and silently disabled noise suppression),
-and asked for the containment shim.
+Reviewed by Codex. Round 1 (`REVISE`) downgraded the step-3 claim above from
+mechanism to hypothesis, rejected a proposed `inputFormat` vs `outputFormat` equality
+gate (the two are legitimately different under VPIO, so the gate would have forced
+raw-capture fallback and silently disabled noise suppression), and asked for the
+containment shim. Round 2 (`REVISE`) caught that the first shim took a Swift closure —
+which puts a Swift frame between the raise and the `@catch`, defeating the whole
+point — that the deadline keyed off a capture-wide counter the fault report itself
+incremented, so a restarted attempt could never be found starved, that a route fault
+arriving *after* signal had been heard was ignored even though the engine had already
+stopped, and that the `catch` called `stop()` on a graph its own contract says must
+not be touched.
 
 ## Symptom 3 — "slow even for small dictations" on another Mac
 

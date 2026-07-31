@@ -2044,6 +2044,12 @@ final class AppCoordinator: ObservableObject {
                     result: .failed("\(message): \(error.localizedDescription)")
                 )
             }
+        case .abortForRouteFailure(let message):
+            // The capture graph is not running and the restart budget is spent. Ending the
+            // recording here through the same preservation path a journal failure uses is what
+            // keeps a dead engine from sitting under a live-looking HUD until the user gives up
+            // — the failure reported at 2026-07-31.
+            handleJournalConsumerFailure(captureID: captureID, result: .failed(message))
         }
     }
 

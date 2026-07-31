@@ -15,23 +15,64 @@ struct AudioCaptureDecisionTests {
     /// A tap that is accepted but never fires delivers no observations at all, so the watchdog's
     /// silent-buffer warning can never trigger — the zero-frame dictation in
     /// docs/dictation-zero-audio-crash-2026-07-31.md went unreported for exactly that reason.
-    @Test func captureWithoutASingleTapCallbackIsEscalated() {
+    @Test func captureWithoutASingleTapCallbackIsRestarted() {
         #expect(
-            AudioCapture.starvedCaptureAction(isCapturing: true, observationCount: 0) == .escalate
+            AudioCapture.starvedCaptureAction(
+                isCapturing: true, tapCallbackCount: 0, restartsUsed: 0
+            ) == .restart
         )
     }
 
-    @Test func captureDeliveringBuffersIsNotEscalated() {
+    @Test func captureDeliveringBuffersIsLeftAlone() {
         #expect(
-            AudioCapture.starvedCaptureAction(isCapturing: true, observationCount: 1) == .ignore
+            AudioCapture.starvedCaptureAction(
+                isCapturing: true, tapCallbackCount: 1, restartsUsed: 0
+            ) == .ignore
         )
     }
 
     /// The deadline fires after the recording already stopped — nothing to escalate.
-    @Test func finishedCaptureIsNotEscalated() {
+    @Test func finishedCaptureIsLeftAlone() {
         #expect(
-            AudioCapture.starvedCaptureAction(isCapturing: false, observationCount: 0) == .ignore
+            AudioCapture.starvedCaptureAction(
+                isCapturing: false, tapCallbackCount: 0, restartsUsed: 0
+            ) == .ignore
         )
+    }
+
+    /// The restart budget has to run out somewhere: a capture starved again after its restarts
+    /// were spent is given up on visibly rather than left running over a dead engine.
+    @Test func repeatedlyStarvedCaptureIsAborted() {
+        #expect(
+            AudioCapture.starvedCaptureAction(
+                isCapturing: true,
+                tapCallbackCount: 0,
+                restartsUsed: AudioCapture.maximumRouteRestarts
+            ) == .abort
+        )
+    }
+
+    /// A configuration change is posted after the engine has already been stopped, so having
+    /// heard audio a moment ago is no reason to ignore it.
+    @Test func routeFaultRestartsRegardlessOfEarlierSignal() {
+        #expect(AudioCapture.routeFaultAction(isCapturing: true, restartsUsed: 0) == .restart)
+        #expect(
+            AudioCapture.routeFaultAction(
+                isCapturing: true, restartsUsed: AudioCapture.maximumRouteRestarts - 1
+            ) == .restart
+        )
+    }
+
+    @Test func routeFaultAbortsOnceTheRestartBudgetIsSpent() {
+        #expect(
+            AudioCapture.routeFaultAction(
+                isCapturing: true, restartsUsed: AudioCapture.maximumRouteRestarts
+            ) == .abort
+        )
+    }
+
+    @Test func routeFaultAfterCaptureEndedIsIgnored() {
+        #expect(AudioCapture.routeFaultAction(isCapturing: false, restartsUsed: 0) == .ignore)
     }
 
     @Test func firstTapBufferBuildsAConverter() {

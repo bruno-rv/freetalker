@@ -41,11 +41,19 @@ CODESIGN_IDENTITY ?= -
 # docs/dictation-zero-audio-crash-2026-07-31.md). Fall back to the main checkout's copy, found via
 # the git common dir, so every worktree signs with the same identity. The value still goes through
 # the single `:=` expansion and `codesign-identity-check`'s allowlist below, exactly as before.
-GIT_COMMON_DIR := $(shell git rev-parse --git-common-dir 2>/dev/null)
-CODESIGN_IDENTITY_FILE := $(firstword $(wildcard .codesign-identity) \
-	$(if $(GIT_COMMON_DIR),$(wildcard $(dir $(GIT_COMMON_DIR)).codesign-identity)))
-ifneq ($(CODESIGN_IDENTITY_FILE),)
-CODESIGN_IDENTITY := $(shell cat $(CODESIGN_IDENTITY_FILE))
+#
+# Make's `wildcard`/`firstword` split on spaces, so a checkout path containing one cannot be
+# carried through them. The whole lookup therefore happens inside one `$(shell ...)`, where the
+# paths stay quoted, and Make only ever sees the resulting identity string — which is then subject
+# to the same single `:=` expansion and `codesign-identity-check` allowlist as before.
+CODESIGN_IDENTITY_FROM_FILE := $(shell \
+	if [ -f .codesign-identity ]; then cat .codesign-identity; \
+	elif common_dir="$$(git rev-parse --git-common-dir 2>/dev/null)" && \
+	     [ -f "$$(dirname "$$common_dir")/.codesign-identity" ]; then \
+		cat "$$(dirname "$$common_dir")/.codesign-identity"; \
+	fi)
+ifneq ($(CODESIGN_IDENTITY_FROM_FILE),)
+CODESIGN_IDENTITY := $(CODESIGN_IDENTITY_FROM_FILE)
 endif
 # Command-line assignments (`make bundle CODESIGN_IDENTITY=...`, which is how release.sh passes
 # the value it read from `.codesign-identity`) default to that same dangerous recursive

@@ -2,21 +2,28 @@
 
 NSErrorDomain const FTObjCExceptionErrorDomain = @"FTObjCExceptionErrorDomain";
 
-BOOL FTRunCatchingObjCException(void (NS_NOESCAPE ^body)(void), NSError **error) {
+static NSError *FTErrorFromException(NSException *exception) {
+    NSMutableDictionary *userInfo = [NSMutableDictionary dictionary];
+    userInfo[NSLocalizedDescriptionKey] = exception.reason ?: exception.name;
+    userInfo[@"FTExceptionName"] = exception.name;
+    if (exception.reason) {
+        userInfo[@"FTExceptionReason"] = exception.reason;
+    }
+    return [NSError errorWithDomain:FTObjCExceptionErrorDomain code:1 userInfo:userInfo];
+}
+
+BOOL FTInstallTapCatchingException(AVAudioNode *node,
+                                   AVAudioNodeBus bus,
+                                   AVAudioFrameCount bufferSize,
+                                   AVAudioFormat *_Nullable format,
+                                   AVAudioNodeTapBlock block,
+                                   NSError **error) {
     @try {
-        body();
+        [node installTapOnBus:bus bufferSize:bufferSize format:format block:block];
         return YES;
     } @catch (NSException *exception) {
         if (error) {
-            NSMutableDictionary *userInfo = [NSMutableDictionary dictionary];
-            userInfo[NSLocalizedDescriptionKey] = exception.reason ?: exception.name;
-            userInfo[@"FTExceptionName"] = exception.name;
-            if (exception.reason) {
-                userInfo[@"FTExceptionReason"] = exception.reason;
-            }
-            *error = [NSError errorWithDomain:FTObjCExceptionErrorDomain
-                                         code:1
-                                     userInfo:userInfo];
+            *error = FTErrorFromException(exception);
         }
         return NO;
     }
