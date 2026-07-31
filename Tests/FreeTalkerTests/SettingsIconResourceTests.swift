@@ -18,6 +18,18 @@ struct SettingsIconResourceTests {
         #expect(try cornerAlpha(of: cgImage) == 0)
     }
 
+    @Test func everySettingsDestinationHasUniqueArtwork() throws {
+        let imageData = try SettingsDestination.allCases.map { destination in
+            let url = try #require(SettingsIconResources.bundle.url(
+                forResource: destination.imageName,
+                withExtension: "png"
+            ))
+            return try Data(contentsOf: url)
+        }
+
+        #expect(Set(imageData).count == SettingsDestination.allCases.count)
+    }
+
     @Test func sidebarMetricsMatchTheApprovedLargerLayout() {
         #expect(SettingsSidebarMetrics.rowSpacing == 10)
         #expect(SettingsSidebarMetrics.iconSize == 28)
