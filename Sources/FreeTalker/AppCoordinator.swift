@@ -288,6 +288,10 @@ final class AppCoordinator: ObservableObject {
         let vocabularySnapshot: [String]
     }
     private var pendingStopRequest: PendingStopRequest?
+    /// Why the in-flight stop was forced, when a microphone route abort forced it — see
+    /// `silentCaptureMessage`. Cleared as soon as the terminal message consumes it, and by
+    /// `beginCapture` so it can never explain a later recording.
+    private var routeAbortMessage: String?
     private struct PendingCaptureCleanup {
         enum Completion {
             case cancellation
@@ -1487,6 +1491,7 @@ final class AppCoordinator: ObservableObject {
             return false
         }
         recordingDestination = nil
+        routeAbortMessage = nil
         oneShotLanguage = Self.nextOneShotLanguage(current: oneShotLanguage, event: .clear)
         let languageSnapshot = Self.captureRecordingLanguageSnapshot(from: AppSettings.shared)
         recordingLanguageSnapshot = languageSnapshot.candidateLanguages
@@ -2055,11 +2060,13 @@ final class AppCoordinator: ObservableObject {
             // journal-failure path would instead discard the writer's pending tail and mark
             // recovery storage unavailable, which blocks every later recording over a fault that
             // was never about storage.
+            //
+            // A terminal flash, not `.captureRouteRestart`'s restore-base one: restore-base puts
+            // the recording panel back after 2.5 s, so a journal drain slower than that would
+            // replace the error with a recording panel over a capture that has stopped.
             lastError = message
-            hud.flash(
-                "Recording stopped — \(message)",
-                lifetime: Self.hudFlashLifetime(for: .captureRouteRestart)
-            )
+            routeAbortMessage = message
+            hud.flash("Recording stopped — \(message)")
             recordingState = .idle
             stopAndTranscribe()
         }
@@ -2202,6 +2209,15 @@ final class AppCoordinator: ObservableObject {
         diagnostics.indicatesSilence ? .noSignal(route: diagnostics.routeFailure) : .ok
     }
 
+    /// A route abort ends in the silent-capture path — there is no audio to transcribe — but "no
+    /// speech was detected" is the wrong explanation when the microphone route died under the
+    /// recording. The route reason replaces it for the user-facing error; the recovery entry keeps
+    /// its own `.silent` wording, which is what the Library is keyed on.
+    nonisolated static func silentCaptureMessage(routeAbortMessage: String?) -> String {
+        guard let routeAbortMessage else { return SilentCapturePresentation.message }
+        return "\(routeAbortMessage) The recording was saved for recovery."
+    }
+
     /// Applies a completed capture's silence classification to `microphoneCaptureHealth` — shared
     /// by `stopAndTranscribe` (normal dictation) and `finishVoiceEditInstructionRecording` (Voice
     /// Edit) so a silent capture on either path updates the signal and refreshes
@@ -2277,7 +2293,11 @@ final class AppCoordinator: ObservableObject {
                         pendingStopRequest = nil
                         _ = destinationLifecycle.take()
                         recordingOutputSelection.resolveTerminal()
-                        lastError = SilentCapturePresentation.message
+                        let silentMessage = Self.silentCaptureMessage(
+                            routeAbortMessage: routeAbortMessage
+                        )
+                        routeAbortMessage = nil
+                        lastError = silentMessage
                         do {
                             try await jobLibraryStore?.refresh()
                         } catch {
@@ -2292,7 +2312,7 @@ final class AppCoordinator: ObservableObject {
                                 router: scratchpadRecordingRouter
                             ) {}
                         }
-                        hud.flash(SilentCapturePresentation.message)
+                        hud.flash(silentMessage)
                         recordingHUDDidReachTerminalState()
                         return
                     }
