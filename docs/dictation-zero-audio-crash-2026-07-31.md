@@ -25,7 +25,7 @@ sequence, including `Voice isolation DSP is available for client ... org.freetal
 just before the mismatch.
 
 Both instances died `EXC_BAD_ACCESS` (`SIGSEGV`) with the same stack shape
-(`/tmp/ft-evidence-2026-07-31/*.ips`, also 07-30's reports):
+(`*.ips` in the evidence bundle below, also 07-30's reports):
 
 ```
 objc_msgSend / objc_opt_class            <- KERN_INVALID_ADDRESS at 0x60 / 0x1e
@@ -185,5 +185,7 @@ session's log). Wasteful, not a latency cause.
 
 ## Evidence bundle
 
-`/tmp/ft-evidence-2026-07-31/` — both `.ips` reports, both failed-dictation
-directories (incl. the 42-byte WAV), and a `jobs.db` snapshot.
+`~/Library/Logs/FreeTalker/incidents/2026-07-31/` — both `.ips` reports, both
+failed-dictation directories (incl. the 42-byte WAV), and a `jobs.db` snapshot. Not
+committed: the snapshot carries dictation text. (Originally collected under
+`/tmp/ft-evidence-2026-07-31/`, which does not survive a reboot.)
