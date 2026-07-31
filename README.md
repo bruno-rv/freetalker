@@ -180,23 +180,73 @@ bundle again, enable it, and relaunch.
 
 ## Settings
 
-Settings uses a sidebar with eight focused sections:
+Settings (menu bar → **Settings…**) uses a sidebar with ten focused
+destinations. The **Processing** destination opens the **Context & Processing**
+page.
 
-- **Privacy** — permissions and on-device context.
-- **Recording** — push-to-talk, hands-free recording, Insert Last Dictation,
-  Voice Edit, and Correction Loop.
-- **Transcription** — microphone input, speech engines, models, live preview,
-  noise reduction, and vocabulary.
-- **Processing** — app rules, automatic template selection, output
-  language, and cloud post-processing.
-- **Launcher** — floating launcher visibility and placement.
-- **Storage** — retention for recovery audio and imported media.
-- **Templates** — create and edit post-processing templates.
-- **Snippets** — reusable Voice Edit expansions and triggers.
+<p align="center">
+  <img src="docs/screenshots/settings-overview.png" alt="FreeTalker Settings overview showing the sidebar with Privacy, Recording, Transcription, Processing, Launcher, Storage, Templates, Snippets, Library, and Usage Statistics" width="700">
+</p>
 
-Each section uses a generated transparent PNG icon. Settings that need more
-context include a question-mark button that opens a short native explanation;
-the same explanation is available as a hover tip.
+- **Privacy** — Check **Accessibility**, **Microphone**, **Input Monitoring**,
+  and **Screen Recording** status, then run **Run Diagnosis** when a permission
+  appears granted but does not work. Choose **Text context** to control what
+  FreeTalker may read when dictation stops. That context stays on this Mac, is
+  kept in memory, and is used only with Apple's on-device processing; FreeTalker
+  never sends it to cloud providers. Turn on **Allow automation (Shortcuts,
+  AppleScript)** to let other apps on this Mac clean up text with your Templates.
+  Automation is off by default.
+- **Recording** — Change the **Push-to-talk key** and bind separate keys for
+  **Insert Last Dictation**, **Voice Edit**, **Dictation History**, and **Correct
+  Last Dictation**. Turn on the correction watcher to offer to remember a
+  single-word edit, and set the hands-free **Auto-stop** limit from 1 to 60
+  minutes.
+- **Transcription** — Choose the microphone and **Reduce background noise**,
+  then select **WhisperKit (on-device)** or **Cloud (BYOK)**. Download, select,
+  and delete speech models; choose dictation languages; enable **Live preview
+  while recording**; and manage vocabulary and vocabulary suggestions. With
+  **Type as you speak (Streaming ASR)** enabled, download and manage its
+  separate streaming model. Cloud STT exposes **Provider**, **Model**, **Base
+  URL**, **API key**, and **Test connection** controls.
+- **Processing** — On the **Context & Processing** page, enable **Automatically
+  choose template**, add **App Rules** that select a Template or transcript
+  language for a specific app, and choose the **Default output language**.
+  Configure optional **Cloud processing** with your provider and, where
+  required, your own API key (BYOK). Translation requires Cloud post-processing;
+  **Same as spoken** does not.
+- **Launcher** — Turn on the **Show edge launcher** and choose its **Screen
+  edge**, **Position along edge**, and pinned **Dictation language**. The
+  **Notchpad** controls whether FreeTalker shows its HUD in the built-in
+  MacBook notch when available.
+- **Storage** — Set retention for failed dictation audio and imported
+  transcripts. Recovery audio, imported media, derived audio, transcripts, and
+  speaker data stay on this Mac, and FreeTalker never changes or deletes the
+  original imported source. **Back Up…** saves settings, Templates, and Snippets
+  to JSON; **Restore…** overwrites current settings and merges Templates and
+  Snippets. API keys stay in the macOS Keychain and are excluded from JSON
+  backups.
+- **Templates** — Enable **Voice commands**, set their comma-separated keywords,
+  and use **Import…**, **Export…**, **New Template**, and **Delete Template** to
+  manage reusable dictation formats. Select a Template to edit its name and
+  prompt, or make it the **Active Template**.
+- **Snippets** — Create, edit, and delete Voice Edit shortcuts. Give each
+  Snippet a name, add one trigger phrase per line, and enter its expansion. When
+  a trigger matches, FreeTalker replaces the selected text with the expansion
+  verbatim; other Voice Edit instructions use the normal AI edit.
+- **Library** — Switch among **Dictations**, **Recoveries**, and **Imports**.
+  Search past dictations, copy or translate the selected text, re-process it
+  with another Template, or delete entries. **Delete All** also removes saved
+  debug audio. Use **Recoveries** for failed dictation audio and **Imports** for
+  imported media and transcripts.
+- **Usage Statistics** — Review total dictations, total words, active days, and
+  estimated time saved; inspect dictations per day for the last 30 days; and
+  compare counts by language, Template, engine, and app. These statistics come
+  from Dictation History, so deleting a dictation removes it from the
+  statistics.
+
+Each destination uses a generated transparent PNG icon. Settings that need
+more context include a question-mark button that opens a short native
+explanation; the same explanation is available as a hover tip.
 
 ## Running the app
 
