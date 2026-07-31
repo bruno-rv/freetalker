@@ -33,8 +33,19 @@ CODESIGN_IDENTITY ?= -
 # `codesign-identity-check`) ever runs. `:=` instead expands the right-hand side exactly ONCE,
 # at this line, and stores the resulting text as an inert, static string forever after — so even
 # file content that LOOKS like Make syntax is never re-interpreted as Make syntax again.
-ifneq ($(wildcard .codesign-identity),)
-CODESIGN_IDENTITY := $(shell cat .codesign-identity)
+#
+# `.codesign-identity` is gitignored, so it exists only in the checkout
+# `scripts/make-signing-cert.sh` was run in — a `git worktree` gets none. A `make app` from a
+# worktree therefore used to ad-hoc sign silently, which orphans the previous install's
+# Accessibility, Input Monitoring and microphone TCC grants (see
+# docs/dictation-zero-audio-crash-2026-07-31.md). Fall back to the main checkout's copy, found via
+# the git common dir, so every worktree signs with the same identity. The value still goes through
+# the single `:=` expansion and `codesign-identity-check`'s allowlist below, exactly as before.
+GIT_COMMON_DIR := $(shell git rev-parse --git-common-dir 2>/dev/null)
+CODESIGN_IDENTITY_FILE := $(firstword $(wildcard .codesign-identity) \
+	$(if $(GIT_COMMON_DIR),$(wildcard $(dir $(GIT_COMMON_DIR)).codesign-identity)))
+ifneq ($(CODESIGN_IDENTITY_FILE),)
+CODESIGN_IDENTITY := $(shell cat $(CODESIGN_IDENTITY_FILE))
 endif
 # Command-line assignments (`make bundle CODESIGN_IDENTITY=...`, which is how release.sh passes
 # the value it read from `.codesign-identity`) default to that same dangerous recursive

@@ -175,6 +175,11 @@ final class AudioCapture: @unchecked Sendable {
         case abort
     }
 
+    enum ConverterCacheAction: Equatable {
+        case reuse
+        case rebuild
+    }
+
     enum ConfiguredDeviceVerificationAction: Equatable {
         case accept
         case abortMismatch
@@ -190,6 +195,12 @@ final class AudioCapture: @unchecked Sendable {
     private let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false)!
     private var isCapturing = false
     private var conversionFailureCount = 0
+    /// Converter from the tap's *live* input format to `targetFormat`, built lazily from the first
+    /// buffer and rebuilt whenever the bus renegotiates mid-capture. Pinning a converter to a
+    /// format read before the graph settled is what broke capture — see `startCaptureAttempt`.
+    /// Both guarded by `samplesLock`.
+    private var tapConverter: AVAudioConverter?
+    private var tapConverterFormat: AVAudioFormat?
     private var sampleConsumer: (@Sendable ([Float]) -> CaptureJournalWriter.EnqueueResult)?
     /// Optional live-tap fan-out (Streaming ASR): receives each converted buffer's samples
     /// alongside `sampleConsumer`, purely additively — `samples` accumulation and
@@ -259,6 +270,18 @@ final class AudioCapture: @unchecked Sendable {
     ) -> RawCapturePostconditionAction {
         guard effectiveVoiceProcessing else { return .accept }
         return usingReplacementEngine ? .abort : .replaceEngine
+    }
+
+    /// Whether the cached tap converter still matches what the tap is delivering. The tap follows
+    /// the input bus's live format (`installTap(format: nil)`), and that format can change
+    /// mid-capture — a device switch or a voice-processing transition renegotiates the bus — so a
+    /// converter pinned to an earlier format would silently resample against the wrong input rate.
+    nonisolated static func converterCacheAction(
+        cachedFormat: AVAudioFormat?,
+        incomingFormat: AVAudioFormat
+    ) -> ConverterCacheAction {
+        guard let cachedFormat else { return .rebuild }
+        return cachedFormat == incomingFormat ? .reuse : .rebuild
     }
 
     nonisolated static func configuredDeviceVerificationAction(
@@ -383,17 +406,28 @@ final class AudioCapture: @unchecked Sendable {
                 try applyConfiguredInputDevice(uid: deviceUID, to: attemptInput)
             }
 
-            let inputFormat = attemptInput.outputFormat(forBus: 0)
-            Self.logger.info("Negotiated input format: \(inputFormat.description, privacy: .public)")
-            guard let negotiatedConverter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
-                throw CaptureError.converterUnavailable(inputFormat.description)
+            // `format: nil` — the tap follows the input bus's live format instead of one read
+            // here. Reading the format here and passing it in is a race: applying the configured
+            // device above (and any voice-processing transition before it) renegotiates the bus
+            // asynchronously, so `outputFormat(forBus:)` can still report the previous device's
+            // rate. Observed on a 16 kHz USB mic: 48 kHz reported, 16 kHz hardware, and
+            // AVAudioEngine then either installs nothing at all ("Failed to create tap, config
+            // change pending!" — capture runs to completion with zero frames, which is what left
+            // recovery jobs stuck at `preparing` with progress 0) or raises an ObjC exception
+            // ("Failed to create tap due to format mismatch"). That exception unwinds these Swift
+            // frames without running their cleanup and strands the main thread's executor
+            // tracking record, so the app later segfaults inside an unrelated MainActor isolation
+            // check. See docs/dictation-zero-audio-crash-2026-07-31.md.
+            samplesLock.withLock {
+                tapConverter = nil
+                tapConverterFormat = nil
             }
-            attemptInput.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
-                self?.consume(
-                    buffer: buffer, inputFormat: inputFormat,
-                    converter: negotiatedConverter, generation: generation
-                )
+            attemptInput.installTap(onBus: 0, bufferSize: 4096, format: nil) { [weak self] buffer, _ in
+                self?.consume(buffer: buffer, generation: generation)
             }
+            Self.logger.info(
+                "Installed tap; bus format: \(attemptInput.outputFormat(forBus: 0).description, privacy: .public)"
+            )
             tapInstalled = true
             engine.prepare()
             try engine.start()
@@ -690,14 +724,37 @@ final class AudioCapture: @unchecked Sendable {
         return deviceID
     }
 
-    private func consume(
-        buffer: AVAudioPCMBuffer,
-        inputFormat: AVAudioFormat,
-        converter: AVAudioConverter,
-        generation: UUID
-    ) {
+    /// Converter for the format the tap is actually delivering, cached across buffers and rebuilt
+    /// when the bus renegotiates. Returns nil only when CoreAudio cannot convert that format at
+    /// all, which `consume` treats as a conversion failure.
+    private func converter(for inputFormat: AVAudioFormat) -> AVAudioConverter? {
+        samplesLock.withLock {
+            if let tapConverter, Self.converterCacheAction(
+                cachedFormat: tapConverterFormat, incomingFormat: inputFormat
+            ) == .reuse {
+                return tapConverter
+            }
+            guard let converter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
+                return nil
+            }
+            tapConverter = converter
+            tapConverterFormat = inputFormat
+            return converter
+        }
+    }
+
+    private func consume(buffer: AVAudioPCMBuffer, generation: UUID) {
         guard generationGate.begin(generation) else { return }
         defer { generationGate.finish(generation) }
+        // The buffer's own format is authoritative — see `installTap(format: nil)` above.
+        let inputFormat = buffer.format
+        guard let converter = converter(for: inputFormat) else {
+            Self.logger.error(
+                "No converter available for tap format \(inputFormat.description, privacy: .public)"
+            )
+            recordConversionFailure(generation: generation)
+            return
+        }
         let ratio = targetFormat.sampleRate / inputFormat.sampleRate
         let outCapacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 16
         guard let outBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outCapacity) else {

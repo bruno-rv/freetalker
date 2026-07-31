@@ -942,6 +942,19 @@ final class AppCoordinator: ObservableObject {
         "Could not start recording: \(errorDescription)"
     }
 
+    /// Monotonic elapsed seconds — `ContinuousClock` keeps stage timings honest across a clock
+    /// adjustment or a sleep/wake in the middle of a long dictation.
+    nonisolated static func elapsedSeconds(since start: ContinuousClock.Instant) -> Double {
+        let duration = ContinuousClock.now - start
+        return Double(duration.components.seconds)
+            + Double(duration.components.attoseconds) / 1e18
+    }
+
+    nonisolated static func stageDurationText(_ seconds: Double?) -> String {
+        guard let seconds else { return "n/a" }
+        return String(format: "%.2f", seconds)
+    }
+
     private func beginHotKeyRetryPollIfNeeded() {
         guard permissionPollTimer == nil else { return }
         permissionPollTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
@@ -3868,7 +3881,29 @@ final class AppCoordinator: ObservableObject {
         localContext: LocalProcessingContext?,
         earlyInsertion: EarlyInsertionHandler?
     ) async throws -> DictationProcessingResult {
+        // docs/perf-dictation-latency-2026-07-29.md could not attribute 19–50 s of the measured
+        // stop→text wait because the pipeline records no stage duration anywhere. One notice per
+        // dictation closes that on whichever machine is slow, without changing any behaviour.
+        // Durations and the engine name only — never transcript text.
+        let stageStart = ContinuousClock.now
+        var transcribeSeconds: Double?
+        var refineSeconds: Double?
+        defer {
+            let audioSeconds = Double(samples.count) / Double(CaptureSegmentCodec.sampleRate)
+            Self.logger.notice(
+                """
+                stage timings: engine=\(engineName, privacy: .public) \
+                audio=\(Self.stageDurationText(audioSeconds), privacy: .public)s \
+                transcribe=\(Self.stageDurationText(transcribeSeconds), privacy: .public)s \
+                refine=\(Self.stageDurationText(refineSeconds), privacy: .public)s \
+                total=\(Self.stageDurationText(Self.elapsedSeconds(since: stageStart)), privacy: .public)s
+                """
+            )
+        }
+
+        let transcribeStart = ContinuousClock.now
         let transcription = try await engine.transcribe(samples: samples, forcedLanguage: context.transcriptionLanguage, candidateLanguages: context.candidateLanguages, vocabulary: context.vocabularySnapshot)
+        transcribeSeconds = Self.elapsedSeconds(since: transcribeStart)
         guard !transcription.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw PipelineError.emptyTranscript
         }
@@ -3898,6 +3933,8 @@ final class AppCoordinator: ObservableObject {
                     underlyingError: TranslationService.Error.unavailable(.invalidConfiguration)
                 )
             }
+            let translateStart = ContinuousClock.now
+            defer { refineSeconds = Self.elapsedSeconds(since: translateStart) }
             do {
                 refined = try await translator.process(
                     source: transcription.text,
@@ -3937,6 +3974,8 @@ final class AppCoordinator: ObservableObject {
                 Self.logger.notice("post-processing request: voice command policy enabled")
             }
             let (refinedText, fallback): (String, PostProcessingFallbackReason?)
+            let refineStart = ContinuousClock.now
+            defer { refineSeconds = Self.elapsedSeconds(since: refineStart) }
             do {
                 (refinedText, fallback) = try await applyPostProcessing(
                     transcript: transcription.text, voiceCommandPolicy: request.voiceCommandPolicy

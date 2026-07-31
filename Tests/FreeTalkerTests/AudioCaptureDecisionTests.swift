@@ -1,7 +1,53 @@
+import AVFoundation
 import Testing
 @testable import FreeTalker
 
 struct AudioCaptureDecisionTests {
+    private static func format(sampleRate: Double, channels: AVAudioChannelCount = 1) -> AVAudioFormat {
+        AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: sampleRate,
+            channels: channels,
+            interleaved: false
+        )!
+    }
+
+    @Test func firstTapBufferBuildsAConverter() {
+        #expect(
+            AudioCapture.converterCacheAction(
+                cachedFormat: nil, incomingFormat: Self.format(sampleRate: 48_000)
+            ) == .rebuild
+        )
+    }
+
+    @Test func unchangedTapFormatReusesTheConverter() {
+        #expect(
+            AudioCapture.converterCacheAction(
+                cachedFormat: Self.format(sampleRate: 48_000),
+                incomingFormat: Self.format(sampleRate: 48_000)
+            ) == .reuse
+        )
+    }
+
+    /// The regression the zero-audio/crash bug came from: the bus renegotiated from 48 kHz to the
+    /// 16 kHz USB microphone after capture started. A converter pinned to the old format would
+    /// resample against the wrong input rate — see
+    /// docs/dictation-zero-audio-crash-2026-07-31.md.
+    @Test func renegotiatedTapFormatRebuildsTheConverter() {
+        #expect(
+            AudioCapture.converterCacheAction(
+                cachedFormat: Self.format(sampleRate: 48_000),
+                incomingFormat: Self.format(sampleRate: 16_000)
+            ) == .rebuild
+        )
+        #expect(
+            AudioCapture.converterCacheAction(
+                cachedFormat: Self.format(sampleRate: 48_000, channels: 1),
+                incomingFormat: Self.format(sampleRate: 48_000, channels: 2)
+            ) == .rebuild
+        )
+    }
+
     @Test func journalConsumerAcceptsSamplesWithoutFailureHandling() {
         #expect(AudioCapture.consumerFailureAction(for: .accepted) == .none)
     }
