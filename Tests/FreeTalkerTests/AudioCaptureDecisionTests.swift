@@ -18,7 +18,7 @@ struct AudioCaptureDecisionTests {
     @Test func captureWithoutASingleTapCallbackIsRestarted() {
         #expect(
             AudioCapture.starvedCaptureAction(
-                isCapturing: true, tapCallbackCount: 0, restartsUsed: 0
+                isCapturing: true, convertedAnything: false, restartsUsed: 0
             ) == .restart
         )
     }
@@ -26,7 +26,7 @@ struct AudioCaptureDecisionTests {
     @Test func captureDeliveringBuffersIsLeftAlone() {
         #expect(
             AudioCapture.starvedCaptureAction(
-                isCapturing: true, tapCallbackCount: 1, restartsUsed: 0
+                isCapturing: true, convertedAnything: true, restartsUsed: 0
             ) == .ignore
         )
     }
@@ -35,7 +35,7 @@ struct AudioCaptureDecisionTests {
     @Test func finishedCaptureIsLeftAlone() {
         #expect(
             AudioCapture.starvedCaptureAction(
-                isCapturing: false, tapCallbackCount: 0, restartsUsed: 0
+                isCapturing: false, convertedAnything: false, restartsUsed: 0
             ) == .ignore
         )
     }
@@ -46,7 +46,7 @@ struct AudioCaptureDecisionTests {
         #expect(
             AudioCapture.starvedCaptureAction(
                 isCapturing: true,
-                tapCallbackCount: 0,
+                convertedAnything: false,
                 restartsUsed: AudioCapture.maximumRouteRestarts
             ) == .abort
         )
@@ -82,7 +82,7 @@ struct AudioCaptureDecisionTests {
         let generation = UUID()
         let first = AudioCapture.resolveFault(
             kind: .routeChange, message: "route died", generation: generation,
-            faultedGeneration: nil, isCapturing: true, tapCallbackCount: 0, restartsUsed: 0
+            faultedGeneration: nil, isCapturing: true, convertedAnything: false, restartsUsed: 0
         )
         #expect(first.decision == .restartForRouteFailure("route died"))
         #expect(first.restartsUsed == 1)
@@ -92,7 +92,7 @@ struct AudioCaptureDecisionTests {
             kind: .starvedTap, message: AudioCapture.noAudioDeliveredMessage,
             generation: generation,
             faultedGeneration: first.faultedGeneration, isCapturing: true,
-            tapCallbackCount: 0, restartsUsed: first.restartsUsed
+            convertedAnything: false, restartsUsed: first.restartsUsed
         )
         #expect(second.decision == nil)
         #expect(second.restartsUsed == first.restartsUsed)
@@ -110,7 +110,7 @@ struct AudioCaptureDecisionTests {
             let resolution = AudioCapture.resolveFault(
                 kind: .starvedTap, message: "dead", generation: UUID(),
                 faultedGeneration: faulted, isCapturing: true,
-                tapCallbackCount: 0, restartsUsed: restartsUsed
+                convertedAnything: false, restartsUsed: restartsUsed
             )
             faulted = resolution.faultedGeneration
             restartsUsed = resolution.restartsUsed
@@ -137,46 +137,38 @@ struct AudioCaptureDecisionTests {
         #expect(AudioCapture.convertedBufferAction(frameCount: 1) == .accept)
     }
 
-    /// Repeated zero-frame conversions must advance the per-attempt deadline to an escalation, and
-    /// escalate exactly once.
-    @Test func repeatedUnusableBuffersEscalateOnce() {
-        let bufferSeconds = 4096.0 / 48_000
-        var unusableSeconds: TimeInterval = 0
-        var escalated = false
-        var escalations = 0
-        for _ in 0..<Int((AudioCapture.unusableAudioDeadline / bufferSeconds).rounded(.up) + 5) {
-            unusableSeconds += bufferSeconds
-            if AudioCapture.unusableAudioAction(
-                convertedAnything: false,
-                alreadyEscalated: escalated,
-                unusableSeconds: unusableSeconds
-            ) == .escalate {
-                escalations += 1
-                escalated = true
-            }
-        }
-        #expect(escalations == 1)
-        #expect(unusableSeconds >= AudioCapture.unusableAudioDeadline)
-    }
-
-    /// An attempt that converted real audio earlier is not escalated by later failures — that is a
-    /// degraded capture, not a dead one, and it still has audio worth keeping.
-    @Test func failuresAfterUsableAudioAreNotEscalated() {
+    /// The hole this predicate closes: one callback arrives, converts to nothing, and no further
+    /// callback ever comes. A "did any callback arrive?" deadline passes that capture as live
+    /// forever; the deadline asks whether anything usable was produced, so it does not.
+    @Test func oneUnusableCallbackThenSilenceIsStarved() {
         #expect(
-            AudioCapture.unusableAudioAction(
-                convertedAnything: true,
-                alreadyEscalated: false,
-                unusableSeconds: AudioCapture.unusableAudioDeadline * 10
-            ) == .ignore
+            AudioCapture.starvedCaptureAction(
+                isCapturing: true, convertedAnything: false, restartsUsed: 0
+            ) == .restart
+        )
+        #expect(
+            AudioCapture.starvedCaptureMessage(tapCallbackCount: 1)
+                == AudioCapture.unusableAudioMessage
+        )
+        #expect(
+            AudioCapture.starvedCaptureMessage(tapCallbackCount: 0)
+                == AudioCapture.noAudioDeliveredMessage
         )
     }
 
-    @Test func briefUnusableAudioIsToleratedBeforeTheDeadline() {
+    /// An attempt that converted real audio is never starved — that is a degraded capture at worst,
+    /// and it has audio worth keeping.
+    @Test func anAttemptThatProducedUsableAudioIsNeverStarved() {
         #expect(
-            AudioCapture.unusableAudioAction(
-                convertedAnything: false,
-                alreadyEscalated: false,
-                unusableSeconds: AudioCapture.unusableAudioDeadline / 2
+            AudioCapture.starvedCaptureAction(
+                isCapturing: true, convertedAnything: true, restartsUsed: 0
+            ) == .ignore
+        )
+        #expect(
+            AudioCapture.starvedCaptureAction(
+                isCapturing: true,
+                convertedAnything: true,
+                restartsUsed: AudioCapture.maximumRouteRestarts
             ) == .ignore
         )
     }
@@ -185,7 +177,7 @@ struct AudioCaptureDecisionTests {
     @Test func aLiveAttemptIsNeverFaulted() {
         let resolution = AudioCapture.resolveFault(
             kind: .starvedTap, message: "dead", generation: UUID(),
-            faultedGeneration: nil, isCapturing: true, tapCallbackCount: 3, restartsUsed: 0
+            faultedGeneration: nil, isCapturing: true, convertedAnything: true, restartsUsed: 0
         )
         #expect(resolution.decision == nil)
         #expect(resolution.faultedGeneration == nil)
