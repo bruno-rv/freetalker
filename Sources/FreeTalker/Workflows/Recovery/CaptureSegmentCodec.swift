@@ -1,7 +1,7 @@
 import CryptoKit
 import Foundation
 
-enum CaptureJournalError: Error, Equatable, Sendable {
+enum CaptureJournalError: Error, Equatable, Sendable, LocalizedError {
     case invalidConfiguration
     case invalidAudioFormat(sampleRate: Double, channelCount: Int)
     case invalidWAV(String)
@@ -13,6 +13,33 @@ enum CaptureJournalError: Error, Equatable, Sendable {
     case missingCapture(UUID)
     case queueOverflow(maximumFrames: Int)
     case failed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidConfiguration:
+            "Recording configuration is invalid."
+        case .invalidAudioFormat(let sampleRate, let channelCount):
+            "Recording used an unsupported audio format (\(sampleRate) Hz, \(channelCount) channel(s))."
+        case .invalidWAV(let path):
+            "Recording audio is corrupted: \(path)"
+        case .invalidOrdinal(let expected, let actual):
+            "Recording segments are out of order (expected segment \(expected), found \(actual))."
+        case .invalidSampleCount(let path):
+            "Recording segment has an unexpected sample count: \(path)"
+        case .hashMismatch(let path):
+            "Recording segment failed an integrity check: \(path)"
+        case .captureMismatch:
+            "Recording segments belong to different recordings."
+        case .cleanupNotPermitted(let reason):
+            "Recovery cleanup was not permitted: \(reason)"
+        case .missingCapture(let id):
+            "Recording \(id) could not be found in the recovery journal."
+        case .queueOverflow(let maximumFrames):
+            "Recording could not keep up and exceeded its buffer limit (\(maximumFrames) frames)."
+        case .failed(let message):
+            message
+        }
+    }
 }
 
 struct CaptureSegmentCodec: Sendable {
