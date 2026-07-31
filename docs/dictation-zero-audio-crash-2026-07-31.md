@@ -214,16 +214,60 @@ stage timings: engine=WhisperKit audio=12.40s transcribe=2.61s refine=1.88s tota
 ```
 
 First local measurement, from the verification run above: `audio=18.94s transcribe=38.76s
-refine=0.55s` — RTF **2.05**, ten times worse than the 0.20 measured on 07-29, with
-post-processing contributing 0.55 s. That was the first transcription after a relaunch, so it
-carries model load plus ANE compilation; a second dictation on the same launch separates that
-one-off from steady state. It does establish that the cloud LLM is not what makes a small
-dictation slow here — `transcribe` is 98% of the wall clock.
+refine=0.55s` — RTF **2.05**, with post-processing contributing 0.55 s. It reproduced locally
+after all, and `transcribe` was 98% of the wall clock, so the cloud LLM was never the cause.
 
 `audio` is the recording's length, so `transcribe`/`audio` is the effective RTF on that
-machine, and `total − transcribe − refine` is what remains unaccounted for. That
-splits the three candidates — a slow model on slow silicon, the cloud LLM's tail, or
-the still-unattributed remainder — which cannot be told apart from the outside.
+machine, and `total − transcribe − refine` is what remains unaccounted for.
+
+### It was WhisperKit's temperature-fallback budget (19:40, same day)
+
+The cost is not proportional to the audio. Two consecutive 6-second dictations in one process:
+
+| | `transcribe` |
+|---|---|
+| run A | 2.75s |
+| run B | 35.43s |
+
+A constant ~33 s appearing and disappearing on near-identical input isn't a slow model. Two
+suspects were eliminated by measurement rather than by reading:
+
+- **Language auto-detect.** Pinning the dictation language (so `forcedLanguage != nil` skips
+  `detectLangauge` entirely) made a run fast — but so did leaving it unpinned, on a different
+  attempt. Direct instrumentation settled it: **0.32–0.68 s** per dictation. Innocent.
+- **Model load.** A fresh launch's *first* dictation is fast (2.74 s), so the model is warm
+  before the first keypress. Not in this path.
+
+The engine now logs WhisperKit's own decode timings, which name the mechanism outright:
+
+```
+fast: fallbacks=0 windows=1 loops=52  logmel=0.00s encode=0.26s decodeLoop=2.41s  fallbackTime=0.00s
+slow: fallbacks=5 windows=1 loops=832 logmel=0.01s encode=0.26s decodeLoop=35.10s fallbackTime=34.83s
+```
+
+Mel and encode are constant at 0.27 s. All of it is the decode loop, re-run **five extra times**
+— WhisperKit's `DecodingOptions.temperatureFallbackCount` default — because its quality
+heuristics rejected each pass. 832 loops for six seconds of speech is the decoder repeating
+itself: the compression-ratio threshold (2.4) is what rejects, and a higher sampling temperature
+does not fix a repetition, so the retries pay full price and return the same text. Bruno's own
+slow dictation is the visible case — its stored transcript is `"Hello, that's 123456, Hello,
+that's 123456 6 6 6,"`.
+
+With real speech (driven through `say` into the same microphone) the storm doesn't happen at
+all: `fallbacks=0`, `compressionRatio` 1.00–1.11, `transcribe` 3.06–3.11 s for ~6 s clips. So
+the trigger is repetitive or near-silent audio, not the machine and not the model choice.
+
+Fix: `decodeFallbackBudget(preview:)` — 2 on the final path, still 0 for preview ticks. Measured
+after, same driven clips: worst case **9.15 s** (`fallbacks=2 decodeLoop=8.83s`), real speech
+3.29 s. A ~4× cut in the worst case, and the passes that fix a merely unsure decode are kept.
+If a real transcript is ever seen to need pass four or five, the upgrade path is to keep
+retrying only while `DecodingResult.fallback.fallbackReason` is one temperature can move —
+not to raise the number again.
+
+Still open: the app happily transcribes and inserts hallucinated text from a silent capture
+(`"Closed Captioning by Stagetext, www.stagetext.com"` from six seconds of room noise). That's a
+separate defect from this one — cheap to fix at the capture watchdog's existing peak/rms, and
+not attempted here.
 
 ## Non-issue found on the way
 

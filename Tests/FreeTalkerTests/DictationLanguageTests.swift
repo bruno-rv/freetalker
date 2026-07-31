@@ -193,6 +193,13 @@ struct DictationLanguageTests {
         #expect(WhisperKitEngine.constrainedLanguage(langProbs: langProbs, candidates: ["en", "pt"]) == "pt")
     }
 
+    @Test func finalDecodeRetriesAreBoundedAndPreviewsGetNone() {
+        // The final path used WhisperKit's default of 5, which is how a 6-second dictation reached
+        // 35s of decoding (`fallbacks=5 loops=832`). Previews stay at zero.
+        #expect(WhisperKitEngine.decodeFallbackBudget(preview: false) == 2)
+        #expect(WhisperKitEngine.decodeFallbackBudget(preview: true) == 0)
+    }
+
     @Test func constrainedLanguageFallsBackWhenCandidatesEmpty() {
         let langProbs: [String: Float] = ["en": 0.9, "pt": 0.1]
         let winner = WhisperKitEngine.constrainedLanguage(langProbs: langProbs, candidates: [])

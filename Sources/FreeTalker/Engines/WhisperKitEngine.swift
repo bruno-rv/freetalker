@@ -339,6 +339,8 @@ final class ModelReloadController<Kit>: @unchecked Sendable {
 }
 
 final class WhisperKitEngine: ObservableObject, TranscriptionEngine, WhisperFileTranscriptionBackend, @unchecked Sendable {
+    private static let logger = Logger(subsystem: "org.freetalker.app", category: "stt")
+
     let name = "WhisperKit"
     @MainActor @Published private(set) var statusText: String = "Not loaded"
 
@@ -539,7 +541,9 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, WhisperFile
                 // (`candidateLanguages` — an immutable per-request snapshot, see PLAN.md F5.3),
                 // then pin the real decode to it instead of letting WhisperKit detect+decode
                 // freely.
+                let detectStart = Date()
                 let (_, langProbs) = try await kit.detectLangauge(audioArray: samples)
+                Self.logger.info("language detection took \(Date().timeIntervalSince(detectStart), format: .fixed(precision: 2))s")
                 try checkPreviewCancellation(cancelFlag)
                 language = Self.constrainedLanguage(langProbs: langProbs, candidates: candidateLanguages)
             }
@@ -560,11 +564,8 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, WhisperFile
             // final transcript, not for a preview tick that's superseded within
             // `livePreviewTickInterval` seconds anyway. `wordTimestamps` is already `false` by
             // default (never set true anywhere in this app), so there's nothing to additionally
-            // disable there. The final path (`cancelFlag == nil`) is untouched — same defaults as
-            // before this fix.
-            if cancelFlag != nil {
-                options.temperatureFallbackCount = 0
-            }
+            // disable there.
+            options.temperatureFallbackCount = Self.decodeFallbackBudget(preview: cancelFlag != nil)
 
             // Bias decoding toward user-registered vocabulary (proper nouns/jargon) via
             // WhisperKit's `promptTokens`, following the same encode pattern as WhisperKit's own
@@ -595,6 +596,7 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, WhisperFile
             }
 
             let results = try await kit.transcribe(audioArray: samples, decodeOptions: options, callback: callback)
+            Self.logDecodeTimings(results, preview: cancelFlag != nil)
 
             // See `shouldDiscardPreviewResult` — an early-stopped decode returns normally with
             // partial text rather than throwing, so cancellation has to be checked explicitly
@@ -611,6 +613,64 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, WhisperFile
             await setReadyStatus()
             throw error
         }
+    }
+
+    /// How many extra decode passes a rejected transcription may buy. WhisperKit's own default is
+    /// 5, and a maxed-out budget is what made short dictations take ~35s: measured on an M5 Pro
+    /// with `large-v3_turbo`, one pass over a 30 s window costs ~2.5 s, so six of them is the
+    /// whole wall clock (`fallbacks=5 loops=832 decodeLoop=35.10s` against `fallbacks=0 loops=52
+    /// decodeLoop=2.41s` for the same length of audio).
+    ///
+    /// Retries only help when a pass failed for a reason a higher sampling temperature can change.
+    /// The rejection this app actually hits is the compression-ratio threshold — the decoder
+    /// repeating itself, either hallucinating on near-silence or echoing genuinely repetitive
+    /// speech ("Hello, that's 123456, Hello, that's 123456 6 6 6") — and the retries return the
+    /// same rejected text after paying for all five. Two keeps the passes that fix a merely unsure
+    /// decode and drops the tail that only ever spends time.
+    ///
+    /// A budget, not a quality judgement: if a real transcript is ever seen to need pass four or
+    /// five, the upgrade path is to keep retrying only while the rejection reason is one
+    /// temperature can move (WhisperKit exposes `DecodingResult.fallback.fallbackReason`), rather
+    /// than raising this number again.
+    ///
+    /// Preview ticks get none. They are superseded within `livePreviewTickInterval` seconds
+    /// anyway, and their cost has to stay bounded independently of cancellation because
+    /// WhisperKit's pre-decode stages aren't interruptible (Codex round-3 finding; the other half
+    /// of that bound is `AudioCapture.snapshotSuffix`).
+    nonisolated static func decodeFallbackBudget(preview: Bool) -> Int {
+        preview ? 0 : 2
+    }
+
+    /// WhisperKit re-runs a whole decode pass, up to `temperatureFallbackCount` extra times, when
+    /// its own compression-ratio/log-prob heuristics reject a pass — so an otherwise identical
+    /// dictation can cost 1× or 6× the decode. Without this line a fallback storm is
+    /// indistinguishable in the log from "the model is just slow on this machine".
+    private static func logDecodeTimings(_ results: [TranscriptionResult], preview: Bool) {
+        guard let timings = results.first?.timings else { return }
+        logger.info(
+            """
+            decode timings\(preview ? " (preview)" : ""): \
+            fallbacks=\(timings.totalDecodingFallbacks, format: .fixed(precision: 0)) \
+            windows=\(timings.totalDecodingWindows, format: .fixed(precision: 0)) \
+            loops=\(timings.totalDecodingLoops, format: .fixed(precision: 0)) \
+            logmel=\(timings.logmels, format: .fixed(precision: 2))s \
+            encode=\(timings.encoding, format: .fixed(precision: 2))s \
+            decodeLoop=\(timings.decodingLoop, format: .fixed(precision: 2))s \
+            fallbackTime=\(timings.decodingFallback, format: .fixed(precision: 2))s
+            """
+        )
+        // Which threshold rejected the pass: compression ratio > 2.4 means the decode repeated
+        // itself, avgLogprob < -1.0 means it was unsure, noSpeechProb > 0.6 means silence.
+        guard let segment = results.first?.segments.first else { return }
+        logger.info(
+            """
+            decode quality: temperature=\(segment.temperature, format: .fixed(precision: 2)) \
+            compressionRatio=\(segment.compressionRatio, format: .fixed(precision: 2)) \
+            avgLogprob=\(segment.avgLogprob, format: .fixed(precision: 2)) \
+            noSpeechProb=\(segment.noSpeechProb, format: .fixed(precision: 2)) \
+            tokens=\(segment.tokens.count)
+            """
+        )
     }
 
     private func kitForTranscription() async throws -> WhisperKit {
