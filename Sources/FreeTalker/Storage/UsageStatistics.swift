@@ -103,7 +103,10 @@ struct UsageStatsSnapshot: Sendable, Equatable {
     /// contribute a rate.
     var rowsWithPositiveDuration: Int = 0
     /// Words from those same rows, so pace is words-over-their-own-time rather than all words over
-    /// some rows' time.
+    /// some rows' time. Counted from the raw `transcript` — what was actually *said* in those
+    /// seconds — not the post-processed or translated output: a PT→EN row's `refined` is English
+    /// text produced from Portuguese speaking time, and even a same-language template changes the
+    /// word count by tightening the wording.
     var wordsWithDuration: Int = 0
     var longestDictation: UsageStatLongest?
     /// Distinct lowercased, punctuation-trimmed words across all dictations.
@@ -256,7 +259,9 @@ struct UsageStatsSnapshot: Sendable, Equatable {
                 if duration > 0 {
                     snapshot.rowsWithPositiveDuration += 1
                     snapshot.speakingSeconds += duration
-                    snapshot.wordsWithDuration += rowWords
+                    // Legacy rows can have an empty `transcript`; those fall back to the counted
+                    // display text rather than dropping out of the numerator alone.
+                    snapshot.wordsWithDuration += row.transcript.isEmpty ? rowWords : wordCount(row.transcript)
                 }
             }
         }

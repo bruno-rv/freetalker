@@ -218,6 +218,23 @@ import Testing
         #expect(snapshot.totalWords == 65)
     }
 
+    @Test func speakingPaceCountsSpokenWordsNotProducedText() {
+        // A PT→EN row: 30 English words came out of 60 seconds of Portuguese speech. Pace must
+        // measure the 90 words that were actually said, not the translation's word count.
+        let spoken = Array(repeating: "palavra", count: 90).joined(separator: " ")
+        let translated = Array(repeating: "word", count: 30).joined(separator: " ")
+        let row = Self.row(
+            language: "pt", durationSecs: 60, refined: translated, transcript: spoken,
+            requestedOutputLanguage: .english
+        )
+        let snapshot = UsageStatsSnapshot.compute(rows: [row], now: Self.referenceNow, calendar: Self.utcCalendar())
+
+        #expect(snapshot.wordsWithDuration == 90)
+        #expect(abs((snapshot.wordsPerMinute ?? 0) - 90) < 0.001)
+        // The delivered text is still what `totalWords` counts — that metric is about output.
+        #expect(snapshot.totalWords == 30)
+    }
+
     @Test func zeroAndMissingDurationsLeavePaceUnavailableRatherThanInfinite() {
         let rows = [Self.row(durationSecs: 0, refined: "some words here"), Self.row(durationSecs: nil)]
         let snapshot = UsageStatsSnapshot.compute(rows: rows, now: Self.referenceNow, calendar: Self.utcCalendar())
