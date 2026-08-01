@@ -1,4 +1,5 @@
 import Foundation
+import os
 import Testing
 @testable import FreeTalker
 
@@ -116,6 +117,15 @@ import Testing
         #expect(WhisperKitEngine.constrainedLanguage(
             langProbs: ["en": 0.99, "pt": 0.01], candidates: ["pt"]
         ) == "pt")
+    }
+
+    /// Codex adversarial review rounds 2 and 3: the `notice` promotion is for the one decode the
+    /// user waited for. A preview tick runs every ~1.5 s, so anything it logs persistently buries
+    /// the evidence the promotion exists to preserve — and there is more than one such site, which
+    /// is what made the first fix incomplete.
+    @Test func previewDiagnosticsStayOutOfThePersistentLog() {
+        #expect(WhisperKitEngine.diagnosticLogLevel(preview: true) == .info)
+        #expect(WhisperKitEngine.diagnosticLogLevel(preview: false) == .default)
     }
 
     @Test func severalCandidatesStillRequireDetection() {

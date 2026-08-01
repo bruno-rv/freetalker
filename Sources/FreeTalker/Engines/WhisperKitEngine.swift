@@ -561,7 +561,10 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, WhisperFile
                 // freely.
                 let detectStart = Date()
                 let (_, langProbs) = try await kit.detectLangauge(audioArray: samples)
-                Self.logger.notice("language detection took \(Date().timeIntervalSince(detectStart), format: .fixed(precision: 2))s")
+                Self.logger.log(
+                    level: Self.diagnosticLogLevel(preview: cancelFlag != nil),
+                    "language detection took \(Date().timeIntervalSince(detectStart), format: .fixed(precision: 2))s"
+                )
                 try checkPreviewCancellation(cancelFlag)
                 language = Self.constrainedLanguage(langProbs: langProbs, candidates: candidateLanguages)
             }
@@ -664,21 +667,30 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, WhisperFile
     /// dictation can cost 1× or 6× the decode. Without this line a fallback storm is
     /// indistinguishable in the log from "the model is just slow on this machine".
     ///
-    /// `notice`, not `info`, for the FINAL decode: info-level messages only live in the in-memory
+    /// The level every per-decode diagnostic in this engine logs at.
+    ///
+    /// `notice` (`.default`) for the FINAL decode: info-level messages only live in the in-memory
     /// buffer and are evicted within hours, which is exactly why the 2026-08-01 08:30 storm
     /// (1.79 s of audio, 15.24 s of decode) could not be diagnosed afterwards — `stage timings`
     /// had survived and these had not.
     ///
-    /// Preview ticks stay at `info` (Codex adversarial review round 2). A tick runs about every
+    /// `info` for preview ticks (Codex adversarial review rounds 2 and 3). A tick runs about every
     /// 1.5 s and gets no fallback budget at all, so promoting them would write hundreds of
-    /// persistent `fallbacks=0` records per long Recording — pure noise around the one decode the
-    /// user actually waited for, in a log the storm evidence has to be findable in.
+    /// persistent records per long Recording — pure noise around the one decode the user actually
+    /// waited for, in a log the storm evidence has to be findable in. One function rather than a
+    /// literal at each site, because it was the *second* site (language detection) that made the
+    /// first fix incomplete.
+    nonisolated static func diagnosticLogLevel(preview: Bool) -> OSLogType {
+        preview ? .info : .default
+    }
+
+    /// See `diagnosticLogLevel` for why this is level-parameterized rather than `logger.notice`.
     private static func logDecodeTimings(_ results: [TranscriptionResult], preview: Bool) {
         guard let timings = results.first?.timings else { return }
-        // `.default` is `notice`'s level; `Logger.log(level:)` takes it as an ordinary argument,
-        // which `logger.notice`/`logger.info` (whose message must be a literal interpolation at
-        // the call site) can't express without duplicating the whole format string.
-        let level: OSLogType = preview ? .info : .default
+        // `Logger.log(level:)` takes the level as an ordinary argument, which
+        // `logger.notice`/`logger.info` (whose message must be a literal interpolation at the call
+        // site) can't express without duplicating the whole format string.
+        let level = diagnosticLogLevel(preview: preview)
         logger.log(
             level: level,
             """
