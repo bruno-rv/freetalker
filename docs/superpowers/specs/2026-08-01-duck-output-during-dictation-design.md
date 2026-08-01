@@ -13,7 +13,7 @@ volume for the duration of a recording and put it back afterwards.
 | Absolute 0.10 or relative? | **Relative** (`original * 0.10`) | An absolute floor would make it *louder* for anyone already below 10%. |
 | Skip when headphones are connected? | **No, always duck** | One code path, always matches what was asked. Transport-type classification is a guess anyway — a USB DAC feeding desk speakers looks identical to a USB headset. |
 | Settings toggle? | **No** | Requested as behaviour, not as a preference. |
-| Persist restoration across launches? | **No** | See "Ownership and recovery" — every in-process path is covered instead, which is where the real exposure was. |
+| Persist restoration across launches? | **No** | Two sequences can strand a device at 10% as a result; both are enumerated under "Accepted limitations" rather than hidden. |
 
 ## Feasibility, verified on the target machine
 
@@ -35,62 +35,93 @@ The implementation tries main first, falls back to channels 1 and 2, and degrade
 
 ```
 duck()     resolve the default output device, then for each controllable element:
-             read original -> append to ledger -> write original * 0.10 -> read back -> record
-restore()  drain the ledger: for each entry still owned, write the original back
+             read original -> record entry -> write target -> read back -> mark written
+restore()  drain the ledger: for each entry, decide restore / relinquish / defer
 ```
 
-The unit of state is a **ledger entry**, not a single saved value:
+### Ledger entry and its states
 
 ```
-DuckedElement { deviceUID: String, element: UInt32, original: Float, readback: Float? }
+DuckedElement {
+    deviceUID: String       // not AudioDeviceID — those are recycled
+    element:   UInt32
+    original:  Float        // what to put back
+    target:    Float        // what we asked for
+    readback:  Float?       // what the device reported after the write, if we could read it
+}
 ```
 
-Policy lives in `nonisolated static` helpers so it is testable without a sound card, matching the
-shape already used for `AppCoordinator.decoderBiasVocabulary` and
-`WhisperKitEngine.predeterminedLanguage`:
+An entry exists in exactly one state:
+
+| State | Meaning | Next |
+|---|---|---|
+| **pending** | recorded, write not yet attempted | write succeeds → *written*; write fails → **removed** |
+| **written** | we changed this element | restore succeeds → **removed**; ownership lost → **removed**; device unreachable → stays *written* |
+
+The two removals that are easy to get wrong:
+
+- **A failed write removes the entry.** `duck()` records before it writes, so that a crash between
+  the two does not lose the original. But if the write itself returns an error, FreeTalker never
+  changed anything, and keeping the entry would let a later restore overwrite a volume the user
+  chose afterwards. Confirmed-unwritten is confirmed-not-ours.
+- **Ownership loss removes the entry without writing.** See below.
+
+### The ownership check
+
+`ownedValue = readback ?? target`. A device may quantize (`0.10` in, `0.09803922` out), so the
+read-back is preferred; when the read-back failed, the requested target is the best evidence we
+have that the element is still as we left it. It is *not* a licence to write unconditionally — a
+failed read-back must not turn into "overwrite whatever the user has since chosen".
+
+On restore, per entry:
+
+| Current value | Action |
+|---|---|
+| unreadable | **defer** — keep the entry, retry later |
+| ≈ `ownedValue` (±0.01) | **restore** — write `original`; remove on success, keep on write failure |
+| anything else | **relinquish** — the user moved it; remove the entry, write nothing |
+
+Relinquish must be a definitive transition, not a skip: leaving a mismatched entry in the ledger
+means a later duck/stop could rediscover it the moment the user happens to land back on the old
+ducked value, and overwrite a deliberate choice with a stale original.
+
+### Partial duck rolls back
+
+With the channel-1/2 fallback, `duck()` writes more than once. If any element fails after another
+succeeded, the successful ones are restored through the ordinary restore path and the attempt is
+abandoned — half-ducked stereo is worse than not ducking. If a *rollback* write fails, that entry
+stays *written* and is retried like any other deferred entry.
+
+### Retry and termination
+
+Deferred entries are retried on the next `duck()`, the next `stop()`, and at termination.
+`App.swift:230`'s Quit button calls `NSApplication.shared.terminate` directly with no capture
+teardown, so quitting mid-dictation would otherwise leave the volume down; an
+`applicationWillTerminate` hook drains the ledger synchronously. All in-process — nothing is
+written to disk.
+
+### Isolation
+
+`AudioCapture` is `@unchecked Sendable` and is called from several threads. Each of
+check-record-write and check-decide-remove is taken under a single `NSLock` that also covers the
+CoreAudio calls, so two concurrent `duck()` calls cannot both observe an empty ledger and compound
+the attenuation. Sequential duplicate-call tests cannot catch this; the isolation has to be stated,
+not inferred.
+
+### Resolving the device
+
+Keying by UID is only useful with a resolver that can find the device again. `AudioInputDevices`
+cannot be reused for this: `stringProperty` is private (AudioInputDevices.swift:56) and
+`resolveID(forUID:)` goes through `enumerate()`, which filters to `inputChannelCount > 0` (:38, :42)
+— an output-only USB DAC is invisible to it. The ducker therefore carries its own resolver that
+enumerates every CoreAudio device and matches the stored UID, independent of input capability and
+of which device is currently default.
+
+Policy helpers stay `nonisolated static` so they test without a sound card, matching
+`AppCoordinator.decoderBiasVocabulary` and `WhisperKitEngine.predeterminedLanguage`:
 
 - `duckTarget(original:)` → `original * 0.10`
-- `shouldRestore(entry:current:tolerance:)` → whether this element is still ours to restore
-
-CoreAudio access follows the existing idiom in `Core/AudioInputDevices.swift`
-(`AudioObjectPropertyAddress` + `AudioObjectGetPropertyData`), and reuses its `stringProperty`
-helper for the device UID.
-
-## Ownership and recovery
-
-The governing rule: **never mutate a volume that is not already recorded in the ledger, and never
-drop a ledger entry that has not been successfully restored.** Everything below follows from it.
-
-**Record before you write.** Read the original, append the entry, *then* write. The reverse order —
-the obvious one — loses the original if the process dies or the read-back fails between write and
-save, and there is then nothing to undo with.
-
-**Read-back is a refinement, not a precondition.** After writing, read the value back and store it
-so `restore()` can tell "still what we set" from "the user changed it". If the read-back itself
-fails, the entry keeps `readback: nil` and restore treats it as unconditionally ours — we know we
-wrote it, we just cannot verify it later. Failing to read is not a reason to abandon a mutation we
-made.
-
-**Partial duck rolls back.** With the channel-1/2 fallback, `duck()` performs more than one write.
-If any element fails after another has succeeded, restore the ones that succeeded and abandon the
-attempt: half-ducked stereo is worse than not ducking.
-
-**Restore keeps what it could not finish.** An entry is removed from the ledger only after its write
-succeeds. If the device is absent — display asleep, headphones unplugged — the entry stays and is
-retried on the next `duck()`, the next `stop()`, and at termination. Without this, a device that
-disappears mid-recording and reappears later comes back at 10% with the only record of its original
-already discarded. Device volume is persistent hardware state; forgetting it is not free.
-
-**Restore runs on termination.** `App.swift:230`'s Quit button calls `NSApplication.shared.terminate`
-directly, with no capture teardown, so quitting mid-dictation would otherwise leave the volume down.
-An `applicationWillTerminate` hook drains the ledger synchronously. This is in-process only — it
-does not make the design persist anything across launches.
-
-**One lock, whole transition.** `AudioCapture` is `@unchecked Sendable` and calls in from several
-threads. The ledger's check-record-write and check-write-drop sequences are each taken under a
-single `NSLock` that also covers the CoreAudio calls, so two concurrent `duck()` calls cannot both
-observe an empty ledger and compound the attenuation. Sequential duplicate-call tests cannot catch
-this; the isolation has to be stated, not inferred.
+- `restoreDecision(entry:current:tolerance:)` → `.restore` / `.relinquish` / `.defer`
 
 ## Where it hooks
 
@@ -107,16 +138,17 @@ Two placement details that decide whether it actually holds:
   calls `stop()` — with `wasCapturing == false`. Put the restore inside that branch and the exact
   restart-failure path this design is supposed to survive leaves the output ducked.
 
-Live-preview ticks are not a concern: they read from the existing capture buffer
-(`snapshotSuffix`) and never call `start()`/`stop()`.
+Live-preview ticks are not a concern: they read the existing capture buffer (`snapshotSuffix`) and
+never call `start()`/`stop()`.
 
 ## Error handling
 
 Every CoreAudio call can fail and none of them are fatal. Failures never block or delay a recording.
 If no element on the device has a settable volume, `duck()` records nothing and `restore()` has
 nothing to drain. One `notice`-level log line per transition (`ducked BuiltInSpeakerDevice 0.44 ->
-0.04`, `restored BuiltInSpeakerDevice 0.44`, `restore deferred, device absent`), consistent with the
-diagnostics convention in `docs/perf-decoder-prompt-2026-08-01.md`.
+0.04`, `restored BuiltInSpeakerDevice 0.44`, `relinquished, user changed volume`, `restore deferred,
+device absent`), consistent with the diagnostics convention in
+`docs/perf-decoder-prompt-2026-08-01.md`.
 
 ## Testing
 
@@ -126,13 +158,18 @@ A fake volume device behind a small protocol, so the whole state machine runs wi
 - the target is relative to the starting volume, not an absolute floor
 - a second duck while ducked does not overwrite the saved original
 - a second restore is a no-op
-- a volume the user changed mid-recording is left alone
-- read-back failure still leaves a restorable entry
+- a volume the user changed mid-recording is left alone **and its entry is dropped**, so the next
+  duck records the new value as its original
+- a user change after a *failed* read-back is still left alone
+- a failed duck write leaves no entry, so a later restore cannot overwrite the user's value
 - a second-element write failure rolls back the first
+- a failed rollback write keeps the entry for retry
 - a device absent at restore keeps its entry, and a later attempt restores it
 - termination drains the ledger
 - `stop()` restores even when `wasCapturing` is false
 - interleaved duck/restore calls do not compound the attenuation
+- the UID resolver finds an output-only device (no input channels) and one that is not the current
+  default
 - a device with no settable volume degrades to doing nothing, and recording still starts
 
 ## Accepted limitations
@@ -140,12 +177,17 @@ A fake volume device behind a small protocol, so the whole state machine runs wi
 - **Playback keeps advancing.** A 5 s dictation over a podcast still loses 5 s of it. That is the
   cost of ducking rather than pausing, chosen deliberately.
 - **Switching the default output mid-recording leaves the rest of that dictation unducked.** The
-  ledger is keyed by device UID, so the device that was ducked is still restored correctly at stop —
-  nothing is stranded. The new device simply is not ducked for the remainder. Fixing it means a
-  `kAudioHardwarePropertyDefaultOutputDevice` listener and duck-on-switch, which is real complexity
-  for a case that lasts seconds. Revisit if it ever happens in practice.
-- **A crash or `SIGKILL` mid-recording leaves the volume at 10%.** Graceful quit is covered above;
-  an unhandled crash is not. Recovering it would mean persisting audio state across launches, which
-  buys a stale-restore failure mode to solve something one volume-key press fixes.
+  ledger is UID-keyed, so the device that was ducked is still restored at stop provided it is still
+  connected. Ducking the new device too would need a
+  `kAudioHardwarePropertyDefaultOutputDevice` listener — real complexity for a case that lasts
+  seconds. Revisit if it happens in practice.
+- **A device that is unplugged and never comes back before FreeTalker exits stays at 10%.** Duck the
+  speakers, unplug or sleep the device so output moves elsewhere, then stop and quit while it is
+  still absent: every restore attempt defers, and termination discards the ledger. The device's
+  volume is persistent hardware state, so it comes back quiet. This is the same failure class as the
+  crash case below and has the same one-keypress fix; closing it properly would mean writing the
+  ledger to disk and reconciling it on the next launch.
+- **A crash or `SIGKILL` mid-recording leaves the volume at 10%.** Graceful quit is covered;
+  an unhandled crash is not.
 - **System-wide, not per-application.** This moves the output device's volume, not any individual
   app's.
