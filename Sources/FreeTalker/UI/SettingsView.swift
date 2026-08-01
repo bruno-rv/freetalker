@@ -1288,7 +1288,7 @@ private struct GeneralSettingsView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Vocabulary")
                 .font(.headline)
-            Text("Shared across WhisperKit, Cloud STT, and post-processing. One term per line — proper nouns, names, or jargon that should be recognized and spelled correctly.")
+            Text("Shared across Cloud STT, post-processing, and WhisperKit when you finish without post-processing. One term per line — proper nouns, names, or jargon that should be recognized and spelled correctly.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             VocabularyEditorField(text: $settings.vocabularyText)

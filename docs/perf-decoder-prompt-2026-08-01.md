@@ -79,7 +79,10 @@ with a 41-token prompt — i.e. it aborted *inside the prompt prefill* and retur
 the app is `PipelineError.emptyTranscript` ("Transcription failed — audio saved"). One clip was
 identical, and on the 1.8 s near-silence clip the prompted decode was the cleaner of the two.
 
-Timing over the same corpus, warm: **10.3 s with the prompt, 5.8 s without.**
+Timing over the same corpus: **10.3 s with the prompt, 5.8 s without.** Unlike `measurePromptTokenCost`
+above, this pass has no warmup discard, so the first clip carries the CoreML compute-plan cost; the
+conclusion is unaffected (with-prompt was slower on every individual clip, and the warmed benchmark
+agrees).
 
 Honest limit of this evidence: **none of the preserved captures contains a registered vocabulary
 term**, so per-term recall — the thing the prompt is actually for — is still unmeasured. What is
@@ -121,6 +124,10 @@ Plus two smaller ones:
   diagnosed after the fact while `stage timings` for the same dictation had survived. Preview ticks
   stay at `info` (Codex round 2): they run every ~1.5 s with no fallback budget, so promoting them
   would bury the one decode the user waited for under hundreds of `fallbacks=0` records.
+- Settings copy. The Vocabulary section claimed the terms were "Shared across WhisperKit, Cloud STT,
+  and post-processing", which stopped being true for WhisperKit on every refined/translated
+  dictation. It now names the one WhisperKit path that still biases the decoder. The term/character
+  limits are unchanged — the fit gate still binds on Raw and on Cloud STT's `prompt` field.
 
 ### Expected end-to-end
 
