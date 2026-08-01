@@ -56,7 +56,8 @@ An entry exists in exactly one state:
 | State | Meaning | Next |
 |---|---|---|
 | **pending** | recorded, write not yet attempted | write succeeds → *written*; write fails → **removed** |
-| **written** | we changed this element | restore succeeds → **removed**; ownership lost → **removed**; device unreachable → stays *written* |
+| **written** | we changed this element and know what the device reported | restore succeeds → **removed**; ownership lost → **removed**; device unreachable → stays *written* |
+| **ambiguous** | we changed this element but could neither verify nor undo it | quarantined: never re-ducked; a later successful read promotes it to *written* |
 
 The two removals that are easy to get wrong:
 
@@ -92,9 +93,23 @@ means a later duck/stop could rediscover it the moment the user happens to land 
 ducked value, and overwrite a deliberate choice with a stale original.
 
 The one residual case is a read-back failure whose corrective rollback *also* fails. The element is
-then ducked with no verified value. The entry is kept with `readback: nil` and restored only if the
-current value matches the requested `target` within the same epsilon; otherwise it is relinquished.
-Two consecutive CoreAudio failures on the same element is the floor of what this design tries to
+then ducked with no verified value, and it must not be compared against the requested `target`: on
+the same 16-step device that motivated dropping the tolerance, `target` 0.10 reads back as 0.125, so
+a `target` comparison would call the untouched ducked value a user change, discard the original, and
+let the next duck attenuate 0.125 *again*. The failure path would end up quieter than the 10% this
+design promises.
+
+So that entry becomes **ambiguous**, and ambiguous means quarantined:
+
+- the element is **never ducked again** while ambiguous — this is what stops compounding
+- every later restore attempt retries the read. The first successful read adopts that value as the
+  reference, and normal rules resume: at or above `original` means the user raised it, so
+  relinquish; below `original` means it is still our attenuation, so write `original` back
+- if the reads keep failing, the entry stays quarantined and termination makes one blind
+  best-effort write of `original` — we know we lowered this element and nothing has ever
+  contradicted that
+
+Three consecutive CoreAudio failures on one element is the floor of what this design tries to
 recover from.
 
 ### Partial duck rolls back
@@ -188,7 +203,8 @@ A fake volume device behind a small protocol, so the whole state machine runs wi
 - a failed read-back rolls the element back immediately and leaves no entry
 - a failed duck write leaves no entry, so a later restore cannot overwrite the user's value
 - a second-element write failure rolls back the first
-- a failed rollback write keeps the entry for retry
+- a failed rollback write quarantines the element: on a coarsely quantized device, the next `duck()`
+  does **not** attenuate it a second time, and a later successful read restores the true original
 - a device absent at restore keeps its entry, and a later attempt restores it
 - absent at stop → reconnects as default → next `duck()` restores it *first*, then ducks it fresh,
   and it stays ducked until that new capture stops
