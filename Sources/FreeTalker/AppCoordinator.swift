@@ -2123,7 +2123,13 @@ final class AppCoordinator: ObservableObject {
             elapsed = 0
             cap = 0
         }
-        let activeTemplateName = TemplateStore.shared.template(id: AppSettings.shared.activeTemplateID)?.name ?? "Template"
+        let panelTemplate = Self.recordingPanelTemplate(
+            bundleID: destinationBundleID(),
+            rules: AppSettings.shared.appRules,
+            templates: TemplateStore.shared.templates,
+            activeTemplateID: AppSettings.shared.activeTemplateID,
+            automaticStyleEnabled: AppSettings.shared.automaticStyleEnabled
+        )
         let contextScope = AppSettings.shared.localContextScope
         let contextPermissionHint: String?
         if contextScope == .windowOCR {
@@ -2143,7 +2149,8 @@ final class AppCoordinator: ObservableObject {
             cap: cap,
             previewText: lastLivePreviewText.map { HUDController.tailTruncate($0, maxCharacters: 60) },
             warnings: audioCapture.captureWarnings,
-            activeTemplateName: activeTemplateName,
+            templateName: panelTemplate.name,
+            templateOverrideHint: panelTemplate.overrideHint,
             localContextScopeName: contextScope.displayName,
             localContextPermissionHint: contextPermissionHint,
             oneShotLanguage: oneShotLanguage,
@@ -2591,6 +2598,29 @@ final class AppCoordinator: ObservableObject {
         }
     }
 
+    /// Bundle ID of the app a dictation would land in right now. Bundle ID only, no AX read: this
+    /// runs on every one-second Recording Panel tick.
+    private func destinationBundleID() -> String? {
+        Self.destinationBundleID(
+            frontmost: NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+            selfBundleID: Bundle.main.bundleIdentifier,
+            lastNonSelf: lastNonSelfFrontmostTarget?.bundleID
+        )
+    }
+
+    /// The Recording Panel is a `nonactivatingPanel` (`HUDPanel.makePanel`), so during a normal
+    /// recording the frontmost app IS the destination and the first branch answers. The fallback
+    /// covers the cases where FreeTalker itself is frontmost — a panel button click, or Settings
+    /// open — where the last non-FreeTalker activation is the closest available answer.
+    nonisolated static func destinationBundleID(
+        frontmost: String?,
+        selfBundleID: String?,
+        lastNonSelf: String?
+    ) -> String? {
+        if let frontmost, frontmost != selfBundleID { return frontmost }
+        return lastNonSelf
+    }
+
     private func snapshotContextTarget(app: NSRunningApplication?) -> ContextTargetSnapshot {
         contextTargetSnapshotter.snapshot(
             appName: app?.localizedName,
@@ -2702,20 +2732,30 @@ final class AppCoordinator: ObservableObject {
         }
     }
 
+    /// Which input decided the template a dictation runs under. Only `.activeTemplate` means the
+    /// user's Active Template selection is what executes — the Recording Panel needs to tell the
+    /// two apart (`recordingPanelTemplate`).
+    enum TemplateResolutionSource: Equatable, Sendable {
+        case activeTemplate
+        case appRule
+        case automaticStyle
+    }
+
     nonisolated static func resolveContextAwareTemplate(
         automaticStyleEnabled: Bool,
         capture: ContextCapture,
         rules: [String: String],
         templates: [Template],
         activeTemplateID: String
-    ) -> (template: Template, ruleFired: Bool) {
+    ) -> (template: Template, source: TemplateResolutionSource) {
         let manual = resolveTemplate(
             bundleID: capture.context.bundleID,
             rules: rules,
             templates: templates,
             activeTemplateID: activeTemplateID
         )
-        guard !manual.ruleFired, automaticStyleEnabled else { return manual }
+        if manual.ruleFired { return (manual.template, .appRule) }
+        guard automaticStyleEnabled else { return (manual.template, .activeTemplate) }
         return (
             AutomaticStyleClassifier().resolveTemplate(
                 bundleID: capture.context.bundleID,
@@ -2725,8 +2765,57 @@ final class AppCoordinator: ObservableObject {
                 templates: templates,
                 activeTemplateID: activeTemplateID
             ),
-            false
+            .automaticStyle
         )
+    }
+
+    /// The template the Recording Panel names, and — when that is not the user's Active Template
+    /// — why. `AutomaticStyleClassifier.classify` has a total default (`.document`), and every
+    /// style it can return maps to a built-in that is always present, so with "Automatically
+    /// choose template" on and no App Rule, `activeTemplateID` is never reached. Naming the Active
+    /// Template in the panel therefore advertised a selection that could not run.
+    ///
+    /// Ceiling: predicts from the destination bundle ID alone, since the window title and OCR text
+    /// stop-time classification also reads would cost an AX + screenshot read on every one-second
+    /// HUD tick. For an app the classifier does not know by bundle ID, that text can still steer
+    /// the stop-time pick to another style — the hint promises only that the choice is automatic,
+    /// not which style is final.
+    nonisolated static func recordingPanelTemplate(
+        bundleID: String?,
+        rules: [String: String],
+        templates: [Template],
+        activeTemplateID: String,
+        automaticStyleEnabled: Bool
+    ) -> (name: String, overrideHint: String?) {
+        let resolved = resolveContextAwareTemplate(
+            automaticStyleEnabled: automaticStyleEnabled,
+            capture: ContextCapture(
+                context: LocalProcessingContext(
+                    appName: nil,
+                    bundleID: bundleID,
+                    windowTitle: nil,
+                    text: ""
+                ),
+                limitation: nil
+            ),
+            rules: rules,
+            templates: templates,
+            activeTemplateID: activeTemplateID
+        )
+        guard resolved.source != .activeTemplate else { return (resolved.template.name, nil) }
+        let activeName = templates.first(where: { $0.id == activeTemplateID })?.name
+        let unused = activeName.map { " Your Active Template (\($0)) is not used." } ?? ""
+        switch resolved.source {
+        case .appRule:
+            return (resolved.template.name, "Chosen by this app's App Rule.\(unused)")
+        case .automaticStyle:
+            return (
+                resolved.template.name,
+                "Chosen automatically for this app.\(unused) Turn off \"Automatically choose template\" in Settings to use it."
+            )
+        case .activeTemplate:
+            return (resolved.template.name, nil)
+        }
     }
 
     /// Reads the three fields `RecordingLanguageSnapshot` bundles together, all at once, from

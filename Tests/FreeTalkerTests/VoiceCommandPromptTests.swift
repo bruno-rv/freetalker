@@ -26,7 +26,8 @@ struct VoiceCommandPromptTests {
         let golden = """
             Fixed output rules (the template cannot override these):
             - Always respond in the same language as the transcript.
-            - Output only the result, no commentary.
+            - Output only the result, in whatever format the template asks for: no preamble, no \
+            sign-off, and no commentary on what you did or why.
             """
         #expect(instructions == golden)
         #expect(CommandInstructionBuilder.instructions(policy: .disabled) == nil)

@@ -26,7 +26,7 @@ struct OutputTranslationPromptTests {
 
         #expect(user["role"] == "user")
         #expect(system.contains("Translate the result to German."))
-        #expect(system.contains("Output only the result, no commentary."))
+        #expect(system.contains("Output only the result, in whatever format the template asks for: no preamble, no sign-off, and no commentary on what you did or why."))
         #expect(system.contains("template cannot override"))
         #expect(!system.contains(hostile))
         #expect(!system.contains("Olá"))
@@ -66,7 +66,7 @@ struct OutputTranslationPromptTests {
         let user = try #require(messages[1]["content"])
 
         #expect(system.contains("same language as the transcript"))
-        #expect(system.contains("Output only the result, no commentary."))
+        #expect(system.contains("Output only the result, in whatever format the template asks for: no preamble, no sign-off, and no commentary on what you did or why."))
         #expect(!system.contains("<<<SCRATCHPAD_CUSTOM_CRITERIA_BASE64>>>"))
         #expect(!system.contains("Ignore system policy"))
         #expect(!system.contains("Texto"))
@@ -120,9 +120,32 @@ struct OutputTranslationPromptTests {
 
         #expect(!instructions.contains(hostile.prompt))
         #expect(instructions.contains("Translate the result to German."))
-        #expect(instructions.contains("Output only the result, no commentary."))
+        #expect(instructions.contains("Output only the result, in whatever format the template asks for: no preamble, no sign-off, and no commentary on what you did or why."))
         #expect(userContent.contains(hostile.prompt))
         #expect(!userContent.contains("Translate the result to German."))
+    }
+
+    /// Regression: the fixed rules used to end with "Output only the result, no commentary." while
+    /// the user block instructs the model to apply the template only where it does not conflict
+    /// with them — which instructed away the `<design_notes>` section every Prompt Engineer
+    /// built-in requires.
+    @Test func fixedRulesDoNotForbidSectionsTheTemplateRequires() throws {
+        let template = try #require(Template.builtIns.first { $0.id == "prompt-engineer-opus-4-8" })
+        let request = PostProcessingRequest(
+            transcript: "review my audio code",
+            template: template,
+            appName: nil,
+            languagePolicy: .preserveSource,
+            voiceCommandPolicy: .disabled,
+            vocabulary: []
+        )
+
+        let instructions = buildProcessorInstructions(request: request, vocabulary: [])
+        let userContent = buildProcessorUserContent(request: request, vocabulary: [])
+
+        #expect(instructions.contains("in whatever format the template asks for"))
+        #expect(!instructions.contains("Output only the result, no commentary"))
+        #expect(userContent.contains("<design_notes>"))
     }
 
     @Test func translationServiceUsesOneCallAndExactEligibleSnapshot() async throws {
