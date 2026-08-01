@@ -40,8 +40,10 @@ struct RecordingProcessingContext: Equatable, Sendable {
     var candidateLanguages: [String] = []
     /// The effective vocabulary (manual + approved self-learning terms), snapshotted ONCE at stop
     /// time (`AppCoordinator.makeStopRequest`/`captureStopSettingsSnapshot`) and carried through
-    /// to every consumer of this dictation's processing — STT biasing (`engine.transcribe`) and
-    /// post-processing (`PostProcessingRequest.vocabulary`) alike — so the two can never disagree
+    /// to every consumer of this dictation's processing — post-processing
+    /// (`PostProcessingRequest.vocabulary`) directly, STT biasing (`engine.transcribe`) through
+    /// `AppCoordinator.decoderBiasVocabulary`, which spends the decoder prompt only on paths with
+    /// no LLM pass to carry the terms — so the two can never disagree
     /// about which vocabulary applied to this dictation, even though the actual work can run long
     /// after a later `vocabularyText` edit or vocabulary decision changes what's "live". Mirrors
     /// `candidateLanguages`'/`cloudSnapshot`'s own snapshot-threading pattern (PLAN.md PR A, item

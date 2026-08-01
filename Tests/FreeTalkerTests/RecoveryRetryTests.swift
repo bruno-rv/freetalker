@@ -56,8 +56,13 @@ import Testing
     /// the transcriber, once for the post-processing request — with an `await` (the transcription
     /// call) between them. `VocabularyMutatingTranscriberProbe` mutates the shared cache from
     /// inside that gap, exactly where a concurrent decision or `refreshApprovedVocabularyCache`
-    /// could land mid-retry; both reads must still observe the SAME snapshot. See Codex finding
-    /// (AppCoordinator.swift:3769/3797).
+    /// could land mid-retry; the post-processing request must still carry the snapshot taken
+    /// BEFORE the transcription, not a re-read. See Codex finding (AppCoordinator.swift:3769/3797).
+    ///
+    /// The transcriber's own argument is now that same snapshot put through
+    /// `decoderBiasVocabulary` — retry always post-processes, so it takes the empty projection —
+    /// which is asserted here rather than assumed, so a future "just pass the vocabulary
+    /// through" edit shows up as a failure instead of as a silent latency regression.
     @MainActor @Test func recoveryRetryUsesOneVocabularySnapshotForTranscriptionAndPostProcessing() async throws {
         let originalVocabularyText = AppSettings.shared.vocabularyText
         defer { AppSettings.shared.vocabularyText = originalVocabularyText }
@@ -79,7 +84,10 @@ import Testing
 
         let transcriberVocabulary = await transcriber.receivedVocabulary
         let postProcessorVocabulary = try #require(await processor.lastRequest?.vocabulary)
-        #expect(transcriberVocabulary == postProcessorVocabulary)
+        #expect(postProcessorVocabulary == ["Alpha"])
+        #expect(transcriberVocabulary == AppCoordinator.decoderBiasVocabulary(
+            postProcessorVocabulary, refinementCarriesVocabulary: true
+        ))
     }
 
     /// Codex round-5 finding 8: proves a persisted attempt's durable voice-command snapshot

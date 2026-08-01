@@ -418,6 +418,20 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, WhisperFile
         return pool.max { langProbs[$0, default: -.infinity] < langProbs[$1, default: -.infinity] } ?? pool[0]
     }
 
+    /// The language to decode in when it can be known without asking the model — a caller's forced
+    /// language, or a Dictation Language Set with nothing to choose between. `nil` means detection
+    /// has to run.
+    ///
+    /// The single-candidate case is an equivalence, not a heuristic: `constrainedLanguage` picks
+    /// the argmax *within* `candidates`, so a one-element pool returns that element for every
+    /// possible probability distribution. Detection is a whole extra logmel+encoder pass over the
+    /// audio (~0.33 s here, on top of the encoder pass the decode itself repeats) bought to
+    /// re-derive a constant.
+    nonisolated static func predeterminedLanguage(forced: String?, candidates: [String]) -> String? {
+        if let forced { return forced }
+        return candidates.count == 1 ? candidates[0] : nil
+    }
+
     func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String], vocabulary: [String], allowEarlyCancel: Bool) async throws -> TranscriptionOutput {
         guard allowEarlyCancel else {
             return try await gate.run { [self] in try await performTranscribe(samples: samples, forcedLanguage: forcedLanguage, candidateLanguages: candidateLanguages, vocabulary: vocabulary, cancelFlag: nil) }
@@ -531,8 +545,8 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, WhisperFile
 
         do {
             let language: String
-            if let forcedLanguage {
-                language = forcedLanguage
+            if let known = Self.predeterminedLanguage(forced: forcedLanguage, candidates: candidateLanguages) {
+                language = known
             } else {
                 await setStatus("Detecting language…")
                 // Whisper's unconstrained auto-detect spans ~99 languages and misfires badly on
@@ -543,7 +557,7 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, WhisperFile
                 // freely.
                 let detectStart = Date()
                 let (_, langProbs) = try await kit.detectLangauge(audioArray: samples)
-                Self.logger.info("language detection took \(Date().timeIntervalSince(detectStart), format: .fixed(precision: 2))s")
+                Self.logger.notice("language detection took \(Date().timeIntervalSince(detectStart), format: .fixed(precision: 2))s")
                 try checkPreviewCancellation(cancelFlag)
                 language = Self.constrainedLanguage(langProbs: langProbs, candidates: candidateLanguages)
             }
@@ -645,9 +659,13 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, WhisperFile
     /// its own compression-ratio/log-prob heuristics reject a pass — so an otherwise identical
     /// dictation can cost 1× or 6× the decode. Without this line a fallback storm is
     /// indistinguishable in the log from "the model is just slow on this machine".
+    ///
+    /// `notice`, not `info`: info-level messages only live in the in-memory buffer and are evicted
+    /// within hours, which is exactly why the 2026-08-01 08:30 storm (1.79 s of audio, 15.24 s of
+    /// decode) could not be diagnosed afterwards — `stage timings` had survived and these had not.
     private static func logDecodeTimings(_ results: [TranscriptionResult], preview: Bool) {
         guard let timings = results.first?.timings else { return }
-        logger.info(
+        logger.notice(
             """
             decode timings\(preview ? " (preview)" : ""): \
             fallbacks=\(timings.totalDecodingFallbacks, format: .fixed(precision: 0)) \
@@ -666,7 +684,7 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, WhisperFile
             // An all-zero segment is one WhisperKit never filled in; printing it would read as a
             // measurement of a perfect decode.
             guard segment.compressionRatio != 0 || segment.avgLogprob != 0 else { continue }
-            logger.info(
+            logger.notice(
                 """
                 decode quality [\(index)]: \
                 temperature=\(segment.temperature, format: .fixed(precision: 2)) \

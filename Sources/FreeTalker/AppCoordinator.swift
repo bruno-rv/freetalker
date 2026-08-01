@@ -3181,10 +3181,12 @@ final class AppCoordinator: ObservableObject {
         // cancelled/early-stopped attempt throws and lands here as `try?`. Errors are otherwise
         // non-fatal — the unchanged final pipeline still owns the real result; just let the next
         // tick retry.
-        // Preview has no "stop time" yet — it always wants whatever is live right now, unlike the
-        // final pipeline below (which threads a stop-time snapshot; see
-        // `RecordingProcessingContext.vocabularySnapshot`).
-        guard let result = try? await whisperEngine.transcribe(samples: window, forcedLanguage: nil, candidateLanguages: recordingLanguageSnapshot, vocabulary: AppSettings.shared.vocabulary, allowEarlyCancel: true) else { return }
+        // No vocabulary biasing: at ~45 ms of decoder inference per prompt token per window (see
+        // `decoderBiasVocabulary`) it was the majority of a tick's cost, spent on text that is
+        // display-only and superseded by the next tick — and, while a Recording runs, spent on the
+        // same ANE the final transcription is about to need. The words the user keeps come from
+        // the final pipeline, which makes its own decision.
+        guard let result = try? await whisperEngine.transcribe(samples: window, forcedLanguage: nil, candidateLanguages: recordingLanguageSnapshot, vocabulary: [], allowEarlyCancel: true) else { return }
 
         guard Self.shouldAcceptLivePreviewResult(isRecording: isRecording, resultGeneration: generation, currentGeneration: livePreviewGeneration) else { return }
 
@@ -3736,6 +3738,34 @@ final class AppCoordinator: ObservableObject {
         return processor is CloudLLMProcessor
     }
 
+    /// The vocabulary the *speech model* should be biased toward, given whether an LLM pass will
+    /// also see the same list.
+    ///
+    /// Biasing WhisperKit costs one full decoder inference per prompt token per 30 s window:
+    /// `TextDecoder`'s main loop calls `predictLogits` on every prefill iteration exactly as it
+    /// does on a generated token, and a non-nil `promptTokens` additionally disables its KV
+    /// prefill cache (`TextDecoder.swift`'s `usePrefillCache` guard). Measured on this machine
+    /// with `large-v3_turbo`: ~45 ms per loop, and a 13-term vocabulary is ~41 loops — ~1.85 s
+    /// added to every window, which for a 5 s dictation was more than half the decode.
+    ///
+    /// Every post-processing path already passes the same terms to its LLM as a spelling hint
+    /// (`vocabularyInstruction`, via `CloudLLMProcessor`, `AppleFMProcessor` and
+    /// `TranslationService`), so paying for the decoder prompt too buys a second copy of the same
+    /// bias at first-class latency. Raw (`skipPostProcessing`) has no LLM pass at all, so it keeps
+    /// the prompt — it is the one path where dropping it would lose the feature.
+    ///
+    /// The trade is real and deliberate, not free: post-processing corrects a misspelled proper
+    /// noun, the decoder prompt would have made it less likely to be misheard in the first place,
+    /// and a *failed* post-processing pass (which falls back to the raw transcript) now also falls
+    /// back to un-biased words. If a term is ever seen surviving that gap, the upgrade path is a
+    /// small token-budgeted prompt rather than the whole list.
+    nonisolated static func decoderBiasVocabulary(
+        _ vocabulary: [String],
+        refinementCarriesVocabulary: Bool
+    ) -> [String] {
+        refinementCarriesVocabulary ? [] : vocabulary
+    }
+
     private func logPostProcessingFallback(_ reason: PostProcessingFallbackReason) {
         switch reason {
         case .error(let error):
@@ -3940,7 +3970,16 @@ final class AppCoordinator: ObservableObject {
         }
 
         let transcribeStart = ContinuousClock.now
-        let transcription = try await engine.transcribe(samples: samples, forcedLanguage: context.transcriptionLanguage, candidateLanguages: context.candidateLanguages, vocabulary: context.vocabularySnapshot)
+        let transcription = try await engine.transcribe(
+            samples: samples,
+            forcedLanguage: context.transcriptionLanguage,
+            candidateLanguages: context.candidateLanguages,
+            // Only the Raw path pays for decoder-side biasing — see `decoderBiasVocabulary`. The
+            // full snapshot still reaches whichever LLM pass runs below, unchanged.
+            vocabulary: Self.decoderBiasVocabulary(
+                context.vocabularySnapshot, refinementCarriesVocabulary: !skipPostProcessing
+            )
+        )
         transcribeSeconds = Self.elapsedSeconds(since: transcribeStart)
         guard !transcription.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw PipelineError.emptyTranscript
@@ -4553,7 +4592,9 @@ final class AppCoordinator: ObservableObject {
             samples: samples,
             configuration: configuration,
             candidateLanguages: AppSettings.shared.dictationLanguages,
-            vocabulary: vocabularySnapshot,
+            // Retry always runs the post-processing pass below, which carries the same terms — so
+            // the decoder prompt is the redundant copy here too. See `decoderBiasVocabulary`.
+            vocabulary: Self.decoderBiasVocabulary(vocabularySnapshot, refinementCarriesVocabulary: true),
             defaultModel: AppSettings.shared.whisperModel
         )
         // Retry must apply the same post-processing (active processor + template) the live path
