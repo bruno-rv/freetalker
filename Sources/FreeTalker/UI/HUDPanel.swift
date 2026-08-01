@@ -283,7 +283,12 @@ final class HUDController {
         var cap: TimeInterval
         var previewText: String?
         var warnings: [String]
-        var activeTemplateName: String
+        /// The template this recording will actually run — an App Rule's or the automatic
+        /// classifier's pick when either overrides the Active Template selection.
+        var templateName: String
+        /// nil when `templateName` IS the Active Template; otherwise why it isn't, shown as the
+        /// template button's tooltip so a selection that cannot run is never presented as active.
+        var templateOverrideHint: String?
         var localContextScopeName: String
         var localContextPermissionHint: String?
         /// nil, or a code from `languageOptions` — which one-shot choice (if any) is currently
@@ -944,10 +949,17 @@ struct HUDModeContent: View {
             )
 
             Button(action: panelCallbacks.onCycleTemplate) {
-                Text(state.activeTemplateName)
-                    .lineLimit(1)
-                    .frame(maxWidth: 120, alignment: .leading)
+                HStack(spacing: 3) {
+                    if state.templateOverrideHint != nil {
+                        Image(systemName: "wand.and.stars")
+                            .font(.caption2)
+                    }
+                    Text(state.templateName)
+                        .lineLimit(1)
+                }
+                .frame(maxWidth: 120, alignment: .leading)
             }
+            .help(state.templateOverrideHint ?? "Active Template — click to cycle")
 
             if !state.isLocked {
                 Button(action: panelCallbacks.onLock) {

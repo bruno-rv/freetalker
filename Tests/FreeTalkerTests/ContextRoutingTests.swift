@@ -69,7 +69,7 @@ import Testing
         )
 
         #expect(result.template == manual)
-        #expect(result.ruleFired)
+        #expect(result.source == .appRule)
     }
 
     @Test func automaticStyleOffUsesActiveTemplate() {
@@ -84,7 +84,71 @@ import Testing
         )
 
         #expect(result.template == active)
-        #expect(!result.ruleFired)
+        #expect(result.source == .activeTemplate)
+    }
+
+    /// The defect this guards: `AutomaticStyleClassifier.classify` always returns a style, and
+    /// every style maps to a built-in that is always present, so with automatic style on and no
+    /// App Rule the Active Template is unreachable — the panel must name the style's template and
+    /// say why, never the selection that cannot run.
+    @Test func recordingPanelNamesTheAutomaticStylePickNotTheActiveTemplate() {
+        let active = Template(id: "prompt-engineer-opus-4-8", name: "Prompt Engineer (Opus 5)", prompt: "Opus")
+
+        let panel = AppCoordinator.recordingPanelTemplate(
+            bundleID: "com.unknown.editor",
+            rules: [:],
+            templates: Template.builtIns,
+            activeTemplateID: active.id,
+            automaticStyleEnabled: true
+        )
+
+        #expect(panel.name == "Clean Dictation")
+        #expect(panel.overrideHint?.contains("Prompt Engineer (Opus 5)") == true)
+        #expect(panel.overrideHint?.contains("Automatically choose template") == true)
+    }
+
+    @Test func recordingPanelNamesTheAppRulePickWithItsReason() {
+        let manual = Template(id: "manual", name: "Manual", prompt: "Manual")
+        let active = Template(id: "active", name: "Active", prompt: "Active")
+
+        let panel = AppCoordinator.recordingPanelTemplate(
+            bundleID: "com.apple.mail",
+            rules: ["com.apple.mail": manual.id],
+            templates: [manual, active] + Template.builtIns,
+            activeTemplateID: active.id,
+            automaticStyleEnabled: true
+        )
+
+        #expect(panel.name == "Manual")
+        #expect(panel.overrideHint?.contains("App Rule") == true)
+        #expect(panel.overrideHint?.contains("Active") == true)
+    }
+
+    @Test func destinationFallsBackToTheLastNonSelfAppOnlyWhenFreeTalkerIsFrontmost() {
+        #expect(AppCoordinator.destinationBundleID(
+            frontmost: "com.apple.mail", selfBundleID: "org.freetalker.app", lastNonSelf: "com.tinyspeck.slackmacgap"
+        ) == "com.apple.mail")
+        #expect(AppCoordinator.destinationBundleID(
+            frontmost: "org.freetalker.app", selfBundleID: "org.freetalker.app", lastNonSelf: "com.tinyspeck.slackmacgap"
+        ) == "com.tinyspeck.slackmacgap")
+        #expect(AppCoordinator.destinationBundleID(
+            frontmost: nil, selfBundleID: "org.freetalker.app", lastNonSelf: nil
+        ) == nil)
+    }
+
+    @Test func recordingPanelHasNoOverrideHintWhenTheActiveTemplateRuns() {
+        let active = Template(id: "active", name: "Active", prompt: "Active")
+
+        let panel = AppCoordinator.recordingPanelTemplate(
+            bundleID: "com.apple.mail",
+            rules: [:],
+            templates: [active] + Template.builtIns,
+            activeTemplateID: active.id,
+            automaticStyleEnabled: false
+        )
+
+        #expect(panel.name == "Active")
+        #expect(panel.overrideHint == nil)
     }
 
     @Test func automaticStyleDefaultsOffAndPersists() {

@@ -205,7 +205,7 @@ struct NotchpadPresentationLifecycleTests {
             cap: 120,
             previewText: "preview",
             warnings: [],
-            activeTemplateName: "Clean",
+            templateName: "Clean",
             localContextScopeName: "Off",
             localContextPermissionHint: nil,
             oneShotLanguage: nil,

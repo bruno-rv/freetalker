@@ -146,7 +146,7 @@ struct NotchpadRoutingTests {
                 cap: 60,
                 previewText: "hi",
                 warnings: [],
-                activeTemplateName: "Clean",
+                templateName: "Clean",
                 localContextScopeName: "Off",
                 localContextPermissionHint: nil,
                 oneShotLanguage: nil,
