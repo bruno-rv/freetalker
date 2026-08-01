@@ -129,11 +129,25 @@ Plus two smaller ones:
   dictation. It now names the one WhisperKit path that still biases the decoder. The term/character
   limits are unchanged — the fit gate still binds on Raw and on Cloud STT's `prompt` field.
 
-### Expected end-to-end
+### End-to-end, on the live app
 
-For the 5.4 s dictation measured at 21:52 on 2026-07-31 (stop → text 3.82 s = 0.33 detect + 2.4
-decode + 0.53 refine + ~0.3 pipeline overhead), the decode term drops to ~0.6 s: **~2.0 s, ~1.9×**.
-Not verified on the live app — that needs a real dictation through the mic.
+Verified 2026-08-01 12:30 on the installed build (`d383d0f`), real dictations through the mic. The
+11:36 line is the last dictation on the old build, ~2 minutes before the install — same machine,
+same session, same vocabulary:
+
+| Build | audio | transcribe | loops | windows | total |
+|---|---|---|---|---|---|
+| old (11:36) | 3.33 s | 2.77 s | — | 1 | 3.34 s |
+| new (12:30) | 4.86 s | **1.08 s** | 12 | 1 | **2.44 s** |
+| new (12:31) | 60.16 s | 6.04 s | 119 | 3 | 6.90 s |
+
+`loops=12` on a single window is the whole point: the constant ~41 is gone, and what remains tracks
+what was actually said. Transcribe fell 2.77 s → 1.08 s on 46% *more* audio. The 60 s case took
+`fallbacks=1` (one window decoded twice) and still beat the old build's 8.81 s / 187 loops.
+
+`language detection took 0.31s` still appears — Bruno's Dictation Language Set is `["en", "pt"]`, so
+`predeterminedLanguage` correctly declines to skip it. That saving only lands for single-language
+users.
 
 ## What this does not fix
 
