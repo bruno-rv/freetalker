@@ -68,22 +68,34 @@ The two removals that are easy to get wrong:
 
 ### The ownership check
 
-`ownedValue = readback ?? target`. A device may quantize (`0.10` in, `0.09803922` out), so the
-read-back is preferred; when the read-back failed, the requested target is the best evidence we
-have that the element is still as we left it. It is *not* a licence to write unconditionally — a
-failed read-back must not turn into "overwrite whatever the user has since chosen".
+Ownership rests on **the value the device itself reported after the write**, compared with
+representation-level epsilon (1e-4) only. No approximate tolerance band: devices quantize by wildly
+different amounts — a 16-step device can answer `0.125` to a requested `0.10` — so any fixed
+tolerance is simultaneously too tight for coarse devices (false relinquish, leaving them ducked) and
+too loose for fine ones (a real 0.005 user adjustment silently overwritten).
+
+That only works if a read-back exists, so **a failed read-back is not tolerated, it is undone**:
+write the original straight back, drop the entry, and skip ducking this element. An unverifiable
+mutation is not worth keeping. This replaces the earlier `readback ?? target` rule, which had to
+invent an ownership claim precisely where the evidence was missing.
 
 On restore, per entry:
 
 | Current value | Action |
 |---|---|
 | unreadable | **defer** — keep the entry, retry later |
-| ≈ `ownedValue` (±0.01) | **restore** — write `original`; remove on success, keep on write failure |
+| `== readback` (±1e-4) | **restore** — write `original`; remove on success, keep on write failure |
 | anything else | **relinquish** — the user moved it; remove the entry, write nothing |
 
 Relinquish must be a definitive transition, not a skip: leaving a mismatched entry in the ledger
 means a later duck/stop could rediscover it the moment the user happens to land back on the old
 ducked value, and overwrite a deliberate choice with a stale original.
+
+The one residual case is a read-back failure whose corrective rollback *also* fails. The element is
+then ducked with no verified value. The entry is kept with `readback: nil` and restored only if the
+current value matches the requested `target` within the same epsilon; otherwise it is relinquished.
+Two consecutive CoreAudio failures on the same element is the floor of what this design tries to
+recover from.
 
 ### Partial duck rolls back
 
@@ -95,6 +107,15 @@ stays *written* and is retried like any other deferred entry.
 ### Retry and termination
 
 Deferred entries are retried on the next `duck()`, the next `stop()`, and at termination.
+
+**`duck()` reconciles before it transacts**, both under the same lock. The order matters: if device
+A was absent at the previous stop and has since reconnected as the default, a naive implementation
+sees an existing entry for A, decides it is already ducked, skips recording a new original — and
+then the deferred restore fires and puts A back to full volume *during the new recording*. So:
+drain the ledger first; only then read the current volume and open a fresh transaction. If A's
+restoration fails, abandon the new duck rather than ducking a device whose original is still
+unresolved.
+
 `App.swift:230`'s Quit button calls `NSApplication.shared.terminate` directly with no capture
 teardown, so quitting mid-dictation would otherwise leave the volume down; an
 `applicationWillTerminate` hook drains the ledger synchronously. All in-process — nothing is
@@ -121,7 +142,8 @@ Policy helpers stay `nonisolated static` so they test without a sound card, matc
 `AppCoordinator.decoderBiasVocabulary` and `WhisperKitEngine.predeterminedLanguage`:
 
 - `duckTarget(original:)` → `original * 0.10`
-- `restoreDecision(entry:current:tolerance:)` → `.restore` / `.relinquish` / `.defer`
+- `restoreDecision(entry:current:)` → `.restore` / `.relinquish` / `.defer` (epsilon is a constant,
+  not a knob — it exists for float representation, not for device quantization)
 
 ## Where it hooks
 
@@ -160,11 +182,16 @@ A fake volume device behind a small protocol, so the whole state machine runs wi
 - a second restore is a no-op
 - a volume the user changed mid-recording is left alone **and its entry is dropped**, so the next
   duck records the new value as its original
-- a user change after a *failed* read-back is still left alone
+- a user change smaller than the old 0.01 tolerance is still detected as a user change
+- a coarsely quantized device (16 steps, `0.10` requested → `0.125` reported) restores correctly
+  rather than false-relinquishing
+- a failed read-back rolls the element back immediately and leaves no entry
 - a failed duck write leaves no entry, so a later restore cannot overwrite the user's value
 - a second-element write failure rolls back the first
 - a failed rollback write keeps the entry for retry
 - a device absent at restore keeps its entry, and a later attempt restores it
+- absent at stop → reconnects as default → next `duck()` restores it *first*, then ducks it fresh,
+  and it stays ducked until that new capture stops
 - termination drains the ledger
 - `stop()` restores even when `wasCapturing` is false
 - interleaved duck/restore calls do not compound the attenuation
