@@ -113,6 +113,19 @@ The cost is that the element can stay at ~10% for the rest of the session. That 
 one-keypress failure as the other cases under "Accepted limitations", and it takes three
 consecutive CoreAudio failures on one element to reach it.
 
+### The floor: don't duck what is already quiet
+
+`duck()` skips any element whose current volume is at or below **0.15**.
+
+This exists on its own merits — attenuating 5% to 0.5% buys nothing, because at 5% the speakers are
+already not reaching the microphone in any meaningful way — but it is also what bounds every
+compounding scenario in this design. The ledger is in-process, so a quarantine does not survive a
+relaunch; without a floor, an element left near 10% by the ambiguous path would be treated as a
+fresh `original` on the next launch and taken to 1%, then 0.1%. With the floor, the second launch
+sees 0.10 ≤ 0.15 and declines. The worst case is therefore one extra attenuation step (an element
+sitting just above the floor, say 0.20, going to 0.02 once) rather than an unbounded spiral, and it
+costs one constant instead of a persisted tombstone store plus a user-facing reset control.
+
 ### Partial duck rolls back
 
 With the channel-1/2 fallback, `duck()` writes more than once. If any element fails after another
@@ -158,6 +171,7 @@ Policy helpers stay `nonisolated static` so they test without a sound card, matc
 `AppCoordinator.decoderBiasVocabulary` and `WhisperKitEngine.predeterminedLanguage`:
 
 - `duckTarget(original:)` → `original * 0.10`
+- `shouldDuck(original:)` → `original > 0.15` (see "The floor")
 - `restoreDecision(entry:current:)` → `.restore` / `.relinquish` / `.defer` (epsilon is a constant,
   not a knob — it exists for float representation, not for device quantization)
 
@@ -215,6 +229,8 @@ A fake volume device behind a small protocol, so the whole state machine runs wi
 - interleaved duck/restore calls do not compound the attenuation
 - the UID resolver finds an output-only device (no input channels) and one that is not the current
   default
+- an element already at or below the floor is not ducked at all, so a fresh process that inherits a
+  quarantined ~10% element does not attenuate it again
 - a device with no settable volume degrades to doing nothing, and recording still starts
 
 ## Accepted limitations
