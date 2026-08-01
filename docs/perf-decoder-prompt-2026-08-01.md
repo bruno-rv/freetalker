@@ -60,9 +60,31 @@ text" behaviour actually influences here:
 - with prompt: `… I need you to evaluate it and try to optimize this time. Faster than it currently is at least by 10% …`
 - without: `… I need to evaluate it and try to optimize this time. it should be faster than it currently is at at least by 10% …`
 
-That gap is precisely what the post-processing pass is for. Note also that on the 6 s slice the
-prompted decode returned **empty text** while the unprompted one returned words — on short audio
-the prompt is not reliably an improvement at all.
+That gap is precisely what the post-processing pass is for.
+
+Codex's adversarial review (round 2) asked for more than one recording, so
+`measureVocabularyRecallAcrossCorpus` decodes every preserved capture on this machine twice —
+4 distinct clips over 1 s, 39 s of audio, English and Portuguese:
+
+| Clip | with prompt | without prompt |
+|---|---|---|
+| 18.2 s | `Hello, I am just testing the app now that I have pointed to use the GIMA 4 model. Let's see how good or even better it gets.` | identical |
+| 16.4 s | `Calma aí menino, vai cair aqui.` | `Calma aí, menino. Vai cair aqui. Não, não, não, não, não. Isso aqui, ó.` |
+| 3.0 s | *(empty)* | `Ele não vai aguentar não, a hora ele vai ter que ser o januário, entendeu?` |
+| 1.8 s | `Thank you.` | `Thank you. Thank. Thank you.` |
+
+**The prompt was not a pure accuracy win being traded away for speed.** On two of four clips it
+truncated or entirely emptied the transcript; on the 3.0 s clip the decode stopped after 31 loops
+with a 41-token prompt — i.e. it aborted *inside the prompt prefill* and returned nothing, which in
+the app is `PipelineError.emptyTranscript` ("Transcription failed — audio saved"). One clip was
+identical, and on the 1.8 s near-silence clip the prompted decode was the cleaner of the two.
+
+Timing over the same corpus, warm: **10.3 s with the prompt, 5.8 s without.**
+
+Honest limit of this evidence: **none of the preserved captures contains a registered vocabulary
+term**, so per-term recall — the thing the prompt is actually for — is still unmeasured. What is
+measured is that the prompt costs ~1.8× the decode and, on short audio, loses words. If a term is
+ever seen surviving post-processing misspelled, `decoderBiasVocabulary` is the one place to change.
 
 ## The change
 
@@ -93,10 +115,12 @@ Plus two smaller ones:
   heuristic: `constrainedLanguage` is an argmax restricted to the candidate set, so a one-element
   set resolves to that element for every distribution detection could return. Bruno's set is
   `["en", "pt"]`, so this changes nothing for him.
-- `decode timings` / `decode quality` / `language detection took` moved from `info` to `notice`.
-  Info-level messages are evicted from the in-memory buffer within hours, which is why the
-  2026-08-01 08:30 storm (1.79 s of audio → 15.24 s of decode) could not be diagnosed after the
-  fact while `stage timings` for the same dictation had survived.
+- `decode timings` / `decode quality` / `language detection took` moved from `info` to `notice`
+  **for final decodes only**. Info-level messages are evicted from the in-memory buffer within
+  hours, which is why the 2026-08-01 08:30 storm (1.79 s of audio → 15.24 s of decode) could not be
+  diagnosed after the fact while `stage timings` for the same dictation had survived. Preview ticks
+  stay at `info` (Codex round 2): they run every ~1.5 s with no fallback budget, so promoting them
+  would bury the one decode the user waited for under hundreds of `fallbacks=0` records.
 
 ### Expected end-to-end
 

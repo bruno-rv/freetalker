@@ -664,12 +664,23 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, WhisperFile
     /// dictation can cost 1× or 6× the decode. Without this line a fallback storm is
     /// indistinguishable in the log from "the model is just slow on this machine".
     ///
-    /// `notice`, not `info`: info-level messages only live in the in-memory buffer and are evicted
-    /// within hours, which is exactly why the 2026-08-01 08:30 storm (1.79 s of audio, 15.24 s of
-    /// decode) could not be diagnosed afterwards — `stage timings` had survived and these had not.
+    /// `notice`, not `info`, for the FINAL decode: info-level messages only live in the in-memory
+    /// buffer and are evicted within hours, which is exactly why the 2026-08-01 08:30 storm
+    /// (1.79 s of audio, 15.24 s of decode) could not be diagnosed afterwards — `stage timings`
+    /// had survived and these had not.
+    ///
+    /// Preview ticks stay at `info` (Codex adversarial review round 2). A tick runs about every
+    /// 1.5 s and gets no fallback budget at all, so promoting them would write hundreds of
+    /// persistent `fallbacks=0` records per long Recording — pure noise around the one decode the
+    /// user actually waited for, in a log the storm evidence has to be findable in.
     private static func logDecodeTimings(_ results: [TranscriptionResult], preview: Bool) {
         guard let timings = results.first?.timings else { return }
-        logger.notice(
+        // `.default` is `notice`'s level; `Logger.log(level:)` takes it as an ordinary argument,
+        // which `logger.notice`/`logger.info` (whose message must be a literal interpolation at
+        // the call site) can't express without duplicating the whole format string.
+        let level: OSLogType = preview ? .info : .default
+        logger.log(
+            level: level,
             """
             decode timings\(preview ? " (preview)" : ""): \
             fallbacks=\(timings.totalDecodingFallbacks, format: .fixed(precision: 0)) \
@@ -688,7 +699,8 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, WhisperFile
             // An all-zero segment is one WhisperKit never filled in; printing it would read as a
             // measurement of a perfect decode.
             guard segment.compressionRatio != 0 || segment.avgLogprob != 0 else { continue }
-            logger.notice(
+            logger.log(
+                level: level,
                 """
                 decode quality [\(index)]: \
                 temperature=\(segment.temperature, format: .fixed(precision: 2)) \

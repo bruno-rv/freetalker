@@ -63,10 +63,102 @@ import WhisperKit
         }
     }
 
+    /// Codex adversarial review round 2 asked whether withholding the prompt costs proper-noun
+    /// recall, not just formatting. This decodes every preserved capture on this machine twice and
+    /// reports which registered terms each transcript contains, so the answer is a count rather
+    /// than an opinion.
+    ///
+    ///     … FREETALKER_DECODE_BENCH=1 swift test --filter measureVocabularyRecallAcrossCorpus
+    @Test func measureVocabularyRecallAcrossCorpus() async throws {
+        guard ProcessInfo.processInfo.environment["FREETALKER_DECODE_BENCH"] != nil else { return }
+
+        let corpusRoot = NSString(string: "~/Library/Application Support/FreeTalker/failed-dictations").expandingTildeInPath
+        var seen = Set<Data>()
+        var clips: [(name: String, samples: [Float])] = []
+        for name in try FileManager.default.contentsOfDirectory(atPath: corpusRoot).sorted()
+        where name.hasSuffix(".wav") {
+            let data = try Data(contentsOf: URL(fileURLWithPath: corpusRoot).appendingPathComponent(name))
+            guard seen.insert(data).inserted else { continue }
+            let samples = Self.decodePCM(data)
+            guard samples.count >= 16_000 else { continue }
+            clips.append((name, samples))
+        }
+        // The app rewrites/removes this one; include it when it happens to be there.
+        if let latest = try? Self.loadPCM(path: Self.audioPath) {
+            clips.append(("last-dictation.wav", latest))
+        }
+        let seconds = clips.reduce(0.0) { $0 + Double($1.samples.count) / 16_000 }
+        print("=== recall: \(clips.count) distinct clips, \(String(format: "%.0f", seconds))s of audio")
+
+        let kit = try await WhisperKit(WhisperKitConfig(
+            modelFolder: Self.modelFolder, verbose: false, logLevel: .none, load: true, download: false
+        ))
+        let tokenizer = try #require(kit.tokenizer)
+        let promptTokens = tokenizer.encode(text: VocabularyFitGate.serializedPrompt(Self.vocabulary))
+            .filter { $0 < tokenizer.specialTokens.specialTokenBegin }
+
+        var hits: [String: (withPrompt: Int, without: Int)] = [:]
+        var wall: (withPrompt: Double, without: Double) = (0, 0)
+        for clip in clips {
+            let (_, langProbs) = try await kit.detectLangauge(audioArray: clip.samples)
+            let language = WhisperKitEngine.constrainedLanguage(langProbs: langProbs, candidates: ["en", "pt"])
+            var texts: [String: String] = [:]
+            for (variant, prompt) in [("with-prompt", promptTokens), ("no-prompt", nil as [Int]?)] {
+                var options = DecodingOptions()
+                options.language = language
+                options.usePrefillPrompt = true
+                options.detectLanguage = false
+                options.temperatureFallbackCount = WhisperKitEngine.decodeFallbackBudget(preview: false)
+                options.promptTokens = prompt
+                let start = Date()
+                let results = try await kit.transcribe(audioArray: clip.samples, decodeOptions: options)
+                let elapsed = Date().timeIntervalSince(start)
+                if variant == "with-prompt" { wall.withPrompt += elapsed } else { wall.without += elapsed }
+                texts[variant] = results.map(\.text).joined(separator: " ")
+                let timings = results.first?.timings
+                print("""
+                === recall clip=\(clip.name) audio=\(String(format: "%.1f", Double(clip.samples.count) / 16_000))s \
+                \(variant) wall=\(String(format: "%.2f", elapsed))s \
+                loops=\(Int(timings?.totalDecodingLoops ?? 0)) windows=\(Int(timings?.totalDecodingWindows ?? 0)) \
+                promptTokens=\(prompt?.count ?? 0) chars=\(texts[variant]!.count)
+                ===   text: \(texts[variant]!)
+                """)
+            }
+            for term in Self.vocabulary {
+                let inPrompted = texts["with-prompt"]!.range(of: term, options: .caseInsensitive) != nil
+                let inPlain = texts["no-prompt"]!.range(of: term, options: .caseInsensitive) != nil
+                if inPrompted || inPlain {
+                    var entry = hits[term] ?? (0, 0)
+                    entry.withPrompt += inPrompted ? 1 : 0
+                    entry.without += inPlain ? 1 : 0
+                    hits[term] = entry
+                }
+                // Only the clips where the two decisions differ are worth reading by hand.
+                if inPrompted != inPlain {
+                    print("""
+                    === recall DIVERGENCE \(clip.name) term=\(term) prompted=\(inPrompted) plain=\(inPlain)
+                    ===   with-prompt: \(texts["with-prompt"]!)
+                    ===   no-prompt:   \(texts["no-prompt"]!)
+                    """)
+                }
+            }
+        }
+        for (term, counts) in hits.sorted(by: { $0.key < $1.key }) {
+            print("=== recall term=\(term) with-prompt=\(counts.withPrompt) no-prompt=\(counts.without)")
+        }
+        print("""
+        === recall totals: with-prompt=\(String(format: "%.1f", wall.withPrompt))s \
+        no-prompt=\(String(format: "%.1f", wall.without))s over \(String(format: "%.0f", seconds))s of audio
+        """)
+    }
+
     /// 16 kHz mono PCM16 — the only format `CaptureSegmentCodec` ever writes.
     private static func loadPCM(path: String) throws -> [Float] {
-        let data = try Data(contentsOf: URL(fileURLWithPath: path))
-        let body = data.dropFirst(44)
+        decodePCM(try Data(contentsOf: URL(fileURLWithPath: path)))
+    }
+
+    private static func decodePCM(_ data: Data) -> [Float] {
+        let body = Data(data.dropFirst(44))
         return body.withUnsafeBytes { raw -> [Float] in
             let ints = raw.bindMemory(to: Int16.self)
             return ints.map { Float($0) / 32768.0 }
