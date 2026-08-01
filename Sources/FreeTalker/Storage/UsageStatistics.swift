@@ -14,6 +14,21 @@ struct DictationStatRow: Sendable, Equatable {
     let durationSecs: Double?
     let refined: String
     let transcript: String
+    /// Needed only by the rewrite share: a translated row's `refined` is a different language, so
+    /// comparing it against `transcript` measures translation, not post-processing.
+    let requestedOutputLanguage: OutputLanguage
+
+    /// Whether `transcript` vs `refined` is a meaningful "did post-processing change my words?"
+    /// comparison for this row. Same three-part rule as `VocabularyMiner.isEligible`: same-language
+    /// (not a translation) and an actual template (the reserved "Raw Transcript" name is what
+    /// `AppCoordinator` records when post-processing is skipped, and it writes the transcript
+    /// straight through, so those rows would otherwise all read as "unchanged"). Legacy rows with
+    /// an empty `refined` never ran post-processing at all.
+    var refinementIsComparable: Bool {
+        guard requestedOutputLanguage == .sameAsSpoken else { return false }
+        guard !TemplateStore.isReservedTemplateName(template) else { return false }
+        return !refined.isEmpty && !transcript.isEmpty
+    }
 }
 
 /// A single grouped bucket (by language / template / engine / app). `words` is the same
@@ -96,10 +111,10 @@ struct UsageStatsSnapshot: Sendable, Equatable {
     /// Deliberately a raw count, not a type/token ratio: TTR shrinks as history grows, so it would
     /// read as the user's vocabulary narrowing when only their corpus grew.
     var uniqueWords: Int = 0
-    /// Rows where a comparison between raw and post-processed text is actually meaningful — both
-    /// sides non-empty. Legacy/raw-only rows (`refined` empty means post-processing never ran, per
-    /// `DictationStatRow`) are excluded rather than counted as "unchanged", which would report a
-    /// falsely low edit rate on a history full of them.
+    /// Rows where comparing raw against post-processed text is actually meaningful — see
+    /// `DictationStatRow.refinementIsComparable`. Translations, raw-transcript rows, and legacy
+    /// rows are excluded rather than scored as rewritten/unchanged, either of which would move the
+    /// rate for a reason that has nothing to do with post-processing.
     var comparableRefinedRows: Int = 0
     /// Of those, the ones post-processing actually changed.
     var editedByRefinementRows: Int = 0
@@ -217,7 +232,7 @@ struct UsageStatsSnapshot: Sendable, Equatable {
             engineTallies[row.engine, default: .zero].add(words: rowWords)
             appTallies[row.bundleID ?? untrackedAppKey, default: .zero].add(words: rowWords)
 
-            if !row.refined.isEmpty && !row.transcript.isEmpty {
+            if row.refinementIsComparable {
                 snapshot.comparableRefinedRows += 1
                 if row.refined != row.transcript { snapshot.editedByRefinementRows += 1 }
             }

@@ -152,6 +152,10 @@ private struct UsageHistogramChart: View {
                             .minimumScaleFactor(0.5)
                     }
                     .frame(maxWidth: .infinity, alignment: .bottom)
+                    // The caption is its own accessibility element, so the column has to collapse
+                    // into one before the label replaces it — unlike the daily chart, whose column
+                    // holds nothing but a shape.
+                    .accessibilityElement(children: .ignore)
                     .accessibilityLabel(bar.accessibilityLabel)
                 }
             }
@@ -221,7 +225,7 @@ struct UsageStatisticsView: View {
                     LabeledContent("Total speaking time", value: UsageStatisticsFormatting.shortDuration(snapshot.speakingSeconds))
                     LabeledContent("Distinct words used", value: UsageStatisticsFormatting.count(snapshot.uniqueWords))
                     LabeledContent("Rewritten by post-processing", value: UsageStatisticsFormatting.percentage(snapshot.refinementRate))
-                    Text("Pace and speaking time cover the \(snapshot.rowsWithPositiveDuration) of \(snapshot.totalDictations) dictations with a recorded duration. The rewrite share covers the \(snapshot.comparableRefinedRows) that were post-processed by a template — raw-only dictations have nothing to compare against.")
+                    Text("Pace and speaking time cover the \(snapshot.rowsWithPositiveDuration) of \(snapshot.totalDictations) dictations with a recorded duration. The rewrite share covers the \(snapshot.comparableRefinedRows) that a template post-processed in the language you spoke — raw transcripts and translations have nothing to compare against.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }

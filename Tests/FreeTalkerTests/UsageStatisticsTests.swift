@@ -18,14 +18,16 @@ import Testing
         bundleID: String? = "com.apple.TextEdit",
         durationSecs: Double? = nil,
         refined: String = "hello world",
-        transcript: String = ""
+        transcript: String = "",
+        requestedOutputLanguage: OutputLanguage = .sameAsSpoken
     ) -> DictationStatRow {
         let calendar = utcCalendar()
         let now = calendar.date(from: DateComponents(year: 2026, month: 7, day: 16, hour: hour))!
         let timestamp = calendar.date(byAdding: .day, value: -daysAgo, to: now)!
         return DictationStatRow(
             timestamp: timestamp, language: language, template: template, engine: engine,
-            bundleID: bundleID, durationSecs: durationSecs, refined: refined, transcript: transcript
+            bundleID: bundleID, durationSecs: durationSecs, refined: refined, transcript: transcript,
+            requestedOutputLanguage: requestedOutputLanguage
         )
     }
 
@@ -185,6 +187,7 @@ import Testing
         let tracked = try #require(rows.first { $0.bundleID == "com.apple.TextEdit" })
         #expect(tracked.durationSecs == 3.5)
         #expect(tracked.refined == "hello world")
+        #expect(tracked.requestedOutputLanguage == .sameAsSpoken)
         let untracked = try #require(rows.first { $0.bundleID == nil })
         #expect(untracked.durationSecs == nil)
 
@@ -296,6 +299,27 @@ import Testing
         #expect(snapshot.comparableRefinedRows == 2)
         #expect(snapshot.editedByRefinementRows == 1)
         #expect(abs((snapshot.refinementRate ?? 0) - 0.5) < 0.001)
+    }
+
+    @Test func rewriteShareExcludesTranslationsAndRawTranscripts() {
+        // A translated row's `refined` is another language — always different, never a measure of
+        // post-processing.
+        let translated = Self.row(refined: "texto limpo", transcript: "clean text", requestedOutputLanguage: .portuguese)
+        // Post-processing skipped: `AppCoordinator` records the reserved template name and writes
+        // the transcript straight through, so this is "never ran", not "ran and changed nothing".
+        let rawTranscript = Self.row(
+            template: TemplateStore.rawTranscriptTemplateName,
+            refined: "same text", transcript: "same text"
+        )
+        let rewritten = Self.row(refined: "clean text", transcript: "raw text")
+
+        let snapshot = UsageStatsSnapshot.compute(
+            rows: [translated, rawTranscript, rewritten], now: Self.referenceNow, calendar: Self.utcCalendar()
+        )
+
+        #expect(snapshot.comparableRefinedRows == 1)
+        #expect(snapshot.editedByRefinementRows == 1)
+        #expect(abs((snapshot.refinementRate ?? 0) - 1.0) < 0.001)
     }
 
     @Test func splitsCarryWordsAlongsideCounts() throws {
