@@ -113,18 +113,26 @@ The cost is that the element can stay at ~10% for the rest of the session. That 
 one-keypress failure as the other cases under "Accepted limitations", and it takes three
 consecutive CoreAudio failures on one element to reach it.
 
-### The floor: don't duck what is already quiet
+### Two bounds on compounding
 
-`duck()` skips any element whose current volume is at or below **0.15**.
+The ledger is in-process, so the ambiguous quarantine does not survive a relaunch. An element left
+quiet by that path would otherwise be read as a fresh `original` next launch and attenuated again.
+Two rules bound it, and neither needs persistence.
 
-This exists on its own merits — attenuating 5% to 0.5% buys nothing, because at 5% the speakers are
-already not reaching the microphone in any meaningful way — but it is also what bounds every
-compounding scenario in this design. The ledger is in-process, so a quarantine does not survive a
-relaunch; without a floor, an element left near 10% by the ambiguous path would be treated as a
-fresh `original` on the next launch and taken to 1%, then 0.1%. With the floor, the second launch
-sees 0.10 ≤ 0.15 and declines. The worst case is therefore one extra attenuation step (an element
-sitting just above the floor, say 0.20, going to 0.02 once) rather than an unbounded spiral, and it
-costs one constant instead of a persisted tombstone store plus a user-facing reset control.
+**A floor.** `duck()` skips any element whose current volume is at or below **0.15**. This stands on
+its own — attenuating 5% to 0.5% buys nothing, the speakers are not reaching the microphone at 5%
+either way — and it stops the ordinary repeat: a second launch sees 0.10 ≤ 0.15 and declines.
+
+**A zero check.** If the post-write read-back is exactly 0, roll back immediately and do not duck
+that element. Devices quantize *upward* as well as down: one with 0.20 increments can answer a
+requested 0.10 with 0.20, which clears the floor, and the next launch's requested 0.02 can land on
+0. A silent Mac is precisely the outcome this design chose ducking over muting to avoid, so it is
+refused directly rather than argued away.
+
+Together these terminate the chain on coarse devices too: the value either falls to at-or-below the
+floor and is left alone, or hits zero and is rolled back, or quantizes back to where it already was
+and nothing changes. The floor alone does **not** bound attenuation universally — the earlier claim
+that it did was wrong, because it assumed downward quantization.
 
 ### Partial duck rolls back
 
@@ -231,6 +239,8 @@ A fake volume device behind a small protocol, so the whole state machine runs wi
   default
 - an element already at or below the floor is not ducked at all, so a fresh process that inherits a
   quarantined ~10% element does not attenuate it again
+- a device with coarse upward quantization whose first read-back lands *above* the floor: the next
+  process ducks it once more, and a read-back of 0 is rolled back rather than left muted
 - a device with no settable volume degrades to doing nothing, and recording still starts
 
 ## Accepted limitations
