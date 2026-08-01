@@ -86,7 +86,9 @@ import Testing
         let postProcessorVocabulary = try #require(await processor.lastRequest?.vocabulary)
         #expect(postProcessorVocabulary == ["Alpha"])
         #expect(transcriberVocabulary == AppCoordinator.decoderBiasVocabulary(
-            postProcessorVocabulary, refinementCarriesVocabulary: true
+            postProcessorVocabulary,
+            refinementCarriesVocabulary: true,
+            biasCostsDecodeTime: await transcriber.vocabularyBiasCostsDecodeTime
         ))
     }
 
@@ -536,6 +538,8 @@ private actor RecoveryLocalTranscriberProbe: RecoveryLocalTranscribing {
 /// `AppSettings.shared` mid-retry) BEFORE returning — see
 /// `recoveryRetryUsesOneVocabularySnapshotForTranscriptionAndPostProcessing`.
 private actor VocabularyMutatingTranscriberProbe: RecoveryLocalTranscribing {
+    /// Stands in for WhisperKit, which is the only thing production injects here.
+    nonisolated let vocabularyBiasCostsDecodeTime = true
     private(set) var receivedVocabulary: [String] = []
     private let onTranscribe: @MainActor @Sendable () -> Void
 

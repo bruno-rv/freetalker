@@ -344,6 +344,10 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, WhisperFile
     let name = "WhisperKit"
     @MainActor @Published private(set) var statusText: String = "Not loaded"
 
+    /// See `TranscriptionEngine.vocabularyBiasCostsDecodeTime`. Also satisfies
+    /// `RecoveryLocalTranscribing`'s identical requirement — retry transcription is this engine.
+    let vocabularyBiasCostsDecodeTime = true
+
     private let modelController = ModelReloadController<WhisperKit>()
     private let gate = SerialGate()
     private let downloadCoordinator: SpeechModelDownloadCoordinator

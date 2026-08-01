@@ -3738,21 +3738,28 @@ final class AppCoordinator: ObservableObject {
         return processor is CloudLLMProcessor
     }
 
-    /// The vocabulary the *speech model* should be biased toward, given whether an LLM pass will
-    /// also see the same list.
+    /// The vocabulary the *speech engine* should be biased toward, given what that bias costs it
+    /// and whether an LLM pass will also see the same list.
     ///
     /// Biasing WhisperKit costs one full decoder inference per prompt token per 30 s window:
     /// `TextDecoder`'s main loop calls `predictLogits` on every prefill iteration exactly as it
     /// does on a generated token, and a non-nil `promptTokens` additionally disables its KV
     /// prefill cache (`TextDecoder.swift`'s `usePrefillCache` guard). Measured on this machine
-    /// with `large-v3_turbo`: ~45 ms per loop, and a 13-term vocabulary is ~41 loops — ~1.85 s
-    /// added to every window, which for a 5 s dictation was more than half the decode.
+    /// with `large-v3_turbo`: ~45 ms per loop, and a 13-term vocabulary is 41 loops — ~1.85 s
+    /// added to every window, which for a 6 s dictation was more than half the decode.
     ///
     /// Every post-processing path already passes the same terms to its LLM as a spelling hint
     /// (`vocabularyInstruction`, via `CloudLLMProcessor`, `AppleFMProcessor` and
-    /// `TranslationService`), so paying for the decoder prompt too buys a second copy of the same
-    /// bias at first-class latency. Raw (`skipPostProcessing`) has no LLM pass at all, so it keeps
-    /// the prompt — it is the one path where dropping it would lose the feature.
+    /// `TranslationService`), so paying that a second time buys a second copy of the same bias at
+    /// first-class latency. Withheld only when BOTH hold:
+    ///
+    /// - `biasCostsDecodeTime` — the engine's own answer (`vocabularyBiasCostsDecodeTime`).
+    ///   `CloudSTTEngine` carries the terms as a multipart `prompt` field on a request it was
+    ///   already making, so there is nothing to save and it always gets the full list (Codex
+    ///   adversarial review, 2026-08-01).
+    /// - `refinementCarriesVocabulary` — something downstream will apply the terms anyway. Raw
+    ///   (`skipPostProcessing`) has no LLM pass at all, so it keeps the prompt; it is the one path
+    ///   where withholding would lose the feature rather than relocate it.
     ///
     /// The trade is real and deliberate, not free: post-processing corrects a misspelled proper
     /// noun, the decoder prompt would have made it less likely to be misheard in the first place,
@@ -3761,9 +3768,10 @@ final class AppCoordinator: ObservableObject {
     /// small token-budgeted prompt rather than the whole list.
     nonisolated static func decoderBiasVocabulary(
         _ vocabulary: [String],
-        refinementCarriesVocabulary: Bool
+        refinementCarriesVocabulary: Bool,
+        biasCostsDecodeTime: Bool
     ) -> [String] {
-        refinementCarriesVocabulary ? [] : vocabulary
+        biasCostsDecodeTime && refinementCarriesVocabulary ? [] : vocabulary
     }
 
     private func logPostProcessingFallback(_ reason: PostProcessingFallbackReason) {
@@ -3974,10 +3982,13 @@ final class AppCoordinator: ObservableObject {
             samples: samples,
             forcedLanguage: context.transcriptionLanguage,
             candidateLanguages: context.candidateLanguages,
-            // Only the Raw path pays for decoder-side biasing — see `decoderBiasVocabulary`. The
-            // full snapshot still reaches whichever LLM pass runs below, unchanged.
+            // Withheld only from an engine that pays decode time for it, and only when the pass
+            // below will carry the terms anyway — see `decoderBiasVocabulary`. The full snapshot
+            // still reaches whichever LLM pass runs below, unchanged.
             vocabulary: Self.decoderBiasVocabulary(
-                context.vocabularySnapshot, refinementCarriesVocabulary: !skipPostProcessing
+                context.vocabularySnapshot,
+                refinementCarriesVocabulary: !skipPostProcessing,
+                biasCostsDecodeTime: engine.vocabularyBiasCostsDecodeTime
             )
         )
         transcribeSeconds = Self.elapsedSeconds(since: transcribeStart)
@@ -4588,13 +4599,19 @@ final class AppCoordinator: ObservableObject {
         // terms cache republishes (a concurrent decision, or `refreshApprovedVocabularyCache`)
         // between them, mid-retry. See Codex finding (AppCoordinator.swift:3769/3797).
         let vocabularySnapshot = AppSettings.shared.vocabulary
-        let transcription = try await RecoveryLocalProcessor(transcriber: transcriber ?? whisperEngine).process(
+        let localTranscriber = transcriber ?? whisperEngine
+        let transcription = try await RecoveryLocalProcessor(transcriber: localTranscriber).process(
             samples: samples,
             configuration: configuration,
             candidateLanguages: AppSettings.shared.dictationLanguages,
             // Retry always runs the post-processing pass below, which carries the same terms — so
-            // the decoder prompt is the redundant copy here too. See `decoderBiasVocabulary`.
-            vocabulary: Self.decoderBiasVocabulary(vocabularySnapshot, refinementCarriesVocabulary: true),
+            // for an engine that pays decode time for the prompt, this is the redundant copy. See
+            // `decoderBiasVocabulary`.
+            vocabulary: Self.decoderBiasVocabulary(
+                vocabularySnapshot,
+                refinementCarriesVocabulary: true,
+                biasCostsDecodeTime: localTranscriber.vocabularyBiasCostsDecodeTime
+            ),
             defaultModel: AppSettings.shared.whisperModel
         )
         // Retry must apply the same post-processing (active processor + template) the live path

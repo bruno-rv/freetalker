@@ -7,6 +7,16 @@ enum RecoveryLocalProcessingError: LocalizedError {
 
 protocol RecoveryLocalTranscribing: Sendable {
     func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String], vocabulary: [String], exactModel: String) async throws -> TranscriptionOutput
+
+    /// Same requirement, same default, and for the same reason as
+    /// `TranscriptionEngine.vocabularyBiasCostsDecodeTime` — retry has its own transcriber
+    /// protocol, so the policy has to be readable through this one too rather than assumed from
+    /// the fact that production only ever injects WhisperKit here.
+    var vocabularyBiasCostsDecodeTime: Bool { get }
+}
+
+extension RecoveryLocalTranscribing {
+    var vocabularyBiasCostsDecodeTime: Bool { false }
 }
 
 extension WhisperKitEngine: RecoveryLocalTranscribing {}

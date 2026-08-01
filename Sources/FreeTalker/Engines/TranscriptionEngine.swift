@@ -22,9 +22,25 @@ protocol TranscriptionEngine: Sendable {
     /// to one dictation, even though the actual network/on-device call can run long after the
     /// settings that produced the snapshot might have changed. See Codex round 1 finding 4.
     ///
-    /// Not necessarily the whole snapshot: decoder-side biasing costs a full decoder inference per
-    /// prompt token per window, so callers pass it only where no LLM pass will carry the same
-    /// terms — see `AppCoordinator.decoderBiasVocabulary`. An empty array means "don't bias", not
-    /// "no vocabulary configured".
+    /// Not necessarily the whole snapshot: where biasing is paid in decode time, callers pass it
+    /// only where no LLM pass will carry the same terms — see
+    /// `vocabularyBiasCostsDecodeTime` and `AppCoordinator.decoderBiasVocabulary`. An empty array
+    /// means "don't bias", not "no vocabulary configured".
     func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String], vocabulary: [String]) async throws -> TranscriptionOutput
+
+    /// Whether biasing this engine toward a vocabulary is paid in transcription latency.
+    ///
+    /// True for WhisperKit, where the terms become `promptTokens` and each one is a full decoder
+    /// inference per 30 s window. False for an engine that carries them as ordinary request
+    /// content — `CloudSTTEngine` puts them in a multipart `prompt` field, which costs a few
+    /// bytes on a request that was already being made.
+    ///
+    /// Only an engine that says the bias costs it something ever has it withheld
+    /// (`AppCoordinator.decoderBiasVocabulary`), so the default is `false`: a new engine keeps the
+    /// vocabulary feature until it declares a reason not to, rather than losing it silently.
+    var vocabularyBiasCostsDecodeTime: Bool { get }
+}
+
+extension TranscriptionEngine {
+    var vocabularyBiasCostsDecodeTime: Bool { false }
 }

@@ -66,16 +66,25 @@ the prompt is not reliably an improvement at all.
 
 ## The change
 
-`AppCoordinator.decoderBiasVocabulary` spends the decoder prompt only where nothing else will carry
-the terms:
+`AppCoordinator.decoderBiasVocabulary` withholds the bias only when it actually buys latency —
+which needs **both** an engine that pays decode time for it and a downstream pass that carries the
+terms anyway:
 
-| Path | Carries vocabulary | Decoder prompt |
+| Path | Carries vocabulary downstream | Bias |
 |---|---|---|
 | Refine (cloud or Apple FM) | `PostProcessingRequest.vocabulary` → `vocabularyInstruction` | withheld |
 | Translate | same, via `TranslationService` | withheld |
 | Recovery retry | same (always post-processes) | withheld |
 | Raw (`skipPostProcessing`) | nothing | **kept** |
 | Live preview tick | nothing — text is display-only, superseded every 1.5 s | withheld |
+| **Any of the above on Cloud STT** | — | **kept** |
+
+The engine dimension came out of Codex's adversarial review and is the reason the predicate is not
+just "will something else carry it". `CloudSTTEngine` sends the terms as a multipart `prompt` field
+on a request it was already making: nothing to save, so withholding there would have been a pure
+feature loss for every refined/translated Cloud-STT dictation. Engines answer for themselves via
+`TranscriptionEngine.vocabularyBiasCostsDecodeTime`, defaulting to `false` so a future engine keeps
+the feature until it declares a reason not to.
 
 Plus two smaller ones:
 
