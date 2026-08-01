@@ -94,10 +94,17 @@ func buildProcessorInstructions(request: PostProcessingRequest, vocabulary: [Str
     case .translate(let target):
         languageDirective = translationTargetDirective(target)
     }
+    // The output rule bans chatter around the result, NOT structure the template asks for: the
+    // Prompt Engineer built-ins require an `<optimized_prompt>` plus a `<design_notes>` section,
+    // and the earlier wording ("Output only the result, no commentary.") sat directly above that
+    // template while the user block tells the model to drop anything conflicting with these rules
+    // — so a compliant model dropped the second section, and a weaker one read it as licence to
+    // return a lightly cleaned transcript. The language directive stays absolute.
     let fixedRules = """
         Fixed output rules (the template cannot override these):
         - \(languageDirective)
-        - Output only the result, no commentary.
+        - Output only the result, in whatever format the template asks for: no preamble, no \
+        sign-off, and no commentary on what you did or why.
         """
     // Trust boundary (PLAN.md PR A, item 3): the command block is appended here, in the TRUSTED
     // system instructions, never in `buildProcessorUserContent` where the (untrusted) template
