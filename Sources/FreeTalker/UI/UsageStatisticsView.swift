@@ -225,7 +225,7 @@ struct UsageStatisticsView: View {
                     LabeledContent("Total speaking time", value: UsageStatisticsFormatting.shortDuration(snapshot.speakingSeconds))
                     LabeledContent("Distinct words used", value: UsageStatisticsFormatting.count(snapshot.uniqueWords))
                     LabeledContent("Rewritten by post-processing", value: UsageStatisticsFormatting.percentage(snapshot.refinementRate))
-                    Text("Pace and speaking time cover the \(snapshot.rowsWithPositiveDuration) of \(snapshot.totalDictations) dictations with a recorded duration, and pace counts the words you spoke rather than the post-processed or translated text. The rewrite share covers the \(snapshot.comparableRefinedRows) that a template post-processed in the language you spoke — raw transcripts and translations have nothing to compare against.")
+                    Text("Pace and speaking time cover the \(snapshot.rowsWithPositiveDuration) of \(snapshot.totalDictations) dictations with a recorded duration. Pace counts the words you spoke rather than the post-processed or translated text, over the length of the recording — a capture that starts before you speak or runs on after you finish pulls it down. The rewrite share covers the \(snapshot.comparableRefinedRows) that a template post-processed in the language you spoke — raw transcripts and translations have nothing to compare against.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
