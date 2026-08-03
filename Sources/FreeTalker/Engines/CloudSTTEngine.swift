@@ -62,12 +62,9 @@ final class CloudSTTEngine: ObservableObject, TranscriptionEngine, @unchecked Se
         request.timeoutInterval = Self.transcribeTimeout(audioSeconds: audioSeconds)
         request.httpBody = multipartBody(boundary: boundary, wavData: wavData, model: model, vocabulary: vocabulary, forcedLanguage: forcedLanguage)
 
-        let session = Self.session(audioSeconds: audioSeconds)
-        // `invalidateAndCancel`, not `finishTasksAndInvalidate`: on cancellation the upload must
-        // stop, not keep running while the local fallback transcribes (Codex round 2, finding 4).
-        // Nothing is outstanding on the normal path, where the response has already arrived.
-        defer { session.invalidateAndCancel() }
-        let (data, response) = try await session.data(for: request)
+        // Cancelling the enclosing task cancels this upload, so a stop the user abandoned does not
+        // keep uploading while the local fallback transcribes (Codex round 2, finding 4).
+        let (data, response) = try await Self.session.data(for: request)
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
             let code = (response as? HTTPURLResponse)?.statusCode ?? 0
             throw CloudSTTError.badResponse(status: code, hint: CloudSTTError.classifyHint(status: code))
@@ -86,44 +83,48 @@ final class CloudSTTEngine: ObservableObject, TranscriptionEngine, @unchecked Se
     ///
     /// `timeoutInterval` is inactivity, not a total budget, and the dominant idle window is
     /// server-side transcription: no bytes flow while the endpoint works. So it scales with the
-    /// audio — 2x realtime, which covers a model slower than realtime — with the previous fixed
-    /// 300 s as the ceiling and a 60 s floor. The floor is `URLSession`'s own default, so a short
-    /// stop against a cold-starting endpoint is never abandoned sooner than an unconfigured
-    /// request would be (Codex round 1, finding 7).
+    /// audio, covering an endpoint up to 2x realtime, with the previous fixed 300 s as the ceiling
+    /// and a 60 s floor. The floor is `URLRequest`'s own default, so a short stop against a
+    /// cold-starting endpoint is never abandoned sooner than an unconfigured request would be
+    /// (Codex round 1, finding 7). An endpoint slower than 2x realtime does get abandoned to the
+    /// fallback (Codex round 3, finding 6).
     ///
     /// A dead endpoint used to cost the full 300 s before the dictation failed. Guessing this
     /// number low is now cheap: `FallbackSTTEngine` answers a timeout with one local
-    /// transcription, so being wrong costs a few seconds, not the user's words.
+    /// transcription, so being wrong costs that transcription — which is not free, and can include
+    /// a model download — rather than the user's words.
     static func transcribeTimeout(audioSeconds: Double) -> TimeInterval {
         min(300, max(60, audioSeconds * 2))
     }
 
-    /// Total wall-clock deadline for one transcription, which `timeoutInterval` alone cannot give:
+    /// Total wall-clock ceiling for one transcription, which `timeoutInterval` alone cannot give:
     /// a server dribbling bytes resets the inactivity timer indefinitely (Codex round 1,
-    /// finding 6). Twice the inactivity budget, which is where a stalled-but-dribbling endpoint
-    /// gets caught.
+    /// finding 6).
+    ///
+    /// Flat rather than scaled with the audio, because the session is shared across dictations for
+    /// connection reuse and `timeoutIntervalForResource` is a session-wide setting (Codex round 3,
+    /// finding 3). Twice the largest inactivity budget, so it is only ever the dribbling endpoint
+    /// that hits it first.
     ///
     /// Ceiling (Codex round 2, finding 5): this is a real cap, not just a pathology detector — an
-    /// endpoint that genuinely needs longer than 4x realtime (or 600 s for long audio) is
-    /// abandoned to the local fallback rather than waited out.
-    static func transcribeResourceTimeout(audioSeconds: Double) -> TimeInterval {
-        transcribeTimeout(audioSeconds: audioSeconds) * 2
-    }
+    /// endpoint that genuinely needs longer than ten minutes for one dictation is abandoned to the
+    /// local fallback rather than waited out.
+    static let transcribeResourceTimeout: TimeInterval = 600
 
-    /// A dictation's upload gets its own session so the resource deadline applies to this request
-    /// alone — `URLSession.shared` is process-wide and its configuration is not ours to set.
+    /// One session for every upload, not one per request: a session per dictation would pay a
+    /// fresh DNS lookup and TLS handshake each time (Codex round 3, finding 3). It carries the
+    /// total ceiling; the per-dictation inactivity budget rides on the `URLRequest`, which takes
+    /// precedence over the configuration's.
     ///
     /// `.default`, not `.ephemeral`: the previous `URLSession.shared` path used the shared cookie,
     /// credential and cache stores, and a custom OpenAI-compatible endpoint may depend on them
-    /// (Codex round 2, finding 6). The deadline is the only thing this session changes.
-    private static func session(audioSeconds: Double) -> URLSession {
+    /// (Codex round 2, finding 6). Not `URLSession.shared` itself, whose process-wide
+    /// configuration is not ours to set.
+    private static let session: URLSession = {
         let configuration = URLSessionConfiguration.default
-        configuration.timeoutIntervalForRequest = transcribeTimeout(audioSeconds: audioSeconds)
-        configuration.timeoutIntervalForResource = transcribeResourceTimeout(
-            audioSeconds: audioSeconds
-        )
+        configuration.timeoutIntervalForResource = transcribeResourceTimeout
         return URLSession(configuration: configuration)
-    }
+    }()
 
     @MainActor
     private func setStatus(_ text: String) {

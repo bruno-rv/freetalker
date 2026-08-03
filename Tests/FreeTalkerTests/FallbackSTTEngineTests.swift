@@ -19,7 +19,7 @@ import Testing
         let local = STTSpy(result: .success("local"))
         let engine = FallbackSTTEngine(
             primary: STTSpy(result: .success("cloud"), name: "Cloud STT"),
-            fallback: local, skipsPrimary: false
+            fallback: local, skipsPrimary: false, refinementCarriesVocabulary: false
         )
 
         let output = try await transcribe(engine)
@@ -34,7 +34,7 @@ import Testing
         let engine = FallbackSTTEngine(
             primary: STTSpy(result: .failure(URLError(.timedOut)), name: "Cloud STT"),
             fallback: STTSpy(result: .success("local"), name: "WhisperKit"),
-            skipsPrimary: false
+            skipsPrimary: false, refinementCarriesVocabulary: false
         )
 
         let output = try await transcribe(engine)
@@ -44,12 +44,13 @@ import Testing
     }
 
     /// The Settings warning knows this base URL serves no `/audio/transcriptions`. Spending the
-    /// whole timeout rediscovering that is the wait this removes.
-    @Test func aBaseURLThatServesNoTranscriptionEndpointSkipsTheCloudEntirely() async throws {
+    /// whole timeout rediscovering that is the wait this removes. It reorders the legs rather than
+    /// dropping the cloud one — see the last-resort tests below (Codex round 3, finding 5).
+    @Test func aBaseURLThatServesNoTranscriptionEndpointGoesLocalFirst() async throws {
         let cloud = STTSpy(result: .success("cloud"), name: "Cloud STT")
         let engine = FallbackSTTEngine(
             primary: cloud, fallback: STTSpy(result: .success("local"), name: "WhisperKit"),
-            skipsPrimary: true
+            skipsPrimary: true, refinementCarriesVocabulary: false
         )
 
         let output = try await transcribe(engine)
@@ -77,7 +78,7 @@ import Testing
         let engine = FallbackSTTEngine(
             primary: STTSpy(result: .failure(NamedError(text: "cloud is down")), name: "Cloud STT"),
             fallback: STTSpy(result: .failure(NamedError(text: "no model downloaded")), name: "WhisperKit"),
-            skipsPrimary: false
+            skipsPrimary: false, refinementCarriesVocabulary: false
         )
 
         await #expect(throws: FallbackSTTEngine.BothEnginesFailed.self) {
@@ -99,7 +100,7 @@ import Testing
         let engine = FallbackSTTEngine(
             primary: cloud,
             fallback: STTSpy(result: .failure(NamedError(text: "no model downloaded")), name: "WhisperKit"),
-            skipsPrimary: true
+            skipsPrimary: true, refinementCarriesVocabulary: false
         )
 
         let output = try await transcribe(engine)
@@ -112,7 +113,7 @@ import Testing
         let engine = FallbackSTTEngine(
             primary: STTSpy(result: .failure(NamedError(text: "cloud is down")), name: "Cloud STT"),
             fallback: STTSpy(result: .failure(NamedError(text: "no model downloaded")), name: "WhisperKit"),
-            skipsPrimary: true
+            skipsPrimary: true, refinementCarriesVocabulary: false
         )
 
         do {
@@ -124,30 +125,79 @@ import Testing
         }
     }
 
-    /// With the cloud skipped the local leg is not a maybe, so the withholding rule applies to it
-    /// exactly as it would without the wrapper (Codex round 2, finding 2).
-    @Test func skippingTheCloudLetsTheLocalEngineAnswerForItsOwnBiasCost() {
+    /// One flag cannot serve two legs, so the engine projects per leg instead: the cloud keeps the
+    /// terms it carries for free, and WhisperKit is spared the decoder prompt the refinement will
+    /// carry anyway (Codex round 3, finding 1). The last-resort cloud call is the case that made
+    /// this necessary — it must not inherit a list emptied on the local engine's behalf.
+    @Test func eachLegIsBiasedWithWhatThatLegShouldReceive() async throws {
+        let cloud = VocabularyWitness(name: "Cloud STT", costsDecodeTime: false, fails: true)
+        let local = VocabularyWitness(name: "WhisperKit", costsDecodeTime: true, fails: false)
         let engine = FallbackSTTEngine(
-            primary: CloudSTTEngine(), fallback: WhisperKitEngine(), skipsPrimary: true
+            primary: cloud, fallback: local,
+            skipsPrimary: false, refinementCarriesVocabulary: true
         )
 
-        #expect(engine.vocabularyBiasCostsDecodeTime)
+        _ = try await transcribe(engine, vocabulary: ["Qdrant"])
+
+        #expect(await cloud.received == ["Qdrant"])
+        #expect(await local.received == [])
+    }
+
+    @Test func aLastResortCloudCallStillGetsTheVocabulary() async throws {
+        let cloud = VocabularyWitness(name: "Cloud STT", costsDecodeTime: false, fails: false)
+        let local = VocabularyWitness(name: "WhisperKit", costsDecodeTime: true, fails: true)
+        let engine = FallbackSTTEngine(
+            primary: cloud, fallback: local,
+            skipsPrimary: true, refinementCarriesVocabulary: true
+        )
+
+        _ = try await transcribe(engine, vocabulary: ["Qdrant"])
+
+        #expect(await local.received == [])
+        #expect(await cloud.received == ["Qdrant"])
+    }
+
+    /// A Raw stop has no refinement to carry the terms, so neither leg is withheld from.
+    @Test func aRawStopBiasesBothLegs() async throws {
+        let cloud = VocabularyWitness(name: "Cloud STT", costsDecodeTime: false, fails: true)
+        let local = VocabularyWitness(name: "WhisperKit", costsDecodeTime: true, fails: false)
+        let engine = FallbackSTTEngine(
+            primary: cloud, fallback: local,
+            skipsPrimary: false, refinementCarriesVocabulary: false
+        )
+
+        _ = try await transcribe(engine, vocabulary: ["Qdrant"])
+
+        #expect(await cloud.received == ["Qdrant"])
+        #expect(await local.received == ["Qdrant"])
+    }
+
+    /// The caller must hand over the whole snapshot for the per-leg projection to have anything to
+    /// project, which means the wrapper answers with the cloud's cost, not the local engine's.
+    @Test func theWrapperAsksTheCallerToWithholdNothing() {
+        let engine = FallbackSTTEngine(
+            primary: CloudSTTEngine(), fallback: WhisperKitEngine(),
+            skipsPrimary: true, refinementCarriesVocabulary: true
+        )
+
+        #expect(engine.vocabularyBiasCostsDecodeTime == false)
         #expect(AppCoordinator.decoderBiasVocabulary(
             ["Qdrant"], refinementCarriesVocabulary: true,
             biasCostsDecodeTime: engine.vocabularyBiasCostsDecodeTime
-        ) == [])
+        ) == ["Qdrant"])
     }
 
     /// Codex round 2, finding 1. The cloud can return after the user has already abandoned the
     /// stop; delivering that would paste text into a dictation they cancelled, and flash a notice
     /// about it. The gate makes the ordering exact: the engine is inside the cloud call when the
     /// cancellation lands.
-    @Test func aCloudSuccessThatArrivesAfterCancellationIsNotDelivered() async {
+    @Test(.timeLimit(.minutes(1)))
+    func aCloudSuccessThatArrivesAfterCancellationIsNotDelivered() async {
         let gate = Gate()
         let engine = FallbackSTTEngine(
             primary: STTSpy(result: .success("cloud"), name: "Cloud STT", gate: gate),
             fallback: STTSpy(result: .success("local"), name: "WhisperKit"),
-            skipsPrimary: false
+            skipsPrimary: false, refinementCarriesVocabulary: false
         )
 
         let task = Task { try await transcribe(engine) }
@@ -163,7 +213,7 @@ import Testing
         let local = STTSpy(result: .success("local"))
         let engine = FallbackSTTEngine(
             primary: STTSpy(result: .failure(CancellationError()), name: "Cloud STT"),
-            fallback: local, skipsPrimary: false
+            fallback: local, skipsPrimary: false, refinementCarriesVocabulary: false
         )
 
         await #expect(throws: CancellationError.self) { _ = try await transcribe(engine) }
@@ -176,7 +226,7 @@ import Testing
     /// successful cloud transcription, where biasing is free, to spare the rare fallback.
     @Test func wrappingTheCloudDoesNotCostItItsFreeVocabularyBias() {
         let engine = FallbackSTTEngine(
-            primary: CloudSTTEngine(), fallback: WhisperKitEngine(), skipsPrimary: false
+            primary: CloudSTTEngine(), fallback: WhisperKitEngine(), skipsPrimary: false, refinementCarriesVocabulary: false
         )
 
         #expect(engine.vocabularyBiasCostsDecodeTime == false)
@@ -207,7 +257,7 @@ import Testing
         let engine = FallbackSTTEngine(
             primary: STTSpy(result: .success("cloud"), name: "Cloud STT"),
             fallback: STTSpy(result: .success("local"), name: "WhisperKit"),
-            skipsPrimary: false
+            skipsPrimary: false, refinementCarriesVocabulary: false
         )
 
         #expect(engine.name == "Cloud STT")
@@ -237,14 +287,13 @@ import Testing
     }
 
     /// Codex round 1, finding 6: inactivity alone bounds nothing against a server that dribbles
-    /// bytes, so a total deadline sits at twice the inactivity budget. Asserted exactly — a 1.1x
-    /// multiplier would satisfy "greater than" while bounding nothing in practice (round 2,
-    /// finding 9).
+    /// bytes, so a total ceiling sits above the largest inactivity budget — flat, because the
+    /// session that carries it is shared across dictations (round 3, finding 3).
     @Test(arguments: [0.0, 60.0, 200.0, 3_600.0])
-    func theTotalDeadlineIsTwiceTheInactivityBudget(_ audioSeconds: Double) {
+    func theTotalCeilingIsNeverReachedBeforeTheInactivityBudget(_ audioSeconds: Double) {
         #expect(
-            CloudSTTEngine.transcribeResourceTimeout(audioSeconds: audioSeconds)
-                == CloudSTTEngine.transcribeTimeout(audioSeconds: audioSeconds) * 2
+            CloudSTTEngine.transcribeResourceTimeout
+                >= CloudSTTEngine.transcribeTimeout(audioSeconds: audioSeconds) * 2
         )
     }
 }
@@ -254,8 +303,32 @@ private struct NamedError: LocalizedError {
     var errorDescription: String? { text }
 }
 
+/// Records the vocabulary its leg was actually handed, which is the whole point of the per-leg
+/// projection — a leg's `vocabularyBiasCostsDecodeTime` is what decides what it should get.
+private actor VocabularyWitness: TranscriptionEngine {
+    nonisolated let name: String
+    nonisolated var statusText: String { "Ready" }
+    nonisolated let vocabularyBiasCostsDecodeTime: Bool
+    private let fails: Bool
+    private(set) var received: [String]?
+
+    init(name: String, costsDecodeTime: Bool, fails: Bool) {
+        self.name = name
+        self.vocabularyBiasCostsDecodeTime = costsDecodeTime
+        self.fails = fails
+    }
+
+    func transcribe(samples: [Float], forcedLanguage: String?, candidateLanguages: [String], vocabulary: [String]) async throws -> TranscriptionOutput {
+        received = vocabulary
+        if fails { throw NamedError(text: "\(name) failed") }
+        return TranscriptionOutput(text: name, language: "en")
+    }
+}
+
 /// Holds a spy inside its `transcribe` call until the test lets it out, so "the cancellation
-/// landed while the engine was mid-call" is an ordering, not a race.
+/// landed while the engine was mid-call" is an ordering, not a race. The waits are unbounded, so
+/// the test that uses it carries a `.timeLimit` rather than hanging the suite if the engine never
+/// enters (Codex round 3, finding 4).
 private actor Gate {
     private var entered: CheckedContinuation<Void, Never>?
     private var isEntered = false

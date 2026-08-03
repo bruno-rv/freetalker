@@ -338,22 +338,29 @@ final class AppCoordinator: ObservableObject {
         return action
     }
 
-    /// The cloud leg is wrapped so a failing endpoint costs one local transcription instead of the
-    /// dictation — see `FallbackSTTEngine`. `statusText` and `name` still read as the configured
-    /// engine, so the menu bar and Settings are unchanged.
-    var activeSTTEngine: any TranscriptionEngine {
+    /// The engine as configured, unwrapped — what the menu bar and Settings report on.
+    var configuredSTTEngine: any TranscriptionEngine {
+        AppSettings.shared.sttEngine == .whisperKit ? whisperEngine : cloudSTTEngine
+    }
+
+    /// The engine a stop should actually run. The cloud leg is wrapped so a failing endpoint costs
+    /// one local transcription instead of the dictation — see `FallbackSTTEngine`, which needs
+    /// `refinementCarriesVocabulary` because it applies the decoder-bias withholding rule per leg
+    /// rather than once for a leg nobody can predict.
+    func activeSTTEngine(refinementCarriesVocabulary: Bool) -> any TranscriptionEngine {
         guard AppSettings.shared.sttEngine != .whisperKit else { return whisperEngine }
         return FallbackSTTEngine(
             primary: cloudSTTEngine,
             fallback: whisperEngine,
             skipsPrimary: FallbackSTTEngine.skipPrimary(
                 baseURL: AppSettings.shared.cloudSTTBaseURL
-            )
+            ),
+            refinementCarriesVocabulary: refinementCarriesVocabulary
         )
     }
 
     var engineStatusText: String {
-        activeSTTEngine.statusText
+        configuredSTTEngine.statusText
     }
 
     private init() {
@@ -2459,7 +2466,9 @@ final class AppCoordinator: ObservableObject {
         // channel, a different Mail draft), during the async transcribe/post-process work, the
         // synthetic ⌘V is skipped and the text is left on the pasteboard instead of landing in
         // the wrong place. See Codex finding: paste-target drift / same-app target drift.
-        let engine = activeSTTEngine
+        let engine = activeSTTEngine(
+            refinementCarriesVocabulary: !stopRequest.skipPostProcessing
+        )
         let engineName = engine.name
         let bundleID = frontmostApp?.bundleIdentifier
         let appName = frontmostApp?.localizedName
@@ -3716,7 +3725,7 @@ final class AppCoordinator: ObservableObject {
             return
         }
 
-        let engine = activeSTTEngine
+        let engine = activeSTTEngine(refinementCarriesVocabulary: !skipPostProcessing)
         let engineName = engine.name
         let template = TemplateStore.shared.template(id: AppSettings.shared.activeTemplateID)
             ?? Template.builtIns.first!

@@ -29,11 +29,21 @@ final class FallbackSTTEngine: TranscriptionEngine, @unchecked Sendable {
     /// still attempted if the local leg fails, so a stale decision costs at most one wasted local
     /// transcription and never the dictation (Codex round 2, finding 3).
     let skipsPrimary: Bool
+    /// Whether the post-processing pass will carry the vocabulary terms anyway — the input to
+    /// `AppCoordinator.decoderBiasVocabulary`, which this engine applies per leg rather than
+    /// letting the caller apply it once for a leg it cannot predict.
+    let refinementCarriesVocabulary: Bool
 
-    init(primary: any TranscriptionEngine, fallback: any TranscriptionEngine, skipsPrimary: Bool) {
+    init(
+        primary: any TranscriptionEngine,
+        fallback: any TranscriptionEngine,
+        skipsPrimary: Bool,
+        refinementCarriesVocabulary: Bool
+    ) {
         self.primary = primary
         self.fallback = fallback
         self.skipsPrimary = skipsPrimary
+        self.refinementCarriesVocabulary = refinementCarriesVocabulary
     }
 
     /// The configured engine's name. What actually ran is reported per transcription, on
@@ -42,27 +52,22 @@ final class FallbackSTTEngine: TranscriptionEngine, @unchecked Sendable {
 
     @MainActor var statusText: String { primary.statusText }
 
-    /// The cloud leg's answer, which is the leg that runs on all but the failing dictations.
+    /// The cloud leg's answer, which means the caller withholds nothing and hands over the whole
+    /// snapshot — and `transcribe` then applies the withholding rule per leg, with the engine that
+    /// is about to run.
     ///
-    /// `decoderBiasVocabulary` decides before the call and cannot know which leg will run, so this
-    /// is a choice between two costs. Reporting the OR would withhold the vocabulary from *every*
-    /// successful cloud transcription — where biasing is free, since the terms ride along as a few
-    /// multipart bytes — to spare the rare fallback. Ceiling (Codex round 1, finding 2, inverted):
-    /// a fallback therefore hands WhisperKit the full vocabulary as `promptTokens`, one decoder
-    /// inference per term per 30 s window, on a dictation already running late. Bounded by the
-    /// user's vocabulary size, and paid only when the cloud has already failed.
-    /// When the cloud is being skipped outright the local leg is not a maybe, so it answers for
-    /// itself and the withholding rule applies as it would without the wrapper (Codex round 2,
-    /// finding 2).
-    var vocabularyBiasCostsDecodeTime: Bool {
-        skipsPrimary
-            ? fallback.vocabularyBiasCostsDecodeTime
-            : primary.vocabularyBiasCostsDecodeTime
-    }
+    /// One flag cannot serve two legs. Answering for the local engine strips the vocabulary from
+    /// every successful cloud transcription, where biasing is free (Codex round 1, finding 2);
+    /// answering for the cloud makes a local fallback pay decode time for terms the refinement
+    /// carries anyway; and switching on `skipsPrimary` leaves the last-resort cloud call holding
+    /// an already-emptied list (Codex round 3, finding 1). Projecting inside the engine is the
+    /// only version where each leg gets what it should.
+    var vocabularyBiasCostsDecodeTime: Bool { primary.vocabularyBiasCostsDecodeTime }
 
-    /// Whether the cloud leg is worth attempting at all. Ollama-shaped endpoints have no
-    /// `/audio/transcriptions`, which Settings already warns about — this is that same predicate,
-    /// used to skip straight to local instead of spending the whole timeout discovering it.
+    /// Whether to go local first. Ollama-shaped endpoints have no `/audio/transcriptions`, which
+    /// Settings already warns about — this is that same predicate, used to try local rather than
+    /// spend the whole timeout rediscovering it. It reorders the legs; it does not remove the
+    /// cloud one, which is still the last resort if local fails (Codex round 3, finding 5).
     static func skipPrimary(baseURL: String) -> Bool {
         CloudSTTProviderKind.isKnownNonTranscriptionSTTBaseURL(baseURL)
     }
@@ -134,15 +139,23 @@ final class FallbackSTTEngine: TranscriptionEngine, @unchecked Sendable {
         }
     }
 
-    /// One leg, with the cancellation check that keeps an abandoned stop from arriving as a
-    /// success the pipeline delivers and flashes (Codex round 2, finding 1).
+    /// One leg, biased with whatever that leg should actually receive, and bracketed by the
+    /// cancellation checks that keep an abandoned stop from starting a paid request (Codex round
+    /// 3, finding 2) or arriving as a success the pipeline delivers and flashes (round 2,
+    /// finding 1).
     private func run(
         _ engine: any TranscriptionEngine,
         samples: [Float], forcedLanguage: String?, candidateLanguages: [String], vocabulary: [String]
     ) async throws -> TranscriptionOutput {
+        try Task.checkCancellation()
         let output = try await engine.transcribe(
             samples: samples, forcedLanguage: forcedLanguage,
-            candidateLanguages: candidateLanguages, vocabulary: vocabulary
+            candidateLanguages: candidateLanguages,
+            vocabulary: AppCoordinator.decoderBiasVocabulary(
+                vocabulary,
+                refinementCarriesVocabulary: refinementCarriesVocabulary,
+                biasCostsDecodeTime: engine.vocabularyBiasCostsDecodeTime
+            )
         )
         try Task.checkCancellation()
         return output
