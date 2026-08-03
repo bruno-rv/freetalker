@@ -63,7 +63,10 @@ final class CloudSTTEngine: ObservableObject, TranscriptionEngine, @unchecked Se
         request.httpBody = multipartBody(boundary: boundary, wavData: wavData, model: model, vocabulary: vocabulary, forcedLanguage: forcedLanguage)
 
         let session = Self.session(audioSeconds: audioSeconds)
-        defer { session.finishTasksAndInvalidate() }
+        // `invalidateAndCancel`, not `finishTasksAndInvalidate`: on cancellation the upload must
+        // stop, not keep running while the local fallback transcribes (Codex round 2, finding 4).
+        // Nothing is outstanding on the normal path, where the response has already arrived.
+        defer { session.invalidateAndCancel() }
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
             let code = (response as? HTTPURLResponse)?.statusCode ?? 0
@@ -97,16 +100,24 @@ final class CloudSTTEngine: ObservableObject, TranscriptionEngine, @unchecked Se
 
     /// Total wall-clock deadline for one transcription, which `timeoutInterval` alone cannot give:
     /// a server dribbling bytes resets the inactivity timer indefinitely (Codex round 1,
-    /// finding 6). Set well above the inactivity budget so it only ever catches that pathology,
-    /// never a working endpoint.
+    /// finding 6). Twice the inactivity budget, which is where a stalled-but-dribbling endpoint
+    /// gets caught.
+    ///
+    /// Ceiling (Codex round 2, finding 5): this is a real cap, not just a pathology detector — an
+    /// endpoint that genuinely needs longer than 4x realtime (or 600 s for long audio) is
+    /// abandoned to the local fallback rather than waited out.
     static func transcribeResourceTimeout(audioSeconds: Double) -> TimeInterval {
         transcribeTimeout(audioSeconds: audioSeconds) * 2
     }
 
     /// A dictation's upload gets its own session so the resource deadline applies to this request
     /// alone — `URLSession.shared` is process-wide and its configuration is not ours to set.
+    ///
+    /// `.default`, not `.ephemeral`: the previous `URLSession.shared` path used the shared cookie,
+    /// credential and cache stores, and a custom OpenAI-compatible endpoint may depend on them
+    /// (Codex round 2, finding 6). The deadline is the only thing this session changes.
     private static func session(audioSeconds: Double) -> URLSession {
-        let configuration = URLSessionConfiguration.ephemeral
+        let configuration = URLSessionConfiguration.default
         configuration.timeoutIntervalForRequest = transcribeTimeout(audioSeconds: audioSeconds)
         configuration.timeoutIntervalForResource = transcribeResourceTimeout(
             audioSeconds: audioSeconds

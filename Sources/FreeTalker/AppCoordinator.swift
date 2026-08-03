@@ -2798,9 +2798,10 @@ final class AppCoordinator: ObservableObject {
     ///
     /// Silent substitution is how a broken key or a dead endpoint hides for weeks while Usage
     /// Statistics reports cloud runs that never happened. Ceiling: the HUD shows one message, and
-    /// this one ranks below anything about text the user still has to paste — the durable
-    /// disclosure is the engine recorded on the Dictation row, plus the `stt` log notice, both of
-    /// which happen on every substitution regardless of which message wins the flash.
+    /// this one ranks below anything about text the user still has to paste. What is unconditional
+    /// is the `stt` log notice at the moment of substitution; the Dictation row names the engine
+    /// that actually ran whenever a row is written at all, which a translation or library-save
+    /// failure means it is not (Codex round 2, finding 7).
     nonisolated static func engineSubstitutionNotice(
         configured: String, actual: String
     ) -> String? {

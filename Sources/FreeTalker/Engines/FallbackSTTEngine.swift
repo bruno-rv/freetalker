@@ -23,11 +23,11 @@ final class FallbackSTTEngine: TranscriptionEngine, @unchecked Sendable {
     /// Snapshot taken when the engine is composed, not read live, so one dictation cannot change
     /// its mind halfway through. Mirrors the Settings warning — see `skipPrimary(baseURL:)`.
     ///
-    /// Ceiling (Codex round 1, finding 3): `CloudSTTEngine` reads the base URL again for its own
-    /// request, so editing Settings between the stop and the upload can make the two disagree.
-    /// Both outcomes are safe — skipping a now-valid URL costs one local transcription, attempting
-    /// a now-invalid one falls back — so this stops short of threading an immutable STT
-    /// configuration through the engine.
+    /// `CloudSTTEngine` reads the base URL again for its own request, so editing Settings between
+    /// the stop and the upload can make the two disagree. Rather than thread an immutable STT
+    /// configuration through the engine, `transcribe` makes the skip non-lossy: a skipped cloud is
+    /// still attempted if the local leg fails, so a stale decision costs at most one wasted local
+    /// transcription and never the dictation (Codex round 2, finding 3).
     let skipsPrimary: Bool
 
     init(primary: any TranscriptionEngine, fallback: any TranscriptionEngine, skipsPrimary: Bool) {
@@ -51,7 +51,14 @@ final class FallbackSTTEngine: TranscriptionEngine, @unchecked Sendable {
     /// a fallback therefore hands WhisperKit the full vocabulary as `promptTokens`, one decoder
     /// inference per term per 30 s window, on a dictation already running late. Bounded by the
     /// user's vocabulary size, and paid only when the cloud has already failed.
-    var vocabularyBiasCostsDecodeTime: Bool { primary.vocabularyBiasCostsDecodeTime }
+    /// When the cloud is being skipped outright the local leg is not a maybe, so it answers for
+    /// itself and the withholding rule applies as it would without the wrapper (Codex round 2,
+    /// finding 2).
+    var vocabularyBiasCostsDecodeTime: Bool {
+        skipsPrimary
+            ? fallback.vocabularyBiasCostsDecodeTime
+            : primary.vocabularyBiasCostsDecodeTime
+    }
 
     /// Whether the cloud leg is worth attempting at all. Ollama-shaped endpoints have no
     /// `/audio/transcriptions`, which Settings already warns about — this is that same predicate,
@@ -68,8 +75,8 @@ final class FallbackSTTEngine: TranscriptionEngine, @unchecked Sendable {
             Self.logger.notice("cloud STT skipped: base URL serves no transcription endpoint")
         } else {
             do {
-                return try await primary.transcribe(
-                    samples: samples, forcedLanguage: forcedLanguage,
+                return try await run(
+                    primary, samples: samples, forcedLanguage: forcedLanguage,
                     candidateLanguages: candidateLanguages, vocabulary: vocabulary
                 )
             } catch is CancellationError {
@@ -84,28 +91,61 @@ final class FallbackSTTEngine: TranscriptionEngine, @unchecked Sendable {
             }
         }
 
-        // Cancellation can land while the cloud leg is failing. Checking here and again on the way
-        // out keeps a stop the user abandoned from being answered by a second transcription — or
-        // by a success the pipeline would then deliver (Codex round 1, finding 5).
+        // Cancellation can land while the cloud leg is failing. Checking here, and inside `run`
+        // on the way out, keeps a stop the user abandoned from being answered by a second
+        // transcription — or by a success the pipeline would then deliver (Codex round 1,
+        // finding 5).
         try Task.checkCancellation()
+        let localError: any Error
         do {
-            var output = try await fallback.transcribe(
-                samples: samples, forcedLanguage: forcedLanguage,
+            var output = try await run(
+                fallback, samples: samples, forcedLanguage: forcedLanguage,
                 candidateLanguages: candidateLanguages, vocabulary: vocabulary
             )
-            try Task.checkCancellation()
             output.producedBy = fallback.name
             return output
         } catch is CancellationError {
             throw CancellationError()
         } catch {
             try Task.checkCancellation()
-            // Both legs are the failure. A cloud-only user has no local model downloaded, so
-            // reporting only the cloud reason would send them chasing an endpoint that is not the
-            // whole story — and the recovery entry this produces would fail its retry the same way.
-            guard let primaryError else { throw error }
-            throw BothEnginesFailed(primary: primaryError, fallback: error)
+            localError = error
         }
+
+        // Both legs are the failure now. A cloud-only user has no local model downloaded, so
+        // reporting only the cloud reason would send them chasing an endpoint that is not the
+        // whole story — and the recovery entry this produces would fail its retry the same way.
+        if let primaryError {
+            throw BothEnginesFailed(primary: primaryError, fallback: localError)
+        }
+        // The skip is an optimization, and an optimization must not be why a dictation is lost:
+        // the base URL is read again for the request, so Settings edited during the stop can make
+        // the skip decision stale (Codex round 2, finding 3). A skipped cloud therefore still gets
+        // its chance rather than the stop ending on a local engine that may have no model.
+        do {
+            return try await run(
+                primary, samples: samples, forcedLanguage: forcedLanguage,
+                candidateLanguages: candidateLanguages, vocabulary: vocabulary
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            try Task.checkCancellation()
+            throw BothEnginesFailed(primary: error, fallback: localError)
+        }
+    }
+
+    /// One leg, with the cancellation check that keeps an abandoned stop from arriving as a
+    /// success the pipeline delivers and flashes (Codex round 2, finding 1).
+    private func run(
+        _ engine: any TranscriptionEngine,
+        samples: [Float], forcedLanguage: String?, candidateLanguages: [String], vocabulary: [String]
+    ) async throws -> TranscriptionOutput {
+        let output = try await engine.transcribe(
+            samples: samples, forcedLanguage: forcedLanguage,
+            candidateLanguages: candidateLanguages, vocabulary: vocabulary
+        )
+        try Task.checkCancellation()
+        return output
     }
 
     struct BothEnginesFailed: LocalizedError {
