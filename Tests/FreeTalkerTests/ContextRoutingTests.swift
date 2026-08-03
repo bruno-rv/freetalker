@@ -63,6 +63,7 @@ import Testing
                 templates: [Template(id: "manual", name: "Manual", prompt: "Manual")],
                 activeTemplateID: "manual",
                 automaticStyleEnabled: true,
+                skipPostProcessing: false,
                 processorReadsLocalContext: false
             ) == false
         )
@@ -77,6 +78,7 @@ import Testing
                 templates: [Template(id: "manual", name: "Manual", prompt: "Manual")],
                 activeTemplateID: "manual",
                 automaticStyleEnabled: true,
+                skipPostProcessing: false,
                 processorReadsLocalContext: false
             )
         )
@@ -93,8 +95,27 @@ import Testing
                 templates: [Template(id: "manual", name: "Manual", prompt: "Manual")],
                 activeTemplateID: "manual",
                 automaticStyleEnabled: false,
+                skipPostProcessing: false,
                 processorReadsLocalContext: true
             )
+        )
+    }
+
+    /// Codex round 1, finding 1. A Raw stop returns the transcript untouched and records the raw
+    /// Template name, so neither the classifier's pick nor a local processor's context is ever
+    /// used — the strongest consumer signals must still not buy an OCR here.
+    @Test func rawStopNeverCapturesTheWindow() {
+        #expect(
+            AppCoordinator.windowOCRHasConsumer(
+                scope: .windowOCR,
+                bundleID: "com.example.unknown",
+                rules: [:],
+                templates: [Template(id: "manual", name: "Manual", prompt: "Manual")],
+                activeTemplateID: "manual",
+                automaticStyleEnabled: true,
+                skipPostProcessing: true,
+                processorReadsLocalContext: true
+            ) == false
         )
     }
 
@@ -108,6 +129,7 @@ import Testing
                 templates: [Template(id: "manual", name: "Manual", prompt: "Manual")],
                 activeTemplateID: "manual",
                 automaticStyleEnabled: true,
+                skipPostProcessing: false,
                 processorReadsLocalContext: true
             ) == false
         )

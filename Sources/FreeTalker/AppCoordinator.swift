@@ -2525,6 +2525,7 @@ final class AppCoordinator: ObservableObject {
                     templates: templates,
                     activeTemplateID: activeTemplateID,
                     automaticStyleEnabled: automaticStyleEnabled,
+                    skipPostProcessing: stopRequest.skipPostProcessing,
                     processorReadsLocalContext: processor is AppleFMProcessor
                 )
                     ? await resolveWindowOCR(
@@ -2597,6 +2598,11 @@ final class AppCoordinator: ObservableObject {
     /// With neither present the capture is dead cost. That is not a corner case: an App Rule plus
     /// a cloud LLM is what made a Warp dictation pay for a full-window OCR that nothing read.
     ///
+    /// A Raw stop (`skipPostProcessing`) has neither consumer whatever the settings say: it
+    /// returns the transcript untouched and records `TemplateStore.rawTranscriptTemplateName`, so
+    /// the resolved Template is never applied *or* recorded, and no post-processor runs to be
+    /// handed the text (Codex round 1, finding 1).
+    ///
     /// Gates only the screenshot + Vision leg. The Accessibility read (`captureApprovedContext`)
     /// still runs for every scope, so `.activeWindow` context is unaffected.
     nonisolated static func windowOCRHasConsumer(
@@ -2606,9 +2612,10 @@ final class AppCoordinator: ObservableObject {
         templates: [Template],
         activeTemplateID: String,
         automaticStyleEnabled: Bool,
+        skipPostProcessing: Bool,
         processorReadsLocalContext: Bool
     ) -> Bool {
-        guard scope == .windowOCR else { return false }
+        guard scope == .windowOCR, !skipPostProcessing else { return false }
         if processorReadsLocalContext { return true }
         guard automaticStyleEnabled else { return false }
         return !resolveTemplate(
