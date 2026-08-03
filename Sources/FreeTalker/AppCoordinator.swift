@@ -2585,9 +2585,11 @@ final class AppCoordinator: ObservableObject {
     /// pay for capturing it.
     ///
     /// `resolveWindowOCR` is a ScreenCaptureKit window grab plus a Vision pass, and it is awaited
-    /// before transcription even starts, so its cost lands whole on the user's wait. Measured on
-    /// this machine: ~0.6 s of Vision alone on a text-dense 1920×1050 window, on top of the
-    /// `SCShareableContent` window enumeration. Exactly two consumers read the text:
+    /// before transcription even starts, so its cost lands whole on the user's wait. A standalone
+    /// Vision pass over a text-dense 1920×1050 window takes ~0.6 s here; in the deployed build the
+    /// whole pre-transcription leg — enumeration, capture and OCR — measured ~0.2 s against a small
+    /// window (`capture stopped` to the start of `stage timings`' transcribe stage, 2026-08-03
+    /// 07:45). Either way it buys nothing when no consumer reads the text, and exactly two do:
     ///
     /// - `AutomaticStyleClassifier`, via `resolveContextAwareTemplate` — but only when
     ///   "Automatically choose template" is on AND no App Rule claims this bundle ID, since a rule
