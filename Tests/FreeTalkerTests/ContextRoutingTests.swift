@@ -52,6 +52,67 @@ import Testing
         #expect(AppCoordinator.contextPermissionHint(for: limitation) == hint)
     }
 
+    /// The reported shape: an App Rule for Warp plus a cloud LLM. Neither consumer of the OCR text
+    /// exists, so the screenshot + Vision pass must not run at all.
+    @Test func appRuleAndCloudProcessorSkipWindowOCR() {
+        #expect(
+            AppCoordinator.windowOCRHasConsumer(
+                scope: .windowOCR,
+                bundleID: "dev.warp.Warp-Stable",
+                rules: ["dev.warp.Warp-Stable": "manual"],
+                templates: [Template(id: "manual", name: "Manual", prompt: "Manual")],
+                activeTemplateID: "manual",
+                automaticStyleEnabled: true,
+                processorReadsLocalContext: false
+            ) == false
+        )
+    }
+
+    @Test func automaticStyleWithoutAppRuleStillPaysForWindowOCR() {
+        #expect(
+            AppCoordinator.windowOCRHasConsumer(
+                scope: .windowOCR,
+                bundleID: "com.example.unknown",
+                rules: [:],
+                templates: [Template(id: "manual", name: "Manual", prompt: "Manual")],
+                activeTemplateID: "manual",
+                automaticStyleEnabled: true,
+                processorReadsLocalContext: false
+            )
+        )
+    }
+
+    /// `AppleFMProcessor` is handed the text itself, so it needs the capture even when an App Rule
+    /// has already settled the template.
+    @Test func localProcessorNeedsWindowOCREvenUnderAnAppRule() {
+        #expect(
+            AppCoordinator.windowOCRHasConsumer(
+                scope: .windowOCR,
+                bundleID: "dev.warp.Warp-Stable",
+                rules: ["dev.warp.Warp-Stable": "manual"],
+                templates: [Template(id: "manual", name: "Manual", prompt: "Manual")],
+                activeTemplateID: "manual",
+                automaticStyleEnabled: false,
+                processorReadsLocalContext: true
+            )
+        )
+    }
+
+    @Test(arguments: [LocalContextScope.off, .activeWindow, .focusedField])
+    func nonOCRScopesNeverCaptureTheWindow(_ scope: LocalContextScope) {
+        #expect(
+            AppCoordinator.windowOCRHasConsumer(
+                scope: scope,
+                bundleID: "com.example.unknown",
+                rules: [:],
+                templates: [Template(id: "manual", name: "Manual", prompt: "Manual")],
+                activeTemplateID: "manual",
+                automaticStyleEnabled: true,
+                processorReadsLocalContext: true
+            ) == false
+        )
+    }
+
     @Test func manualRuleWinsLocalAutomaticStyle() {
         let manual = Template(id: "manual", name: "Manual", prompt: "Manual")
         let active = Template(id: "active", name: "Active", prompt: "Active")

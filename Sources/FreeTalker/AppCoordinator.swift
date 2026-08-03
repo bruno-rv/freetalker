@@ -2518,11 +2518,21 @@ final class AppCoordinator: ObservableObject {
                     captureID: staged.captureID
                 )
                 try? await jobLibraryStore?.refresh()
-                let resolvedCapture = await resolveWindowOCR(
+                let resolvedCapture = Self.windowOCRHasConsumer(
                     scope: contextScope,
-                    capture: contextCapture,
-                    target: contextTarget
+                    bundleID: contextCapture.context.bundleID,
+                    rules: appRules,
+                    templates: templates,
+                    activeTemplateID: activeTemplateID,
+                    automaticStyleEnabled: automaticStyleEnabled,
+                    processorReadsLocalContext: processor is AppleFMProcessor
                 )
+                    ? await resolveWindowOCR(
+                        scope: contextScope,
+                        capture: contextCapture,
+                        target: contextTarget
+                    )
+                    : contextCapture
                 if let hint = Self.contextPermissionHint(for: resolvedCapture.limitation) {
                     hud.show(text: hint)
                 }
@@ -2568,6 +2578,45 @@ final class AppCoordinator: ObservableObject {
                 recordingHUDDidReachTerminalState(generation: hudGeneration)
             }
         }
+    }
+
+    /// Whether anything downstream will actually read the OCR'd window text — the only reason to
+    /// pay for capturing it.
+    ///
+    /// `resolveWindowOCR` is a ScreenCaptureKit window grab plus a Vision pass, and it is awaited
+    /// before transcription even starts, so its cost lands whole on the user's wait. Measured on
+    /// this machine: ~0.6 s of Vision alone on a text-dense 1920×1050 window, on top of the
+    /// `SCShareableContent` window enumeration. Exactly two consumers read the text:
+    ///
+    /// - `AutomaticStyleClassifier`, via `resolveContextAwareTemplate` — but only when
+    ///   "Automatically choose template" is on AND no App Rule claims this bundle ID, since a rule
+    ///   returns before the classifier is ever consulted.
+    /// - `AppleFMProcessor`, via `localContextForProcessor` — every cloud post-processor is handed
+    ///   `nil` and never sees the text.
+    ///
+    /// With neither present the capture is dead cost. That is not a corner case: an App Rule plus
+    /// a cloud LLM is what made a Warp dictation pay for a full-window OCR that nothing read.
+    ///
+    /// Gates only the screenshot + Vision leg. The Accessibility read (`captureApprovedContext`)
+    /// still runs for every scope, so `.activeWindow` context is unaffected.
+    nonisolated static func windowOCRHasConsumer(
+        scope: LocalContextScope,
+        bundleID: String?,
+        rules: [String: String],
+        templates: [Template],
+        activeTemplateID: String,
+        automaticStyleEnabled: Bool,
+        processorReadsLocalContext: Bool
+    ) -> Bool {
+        guard scope == .windowOCR else { return false }
+        if processorReadsLocalContext { return true }
+        guard automaticStyleEnabled else { return false }
+        return !resolveTemplate(
+            bundleID: bundleID,
+            rules: rules,
+            templates: templates,
+            activeTemplateID: activeTemplateID
+        ).ruleFired
     }
 
     private func resolveWindowOCR(
