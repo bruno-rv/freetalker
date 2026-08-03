@@ -23,7 +23,10 @@ import Testing
         )
     }
 
-    @Test func missingAudioIsReportedAsMissingRatherThanAmbiguous() throws {
+    /// Recovering a legacy entry deletes its audio and leaves the job row pointing at the gone
+    /// path. There is nothing left to upgrade, so the migrator must say nothing — reporting it
+    /// pinned a Library banner that no action could clear.
+    @Test func audioAlreadyConsumedByARecoveryIsNotReportedAtAll() throws {
         let root = try makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }
 
@@ -35,14 +38,36 @@ import Testing
 
         let result = RecoveryOwnershipMigrator(root: root).migrate(jobs: [job], sessions: [])
 
+        #expect(result.issues.isEmpty)
+        // Nothing to protect either: reconciliation cannot mistake bytes that do not exist for a
+        // filename-owned orphan, and a stale entry would keep the path alive in its view.
+        #expect(result.protectedPaths.isEmpty)
+    }
+
+    /// A path that exists but is not a plain file in the folder is still worth refusing — and the
+    /// refusal must no longer hedge about the file being missing, since absence exits earlier.
+    @Test func aSymlinkedSourceIsRefusedWithoutClaimingItIsMissing() throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let outside = FileManager.default.temporaryDirectory
+            .appendingPathComponent("outside-\(UUID().uuidString).wav")
+        try Data([0x52, 0x49, 0x46, 0x46]).write(to: outside)
+        defer { try? FileManager.default.removeItem(at: outside) }
+
+        let filenameID = UUID()
+        let source = root.appendingPathComponent("\(filenameID.uuidString).wav")
+        try FileManager.default.createSymbolicLink(at: source, withDestinationURL: outside)
+
+        let result = RecoveryOwnershipMigrator(root: root).migrate(
+            jobs: [makeJob(id: UUID(), source: source)], sessions: []
+        )
+
         let issue = try #require(result.issues.first)
-        #expect(result.issues.count == 1)
-        #expect(issue.source.standardizedFileURL == source.standardizedFileURL)
         #expect(issue.message.contains(source.lastPathComponent))
-        #expect(issue.message.contains("missing"))
-        #expect(!issue.message.contains("ambiguous"))
-        // The path stays protected either way — reconciliation must not reinterpret it as an
-        // unowned orphan just because the upgrade was refused.
+        #expect(issue.message.contains("not a plain file inside the recovery folder"))
+        #expect(!issue.message.contains("missing"))
+        // A file *is* there, so the path stays protected while the upgrade is refused.
         #expect(result.protectedPaths.contains(source.standardizedFileURL.path))
     }
 

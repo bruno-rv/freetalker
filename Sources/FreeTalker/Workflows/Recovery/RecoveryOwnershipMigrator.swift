@@ -37,6 +37,13 @@ struct RecoveryOwnershipMigrator: Sendable {
                   let filenameID = UUID(
                     uuidString: source.deletingPathExtension().lastPathComponent
                   ), filenameID != job.id else { continue }
+            // Recovering an entry deletes its audio (`RecoveryRetryPipeline.cleanSource`) while
+            // the job row keeps pointing at the path, so on the legacy flat layout every
+            // successful retry left a job whose source is gone — and reporting that as a failed
+            // upgrade turned it into a Library banner that no action could ever clear. A path
+            // with no file has nothing to upgrade and nothing to protect: reconciliation cannot
+            // mistake bytes that do not exist for a filename-owned orphan.
+            guard fileSystem.exists(source) else { continue }
             // Once an existing job claims this exact legacy path, reconciliation must
             // never reinterpret ambiguous bytes as a filename-owned orphan.
             result.protectedPaths.insert(source.path)
@@ -77,9 +84,11 @@ struct RecoveryOwnershipMigrator: Sendable {
                         "\(name) is named after an identity that already has recovery records"
                     )
                 }
+                // The file existed at the guard above, so this is a symlink, a directory, or
+                // something resolving outside the recovery folder — not an absence.
                 guard let before = fingerprint(source) else {
                     throw CaptureJournalError.failed(
-                        "\(name) is missing, or is not a plain file inside the recovery folder"
+                        "\(name) is not a plain file inside the recovery folder"
                     )
                 }
                 guard RecoveryOwnedArtifactValidator(
