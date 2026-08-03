@@ -44,18 +44,38 @@ struct RecoveryOwnershipMigrator: Sendable {
                 if try dispositions.ownsSource(id: job.id, source: source) {
                     continue
                 }
-                guard !dispositions.ownershipRecordExists(id: job.id),
-                      references[source.path]?.count == 1,
-                      !identityOwners.contains(filenameID),
-                      try dispositions.descriptor(id: filenameID) == nil,
-                      !dispositions.ownershipRecordExists(id: filenameID),
-                      let before = fingerprint(source),
-                      RecoveryOwnedArtifactValidator(
-                        root: root, id: filenameID, fileManager: .default
-                      ).validAudio(source) != nil else {
+                // One generic "ambiguous" for every way this guard can fail told the user that
+                // ownership was contested even when the audio was simply gone or unreadable, and
+                // named no file — so the Library banner it feeds (`RecoveryHealth.degraded`) was
+                // neither true nor actionable. Each refusal now says which file and why; the
+                // outcome for the job is unchanged.
+                let name = source.lastPathComponent
+                guard !dispositions.ownershipRecordExists(id: job.id) else {
                     throw CaptureJournalError.failed(
-                        "Markerless recovery ownership is ambiguous"
+                        "\(name) is already recorded as owned by a different source"
                     )
+                }
+                guard references[source.path]?.count == 1 else {
+                    throw CaptureJournalError.failed(
+                        "\(name) is claimed by more than one recovery entry"
+                    )
+                }
+                guard !identityOwners.contains(filenameID),
+                      try dispositions.descriptor(id: filenameID) == nil,
+                      !dispositions.ownershipRecordExists(id: filenameID) else {
+                    throw CaptureJournalError.failed(
+                        "\(name) is named after another recovery entry that still exists"
+                    )
+                }
+                guard let before = fingerprint(source) else {
+                    throw CaptureJournalError.failed(
+                        "\(name) is missing, or is not a plain file inside the recovery folder"
+                    )
+                }
+                guard RecoveryOwnedArtifactValidator(
+                    root: root, id: filenameID, fileManager: .default
+                ).validAudio(source) != nil else {
+                    throw CaptureJournalError.failed("\(name) is not readable recovery audio")
                 }
                 let hash = try CaptureSegmentCodec(fileSystem: fileSystem).hashFile(source)
                 guard fingerprint(source) == before else {
@@ -78,7 +98,7 @@ struct RecoveryOwnershipMigrator: Sendable {
             } catch {
                 result.issues.append(.init(
                     source: source,
-                    message: "Recovery ownership could not be safely upgraded: \(error.localizedDescription)"
+                    message: "Recovery audio could not be linked to its entry: \(error.localizedDescription)"
                 ))
             }
         }
