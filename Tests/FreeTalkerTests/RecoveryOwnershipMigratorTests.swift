@@ -60,8 +60,35 @@ import Testing
         #expect(result.issues.count == 2)
         for issue in result.issues {
             #expect(issue.message.contains(source.lastPathComponent))
-            #expect(issue.message.contains("more than one recovery entry"))
+            #expect(issue.message.contains("more than one job"))
         }
+    }
+
+    /// Codex round 2, finding 3: `references` is grouped over every job kind, so the other
+    /// claimant need not be a recovery — the message must not promise that it is.
+    @Test func aMediaImportSharingThePathIsCountedButNotCalledARecovery() throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let filenameID = UUID()
+        let source = root.appendingPathComponent("\(filenameID.uuidString).wav")
+        try Data([0x52, 0x49, 0x46, 0x46]).write(to: source)
+        var importJob = makeJob(id: UUID(), source: source)
+        importJob = TranscriptionJob(
+            id: importJob.id, kind: .mediaImport, source: importJob.source, state: importJob.state,
+            progress: 0, createdAt: importJob.createdAt, updatedAt: importJob.updatedAt,
+            startedAt: nil, completedAt: nil, expiresAt: nil, result: nil,
+            needsSourceCleanup: false, sourceCleanupError: nil
+        )
+
+        let result = RecoveryOwnershipMigrator(root: root).migrate(
+            jobs: [makeJob(id: UUID(), source: source), importJob], sessions: []
+        )
+
+        let issue = try #require(result.issues.first)
+        #expect(result.issues.count == 1)
+        #expect(issue.message.contains("more than one job"))
+        #expect(!issue.message.contains("recovery entr"))
     }
 
     @Test func unreadableAudioIsReportedAsUnreadable() throws {

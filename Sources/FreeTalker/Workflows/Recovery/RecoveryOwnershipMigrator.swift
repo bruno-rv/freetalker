@@ -49,22 +49,32 @@ struct RecoveryOwnershipMigrator: Sendable {
                 // named no file — so the Library banner it feeds (`RecoveryHealth.degraded`) was
                 // neither true nor actionable. Each refusal now says which file and why; the
                 // outcome for the job is unchanged.
+                //
+                // Each message says only what its own condition actually establishes. `ownsSource`
+                // returning false above does not mean the existing record names some *other*
+                // file — a stale recorded hash for this same file fails it too — and `references`/
+                // `identityOwners` are built from every job kind, so neither can promise the other
+                // claimant is a recovery (Codex round 2, findings 2–4).
                 let name = source.lastPathComponent
                 guard !dispositions.ownershipRecordExists(id: job.id) else {
                     throw CaptureJournalError.failed(
-                        "\(name) is already recorded as owned by a different source"
+                        "\(name) already has an ownership record that does not match it"
                     )
                 }
                 guard references[source.path]?.count == 1 else {
                     throw CaptureJournalError.failed(
-                        "\(name) is claimed by more than one recovery entry"
+                        "\(name) is claimed by more than one job"
                     )
                 }
-                guard !identityOwners.contains(filenameID),
-                      try dispositions.descriptor(id: filenameID) == nil,
+                guard !identityOwners.contains(filenameID) else {
+                    throw CaptureJournalError.failed(
+                        "\(name) is named after another entry that still exists"
+                    )
+                }
+                guard try dispositions.descriptor(id: filenameID) == nil,
                       !dispositions.ownershipRecordExists(id: filenameID) else {
                     throw CaptureJournalError.failed(
-                        "\(name) is named after another recovery entry that still exists"
+                        "\(name) is named after an identity that already has recovery records"
                     )
                 }
                 guard let before = fingerprint(source) else {

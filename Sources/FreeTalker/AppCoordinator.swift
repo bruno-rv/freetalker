@@ -2605,6 +2605,14 @@ final class AppCoordinator: ObservableObject {
     ///
     /// Gates only the screenshot + Vision leg. The Accessibility read (`captureApprovedContext`)
     /// still runs for every scope, so `.activeWindow` context is unaffected.
+    ///
+    /// Ceiling (Codex round 2, finding 1): skipping the capture also skips its diagnostics, so the
+    /// HUD no longer reports "Screen Recording not granted" or "Stopped window is no longer
+    /// available" on a stop where nothing would have read the text. Discovering those states costs
+    /// exactly the capture this gate exists to avoid, and Settings' Local context section warns
+    /// about the missing permission independently of any dictation. If a per-stop signal is ever
+    /// wanted on the skipped path, `Permissions.screenRecordingAuthorization()` answers the
+    /// permission half without a capture; the vanished-window half cannot be known without one.
     nonisolated static func windowOCRHasConsumer(
         scope: LocalContextScope,
         bundleID: String?,
