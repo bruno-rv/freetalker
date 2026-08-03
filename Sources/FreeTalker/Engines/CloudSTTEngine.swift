@@ -106,8 +106,9 @@ final class CloudSTTEngine: ObservableObject, TranscriptionEngine, @unchecked Se
     ///
     /// Flat rather than scaled with the audio, because the session is shared across dictations for
     /// connection reuse and `timeoutIntervalForResource` is a session-wide setting (Codex round 3,
-    /// finding 3). Twice the largest inactivity budget, so it is only ever the dribbling endpoint
-    /// that hits it first.
+    /// finding 3). Twice the largest inactivity budget, so a stalled endpoint is caught by the
+    /// inactivity timeout long before this — but a transfer that keeps making progress the whole
+    /// time, a slow upload as much as a dribbling response, reaches this first (round 5).
     ///
     /// Ceiling (Codex round 2, finding 5): this is a real cap, not just a pathology detector — an
     /// endpoint that genuinely needs longer than ten minutes for one dictation is abandoned to the
