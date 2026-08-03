@@ -326,9 +326,11 @@ private actor VocabularyWitness: TranscriptionEngine {
 }
 
 /// Holds a spy inside its `transcribe` call until the test lets it out, so "the cancellation
-/// landed while the engine was mid-call" is an ordering, not a race. The waits are unbounded, so
-/// the test that uses it carries a `.timeLimit` rather than hanging the suite if the engine never
-/// enters (Codex round 3, finding 4).
+/// landed while the engine was mid-call" is an ordering, not a race.
+///
+/// Both waits are cancellation-aware: a `.timeLimit` cancels the test's task, but a continuation
+/// nobody resumes stays suspended through that, so the time limit alone would not end a hang
+/// (Codex round 4, finding 1). Cancellation releases whatever is waiting instead.
 private actor Gate {
     private var entered: CheckedContinuation<Void, Never>?
     private var isEntered = false
@@ -337,7 +339,11 @@ private actor Gate {
 
     func waitUntilEntered() async {
         guard !isEntered else { return }
-        await withCheckedContinuation { entered = $0 }
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { entered = $0 }
+        } onCancel: {
+            Task { await self.releaseAll() }
+        }
     }
 
     func enter() async {
@@ -345,10 +351,24 @@ private actor Gate {
         entered?.resume()
         entered = nil
         guard !isOpen else { return }
-        await withCheckedContinuation { opened = $0 }
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { opened = $0 }
+        } onCancel: {
+            Task { await self.releaseAll() }
+        }
     }
 
     func open() {
+        isOpen = true
+        opened?.resume()
+        opened = nil
+    }
+
+    /// Resumes anything waiting and leaves the gate open, so a cancelled test unwinds instead of
+    /// sitting on a continuation forever. Resuming twice would trap, hence the nil-out.
+    private func releaseAll() {
+        entered?.resume()
+        entered = nil
         isOpen = true
         opened?.resume()
         opened = nil

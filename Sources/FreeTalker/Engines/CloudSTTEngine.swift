@@ -83,11 +83,12 @@ final class CloudSTTEngine: ObservableObject, TranscriptionEngine, @unchecked Se
     ///
     /// `timeoutInterval` is inactivity, not a total budget, and the dominant idle window is
     /// server-side transcription: no bytes flow while the endpoint works. So it scales with the
-    /// audio, covering an endpoint up to 2x realtime, with the previous fixed 300 s as the ceiling
-    /// and a 60 s floor. The floor is `URLRequest`'s own default, so a short stop against a
+    /// audio, clamped: `max(60, min(300, 2 * audioSeconds))`. Only between 30 s and 150 s of audio
+    /// is that actually 2x realtime — a shorter stop gets the more generous floor, and past 150 s
+    /// the ceiling bites, so a long dictation abandons an endpoint slower than 2x realtime (Codex
+    /// round 4, finding 2). The floor is `URLRequest`'s own default, so a short stop against a
     /// cold-starting endpoint is never abandoned sooner than an unconfigured request would be
-    /// (Codex round 1, finding 7). An endpoint slower than 2x realtime does get abandoned to the
-    /// fallback (Codex round 3, finding 6).
+    /// (Codex round 1, finding 7).
     ///
     /// A dead endpoint used to cost the full 300 s before the dictation failed. Guessing this
     /// number low is now cheap: `FallbackSTTEngine` answers a timeout with one local
@@ -99,7 +100,9 @@ final class CloudSTTEngine: ObservableObject, TranscriptionEngine, @unchecked Se
 
     /// Total wall-clock ceiling for one transcription, which `timeoutInterval` alone cannot give:
     /// a server dribbling bytes resets the inactivity timer indefinitely (Codex round 1,
-    /// finding 6).
+    /// finding 6). It covers the whole resource lifetime — upload, wait and response — so it caps
+    /// any transcription taking longer than ten minutes end to end, not only the dribbling kind
+    /// (Codex round 4, finding 3).
     ///
     /// Flat rather than scaled with the audio, because the session is shared across dictations for
     /// connection reuse and `timeoutIntervalForResource` is a session-wide setting (Codex round 3,
