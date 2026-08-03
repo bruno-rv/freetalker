@@ -338,8 +338,18 @@ final class AppCoordinator: ObservableObject {
         return action
     }
 
+    /// The cloud leg is wrapped so a failing endpoint costs one local transcription instead of the
+    /// dictation — see `FallbackSTTEngine`. `statusText` and `name` still read as the configured
+    /// engine, so the menu bar and Settings are unchanged.
     var activeSTTEngine: any TranscriptionEngine {
-        AppSettings.shared.sttEngine == .whisperKit ? whisperEngine : cloudSTTEngine
+        guard AppSettings.shared.sttEngine != .whisperKit else { return whisperEngine }
+        return FallbackSTTEngine(
+            primary: cloudSTTEngine,
+            fallback: whisperEngine,
+            skipsPrimary: FallbackSTTEngine.skipPrimary(
+                baseURL: AppSettings.shared.cloudSTTBaseURL
+            )
+        )
     }
 
     var engineStatusText: String {
@@ -3592,6 +3602,13 @@ final class AppCoordinator: ObservableObject {
                     hud.flash("Post-processing failed — raw transcript copied, paste manually (check API key/model in Settings)")
                 } else if !result.posted {
                     hud.flash(skipPostProcessing ? "Copied (raw) — paste manually" : "Copied — paste manually")
+                } else if result.engineName != engineName {
+                    // `FallbackSTTEngine` took over. Silent substitution is how a broken key or a
+                    // dead endpoint hides for weeks while Usage Statistics reports cloud runs that
+                    // never happened, so this says it once, on the dictation it happened to. Ranked
+                    // below the not-posted messages: text the user still has to paste outranks
+                    // which engine produced it.
+                    hud.flash("\(engineName) unavailable — transcribed with \(result.engineName) (check Settings)")
                 } else if result.fallbackReason != nil {
                     hud.flash("Cloud post-processing failed — used raw transcript (check API key/model in Settings)")
                 } else if skipPostProcessing {
@@ -4119,11 +4136,16 @@ final class AppCoordinator: ObservableObject {
         let stageStart = ContinuousClock.now
         var transcribeSeconds: Double?
         var refineSeconds: Double?
+        // What actually transcribed, which is not always what was configured: a cloud stop can be
+        // answered by the local engine (`FallbackSTTEngine`). Everything downstream that names an
+        // engine — this log, the recorded Dictation row, a translation failure — has to say the
+        // one that ran, or history records a cloud dictation that never happened.
+        var effectiveEngineName = engineName
         defer {
             let audioSeconds = Double(samples.count) / Double(CaptureSegmentCodec.sampleRate)
             Self.logger.notice(
                 """
-                stage timings: engine=\(engineName, privacy: .public) \
+                stage timings: engine=\(effectiveEngineName, privacy: .public) \
                 audio=\(Self.stageDurationText(audioSeconds), privacy: .public)s \
                 transcribe=\(Self.stageDurationText(transcribeSeconds), privacy: .public)s \
                 refine=\(Self.stageDurationText(refineSeconds), privacy: .public)s \
@@ -4147,6 +4169,7 @@ final class AppCoordinator: ObservableObject {
             )
         )
         transcribeSeconds = Self.elapsedSeconds(since: transcribeStart)
+        effectiveEngineName = transcription.producedBy ?? engineName
         guard !transcription.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw PipelineError.emptyTranscript
         }
@@ -4172,7 +4195,7 @@ final class AppCoordinator: ObservableObject {
             guard let snapshot = context.cloudSnapshot, snapshot.eligibility.isEligible else {
                 throw OutputTranslationFailure(
                     source: transcription.text, context: failureContext,
-                    engineName: engineName,
+                    engineName: effectiveEngineName,
                     underlyingError: TranslationService.Error.unavailable(.invalidConfiguration)
                 )
             }
@@ -4191,7 +4214,7 @@ final class AppCoordinator: ObservableObject {
                 try Task.checkCancellation()
                 throw OutputTranslationFailure(
                     source: transcription.text, context: failureContext,
-                    engineName: engineName, underlyingError: error
+                    engineName: effectiveEngineName, underlyingError: error
                 )
             }
             recordedTemplateName = context.template.name
@@ -4266,7 +4289,7 @@ final class AppCoordinator: ObservableObject {
             refined: refined,
             language: transcription.language,
             recordedTemplateName: recordedTemplateName,
-            engineName: engineName,
+            engineName: effectiveEngineName,
             fallbackReason: fallbackReason,
             refinementDelivery: delivery
         )

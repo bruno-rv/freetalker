@@ -4,6 +4,11 @@ struct TranscriptionOutput {
     var text: String
     /// BCP-47-ish language code as reported by the engine (e.g. "en", "pt").
     var language: String
+    /// Set only when a different engine than the caller requested produced this — see
+    /// `FallbackSTTEngine`. `nil` means the engine the caller asked for did the work, which is
+    /// every ordinary transcription, so callers record their own engine name unless this says
+    /// otherwise.
+    var producedBy: String?
 }
 
 protocol TranscriptionEngine: Sendable {
