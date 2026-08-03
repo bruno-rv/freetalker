@@ -8,7 +8,7 @@ struct TranscriptionOutput {
     /// `FallbackSTTEngine`. `nil` means the engine the caller asked for did the work, which is
     /// every ordinary transcription, so callers record their own engine name unless this says
     /// otherwise.
-    var producedBy: String?
+    var producedBy: String? = nil
 }
 
 protocol TranscriptionEngine: Sendable {

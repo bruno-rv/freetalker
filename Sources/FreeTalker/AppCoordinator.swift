@@ -2793,6 +2793,21 @@ final class AppCoordinator: ObservableObject {
         isCloudConfigured ? nil : capture.context
     }
 
+    /// What to say when `FallbackSTTEngine` answered a cloud stop with the local engine. `nil` for
+    /// every ordinary dictation, where the configured engine did the work.
+    ///
+    /// Silent substitution is how a broken key or a dead endpoint hides for weeks while Usage
+    /// Statistics reports cloud runs that never happened. Ceiling: the HUD shows one message, and
+    /// this one ranks below anything about text the user still has to paste — the durable
+    /// disclosure is the engine recorded on the Dictation row, plus the `stt` log notice, both of
+    /// which happen on every substitution regardless of which message wins the flash.
+    nonisolated static func engineSubstitutionNotice(
+        configured: String, actual: String
+    ) -> String? {
+        guard configured != actual else { return nil }
+        return "\(configured) unavailable — transcribed with \(actual) (check Settings)"
+    }
+
     nonisolated static func contextPermissionHint(for limitation: ContextCaptureLimitation?) -> String? {
         switch limitation {
         case .accessibilityPermissionRequired:
@@ -3602,13 +3617,10 @@ final class AppCoordinator: ObservableObject {
                     hud.flash("Post-processing failed — raw transcript copied, paste manually (check API key/model in Settings)")
                 } else if !result.posted {
                     hud.flash(skipPostProcessing ? "Copied (raw) — paste manually" : "Copied — paste manually")
-                } else if result.engineName != engineName {
-                    // `FallbackSTTEngine` took over. Silent substitution is how a broken key or a
-                    // dead endpoint hides for weeks while Usage Statistics reports cloud runs that
-                    // never happened, so this says it once, on the dictation it happened to. Ranked
-                    // below the not-posted messages: text the user still has to paste outranks
-                    // which engine produced it.
-                    hud.flash("\(engineName) unavailable — transcribed with \(result.engineName) (check Settings)")
+                } else if let notice = Self.engineSubstitutionNotice(
+                    configured: engineName, actual: result.engineName
+                ) {
+                    hud.flash(notice)
                 } else if result.fallbackReason != nil {
                     hud.flash("Cloud post-processing failed — used raw transcript (check API key/model in Settings)")
                 } else if skipPostProcessing {
@@ -3813,10 +3825,14 @@ final class AppCoordinator: ObservableObject {
                                 if let fallbackReason = result.fallbackReason {
                                     logPostProcessingFallback(fallbackReason)
                                 }
-                                if accepted {
-                                    hud.hide()
-                                } else {
+                                if !accepted {
                                     hud.flash("Dictation ready — reopen Scratchpad to recover it")
+                                } else if let notice = Self.engineSubstitutionNotice(
+                                    configured: engineName, actual: result.engineName
+                                ) {
+                                    hud.flash(notice)
+                                } else {
+                                    hud.hide()
                                 }
                             },
                             onCancellation: {

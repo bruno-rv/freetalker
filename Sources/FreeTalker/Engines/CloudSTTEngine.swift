@@ -58,12 +58,13 @@ final class CloudSTTEngine: ObservableObject, TranscriptionEngine, @unchecked Se
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         // Multi-minute WAV multipart uploads plus server-side transcription commonly exceed
         // URLRequest's 60s default. Not `testConnection`'s 10s timeout, which is deliberately short.
-        request.timeoutInterval = Self.transcribeTimeout(
-            audioSeconds: Double(samples.count) / 16_000
-        )
+        let audioSeconds = Double(samples.count) / 16_000
+        request.timeoutInterval = Self.transcribeTimeout(audioSeconds: audioSeconds)
         request.httpBody = multipartBody(boundary: boundary, wavData: wavData, model: model, vocabulary: vocabulary, forcedLanguage: forcedLanguage)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let session = Self.session(audioSeconds: audioSeconds)
+        defer { session.finishTasksAndInvalidate() }
+        let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
             let code = (response as? HTTPURLResponse)?.statusCode ?? 0
             throw CloudSTTError.badResponse(status: code, hint: CloudSTTError.classifyHint(status: code))
@@ -80,16 +81,37 @@ final class CloudSTTEngine: ObservableObject, TranscriptionEngine, @unchecked Se
 
     /// How long the transcription POST may go without progress.
     ///
-    /// `timeoutInterval` is idle time, not total, and the dominant idle window is server-side
-    /// transcription: no bytes flow while the endpoint works. So the budget scales with the audio
-    /// — 2x realtime, which covers a model slower than realtime — with a 30 s floor for the
-    /// short stops where the upload itself dominates, and the previous fixed 300 s as the ceiling.
+    /// `timeoutInterval` is inactivity, not a total budget, and the dominant idle window is
+    /// server-side transcription: no bytes flow while the endpoint works. So it scales with the
+    /// audio — 2x realtime, which covers a model slower than realtime — with the previous fixed
+    /// 300 s as the ceiling and a 60 s floor. The floor is `URLSession`'s own default, so a short
+    /// stop against a cold-starting endpoint is never abandoned sooner than an unconfigured
+    /// request would be (Codex round 1, finding 7).
     ///
     /// A dead endpoint used to cost the full 300 s before the dictation failed. Guessing this
     /// number low is now cheap: `FallbackSTTEngine` answers a timeout with one local
     /// transcription, so being wrong costs a few seconds, not the user's words.
     static func transcribeTimeout(audioSeconds: Double) -> TimeInterval {
-        min(300, max(30, audioSeconds * 2))
+        min(300, max(60, audioSeconds * 2))
+    }
+
+    /// Total wall-clock deadline for one transcription, which `timeoutInterval` alone cannot give:
+    /// a server dribbling bytes resets the inactivity timer indefinitely (Codex round 1,
+    /// finding 6). Set well above the inactivity budget so it only ever catches that pathology,
+    /// never a working endpoint.
+    static func transcribeResourceTimeout(audioSeconds: Double) -> TimeInterval {
+        transcribeTimeout(audioSeconds: audioSeconds) * 2
+    }
+
+    /// A dictation's upload gets its own session so the resource deadline applies to this request
+    /// alone — `URLSession.shared` is process-wide and its configuration is not ours to set.
+    private static func session(audioSeconds: Double) -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = transcribeTimeout(audioSeconds: audioSeconds)
+        configuration.timeoutIntervalForResource = transcribeResourceTimeout(
+            audioSeconds: audioSeconds
+        )
+        return URLSession(configuration: configuration)
     }
 
     @MainActor

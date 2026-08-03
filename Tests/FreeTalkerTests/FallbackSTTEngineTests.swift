@@ -103,21 +103,37 @@ import Testing
         #expect(await local.callCount == 0)
     }
 
-    /// `decoderBiasVocabulary` decides before the call, with no way to know which leg will run. If
-    /// the wrapper reported only the cloud's "costs nothing", a fallback would hand WhisperKit the
-    /// full vocabulary as `promptTokens` — one decoder inference per term per 30 s window, paid on
-    /// the one dictation already running late.
-    @Test func biasCostIsClaimedWhenEitherLegPaysForIt() {
+    /// Codex round 1, finding 2. `decoderBiasVocabulary` decides before the call and cannot know
+    /// which leg will run, so the wrapper answers for the cloud — the leg that runs on all but the
+    /// failing dictations. Reporting the OR instead would strip the vocabulary from every
+    /// successful cloud transcription, where biasing is free, to spare the rare fallback.
+    @Test func wrappingTheCloudDoesNotCostItItsFreeVocabularyBias() {
         let engine = FallbackSTTEngine(
             primary: CloudSTTEngine(), fallback: WhisperKitEngine(), skipsPrimary: false
         )
 
-        #expect(CloudSTTEngine().vocabularyBiasCostsDecodeTime == false)
-        #expect(engine.vocabularyBiasCostsDecodeTime)
+        #expect(engine.vocabularyBiasCostsDecodeTime == false)
+        #expect(WhisperKitEngine().vocabularyBiasCostsDecodeTime)
         #expect(AppCoordinator.decoderBiasVocabulary(
             ["Qdrant"], refinementCarriesVocabulary: true,
             biasCostsDecodeTime: engine.vocabularyBiasCostsDecodeTime
-        ) == [])
+        ) == ["Qdrant"])
+    }
+
+    // MARK: - Saying that it happened
+
+    @Test func anOrdinaryDictationClaimsNoSubstitution() {
+        #expect(AppCoordinator.engineSubstitutionNotice(
+            configured: "Cloud STT", actual: "Cloud STT"
+        ) == nil)
+    }
+
+    @Test func aSubstitutionNamesBothEngines() throws {
+        let notice = try #require(AppCoordinator.engineSubstitutionNotice(
+            configured: "Cloud STT", actual: "WhisperKit"
+        ))
+        #expect(notice.contains("Cloud STT"))
+        #expect(notice.contains("WhisperKit"))
     }
 
     @Test func theConfiguredEngineIsStillTheOneNamedAndStatusReported() async {
@@ -137,12 +153,30 @@ import Testing
     /// so the budget tracks the audio rather than sitting at a flat 300 s a dead endpoint spends
     /// in full.
     @Test(arguments: [
-        (0.0, 30.0), (10.0, 30.0), (60.0, 120.0), (63.5, 127.0), (200.0, 300.0), (3_600.0, 300.0)
+        (0.0, 60.0), (10.0, 60.0), (60.0, 120.0), (63.5, 127.0), (200.0, 300.0), (3_600.0, 300.0)
     ])
     func theCloudBudgetTracksTheAudioBetweenAFloorAndTheOldCeiling(
         _ audioSeconds: Double, _ expected: Double
     ) {
         #expect(CloudSTTEngine.transcribeTimeout(audioSeconds: audioSeconds) == expected)
+    }
+
+    /// Codex round 1, finding 7: the floor must never abandon an endpoint sooner than an
+    /// unconfigured `URLRequest` would, or a cold start becomes a fallback.
+    @Test func theFloorIsNeverTighterThanURLSessionsOwnDefault() {
+        #expect(CloudSTTEngine.transcribeTimeout(audioSeconds: 0) >= URLRequest(
+            url: URL(string: "https://example.com")!
+        ).timeoutInterval)
+    }
+
+    /// Codex round 1, finding 6: inactivity alone bounds nothing against a server that dribbles
+    /// bytes, so a total deadline sits above it — high enough to catch only that pathology.
+    @Test(arguments: [0.0, 60.0, 200.0, 3_600.0])
+    func aTotalDeadlineSitsAboveTheInactivityBudget(_ audioSeconds: Double) {
+        #expect(
+            CloudSTTEngine.transcribeResourceTimeout(audioSeconds: audioSeconds)
+                > CloudSTTEngine.transcribeTimeout(audioSeconds: audioSeconds)
+        )
     }
 }
 

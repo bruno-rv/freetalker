@@ -1,14 +1,17 @@
 import Foundation
 import os
 
-/// Cloud STT that never costs the user their words: when the cloud leg fails, the local engine
-/// transcribes instead of the dictation failing.
+/// Cloud STT with the local engine behind it: when the cloud leg fails, the local one transcribes
+/// rather than the dictation failing outright.
 ///
 /// A cloud stop that throws used to end as a failed job at stage `.transcribing`, which the
 /// Library shows under Recoveries — and pressing "Retry Processing" there then succeeded
 /// instantly, because `processRecoveredDictation` has always hardcoded local WhisperKit
 /// ("recovery must not depend on the possibly-broken cloud STT"). The live path deserves the same
-/// rule: whatever the endpoint does — stall, 404, expired key, DNS — the words still land.
+/// rule: whatever the endpoint does — stall, 404, expired key, DNS — the local engine answers.
+///
+/// Not a guarantee that the words land. If the local engine also fails (a cloud-only user with no
+/// model downloaded), this still throws, and the audio stays recoverable exactly as before.
 ///
 /// Only the live path composes this (`AppCoordinator.activeSTTEngine`). Recovery retry keeps
 /// calling the local engine directly; wrapping it would be circular.
@@ -19,6 +22,12 @@ final class FallbackSTTEngine: TranscriptionEngine, @unchecked Sendable {
     let fallback: any TranscriptionEngine
     /// Snapshot taken when the engine is composed, not read live, so one dictation cannot change
     /// its mind halfway through. Mirrors the Settings warning — see `skipPrimary(baseURL:)`.
+    ///
+    /// Ceiling (Codex round 1, finding 3): `CloudSTTEngine` reads the base URL again for its own
+    /// request, so editing Settings between the stop and the upload can make the two disagree.
+    /// Both outcomes are safe — skipping a now-valid URL costs one local transcription, attempting
+    /// a now-invalid one falls back — so this stops short of threading an immutable STT
+    /// configuration through the engine.
     let skipsPrimary: Bool
 
     init(primary: any TranscriptionEngine, fallback: any TranscriptionEngine, skipsPrimary: Bool) {
@@ -33,14 +42,16 @@ final class FallbackSTTEngine: TranscriptionEngine, @unchecked Sendable {
 
     @MainActor var statusText: String { primary.statusText }
 
-    /// True when *either* leg pays decode time for the bias, so `decoderBiasVocabulary` — which
-    /// decides before the call, with no way to know which leg will run — never hands the local
-    /// engine a full vocabulary as `promptTokens` (one decoder inference per term per 30 s
-    /// window). Withholding it from the cloud costs nothing: it carries the terms as a few request
-    /// bytes, and the post-processing pass carries them anyway.
-    var vocabularyBiasCostsDecodeTime: Bool {
-        primary.vocabularyBiasCostsDecodeTime || fallback.vocabularyBiasCostsDecodeTime
-    }
+    /// The cloud leg's answer, which is the leg that runs on all but the failing dictations.
+    ///
+    /// `decoderBiasVocabulary` decides before the call and cannot know which leg will run, so this
+    /// is a choice between two costs. Reporting the OR would withhold the vocabulary from *every*
+    /// successful cloud transcription — where biasing is free, since the terms ride along as a few
+    /// multipart bytes — to spare the rare fallback. Ceiling (Codex round 1, finding 2, inverted):
+    /// a fallback therefore hands WhisperKit the full vocabulary as `promptTokens`, one decoder
+    /// inference per term per 30 s window, on a dictation already running late. Bounded by the
+    /// user's vocabulary size, and paid only when the cloud has already failed.
+    var vocabularyBiasCostsDecodeTime: Bool { primary.vocabularyBiasCostsDecodeTime }
 
     /// Whether the cloud leg is worth attempting at all. Ollama-shaped endpoints have no
     /// `/audio/transcriptions`, which Settings already warns about — this is that same predicate,
@@ -73,11 +84,16 @@ final class FallbackSTTEngine: TranscriptionEngine, @unchecked Sendable {
             }
         }
 
+        // Cancellation can land while the cloud leg is failing. Checking here and again on the way
+        // out keeps a stop the user abandoned from being answered by a second transcription — or
+        // by a success the pipeline would then deliver (Codex round 1, finding 5).
+        try Task.checkCancellation()
         do {
             var output = try await fallback.transcribe(
                 samples: samples, forcedLanguage: forcedLanguage,
                 candidateLanguages: candidateLanguages, vocabulary: vocabulary
             )
+            try Task.checkCancellation()
             output.producedBy = fallback.name
             return output
         } catch is CancellationError {
