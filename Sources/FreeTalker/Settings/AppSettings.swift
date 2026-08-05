@@ -53,6 +53,17 @@ enum LLMProviderKind: String, CaseIterable, Codable, Sendable {
 struct LLMProviderDefault: Equatable {
     let baseURL: String?
     let model: String?
+    /// Model IDs that used to be *this* provider's default. A stored value matching one is a
+    /// stale default rather than a user choice, so it upgrades to `model` on load — same
+    /// migration idiom as `Template.legacyPrompts`/`legacyNames`. Kept per-provider so the
+    /// cross-provider `knownValues` semantics in `resolveProviderDefaults` stay unchanged.
+    let legacyModels: [String]
+
+    init(baseURL: String?, model: String?, legacyModels: [String] = []) {
+        self.baseURL = baseURL
+        self.model = model
+        self.legacyModels = legacyModels
+    }
 }
 
 /// Persisted, non-secret app settings. Backed by UserDefaults (simplest storage that fits;
@@ -900,7 +911,11 @@ final class AppSettings: ObservableObject {
     }
 
     nonisolated static let knownProviderDefaults: [LLMProviderKind: LLMProviderDefault] = [
-        .anthropic: LLMProviderDefault(baseURL: "https://api.anthropic.com/v1", model: "claude-sonnet-4-5"),
+        .anthropic: LLMProviderDefault(
+            baseURL: "https://api.anthropic.com/v1",
+            model: "claude-sonnet-5",
+            legacyModels: ["claude-sonnet-4-5"]
+        ),
         .ollama: LLMProviderDefault(baseURL: "https://ollama.com/v1", model: "gpt-oss:120b"),
         .openAICompatible: LLMProviderDefault(baseURL: nil, model: nil)
     ]
@@ -910,9 +925,16 @@ final class AppSettings: ObservableObject {
         let allBaseURLs = Set(knownProviderDefaults.values.compactMap(\.baseURL))
         let allModels = Set(knownProviderDefaults.values.compactMap(\.model))
 
-        func resolve(_ value: String, knownValues: Set<String>, currentDefault: String?) -> String {
+        func resolve(
+            _ value: String,
+            knownValues: Set<String>,
+            currentDefault: String?,
+            legacyValues: [String] = []
+        ) -> String {
             let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty || (knownValues.contains(trimmed) && trimmed != currentDefault) {
+            if trimmed.isEmpty
+                || (knownValues.contains(trimmed) && trimmed != currentDefault)
+                || legacyValues.contains(trimmed) {
                 return currentDefault ?? ""
             }
             return trimmed
@@ -920,7 +942,12 @@ final class AppSettings: ObservableObject {
 
         return (
             resolve(baseURL, knownValues: allBaseURLs, currentDefault: current.baseURL),
-            resolve(model, knownValues: allModels, currentDefault: current.model)
+            resolve(
+                model,
+                knownValues: allModels,
+                currentDefault: current.model,
+                legacyValues: current.legacyModels
+            )
         )
     }
 
