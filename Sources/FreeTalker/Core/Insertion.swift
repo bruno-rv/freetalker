@@ -209,6 +209,14 @@ enum Insertion {
             return .failure(reason)
         }
 
+        // The one case worth logging on the SUCCESS path: this paste is happening only because
+        // the element check was relaxed for a rebuilt AX tree. Without it `.rebuilt` would be
+        // invisible — a skipped paste logs, an ordinary `.match` needs no explaining, and a paste
+        // that lands because of this relaxation would look identical to one that never needed it.
+        if case .rebuilt = elementComparison {
+            logger.log("paste proceeding on a rebuilt AX tree: app=\(currentBundleID ?? "nil", privacy: .public)")
+        }
+
         let posted = postCommandV()
 
         if posted, restoresPasteboard {
