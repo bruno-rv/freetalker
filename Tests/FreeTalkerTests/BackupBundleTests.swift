@@ -448,6 +448,7 @@ struct BackupBundleTests {
         settingsA.cloudSTTModel = "custom-transcription-model"
         settingsA.setWhisperModelFromUser("openai_whisper-tiny")
         settingsA.livePreviewEnabled = false
+        settingsA.completionSoundEnabled = true
         settingsA.noiseSuppressionEnabled = false
         settingsA.edgeLauncherEnabled = true
         settingsA.notchpadEnabled = true

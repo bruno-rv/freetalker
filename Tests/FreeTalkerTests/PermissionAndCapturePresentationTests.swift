@@ -274,6 +274,75 @@ import Testing
         #expect(reason == .targetDrift)
     }
 
+    // MARK: - `.rebuilt`: an app that rebuilt its AX tree is not the user moving focus
+    // See docs/insertion-delivery-and-feedback-2026-08-05.md.
+
+    @Test func aRebuiltAccessibilityTreePastesForOrdinaryDictationButNeverForStrictCallers() {
+        // Same app, same pid, same window, and the snapshotted element is provably gone. For
+        // ordinary dictation that is the Electron/Chromium re-render case the whole change exists
+        // for — the field never lost focus, only its handle changed.
+        #expect(Insertion.shouldSynthesizePaste(
+            hasTarget: true, snapshotBundleID: "com.example.app", currentBundleID: "com.example.app",
+            pidMatch: true, elementComparison: .rebuilt
+        ) == true)
+        // The History panel replays old text into whatever is frontmost now, so it must not
+        // accept a rebuilt tree as proof of anything — same posture it takes to `.unavailable`.
+        #expect(Insertion.shouldSynthesizePaste(
+            hasTarget: true, snapshotBundleID: "com.example.app", currentBundleID: "com.example.app",
+            pidMatch: true, elementComparison: .rebuilt, strict: true
+        ) == false)
+    }
+
+    @Test func aRebuiltTreeStillCannotRescueADriftedAppIdentity() {
+        // `.rebuilt` is only ever consulted after bundle id and pid have already agreed — it is a
+        // relaxation of the ELEMENT check, not a bypass of the identity checks above it.
+        #expect(Insertion.shouldSynthesizePaste(
+            hasTarget: true, snapshotBundleID: "com.example.app", currentBundleID: "com.example.other",
+            pidMatch: true, elementComparison: .rebuilt
+        ) == false)
+        #expect(Insertion.shouldSynthesizePaste(
+            hasTarget: true, snapshotBundleID: "com.example.app", currentBundleID: "com.example.app",
+            pidMatch: false, elementComparison: .rebuilt
+        ) == false)
+        #expect(Insertion.shouldSynthesizePaste(
+            hasTarget: true, snapshotBundleID: nil, currentBundleID: "com.example.app",
+            pidMatch: true, elementComparison: .rebuilt
+        ) == false)
+    }
+
+    @Test func aPlainElementMismatchStillRefusesExactlyAsBefore() {
+        // The user genuinely moving focus — snapshotted element still alive, just not focused —
+        // must be unaffected by the `.rebuilt` relaxation, strict or not.
+        #expect(Insertion.shouldSynthesizePaste(
+            hasTarget: true, snapshotBundleID: "com.example.app", currentBundleID: "com.example.app",
+            pidMatch: true, elementComparison: .mismatch
+        ) == false)
+        #expect(Insertion.shouldSynthesizePaste(
+            hasTarget: true, snapshotBundleID: "com.example.app", currentBundleID: "com.example.app",
+            pidMatch: true, elementComparison: .mismatch, strict: true
+        ) == false)
+        #expect(Insertion.classifyPreflightFailure(
+            hasTarget: true, snapshotBundleID: "com.example.app", currentBundleID: "com.example.app",
+            pidMatch: true, elementComparison: .mismatch,
+            hasEditableFocusedElement: true, accessibilityTrusted: true
+        ) == .targetDrift)
+    }
+
+    @Test func aRebuiltTreeStillNeedsSomethingEditableToPasteInto() {
+        // The relaxation is about identity only. If nothing editable has focus there is still
+        // nowhere to paste, and the classification must say so rather than reporting drift.
+        #expect(Insertion.classifyPreflightFailure(
+            hasTarget: true, snapshotBundleID: "com.example.app", currentBundleID: "com.example.app",
+            pidMatch: true, elementComparison: .rebuilt,
+            hasEditableFocusedElement: false, accessibilityTrusted: true
+        ) == .noFocusedElement)
+        #expect(Insertion.classifyPreflightFailure(
+            hasTarget: true, snapshotBundleID: "com.example.app", currentBundleID: "com.example.app",
+            pidMatch: true, elementComparison: .rebuilt,
+            hasEditableFocusedElement: true, accessibilityTrusted: true
+        ) == nil)
+    }
+
     // MARK: - `strict` closes the permissive nil-target branch for the History panel only
     // (Codex finding: unverified panel paste reaching Insertion's permissive nil-target branch)
 

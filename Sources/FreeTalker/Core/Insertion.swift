@@ -1,6 +1,7 @@
 import AppKit
 import ApplicationServices
 import CoreGraphics
+import os
 
 /// Identity of the frontmost app (and, best-effort, its focused element/window) snapshotted at
 /// key-up — before the async transcribe/post-process work — so the paste-time check can detect
@@ -47,6 +48,39 @@ enum InsertionFailureReason: Equatable, Sendable {
     case targetDrift
     case noFocusedElement
     case pasteFailed
+
+    /// Stable, non-sensitive token for the unified log — never interpolate app or document names
+    /// into a log line beyond the bundle ids `insert` already emits.
+    var logLabel: String {
+        switch self {
+        case .axDenied: "axDenied"
+        case .targetDrift: "targetDrift"
+        case .noFocusedElement: "noFocusedElement"
+        case .pasteFailed: "pasteFailed"
+        }
+    }
+
+    /// What the HUD tells the user when this reason left the text on the clipboard. Deliberately
+    /// says what happened and what to do, not which AX predicate failed — `logLabel` covers
+    /// diagnosis. `axDenied` is the one reason with a fix the user can act on directly.
+    ///
+    /// `raw` marks a Raw stop (post-processing skipped), so the marker lands next to "copied" —
+    /// what's on the clipboard is the unrefined transcript — rather than trailing the sentence.
+    func hudExplanation(raw: Bool) -> String {
+        let copied = raw ? "copied (raw)" : "copied"
+        switch self {
+        case .axDenied:
+            return raw
+                ? "Copied (raw) — grant Accessibility to paste automatically"
+                : "Copied — grant Accessibility to paste automatically"
+        case .targetDrift:
+            return "Focus changed — \(copied), paste manually"
+        case .noFocusedElement:
+            return "No text field focused — \(copied), paste manually"
+        case .pasteFailed:
+            return "Paste failed — \(copied), paste manually"
+        }
+    }
 }
 
 /// Replaces the bare `Bool` `Insertion.insert` used to return: `posted` preserves the exact
@@ -67,6 +101,12 @@ struct InsertionOutcome: Equatable, Sendable {
 }
 
 enum Insertion {
+    /// A skipped paste used to leave no trace anywhere — no log line, and `insertTrackingCorrection`
+    /// discarded the reason — so "the text never appeared" was indistinguishable from "the app
+    /// pasted and the target swallowed it" from outside the process. See
+    /// docs/insertion-delivery-and-feedback-2026-08-05.md.
+    private static let logger = Logger(subsystem: "org.freetalker.app", category: "insertion")
+
     /// Compares a snapshotted focused element/window against what's focused now. `.unavailable`
     /// covers both "no snapshot was taken at all" and "the snapshot app was AX-opaque, so
     /// neither element nor window were obtainable" — both fall back to bundle+pid identity
@@ -74,7 +114,20 @@ enum Insertion {
     enum ElementComparison {
         case match
         case mismatch
+        /// The snapshotted element no longer exists, but its window does and still matches — the
+        /// app rebuilt its accessibility tree rather than the user moving focus. See
+        /// `compareElements`.
+        case rebuilt
         case unavailable
+
+        var logLabel: String {
+            switch self {
+            case .match: "match"
+            case .mismatch: "mismatch"
+            case .rebuilt: "rebuilt"
+            case .unavailable: "unavailable"
+            }
+        }
     }
 
     /// Snapshots the frontmost app's identity for a later paste-time comparison — bundle id,
@@ -149,13 +202,27 @@ enum Insertion {
             // Either identity drifted since the snapshot (leave the text on the pasteboard for
             // a manual paste rather than pasting into whatever now has focus), or there's no
             // focused element to paste into — see Round 2 Codex finding 1.
+            //
+            // Logged (never the text — bundle ids and the classification only) because this is the
+            // branch that makes dictated text "not appear", and it was previously silent.
+            logger.log("paste skipped: reason=\(reason.logLabel, privacy: .public) snapshotApp=\(target?.bundleID ?? "nil", privacy: .public) currentApp=\(currentBundleID ?? "nil", privacy: .public) pidMatch=\(pidMatch, privacy: .public) element=\(elementComparison.logLabel, privacy: .public)")
             return .failure(reason)
+        }
+
+        // The one case worth logging on the SUCCESS path: this paste is happening only because
+        // the element check was relaxed for a rebuilt AX tree. Without it `.rebuilt` would be
+        // invisible — a skipped paste logs, an ordinary `.match` needs no explaining, and a paste
+        // that lands because of this relaxation would look identical to one that never needed it.
+        if case .rebuilt = elementComparison {
+            logger.log("paste proceeding on a rebuilt AX tree: app=\(currentBundleID ?? "nil", privacy: .public)")
         }
 
         let posted = postCommandV()
 
         if posted, restoresPasteboard {
             schedulePasteboardRestore(savedItems, changeCountAfterWrite: changeCountAfterWrite)
+        } else if !posted {
+            logger.error("paste skipped: reason=\(InsertionFailureReason.pasteFailed.logLabel, privacy: .public) (CGEvent post unavailable)")
         }
         return posted ? .success : .failure(.pasteFailed)
     }
@@ -251,6 +318,14 @@ enum Insertion {
         switch elementComparison {
         case .mismatch: return false
         case .match: return true
+        // Same app, same pid, same window, and the element we snapshotted is provably gone — the
+        // tree was rebuilt under us. Treated exactly like `.unavailable`: permissive for ordinary
+        // dictation, refused for `strict` callers replaying old text into whatever is frontmost
+        // now. This is the narrowest loosening that addresses the reported symptom, and it can
+        // only ever ADD pastes in that one provable case — an app whose old element stays valid
+        // still lands on `.mismatch` and behaves exactly as before. See
+        // docs/insertion-delivery-and-feedback-2026-08-05.md.
+        case .rebuilt: return !strict
         // Matching bundle id/pid only proves it's the same APP, not the same focused field — a
         // same-app focus change (e.g. the user tabbed to a different field, or a new window took
         // focus) between snapshot and paste is exactly as unverifiable as the nil-bundle-id case
@@ -567,14 +642,23 @@ enum Insertion {
     /// whatever the target app does with ⌘V) and only keeps it if the paste actually posted.
     @MainActor
     static func insertTrackingCorrection(_ text: String, target: InsertionTarget?) -> Bool {
+        insertTrackingCorrectionOutcome(text, target: target).posted
+    }
+
+    /// Same insertion, with the classification kept instead of thrown away. `runPipeline` uses this
+    /// so the HUD can say *why* the text stayed on the clipboard; the `-> Bool` wrapper above stays
+    /// for the `insert:` closure parameter every other call site and test already passes, so
+    /// carrying the reason costs no churn at those sites.
+    @MainActor
+    static func insertTrackingCorrectionOutcome(_ text: String, target: InsertionTarget?) -> InsertionOutcome {
         let snapshot = target.flatMap { captureCorrectionAnchor(target: $0) }
-        let posted = insert(text, target: target).posted
-        if posted, let target, let snapshot {
+        let outcome = insert(text, target: target)
+        if outcome.posted, let target, let snapshot {
             RecentInsertionStore.shared.notePending(.init(target: target, baselineValue: snapshot.baseline, anchor: snapshot.anchor, text: text))
         } else {
             RecentInsertionStore.shared.clearPending()
         }
-        return posted
+        return outcome
     }
 
     /// What a two-phase insertion (`AppCoordinator.EarlyInsertionHandler`) needs to find the raw
@@ -791,13 +875,49 @@ enum Insertion {
         if let snapshotElement = snapshot.focusedElement {
             guard let currentElement else { return .mismatch }
             // AXUIElement is CFEqual-comparable for identity — see AXUIElement.h.
-            return CFEqual(snapshotElement, currentElement) ? .match : .mismatch
+            if CFEqual(snapshotElement, currentElement) { return .match }
+            // Identity differs, which used to end the story. But it covers two situations that
+            // deserve opposite answers, and telling them apart is what `.rebuilt` is for:
+            //
+            //  - The user moved focus. The snapshotted element still EXISTS, it just isn't
+            //    focused any more (a different Slack channel, a different Mail draft). Pasting
+            //    would land in the wrong field — this stays `.mismatch`.
+            //  - The app rebuilt its accessibility tree under the same window. The snapshotted
+            //    element is GONE, and whatever is focused now is a fresh handle for the same
+            //    place. Chromium/Electron web areas do this on re-render, and over the 20-70s
+            //    this pipeline takes (docs/perf-dictation-latency-2026-07-29.md) a re-render is
+            //    close to certain — which is how dictated text kept silently not appearing in a
+            //    field that never lost focus.
+            //
+            // Both halves are required. A destroyed element alone doesn't prove we're in the same
+            // place, so the window must still match too; and an unobtainable window on either side
+            // fails closed to `.mismatch` rather than guessing.
+            if isDestroyed(snapshotElement),
+               let snapshotWindow = snapshot.window,
+               let currentWindow,
+               CFEqual(snapshotWindow, currentWindow) {
+                return .rebuilt
+            }
+            return .mismatch
         }
         if let snapshotWindow = snapshot.window {
             guard let currentWindow else { return .mismatch }
             return CFEqual(snapshotWindow, currentWindow) ? .match : .mismatch
         }
         return .unavailable
+    }
+
+    /// Whether an `AXUIElement` refers to something that no longer exists. ONLY an affirmative
+    /// `.invalidUIElement` counts: every other `AXError` (a timeout, `.cannotComplete` from a busy
+    /// or unresponsive app, an unsupported attribute) means "couldn't tell", and treating
+    /// "couldn't tell" as "destroyed" would hand `.rebuilt` its permissive answer on no evidence.
+    /// Fails closed to `false`.
+    ///
+    /// `kAXRoleAttribute` is the probe because every element implements it, so a failure is about
+    /// the element's existence rather than about that particular attribute.
+    private static func isDestroyed(_ element: AXUIElement) -> Bool {
+        var ref: AnyObject?
+        return AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &ref) == .invalidUIElement
     }
 
     /// `kAXDocumentAttribute`, read from whichever of `window`/`element` exposes it (window

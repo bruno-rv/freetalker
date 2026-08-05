@@ -3518,6 +3518,61 @@ final class AppCoordinator: ObservableObject {
         var landed = false
     }
 
+    /// Why the batch paste didn't land, carried from `runPipeline`'s `insert:` closure out to its
+    /// terminal handlers — same shared-by-reference trick as `EarlyInsertionLandedFlag`, and for
+    /// the same reason (the handlers run after the pipeline returns).
+    ///
+    /// This exists rather than widening the `insert:` closure to return `InsertionOutcome` because
+    /// that closure is a test seam passed at 20-odd call sites; the reason is only ever needed on
+    /// the one production path. `nil` after a successful paste, and also on the two-phase path,
+    /// which bypasses this closure entirely.
+    @MainActor
+    final class InsertionFailureBox {
+        var reason: InsertionFailureReason?
+    }
+
+    /// The production batch paste: `Insertion.insertTrackingCorrection` plus keeping the reason it
+    /// would otherwise discard. A static taking the box explicitly, so the `insert:` argument stays
+    /// the same single-expression closure shape it has always been (no captured `self`, no
+    /// multi-statement closure leaning on inference through `??`).
+    static func batchInsertTracking(
+        _ text: String, target: InsertionTarget?, failure: InsertionFailureBox
+    ) -> Bool {
+        let outcome = Insertion.insertTrackingCorrectionOutcome(text, target: target)
+        failure.reason = outcome.failureReason
+        return outcome.posted
+    }
+
+    /// How long a terminal notice the user must ACT on stays up. The 2.5s `flash` default is fine
+    /// for "here's what happened"; it is not enough for "your text is on the clipboard, paste it"
+    /// after a wait long enough that the user looked away — which the latency investigation
+    /// measured at 20-70s. Not `show(text:)`/`.persistentBase`: nothing would dismiss that until
+    /// the next dictation.
+    nonisolated static let actionableNoticeDuration: TimeInterval = 10
+
+    /// What the HUD says when the transcript never reached the document. `reason` comes from
+    /// `Insertion`'s own classification — `nil` covers the paths that don't route through the
+    /// batch `insert:` closure (a caller-supplied test seam, or a live streaming insert), where
+    /// there is no classification to report and the old generic wording is still the honest one.
+    nonisolated static func notPastedMessage(
+        reason: InsertionFailureReason?, skipPostProcessing: Bool
+    ) -> String {
+        guard let reason else {
+            return skipPostProcessing ? "Copied (raw) — paste manually" : "Copied — paste manually"
+        }
+        return reason.hudExplanation(raw: skipPostProcessing)
+    }
+
+    /// The audible half of "the dictation finished", for the case the HUD can't cover: the user
+    /// looked away, or the pill is on another display. Opt-in (`completionSoundEnabled`, default
+    /// off) and deliberately two different sounds — a dictation that needs a manual paste should
+    /// not sound like one that landed. A missing system sound is not worth reporting, so a nil
+    /// lookup is simply silent.
+    static func signalCompletion(delivered: Bool) {
+        guard AppSettings.shared.completionSoundEnabled else { return }
+        NSSound(named: delivered ? NSSound.Name("Glass") : NSSound.Name("Basso"))?.play()
+    }
+
     private func runPipeline(samples: [Float], engine: any TranscriptionEngine, engineName: String, template: Template, appName: String?, target: InsertionTarget?, forcedLanguage: String?, candidateLanguages: [String], outputLanguage: OutputLanguage, cloudSnapshot: CloudLLMSettingsSnapshot, voiceCommands: VoiceCommandSnapshot, vocabularySnapshot: [String], skipPostProcessing: Bool, processor: (any PostProcessor)? = nil, localContext: LocalProcessingContext? = nil, recovery: ForegroundRecovery, bundleID: String?, durationSecs: Double?, hudGeneration: UUID) async {
         defer {
             isProcessing = false
@@ -3538,6 +3593,8 @@ final class AppCoordinator: ObservableObject {
         // copy next to it (see the two-phase note in
         // docs/perf-dictation-latency-2026-07-29.md).
         let earlyInsertionLanded = EarlyInsertionLandedFlag()
+        // Written by `batchInsertTracking`, read by `onSuccess` — see `InsertionFailureBox`.
+        let insertionFailure = InsertionFailureBox()
         let earlyInsertion: EarlyInsertionHandler? = target.flatMap { target -> EarlyInsertionHandler? in
             guard Self.shouldUseTwoPhaseInsertion(
                 hasLiveStreamingSession: liveInsert != nil,
@@ -3570,7 +3627,7 @@ final class AppCoordinator: ObservableObject {
                     voiceCommands: voiceCommands, vocabularySnapshot: vocabularySnapshot,
                     processor: processor, localContext: localContext,
                     earlyInsertion: earlyInsertion,
-                    insert: liveInsert ?? { Insertion.insertTrackingCorrection($0, target: $1) },
+                    insert: liveInsert ?? { Self.batchInsertTracking($0, target: $1, failure: insertionFailure) },
                     record: { result in
                         // Codex finding 3: attach the Correction Loop pending snapshot using the
                         // id THIS EXACT call returns — see `trackCorrectionForRecordedDictation`.
@@ -3612,31 +3669,58 @@ final class AppCoordinator: ObservableObject {
                 )
             },
             onSuccess: { result in
-                guard await completeForegroundRecovery(recovery) else {
-                    hud.flash("Dictation saved — recovery cleanup failed")
-                    return
-                }
+                // Every branch below is terminal for this dictation, so the completion signal is
+                // emitted once, here, rather than repeated in each — including the
+                // recovery-cleanup-failure path, which used to return before the delivery
+                // outcome was reported at all (the user was told about cleanup and nothing about
+                // their text sitting on the clipboard).
+                // `.rawLeftInPlace` counts as not-delivered for the sound: the words are on screen
+                // but the refined text still needs a manual paste, so it must not sound like a
+                // clean landing.
+                Self.signalCompletion(
+                    delivered: result.posted && result.refinementDelivery != .rawLeftInPlace
+                )
+                let cleanedUp = await completeForegroundRecovery(recovery)
                 if let fallbackReason = result.fallbackReason {
                     logPostProcessingFallback(fallbackReason)
                 }
+                let cleanupSuffix = cleanedUp ? "" : " (recovery cleanup failed)"
+                // One message, chosen then shown once — the branches only pick wording and whether
+                // the user still has something to do. A notice that needs action holds the HUD
+                // long enough to be read after a wait spent looking elsewhere; the 2.5s `flash`
+                // default was routinely missed. See
+                // docs/insertion-delivery-and-feedback-2026-08-05.md.
+                let message: String
+                var needsAction = true
                 if result.refinementDelivery == .rawLeftInPlace {
                     // The words are in the document, just un-refined — a different situation from
                     // "nothing was pasted", so it gets its own message rather than "Copied".
-                    hud.flash("Raw transcript left in place — refined text copied")
+                    message = "Raw transcript left in place — refined text copied"
                 } else if !result.posted, result.fallbackReason != nil {
-                    hud.flash("Post-processing failed — raw transcript copied, paste manually (check API key/model in Settings)")
+                    message = "Post-processing failed — raw transcript copied, paste manually (check API key/model in Settings)"
                 } else if !result.posted {
-                    hud.flash(skipPostProcessing ? "Copied (raw) — paste manually" : "Copied — paste manually")
+                    // Say *why* it stayed on the clipboard. `InsertionFailureReason` has always
+                    // classified this; it used to be discarded before reaching the user.
+                    message = Self.notPastedMessage(
+                        reason: insertionFailure.reason, skipPostProcessing: skipPostProcessing
+                    )
                 } else if let notice = Self.engineSubstitutionNotice(
                     configured: engineName, actual: result.engineName
                 ) {
-                    hud.flash(notice)
+                    message = notice
+                    needsAction = false
                 } else if result.fallbackReason != nil {
-                    hud.flash("Cloud post-processing failed — used raw transcript (check API key/model in Settings)")
-                } else if skipPostProcessing {
-                    hud.flash("Pasted (raw)")
+                    message = "Cloud post-processing failed — used raw transcript (check API key/model in Settings)"
                 } else {
-                    hud.hide()
+                    // Previously `hud.hide()`: the only signal a dictation had finished was the
+                    // pill vanishing, which is indistinguishable from a ⌘V the target swallowed.
+                    message = skipPostProcessing ? "Pasted (raw)" : "Pasted"
+                    needsAction = false
+                }
+                if needsAction {
+                    hud.flash(message + cleanupSuffix, duration: Self.actionableNoticeDuration)
+                } else {
+                    hud.flash(message + cleanupSuffix)
                 }
             },
             // `onCancellation`/`onEmptyTranscript`/`onTranslationFailure`/`onFailure` all fire

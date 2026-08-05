@@ -116,6 +116,7 @@ struct SettingsPatch {
     var whisperModel: PatchField<String> = .absent
     var whisperModelChosen: PatchField<Bool> = .absent
     var livePreviewEnabled: PatchField<Bool> = .absent
+    var completionSoundEnabled: PatchField<Bool> = .absent
     var noiseSuppressionEnabled: PatchField<Bool> = .absent
     var edgeLauncherEnabled: PatchField<Bool> = .absent
     var notchpadEnabled: PatchField<Bool> = .absent
@@ -384,6 +385,9 @@ private enum SettingsPatchDecoding {
         if let raw = dict[Keys.livePreviewEnabled] {
             patch.livePreviewEnabled = .present(try bool(raw, Keys.livePreviewEnabled))
         }
+        if let raw = dict[Keys.completionSoundEnabled] {
+            patch.completionSoundEnabled = .present(try bool(raw, Keys.completionSoundEnabled))
+        }
         if let raw = dict[Keys.noiseSuppressionEnabled] {
             patch.noiseSuppressionEnabled = .present(try bool(raw, Keys.noiseSuppressionEnabled))
         }
@@ -573,6 +577,7 @@ extension AppSettings {
         // 7. Everything else — order-independent.
         apply(patch.sttEngine, default: .whisperKit) { sttEngine = $0 }
         apply(patch.livePreviewEnabled, default: true) { livePreviewEnabled = $0 }
+        apply(patch.completionSoundEnabled, default: false) { completionSoundEnabled = $0 }
         apply(patch.noiseSuppressionEnabled, default: true) { noiseSuppressionEnabled = $0 }
         apply(patch.edgeLauncherEnabled, default: false) { edgeLauncherEnabled = $0 }
         apply(patch.notchpadEnabled, default: false) { notchpadEnabled = $0 }
