@@ -384,7 +384,7 @@ struct BackupBundleTests {
         // indistinguishable from a correct restore, so start from a neutral/different baseline.
         env.settings.llmProvider = .anthropic
         env.settings.cloudLLMBaseURL = "https://api.anthropic.com/v1"
-        env.settings.cloudLLMModel = "claude-sonnet-4-5"
+        env.settings.cloudLLMModel = "claude-sonnet-5"
 
         let data = try json(v2Payload(settings: ["llmProvider": "ollama"]))
         _ = try await BackupBundle.restore(data: data, settings: env.settings, templateStore: env.templateStore, snippetStore: env.snippetStore)
@@ -405,7 +405,7 @@ struct BackupBundleTests {
 
         #expect(env.settings.llmProvider == .anthropic)
         #expect(env.settings.cloudLLMBaseURL == "https://api.anthropic.com/v1")
-        #expect(env.settings.cloudLLMModel == "claude-sonnet-4-5")
+        #expect(env.settings.cloudLLMModel == "claude-sonnet-5")
     }
 
     @Test func v2RestoresOpenAICompatibleProviderHasNoKnownDefaultSoFieldsClearToEmpty() async throws {
@@ -414,7 +414,7 @@ struct BackupBundleTests {
         let env = try makeEnv()
         env.settings.llmProvider = .anthropic
         env.settings.cloudLLMBaseURL = "https://api.anthropic.com/v1"
-        env.settings.cloudLLMModel = "claude-sonnet-4-5"
+        env.settings.cloudLLMModel = "claude-sonnet-5"
 
         let data = try json(v2Payload(settings: ["llmProvider": "openAICompatible"]))
         _ = try await BackupBundle.restore(data: data, settings: env.settings, templateStore: env.templateStore, snippetStore: env.snippetStore)
