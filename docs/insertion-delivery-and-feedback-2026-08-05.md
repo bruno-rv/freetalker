@@ -159,6 +159,27 @@ sitting on the clipboard.
 | 6 | Recovery-cleanup early return hides the insertion result | `AppCoordinator.swift:3617` | certain (code); rare |
 | 7 | No focus restore, ever | absence of `activate` before any insert | certain (code) |
 
+## Status
+
+The feedback half of this landed the same day (see "Recommended fixes" below): items 2–6 are
+implemented, item 1 — the drift rule itself — is **not**. So the symptom "the text didn't appear"
+still occurs at the same rate; what changed is that the app now says so, says why, and says it for
+long enough to read.
+
+| Fix | State |
+|---|---|
+| 1. Soften the drift rule | **not done** — needs real-app verification, see the caveat below |
+| 2. Surface the failure reason | done — `AppCoordinator.notPastedMessage` |
+| 3. Persist the actionable notice | done — `actionableNoticeDuration`, 10 s |
+| 4. Completion signal | done — HUD "Pasted" always; opt-in sound (`completionSoundEnabled`) |
+| 5. Log skipped pastes | done — `Insertion.logger`, category `insertion` |
+| 6. Fix the `:3617` early return | done — cleanup failure now appends to the delivery message |
+| 7. Verify the paste landed | not done |
+
+Note what item 4 does and does not buy: the HUD now distinguishes "pasted" from "copied", so a
+dictation that silently went nowhere is visible. It still cannot distinguish "pasted" from "posted
+a ⌘V the target app swallowed" — that needs item 7.
+
 ## Recommended fixes, in order of value
 
 1. **Soften the drift rule instead of failing closed on pointer inequality.** When bundle id and

@@ -269,8 +269,18 @@ explanation; the same explanation is available as a hover tip.
   tap the key again, click the HUD pill, or press Esc to cancel. Holding the key down is still
   classic push-to-talk. An auto-stop cap (default 5 minutes, configurable 1–60
   in Settings → Recording) guards against a stuck key.
-- The refined text is pasted at your cursor. If pasting isn't possible, it's left on the
-  pasteboard and the HUD says "Copied — paste manually".
+- The refined text is pasted at your cursor, and the HUD says "Pasted" when it lands — so a
+  finished dictation is never just the pill disappearing.
+- If pasting isn't possible the text is left on the pasteboard and the HUD says why, so you know
+  what to fix rather than only that something went wrong: "Focus changed — copied, paste
+  manually", "No text field focused — copied, paste manually", "Copied — grant Accessibility to
+  paste automatically", or "Paste failed — copied, paste manually". Those notices stay up
+  10 seconds rather than the usual 2.5, since they're the ones you have to act on.
+- Skipped pastes are logged (reason and bundle ids, never the text) under the `insertion`
+  category — `log stream --predicate 'subsystem == "org.freetalker.app"'`.
+- Settings → Transcription can also **play a sound when a dictation finishes** (off by default),
+  with different sounds for "landed in the app" and "left on the clipboard" — useful when you
+  look away during a long dictation.
 - **Library…** opens the searchable history of past Dictations, with "Re-process with…" to
   re-run a stored transcript through a different Template. Each entry can be deleted
   individually, or wiped entirely with **Delete All** — which also purges any saved debug audio

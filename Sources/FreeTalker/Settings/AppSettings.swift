@@ -248,6 +248,14 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(livePreviewEnabled, forKey: Keys.livePreviewEnabled) }
     }
 
+    /// Play a short system sound when a dictation finishes. **Default OFF** — the HUD's terminal
+    /// message is unconditional, so this is purely for the case where the user has looked away
+    /// from the screen during the wait. See
+    /// docs/insertion-delivery-and-feedback-2026-08-05.md.
+    @Published var completionSoundEnabled: Bool {
+        didSet { defaults.set(completionSoundEnabled, forKey: Keys.completionSoundEnabled) }
+    }
+
     @Published var noiseSuppressionEnabled: Bool {
         didSet { defaults.set(noiseSuppressionEnabled, forKey: Keys.noiseSuppressionEnabled) }
     }
@@ -937,6 +945,7 @@ final class AppSettings: ObservableObject {
         static let whisperModel = "whisperModel"
         static let whisperModelChosen = "whisperModelChosen"
         static let livePreviewEnabled = "livePreviewEnabled"
+        static let completionSoundEnabled = "completionSoundEnabled"
         static let noiseSuppressionEnabled = "noiseSuppressionEnabled"
         static let edgeLauncherEnabled = "edgeLauncherEnabled"
         static let notchpadEnabled = "notchpadEnabled"
@@ -1048,6 +1057,9 @@ final class AppSettings: ObservableObject {
         // Default ON — `.object(forKey:)` (not `.bool(forKey:)`) so an unset key is distinguished
         // from an explicit `false`, which `.bool(forKey:)` can't do (it returns false for both).
         livePreviewEnabled = defaults.object(forKey: Keys.livePreviewEnabled) as? Bool ?? true
+        // Default OFF — plain `.bool(forKey:)` resolves an unset key to `false`, matching "silent
+        // until switched on in Settings." Same idiom as `automationEnabled` below.
+        completionSoundEnabled = defaults.bool(forKey: Keys.completionSoundEnabled)
         noiseSuppressionEnabled = defaults.object(forKey: Keys.noiseSuppressionEnabled) as? Bool ?? true
         edgeLauncherEnabled = defaults.object(forKey: Keys.edgeLauncherEnabled) as? Bool ?? false
         notchpadEnabled = defaults.object(forKey: Keys.notchpadEnabled) as? Bool ?? false
@@ -1292,6 +1304,7 @@ extension AppSettings {
         Keys.whisperModel,
         Keys.whisperModelChosen,
         Keys.livePreviewEnabled,
+        Keys.completionSoundEnabled,
         Keys.noiseSuppressionEnabled,
         Keys.edgeLauncherEnabled,
         Keys.notchpadEnabled,
@@ -1376,6 +1389,7 @@ extension AppSettings {
         out[Keys.whisperModel] = whisperModel
         out[Keys.whisperModelChosen] = whisperModelChosen
         out[Keys.livePreviewEnabled] = livePreviewEnabled
+        out[Keys.completionSoundEnabled] = completionSoundEnabled
         out[Keys.noiseSuppressionEnabled] = noiseSuppressionEnabled
         out[Keys.edgeLauncherEnabled] = edgeLauncherEnabled
         out[Keys.notchpadEnabled] = notchpadEnabled

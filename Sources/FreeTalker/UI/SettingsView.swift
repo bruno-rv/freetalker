@@ -1171,6 +1171,13 @@ private struct GeneralSettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            HStack {
+                Toggle("Play a sound when a dictation finishes", isOn: $settings.completionSoundEnabled)
+                SettingsHelpButton(
+                    title: "Play a sound when a dictation finishes",
+                    message: "The HUD always shows a message when a dictation finishes. Turn this on to also hear one — useful when you look away during long dictations. Text that landed in the app and text left on the clipboard get different sounds."
+                )
+            }
             if settings.sttEngine == .cloud {
                 Picker("Provider", selection: $settings.cloudSTTProvider) {
                     ForEach(CloudSTTProviderKind.allCases, id: \.self) { provider in

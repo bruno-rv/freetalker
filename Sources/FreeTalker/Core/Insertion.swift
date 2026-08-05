@@ -1,6 +1,7 @@
 import AppKit
 import ApplicationServices
 import CoreGraphics
+import os
 
 /// Identity of the frontmost app (and, best-effort, its focused element/window) snapshotted at
 /// key-up — before the async transcribe/post-process work — so the paste-time check can detect
@@ -47,6 +48,39 @@ enum InsertionFailureReason: Equatable, Sendable {
     case targetDrift
     case noFocusedElement
     case pasteFailed
+
+    /// Stable, non-sensitive token for the unified log — never interpolate app or document names
+    /// into a log line beyond the bundle ids `insert` already emits.
+    var logLabel: String {
+        switch self {
+        case .axDenied: "axDenied"
+        case .targetDrift: "targetDrift"
+        case .noFocusedElement: "noFocusedElement"
+        case .pasteFailed: "pasteFailed"
+        }
+    }
+
+    /// What the HUD tells the user when this reason left the text on the clipboard. Deliberately
+    /// says what happened and what to do, not which AX predicate failed — `logLabel` covers
+    /// diagnosis. `axDenied` is the one reason with a fix the user can act on directly.
+    ///
+    /// `raw` marks a Raw stop (post-processing skipped), so the marker lands next to "copied" —
+    /// what's on the clipboard is the unrefined transcript — rather than trailing the sentence.
+    func hudExplanation(raw: Bool) -> String {
+        let copied = raw ? "copied (raw)" : "copied"
+        switch self {
+        case .axDenied:
+            return raw
+                ? "Copied (raw) — grant Accessibility to paste automatically"
+                : "Copied — grant Accessibility to paste automatically"
+        case .targetDrift:
+            return "Focus changed — \(copied), paste manually"
+        case .noFocusedElement:
+            return "No text field focused — \(copied), paste manually"
+        case .pasteFailed:
+            return "Paste failed — \(copied), paste manually"
+        }
+    }
 }
 
 /// Replaces the bare `Bool` `Insertion.insert` used to return: `posted` preserves the exact
@@ -67,6 +101,12 @@ struct InsertionOutcome: Equatable, Sendable {
 }
 
 enum Insertion {
+    /// A skipped paste used to leave no trace anywhere — no log line, and `insertTrackingCorrection`
+    /// discarded the reason — so "the text never appeared" was indistinguishable from "the app
+    /// pasted and the target swallowed it" from outside the process. See
+    /// docs/insertion-delivery-and-feedback-2026-08-05.md.
+    private static let logger = Logger(subsystem: "org.freetalker.app", category: "insertion")
+
     /// Compares a snapshotted focused element/window against what's focused now. `.unavailable`
     /// covers both "no snapshot was taken at all" and "the snapshot app was AX-opaque, so
     /// neither element nor window were obtainable" — both fall back to bundle+pid identity
@@ -75,6 +115,14 @@ enum Insertion {
         case match
         case mismatch
         case unavailable
+
+        var logLabel: String {
+            switch self {
+            case .match: "match"
+            case .mismatch: "mismatch"
+            case .unavailable: "unavailable"
+            }
+        }
     }
 
     /// Snapshots the frontmost app's identity for a later paste-time comparison — bundle id,
@@ -149,6 +197,10 @@ enum Insertion {
             // Either identity drifted since the snapshot (leave the text on the pasteboard for
             // a manual paste rather than pasting into whatever now has focus), or there's no
             // focused element to paste into — see Round 2 Codex finding 1.
+            //
+            // Logged (never the text — bundle ids and the classification only) because this is the
+            // branch that makes dictated text "not appear", and it was previously silent.
+            logger.log("paste skipped: reason=\(reason.logLabel, privacy: .public) snapshotApp=\(target?.bundleID ?? "nil", privacy: .public) currentApp=\(currentBundleID ?? "nil", privacy: .public) pidMatch=\(pidMatch, privacy: .public) element=\(elementComparison.logLabel, privacy: .public)")
             return .failure(reason)
         }
 
@@ -156,6 +208,8 @@ enum Insertion {
 
         if posted, restoresPasteboard {
             schedulePasteboardRestore(savedItems, changeCountAfterWrite: changeCountAfterWrite)
+        } else if !posted {
+            logger.error("paste skipped: reason=\(InsertionFailureReason.pasteFailed.logLabel, privacy: .public) (CGEvent post unavailable)")
         }
         return posted ? .success : .failure(.pasteFailed)
     }
@@ -567,14 +621,23 @@ enum Insertion {
     /// whatever the target app does with ⌘V) and only keeps it if the paste actually posted.
     @MainActor
     static func insertTrackingCorrection(_ text: String, target: InsertionTarget?) -> Bool {
+        insertTrackingCorrectionOutcome(text, target: target).posted
+    }
+
+    /// Same insertion, with the classification kept instead of thrown away. `runPipeline` uses this
+    /// so the HUD can say *why* the text stayed on the clipboard; the `-> Bool` wrapper above stays
+    /// for the `insert:` closure parameter every other call site and test already passes, so
+    /// carrying the reason costs no churn at those sites.
+    @MainActor
+    static func insertTrackingCorrectionOutcome(_ text: String, target: InsertionTarget?) -> InsertionOutcome {
         let snapshot = target.flatMap { captureCorrectionAnchor(target: $0) }
-        let posted = insert(text, target: target).posted
-        if posted, let target, let snapshot {
+        let outcome = insert(text, target: target)
+        if outcome.posted, let target, let snapshot {
             RecentInsertionStore.shared.notePending(.init(target: target, baselineValue: snapshot.baseline, anchor: snapshot.anchor, text: text))
         } else {
             RecentInsertionStore.shared.clearPending()
         }
-        return posted
+        return outcome
     }
 
     /// What a two-phase insertion (`AppCoordinator.EarlyInsertionHandler`) needs to find the raw
