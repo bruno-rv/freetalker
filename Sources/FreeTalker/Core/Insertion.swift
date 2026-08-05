@@ -114,12 +114,17 @@ enum Insertion {
     enum ElementComparison {
         case match
         case mismatch
+        /// The snapshotted element no longer exists, but its window does and still matches — the
+        /// app rebuilt its accessibility tree rather than the user moving focus. See
+        /// `compareElements`.
+        case rebuilt
         case unavailable
 
         var logLabel: String {
             switch self {
             case .match: "match"
             case .mismatch: "mismatch"
+            case .rebuilt: "rebuilt"
             case .unavailable: "unavailable"
             }
         }
@@ -305,6 +310,14 @@ enum Insertion {
         switch elementComparison {
         case .mismatch: return false
         case .match: return true
+        // Same app, same pid, same window, and the element we snapshotted is provably gone — the
+        // tree was rebuilt under us. Treated exactly like `.unavailable`: permissive for ordinary
+        // dictation, refused for `strict` callers replaying old text into whatever is frontmost
+        // now. This is the narrowest loosening that addresses the reported symptom, and it can
+        // only ever ADD pastes in that one provable case — an app whose old element stays valid
+        // still lands on `.mismatch` and behaves exactly as before. See
+        // docs/insertion-delivery-and-feedback-2026-08-05.md.
+        case .rebuilt: return !strict
         // Matching bundle id/pid only proves it's the same APP, not the same focused field — a
         // same-app focus change (e.g. the user tabbed to a different field, or a new window took
         // focus) between snapshot and paste is exactly as unverifiable as the nil-bundle-id case
@@ -854,13 +867,49 @@ enum Insertion {
         if let snapshotElement = snapshot.focusedElement {
             guard let currentElement else { return .mismatch }
             // AXUIElement is CFEqual-comparable for identity — see AXUIElement.h.
-            return CFEqual(snapshotElement, currentElement) ? .match : .mismatch
+            if CFEqual(snapshotElement, currentElement) { return .match }
+            // Identity differs, which used to end the story. But it covers two situations that
+            // deserve opposite answers, and telling them apart is what `.rebuilt` is for:
+            //
+            //  - The user moved focus. The snapshotted element still EXISTS, it just isn't
+            //    focused any more (a different Slack channel, a different Mail draft). Pasting
+            //    would land in the wrong field — this stays `.mismatch`.
+            //  - The app rebuilt its accessibility tree under the same window. The snapshotted
+            //    element is GONE, and whatever is focused now is a fresh handle for the same
+            //    place. Chromium/Electron web areas do this on re-render, and over the 20-70s
+            //    this pipeline takes (docs/perf-dictation-latency-2026-07-29.md) a re-render is
+            //    close to certain — which is how dictated text kept silently not appearing in a
+            //    field that never lost focus.
+            //
+            // Both halves are required. A destroyed element alone doesn't prove we're in the same
+            // place, so the window must still match too; and an unobtainable window on either side
+            // fails closed to `.mismatch` rather than guessing.
+            if isDestroyed(snapshotElement),
+               let snapshotWindow = snapshot.window,
+               let currentWindow,
+               CFEqual(snapshotWindow, currentWindow) {
+                return .rebuilt
+            }
+            return .mismatch
         }
         if let snapshotWindow = snapshot.window {
             guard let currentWindow else { return .mismatch }
             return CFEqual(snapshotWindow, currentWindow) ? .match : .mismatch
         }
         return .unavailable
+    }
+
+    /// Whether an `AXUIElement` refers to something that no longer exists. ONLY an affirmative
+    /// `.invalidUIElement` counts: every other `AXError` (a timeout, `.cannotComplete` from a busy
+    /// or unresponsive app, an unsupported attribute) means "couldn't tell", and treating
+    /// "couldn't tell" as "destroyed" would hand `.rebuilt` its permissive answer on no evidence.
+    /// Fails closed to `false`.
+    ///
+    /// `kAXRoleAttribute` is the probe because every element implements it, so a failure is about
+    /// the element's existence rather than about that particular attribute.
+    private static func isDestroyed(_ element: AXUIElement) -> Bool {
+        var ref: AnyObject?
+        return AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &ref) == .invalidUIElement
     }
 
     /// `kAXDocumentAttribute`, read from whichever of `window`/`element` exposes it (window

@@ -161,20 +161,50 @@ sitting on the clipboard.
 
 ## Status
 
-The feedback half of this landed the same day (see "Recommended fixes" below): items 2–6 are
-implemented, item 1 — the drift rule itself — is **not**. So the symptom "the text didn't appear"
-still occurs at the same rate; what changed is that the app now says so, says why, and says it for
-long enough to read.
-
 | Fix | State |
 |---|---|
-| 1. Soften the drift rule | **not done** — needs real-app verification, see the caveat below |
+| 1. Soften the drift rule | done — `ElementComparison.rebuilt`; **unverified against a real app** |
 | 2. Surface the failure reason | done — `AppCoordinator.notPastedMessage` |
 | 3. Persist the actionable notice | done — `actionableNoticeDuration`, 10 s |
 | 4. Completion signal | done — HUD "Pasted" always; opt-in sound (`completionSoundEnabled`) |
 | 5. Log skipped pastes | done — `Insertion.logger`, category `insertion` |
 | 6. Fix the `:3617` early return | done — cleanup failure now appends to the delivery message |
 | 7. Verify the paste landed | not done |
+
+### How item 1 was narrowed
+
+The blunt version of "soften the drift rule" — paste whenever bundle id, pid and window agree,
+whatever the element says — would have re-opened exactly the mis-delivery the rule was built to
+prevent: switching Slack channel or Mail draft mid-dictation also keeps the window and changes the
+element.
+
+What separates the two cases is not the *new* element but the *old* one:
+
+- **User moved focus** — the snapshotted element still exists, it just isn't focused. Still
+  `.mismatch`, still refused.
+- **App rebuilt its AX tree** — the snapshotted element is *gone*, and the current one is a fresh
+  handle for the same place. That is `.rebuilt`, and ordinary dictation now pastes on it.
+
+`compareElements` probes `kAXRoleAttribute` on the snapshotted element and requires an affirmative
+`.invalidUIElement` — every other `AXError` means "couldn't tell" and fails closed to `.mismatch`.
+The window must still match too, and an unobtainable window on either side also fails closed.
+
+Two properties worth keeping in mind when reviewing it:
+
+- **It can only add pastes in that one provable case.** An app whose stale element stays valid
+  lands on `.mismatch` and behaves exactly as before, so the worst case for the change is that it
+  does nothing.
+- **`strict` callers are untouched.** `.rebuilt` returns `!strict`, so the History panel, streaming
+  live-typing (`streamingSafeElement`) and the two-phase anchor all still demand a real `.match`.
+
+The residual risk is narrow but real: if the focused element is destroyed and focus lands on a
+*different* editable field in the same window (a modal closing, say), this pastes into that field.
+`isEditableFocusedElement` still gates it, so it can only ever be an editable target.
+
+**This is the part that needs real dictation to verify, not a unit test** — the policy is covered
+by `PermissionAndCapturePresentationTests`, but whether Chromium/Electron actually invalidates the
+old element on re-render (rather than keeping it alive) decides whether the fix does anything at
+all. Verify against Slack, VS Code, a browser text area, and a native `NSTextView`.
 
 Note what item 4 does and does not buy: the HUD now distinguishes "pasted" from "copied", so a
 dictation that silently went nowhere is visible. It still cannot distinguish "pasted" from "posted

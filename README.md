@@ -271,6 +271,11 @@ explanation; the same explanation is available as a hover tip.
   in Settings → Recording) guards against a stuck key.
 - The refined text is pasted at your cursor, and the HUD says "Pasted" when it lands — so a
   finished dictation is never just the pill disappearing.
+- Pasting is skipped if focus moved while the dictation was processing, so the text can't land in
+  the wrong field. An app that merely *rebuilds* its accessibility tree under the same window
+  (Electron and browser-based apps do this on any re-render) no longer counts as focus moving —
+  that case used to look identical to a real focus change and was the common reason text silently
+  stayed on the clipboard.
 - If pasting isn't possible the text is left on the pasteboard and the HUD says why, so you know
   what to fix rather than only that something went wrong: "Focus changed — copied, paste
   manually", "No text field focused — copied, paste manually", "Copied — grant Accessibility to
