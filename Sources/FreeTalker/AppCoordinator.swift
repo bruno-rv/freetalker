@@ -2443,7 +2443,10 @@ final class AppCoordinator: ObservableObject {
         let (peak, rms) = stoppedCapture.map { ($0.peak, $0.rms) }
             ?? AudioLevel.peakAndRMS(samples)
         Self.logger.log("capture stopped: samples=\(samples.count) peak=\(peak) rms=\(rms)")
-        writeLastCaptureDebugArtifact(samples)
+        writeLastCaptureDebugArtifact(
+            samples,
+            durableSource: stoppedCapture?.staged?.canonicalAudioURL
+        )
 
         if let issue = Self.capturedAudioIssue(sampleCount: samples.count, peak: peak, rms: rms) {
             lastError = issue
@@ -5024,12 +5027,13 @@ final class AppCoordinator: ObservableObject {
     /// recently captured audio, regardless of whether transcription succeeded. Cheap debug
     /// artifact for the live-mic silence investigation — lets the captured signal be inspected
     /// (played back, or peak/RMS-measured externally) without reproducing the bug interactively.
-    private func writeLastCaptureDebugArtifact(_ samples: [Float]) {
-        let dir = FreeTalkerPaths.applicationSupport
+    private func writeLastCaptureDebugArtifact(_ samples: [Float], durableSource: URL?) {
         do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let data = WAVEncoder.encode(samples: samples, sampleRate: 16_000)
-            try data.write(to: FreeTalkerPaths.debugAudio)
+            try LastCaptureDebugArtifactWriter.publish(
+                durableSource: durableSource,
+                samples: samples,
+                destination: FreeTalkerPaths.debugAudio
+            )
         } catch {
             Self.logger.error("failed to write last-dictation.wav: \(error.localizedDescription, privacy: .public)")
         }

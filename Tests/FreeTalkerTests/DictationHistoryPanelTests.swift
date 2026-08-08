@@ -180,6 +180,22 @@ import Testing
         #expect(HistoryPanelController.shouldInsertRow(exists: store.exists(id: id)) == false)
     }
 
+    @Test func deleteAllPurgesOnlyItsTemporaryStoresDebugAudio() throws {
+        let first = try LibraryStore.temporaryWithDatabaseURL()
+        let second = try LibraryStore.temporaryWithDatabaseURL()
+        let firstDebugAudio = first.databaseURL.deletingLastPathComponent()
+            .appendingPathComponent("last-dictation.wav")
+        let secondDebugAudio = second.databaseURL.deletingLastPathComponent()
+            .appendingPathComponent("last-dictation.wav")
+        try Data("first".utf8).write(to: firstDebugAudio)
+        try Data("second".utf8).write(to: secondDebugAudio)
+
+        try first.store.deleteAll()
+
+        #expect(!FileManager.default.fileExists(atPath: firstDebugAudio.path))
+        #expect(FileManager.default.fileExists(atPath: secondDebugAudio.path))
+    }
+
     // MARK: - Menu-driven panel open refreshes a stale AX target (Codex finding: same-app focus drift)
 
     @Test func refreshedTargetReturnsNilWhenNoStaleTargetWasTracked() {
