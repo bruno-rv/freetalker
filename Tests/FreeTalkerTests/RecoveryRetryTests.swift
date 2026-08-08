@@ -7,7 +7,7 @@ import Testing
     /// the real one, emptied again on the way out. See the removal closure for what that does and
     /// does not achieve — the contents go, the file does not.
     @MainActor private static func isolatedSettings() -> (settings: AppSettings, removeDomain: () -> Void) {
-        let suiteName = "RecoveryRetryTests.\(UUID().uuidString)"
+        let suiteName = TestDefaults.freshSuiteName()
         let defaults = UserDefaults(suiteName: suiteName)!
         return (AppSettings(defaults: defaults), {
             // This empties the domain. It does NOT stop the file appearing, and nothing in this

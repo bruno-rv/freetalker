@@ -5,7 +5,7 @@ import Testing
 @MainActor
 struct NoiseSuppressionSettingsTests {
     @Test func noiseSuppressionDefaultsEnabledWhenUnset() {
-        let suite = "NoiseSuppressionSettingsTests.\(UUID().uuidString)"
+        let suite = TestDefaults.freshSuiteName()
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
 
@@ -15,7 +15,7 @@ struct NoiseSuppressionSettingsTests {
     }
 
     @Test func explicitDisabledNoiseSuppressionPersists() {
-        let suite = "NoiseSuppressionSettingsTests.\(UUID().uuidString)"
+        let suite = TestDefaults.freshSuiteName()
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
 

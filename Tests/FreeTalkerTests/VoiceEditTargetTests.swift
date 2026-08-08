@@ -467,7 +467,7 @@ import Testing
     }
 
     @Test func voiceEditHotkeyPersistsAndInvalidAssignmentsAreDropped() {
-        let suite = "VoiceEditTargetTests.\(UUID().uuidString)"
+        let suite = TestDefaults.freshSuiteName()
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
         let voice = HotKeySpec(modifiers: 0, keyCode: 107)

@@ -20,7 +20,7 @@ struct VocabularySettingsTests {
     @Test("raw vocabulary persists while normalized terms trim blanks")
     @MainActor
     func persistenceAndNormalization() throws {
-        let suite = "VocabularySettingsTests.\(UUID().uuidString)"
+        let suite = TestDefaults.freshSuiteName()
         let defaults = try #require(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let raw = " OpenAI \n\nScreenCaptureKit"
@@ -37,7 +37,7 @@ struct VocabularySettingsTests {
     @Test("shared vocabulary survives transcription-engine switches and reload")
     @MainActor
     func vocabularyIsIndependentOfTranscriptionEngine() throws {
-        let suite = "VocabularySettingsTests.shared.\(UUID().uuidString)"
+        let suite = TestDefaults.freshSuiteName()
         let defaults = try #require(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
 

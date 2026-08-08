@@ -510,7 +510,7 @@ struct BackupBundleTests {
     }
 
     private func makeEnv() throws -> Env {
-        let suite = "BackupBundleTests.\(UUID().uuidString)"
+        let suite = TestDefaults.freshSuiteName()
         let defaults = UserDefaults(suiteName: suite)!
         let templatesDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("backup-bundle-\(UUID().uuidString)", isDirectory: true)

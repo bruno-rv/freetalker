@@ -350,7 +350,7 @@ import Testing
 
 @MainActor
 private func makeSettings() -> AppSettings {
-    let suite = "CorrectionRecorderTests.\(UUID().uuidString)"
+    let suite = TestDefaults.freshSuiteName()
     let defaults = UserDefaults(suiteName: suite)!
     return AppSettings(defaults: defaults)
 }

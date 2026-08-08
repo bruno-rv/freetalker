@@ -12,7 +12,7 @@ struct AutomationServiceTests {
     // MARK: - Consent gate defaults (off on first run, per BRAINSTORM_AUTOMATION_SURFACE.md)
 
     @Test func automationIsDisabledByDefault() throws {
-        let suite = "AutomationServiceTests.\(UUID().uuidString)"
+        let suite = TestDefaults.freshSuiteName()
         let defaults = try #require(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
 
@@ -22,7 +22,7 @@ struct AutomationServiceTests {
     }
 
     @Test func automationEnabledPersistsAcrossReload() throws {
-        let suite = "AutomationServiceTests.\(UUID().uuidString)"
+        let suite = TestDefaults.freshSuiteName()
         let defaults = try #require(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = AppSettings(defaults: defaults)
@@ -126,7 +126,7 @@ struct AutomationServiceTests {
         let promptB = Template(id: "template-b", name: "Report", prompt: "Prompt B")
         let encoder = JSONEncoder()
         try encoder.encode([promptA, promptB]).write(to: fileURL)
-        let defaults = try #require(UserDefaults(suiteName: "AutomationServiceTests.ambiguousMigration.\(UUID().uuidString)"))
+        let defaults = try #require(UserDefaults(suiteName: TestDefaults.freshSuiteName()))
 
         // The one-time `trimmingTemplateNames` migration runs here, on init, exactly as it does
         // on a real launch against a real pre-existing `templates.json`.
@@ -174,7 +174,7 @@ struct AutomationServiceTests {
             .appendingPathComponent("automation-template-canonicalization-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let fileURL = directory.appendingPathComponent("templates.json")
-        let defaults = try #require(UserDefaults(suiteName: "AutomationServiceTests.templateStore.\(UUID().uuidString)"))
+        let defaults = try #require(UserDefaults(suiteName: TestDefaults.freshSuiteName()))
         return TemplateStore(fileURL: fileURL, defaults: defaults)
     }
 

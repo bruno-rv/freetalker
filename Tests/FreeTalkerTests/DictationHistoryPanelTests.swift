@@ -252,7 +252,7 @@ import Testing
     // MARK: - Fourth hotkey slot in the Backup Bundle quartet
 
     @Test func backupBundleRejectsHistoryPanelHotKeyCollidingWithSibling() async throws {
-        let suite = "DictationHistoryPanelTests.\(UUID().uuidString)"
+        let suite = TestDefaults.freshSuiteName()
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
         let templatesDirectory = FileManager.default.temporaryDirectory

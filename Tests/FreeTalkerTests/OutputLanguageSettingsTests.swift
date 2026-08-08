@@ -135,10 +135,7 @@ struct OutputLanguageSettingsTests {
     }
 
     private func isolatedDefaults() -> UserDefaults {
-        let suite = "OutputLanguageSettingsTests.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.set(suite, forKey: "testSuiteName")
-        return defaults
+        TestDefaults.isolated()
     }
 
     private func cloudSnapshot(

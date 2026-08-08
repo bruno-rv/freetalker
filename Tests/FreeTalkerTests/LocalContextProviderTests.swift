@@ -95,7 +95,7 @@ import Testing
     }
 
     @Test func contextScopePersistsAndDefaultsOff() {
-        let suite = "LocalContextProviderTests.\(UUID().uuidString)"
+        let suite = TestDefaults.freshSuiteName()
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
 
@@ -107,7 +107,7 @@ import Testing
     }
 
     @Test func invalidPersistedScopeIsNormalizedToOff() {
-        let suite = "LocalContextProviderTests.\(UUID().uuidString)"
+        let suite = TestDefaults.freshSuiteName()
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
         defaults.set("future-invalid-scope", forKey: "localContextScope")

@@ -47,7 +47,7 @@ struct VoiceCommandSettingsTests {
     // MARK: - Defaults (off by default, per PLAN.md)
 
     @Test func voiceCommandsAreDisabledByDefault() throws {
-        let suite = "VoiceCommandSettingsTests.\(UUID().uuidString)"
+        let suite = TestDefaults.freshSuiteName()
         let defaults = try #require(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
 
@@ -60,7 +60,7 @@ struct VoiceCommandSettingsTests {
     // MARK: - Setter re-normalizes and persists
 
     @Test func settingKeywordsReNormalizesBeforePersisting() throws {
-        let suite = "VoiceCommandSettingsTests.\(UUID().uuidString)"
+        let suite = TestDefaults.freshSuiteName()
         let defaults = try #require(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = AppSettings(defaults: defaults)
@@ -72,7 +72,7 @@ struct VoiceCommandSettingsTests {
     }
 
     @Test func toggleAndKeywordsSurviveReloadFromDefaults() throws {
-        let suite = "VoiceCommandSettingsTests.\(UUID().uuidString)"
+        let suite = TestDefaults.freshSuiteName()
         let defaults = try #require(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = AppSettings(defaults: defaults)
@@ -89,7 +89,7 @@ struct VoiceCommandSettingsTests {
         // A pre-validation UserDefaults value (e.g. written by a future/rolled-back version, or
         // hand-edited) must be normalized on load, not trusted verbatim — mirrors
         // `normalizedCommandKeywords` in `AppSettings.init`.
-        let suite = "VoiceCommandSettingsTests.\(UUID().uuidString)"
+        let suite = TestDefaults.freshSuiteName()
         let defaults = try #require(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         defaults.set(["not valid 1", "Comando"], forKey: "commandKeywords")
@@ -102,7 +102,7 @@ struct VoiceCommandSettingsTests {
     // MARK: - Stop-time snapshot mirrors current toggle/keywords
 
     @Test func voiceCommandSnapshotMirrorsCurrentToggleAndKeywords() throws {
-        let suite = "VoiceCommandSettingsTests.\(UUID().uuidString)"
+        let suite = TestDefaults.freshSuiteName()
         let defaults = try #require(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = AppSettings(defaults: defaults)

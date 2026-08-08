@@ -235,7 +235,7 @@ import Testing
     }
 
     @Test func automaticStyleDefaultsOffAndPersists() {
-        let suite = "ContextRoutingTests.\(UUID().uuidString)"
+        let suite = TestDefaults.freshSuiteName()
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
 

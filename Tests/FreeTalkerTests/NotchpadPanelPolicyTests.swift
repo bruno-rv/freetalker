@@ -11,7 +11,7 @@ struct NotchpadPanelPolicyTests {
     }
 
     @Test func recordingAndRecoveryCallbacksEachForwardExactlyOnce() {
-        let controller = HUDController(settings: AppSettings(defaults: UserDefaults(suiteName: "NotchpadTests-\(UUID().uuidString)")!))
+        let controller = HUDController(settings: AppSettings(defaults: UserDefaults(suiteName: TestDefaults.freshSuiteName())!))
         var counts: [String: Int] = [:]
         func mark(_ key: String) { counts[key, default: 0] += 1 }
         controller.onPanelCancel = { mark("cancel") }

@@ -6,7 +6,7 @@ import Testing
 @MainActor
 struct NotchpadPresentationLifecycleTests {
     @Test func actualControllerKeepsSameRecordingTickUnderRestoreOverlayAndHideIsAtomic() {
-        let settings = AppSettings(defaults: UserDefaults(suiteName: "NotchpadTests-\(UUID().uuidString)")!)
+        let settings = AppSettings(defaults: UserDefaults(suiteName: TestDefaults.freshSuiteName())!)
         let controller = HUDController(settings: settings)
         let base = recordingState(elapsed: 1, generation: 4)
         let tick = recordingState(elapsed: 2, generation: 4)

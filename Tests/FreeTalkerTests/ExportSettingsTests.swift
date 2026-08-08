@@ -5,7 +5,7 @@ import Testing
 @MainActor
 struct ExportSettingsTests {
     @Test func exportedJSONContainsSettingsButNeverAnAPIKey() throws {
-        let suite = "ExportSettingsTests.\(UUID().uuidString)"
+        let suite = TestDefaults.freshSuiteName()
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
 

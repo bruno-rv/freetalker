@@ -7,7 +7,7 @@ struct CloudSTTSettingsTests {
     @Test("defaults to OpenAI transcription with whisper-1")
     @MainActor
     func defaults() throws {
-        let suite = "CloudSTTSettingsTests.defaults.\(UUID().uuidString)"
+        let suite = TestDefaults.freshSuiteName()
         let defaults = try #require(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
 
@@ -21,7 +21,7 @@ struct CloudSTTSettingsTests {
     @Test("migrates an existing custom Cloud STT URL without changing it")
     @MainActor
     func migratesLegacyCustomURL() throws {
-        let suite = "CloudSTTSettingsTests.migration.\(UUID().uuidString)"
+        let suite = TestDefaults.freshSuiteName()
         let defaults = try #require(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         defaults.set("http://localhost:9000/v1", forKey: "cloudSTTBaseURL")
@@ -38,7 +38,7 @@ struct CloudSTTSettingsTests {
     @Test("provider, model, and endpoint fields survive reload")
     @MainActor
     func persistence() throws {
-        let suite = "CloudSTTSettingsTests.persistence.\(UUID().uuidString)"
+        let suite = TestDefaults.freshSuiteName()
         let defaults = try #require(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
 

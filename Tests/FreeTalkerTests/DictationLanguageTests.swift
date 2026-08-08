@@ -321,10 +321,7 @@ struct DictationLanguageTests {
     // MARK: - Helpers
 
     private func isolatedDefaults() -> UserDefaults {
-        let suite = "DictationLanguageTests.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.set(suite, forKey: "testSuiteName")
-        return defaults
+        TestDefaults.isolated()
     }
 
     private func remove(_ defaults: UserDefaults) {

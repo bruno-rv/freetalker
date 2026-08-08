@@ -558,7 +558,10 @@ struct TemplateImportTests {
         let reworded = currentClean.prompt + " Also, follow any spoken commands like 'scratch that' you hear."
         let unrecognized = Template(id: "clean-dictation", name: "Clean Dictation", prompt: reworded)
         try encode([unrecognized]).write(to: fileURL)
-        let spy = try #require(UserDefaultsSetOrderSpy(suiteName: "TemplateImportTests.\(UUID().uuidString)"))
+        // `TestDefaults.freshSuiteName()` rather than a UUID for the same reason as everywhere
+        // else here — a fresh domain per run is a fresh file per run. The spy has to subclass
+        // `UserDefaults`, so it takes the name instead of an instance.
+        let spy = try #require(UserDefaultsSetOrderSpy(suiteName: TestDefaults.freshSuiteName()))
 
         _ = TemplateStore(fileURL: fileURL, defaults: spy)
 
@@ -800,7 +803,7 @@ struct TemplateImportTests {
     }
 
     private func isolatedDefaults() throws -> UserDefaults {
-        try #require(UserDefaults(suiteName: "TemplateImportTests.\(UUID().uuidString)"))
+        TestDefaults.isolated()
     }
 
     private func encode(_ templates: [Template]) throws -> Data {

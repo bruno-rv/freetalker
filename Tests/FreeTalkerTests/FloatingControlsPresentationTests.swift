@@ -72,7 +72,7 @@ import Testing
     }
 
     @Test func externalLanguageChangeRefreshesLauncherPresentation() {
-        let suite = "FloatingControlsPresentationTests.\(UUID())"
+        let suite = TestDefaults.freshSuiteName()
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = AppSettings(defaults: defaults)
@@ -96,7 +96,7 @@ import Testing
     }
 
     @Test func dictationLanguagesChangeRebuildsTheLauncherLanguageMenu() async {
-        let suite = "FloatingControlsPresentationTests.languages.\(UUID())"
+        let suite = TestDefaults.freshSuiteName()
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = AppSettings(defaults: defaults)
@@ -152,7 +152,7 @@ import Testing
     }
 
     @Test func outputSelectionCallbackKeepsPreRecordingOverrideSynchronized() {
-        let suite = "FloatingControlsPresentationTests.output.\(UUID())"
+        let suite = TestDefaults.freshSuiteName()
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = AppSettings(defaults: defaults)
@@ -174,7 +174,7 @@ import Testing
     }
 
     @Test func restartReinstallsOutputDefaultProviderAndCredentialSubscriptionsOnce() async {
-        let suite = "FloatingControlsPresentationTests.restart.\(UUID())"
+        let suite = TestDefaults.freshSuiteName()
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = AppSettings(defaults: defaults)

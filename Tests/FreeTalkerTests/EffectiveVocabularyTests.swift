@@ -82,7 +82,7 @@ struct EffectiveVocabularyTests {
     /// consumer does.
     @MainActor
     @Test func approvedVocabularyCacheFlowsIntoVocabularyAndCloudLLMSnapshot() throws {
-        let suite = "EffectiveVocabularyTests.\(UUID().uuidString)"
+        let suite = TestDefaults.freshSuiteName()
         let defaults = try #require(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = AppSettings(defaults: defaults)
@@ -102,7 +102,7 @@ struct EffectiveVocabularyTests {
     /// property over current `vocabularyText` + the current approved cache.
     @MainActor
     @Test func manualEditCanDisplaceAPreviouslyFittingApprovedTerm() throws {
-        let suite = "EffectiveVocabularyTests.\(UUID().uuidString)"
+        let suite = TestDefaults.freshSuiteName()
         let defaults = try #require(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = AppSettings(defaults: defaults)

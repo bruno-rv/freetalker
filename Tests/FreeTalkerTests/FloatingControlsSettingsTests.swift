@@ -244,10 +244,7 @@ struct FloatingControlsSettingsTests {
     }
 
     private func isolatedDefaults() -> UserDefaults {
-        let suite = "FloatingControlsSettingsTests.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.set(suite, forKey: "testSuiteName")
-        return defaults
+        TestDefaults.isolated()
     }
 
     private func remove(_ defaults: UserDefaults) {
@@ -291,10 +288,11 @@ private final class FloatingSettingsFixture {
     let settings: AppSettings
 
     init() throws {
-        let suite = "FloatingControlsSettingsTests.Fixture.\(UUID().uuidString)"
+        let suite = TestDefaults.freshSuiteName()
         guard let defaults = UserDefaults(suiteName: suite) else {
             throw FloatingSettingsFixtureError.unavailableDefaults
         }
+        defaults.removePersistentDomain(forName: suite)
         suiteName = suite
         cleanupDefaults = defaults
         self.defaults = defaults

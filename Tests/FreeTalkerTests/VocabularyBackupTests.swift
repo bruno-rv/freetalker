@@ -227,8 +227,7 @@ import Testing
     }
 
     private func makeEnv() throws -> Env {
-        let suite = "VocabularyBackupTests.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suite))
+        let defaults = TestDefaults.isolated()
         let templatesDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("vocab-backup-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: templatesDirectory, withIntermediateDirectories: true)

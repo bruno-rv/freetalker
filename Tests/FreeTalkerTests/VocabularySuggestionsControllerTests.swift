@@ -102,7 +102,7 @@ import Testing
         // (VocabularyFitGate.tokenBudget, ~111 bytes) for ONE more 10-byte approved term, never
         // two — see this file's suite-level math in the comment on `termA`/`termB` below.
         let fillerTerms = (0..<4).map { "filler-term-number-\(String(format: "%02d", $0))" }
-        let suite = "VocabularySuggestionsControllerTests.\(UUID().uuidString)"
+        let suite = TestDefaults.freshSuiteName()
         let defaults = try #require(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = AppSettings(defaults: defaults)
