@@ -178,9 +178,14 @@ enum Insertion {
     @discardableResult
     static func insert(
         _ text: String, target: InsertionTarget? = nil, strict: Bool = false,
-        restoresPasteboard: Bool = true
+        restoresPasteboard: Bool = true,
+        // Defaults to the system pasteboard, which is the only thing production ever passes.
+        // Tests pass a private one: this function writes the text BEFORE deciding whether the
+        // paste can proceed, and the drift path below deliberately returns without restoring so
+        // the user can paste manually — correct in the app, but in a test it means every run
+        // leaves its fixture text on the real clipboard.
+        pasteboard: NSPasteboard = .general
     ) -> InsertionOutcome {
-        let pasteboard = NSPasteboard.general
         let savedItems = pasteboardSnapshot(pasteboard)
 
         pasteboard.clearContents()
@@ -229,7 +234,9 @@ enum Insertion {
         let posted = postCommandV()
 
         if posted, restoresPasteboard {
-            schedulePasteboardRestore(savedItems, changeCountAfterWrite: changeCountAfterWrite)
+            schedulePasteboardRestore(
+                savedItems, changeCountAfterWrite: changeCountAfterWrite, pasteboardName: pasteboard.name
+            )
         } else if !posted {
             logger.error("paste skipped: reason=\(InsertionFailureReason.pasteFailed.logLabel, privacy: .public) (CGEvent post unavailable)")
         }
@@ -257,13 +264,15 @@ enum Insertion {
     /// restore option in Settings.
     private static func schedulePasteboardRestore(
         _ savedItems: [[NSPasteboard.PasteboardType: Data]],
-        changeCountAfterWrite: Int
+        changeCountAfterWrite: Int,
+        pasteboardName: NSPasteboard.Name
     ) {
-        // `NSPasteboard.general` is re-read inside the closure rather than captured: it's the same
-        // single system pasteboard either way, and capturing the object would send a
-        // task-isolated reference into a main-actor closure.
+        // The pasteboard is re-looked-up by name inside the closure rather than captured:
+        // capturing the object would send a task-isolated reference into a main-actor closure.
+        // The name is carried so an injected pasteboard restores itself rather than the system
+        // one — previously this hardcoded `.general`, which was right only while `insert` did.
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-            let pasteboard = NSPasteboard.general
+            let pasteboard = NSPasteboard(name: pasteboardName)
             guard pasteboard.changeCount == changeCountAfterWrite else { return }
             restore(savedItems, to: pasteboard)
         }
@@ -766,7 +775,10 @@ enum Insertion {
     @MainActor
     static func restoreEarlyInsertionClipboard(_ receipt: EarlyInsertionReceipt) {
         schedulePasteboardRestore(
-            receipt.savedPasteboard, changeCountAfterWrite: NSPasteboard.general.changeCount
+            receipt.savedPasteboard,
+            changeCountAfterWrite: NSPasteboard.general.changeCount,
+            // The early-insertion path is production-only and always the system pasteboard.
+            pasteboardName: NSPasteboard.general.name
         )
     }
 

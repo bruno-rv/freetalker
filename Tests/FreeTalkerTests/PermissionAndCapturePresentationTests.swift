@@ -1,3 +1,4 @@
+import AppKit
 import AVFoundation
 import Testing
 @testable import FreeTalker
@@ -417,6 +418,14 @@ import Testing
         #expect(reason == .targetDrift)
     }
 
+    /// A pasteboard of this test's own. `Insertion.insert` writes the text before it decides
+    /// whether the paste can proceed, and the drift path it exercises returns without restoring,
+    /// so against `NSPasteboard.general` every run of this suite left its fixture text on the
+    /// user's real clipboard — verified with `pbpaste` after a full run.
+    private static func privatePasteboard() -> NSPasteboard {
+        NSPasteboard(name: NSPasteboard.Name("FreeTalkerTests.PermissionAndCapture.\(UUID().uuidString)"))
+    }
+
     /// `@MainActor` is required, not decorative: `Insertion.insert` mutates `NSPasteboard.general`
     /// and reads back `NSPasteboardItem`s, which any other `clearContents()` invalidates. These two
     /// were bare `@Test`, so swift-testing ran them in parallel on arbitrary threads and each freed
@@ -428,7 +437,9 @@ import Testing
         // target, `strict: true`) must report `.targetDrift`/`posted == false` — the manual-
         // paste flow — never an unverified synthetic paste, regardless of this process's own
         // Accessibility/AX-trust state.
-        let outcome = Insertion.insert("Panel strict-mode test text", target: nil, strict: true)
+        let outcome = Insertion.insert(
+            "Panel strict-mode test text", target: nil, strict: true, pasteboard: Self.privatePasteboard()
+        )
         #expect(outcome == .failure(.targetDrift))
         #expect(!outcome.isPermissionClassFailure)
     }
@@ -442,7 +453,9 @@ import Testing
             bundleID: "org.freetalker.does-not-exist.\(UUID().uuidString)",
             pid: -1, focusedElement: nil, window: nil
         )
-        let outcome = Insertion.insert("Permission Diagnosis test text", target: target)
+        let outcome = Insertion.insert(
+            "Permission Diagnosis test text", target: target, pasteboard: Self.privatePasteboard()
+        )
         #expect(outcome == .failure(.targetDrift))
         #expect(!outcome.isPermissionClassFailure)
     }
