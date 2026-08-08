@@ -13,15 +13,16 @@ import Testing
         let suiteName = "RecoveryRetryTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         return (AppSettings(defaults: defaults), {
-            // Flush first, then remove. `AppSettings.init` normalizes a few keys and writes them
-            // back, and those writes sit in cfprefsd — removing the domain before they land lets
-            // cfprefsd recreate the file afterwards, which is how the pattern leaks a plist per
-            // run despite the removal.
             defaults.removePersistentDomain(forName: suiteName)
             UserDefaults.standard.removeSuite(named: suiteName)
-            // `removePersistentDomain` empties the domain but cfprefsd still writes a 42-byte stub
-            // plist for it, so the file count keeps growing even though nothing is in the files.
-            // Unlinking our own just-unregistered test domain is safe in a way that sweeping
+            // All three steps are load-bearing, and the first two alone are not enough.
+            // `removePersistentDomain` does empty the domain — the file drops from real content to
+            // a 42-byte `{}` — but cfprefsd writes that stub back, so the file count still climbs
+            // by one per run. Measured: removal-only went 8 → 9 → 10 across three runs, and
+            // `synchronize()` before and/or after made no difference. `DictationLanguageTests` is
+            // the same story at scale: 2,124 of its 2,126 leaked files are 42-byte stubs, i.e. its
+            // removal works and it leaks anyway. Unlinking our own just-unregistered test domain
+            // is what holds the count flat, and it is safe in a way that sweeping
             // `~/Library/Preferences` generally is not.
             try? FileManager.default.removeItem(
                 atPath: NSString(string: "~/Library/Preferences/\(suiteName).plist").expandingTildeInPath
