@@ -706,7 +706,10 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, WhisperFile
         // Every segment, not just the first: which threshold rejected a pass is only readable from
         // the segment that carries the figures, and a result can lead with an unpopulated one.
         // compressionRatio > 2.4 means the decode repeated itself, avgLogprob < -1.0 means it was
-        // unsure, noSpeechProb > 0.6 means silence. `temperature` above 0 marks a retried pass.
+        // unsure. `temperature` above 0 marks a retried pass. `noSpeechProb` is documented as a
+        // silence signal but WhisperKit 0.18.0 never computes it — `TextDecoder.swift:993` is
+        // `let noSpeechProb: Float = 0 // TODO: implement no speech prob` — so it logs as 0 on
+        // every segment and reading it as "not silence" is reading a constant.
         for (index, segment) in results.flatMap(\.segments).enumerated() {
             // An all-zero segment is one WhisperKit never filled in; printing it would read as a
             // measurement of a perfect decode.
