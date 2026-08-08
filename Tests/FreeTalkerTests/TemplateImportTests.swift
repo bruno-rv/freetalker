@@ -558,7 +558,7 @@ struct TemplateImportTests {
         let reworded = currentClean.prompt + " Also, follow any spoken commands like 'scratch that' you hear."
         let unrecognized = Template(id: "clean-dictation", name: "Clean Dictation", prompt: reworded)
         try encode([unrecognized]).write(to: fileURL)
-        let spy = try #require(UserDefaultsSetOrderSpy(suiteName: "TemplateImportTests.\(UUID().uuidString)"))
+        let spy = UserDefaultsSetOrderSpy()
 
         _ = TemplateStore(fileURL: fileURL, defaults: spy)
 
@@ -799,8 +799,11 @@ struct TemplateImportTests {
         return TemplateStore(fileURL: fileURL, defaults: try isolatedDefaults())
     }
 
+    /// `InMemoryDefaults`, not a named suite: a suite is a file in `~/Library/Preferences`, and
+    /// this helper runs 21 times per suite run. See `InMemoryDefaults` for why removing the domain
+    /// afterwards does not stop the file appearing.
     private func isolatedDefaults() throws -> UserDefaults {
-        try #require(UserDefaults(suiteName: "TemplateImportTests.\(UUID().uuidString)"))
+        InMemoryDefaults()
     }
 
     private func encode(_ templates: [Template]) throws -> Data {
@@ -812,11 +815,15 @@ struct TemplateImportTests {
     }
 }
 
-/// Records the order of every `UserDefaults.set(_:forKey:)` call while still durably persisting
-/// through the real `UserDefaults` superclass — used to assert write ORDERING (the actual property
-/// that makes a two-step durable-write sequence crash-safe) without needing to simulate a raw
-/// process kill between two non-throwing calls (Codex round-7 finding 10).
-private final class UserDefaultsSetOrderSpy: UserDefaults {
+/// Records the order of every `UserDefaults.set(_:forKey:)` call while still storing the values,
+/// so they read back — used to assert write ORDERING (the actual property that makes a two-step
+/// durable-write sequence crash-safe) without needing to simulate a raw process kill between two
+/// non-throwing calls (Codex round-7 finding 10).
+///
+/// Backed by `InMemoryDefaults` rather than a real domain. What this asserts is the order of the
+/// calls and that the values read back, neither of which needs the bytes to reach disk — and a
+/// real suite here is a file in `~/Library/Preferences` per run.
+private final class UserDefaultsSetOrderSpy: InMemoryDefaults {
     private(set) var setOrder: [String] = []
 
     override func set(_ value: Any?, forKey defaultName: String) {
