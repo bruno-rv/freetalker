@@ -3,10 +3,30 @@ import Testing
 @testable import FreeTalker
 
 @Suite struct RecoveryRetryTests {
-    /// Same pattern as `DictationLanguageTests.isolatedDefaults()`: a per-call domain, so parallel
-    /// suites cannot clear each other's and nothing here can reach the real one.
-    private func isolatedDefaults() -> UserDefaults {
-        UserDefaults(suiteName: "RecoveryRetryTests.\(UUID().uuidString)")!
+    /// A per-call domain, so parallel suites cannot clear each other's and nothing here can reach
+    /// the real one — and removed again on the way out, which the older copies of this pattern do
+    /// not all do. A `UserDefaults` suite is a file in `~/Library/Preferences`, so a per-test UUID
+    /// name without a matching removal leaves one behind on every run: measured at 69,107 such
+    /// files, 298 MB, across nine suites, accumulating since 11 July. Cleaning up the existing
+    /// files and the other suites are separate jobs; this one just does not add to the pile.
+    @MainActor private static func isolatedSettings() -> (settings: AppSettings, removeDomain: () -> Void) {
+        let suiteName = "RecoveryRetryTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        return (AppSettings(defaults: defaults), {
+            // Flush first, then remove. `AppSettings.init` normalizes a few keys and writes them
+            // back, and those writes sit in cfprefsd — removing the domain before they land lets
+            // cfprefsd recreate the file afterwards, which is how the pattern leaks a plist per
+            // run despite the removal.
+            defaults.removePersistentDomain(forName: suiteName)
+            UserDefaults.standard.removeSuite(named: suiteName)
+            // `removePersistentDomain` empties the domain but cfprefsd still writes a 42-byte stub
+            // plist for it, so the file count keeps growing even though nothing is in the files.
+            // Unlinking our own just-unregistered test domain is safe in a way that sweeping
+            // `~/Library/Preferences` generally is not.
+            try? FileManager.default.removeItem(
+                atPath: NSString(string: "~/Library/Preferences/\(suiteName).plist").expandingTildeInPath
+            )
+        })
     }
 
     @MainActor @Test func recoveredDictationMustPersistBeforeItsAudioCanBeFinalized() throws {
@@ -78,7 +98,8 @@ import Testing
         // appear in the assertion below, which is what made this fail 2 of 8 full-suite runs. A
         // fresh instance has an empty cache and an empty domain, so `vocabulary` is exactly what
         // this test sets.
-        let settings = AppSettings(defaults: isolatedDefaults())
+        let (settings, removeDomain) = Self.isolatedSettings()
+        defer { removeDomain() }
         settings.vocabularyText = "Alpha"
 
         let transcriber = VocabularyMutatingTranscriberProbe {
