@@ -299,6 +299,13 @@ import WhisperKit
         // Bruno's own history (library.db `dictations.duration_secs`, 106 rows) puts 72.6% of all
         // transcribed audio seconds in dictations of 30 s or more, mean 30.6 s, max 299.9 s — so
         // the interesting regime is several windows, not one. Sweep it.
+        // Deterministic: the corpus in `corpus()`'s order (filenames sorted, duplicates dropped by
+        // content), repeated until the target is covered, then truncated to exactly
+        // `seconds * 16_000` samples at 16 kHz mono. The manifest is printed below so a run's
+        // numbers can be checked against the input that produced them — the corpus lives outside
+        // the repo (`~/Library/Application Support/FreeTalker/failed-dictations`) and grows as
+        // dictations fail, so a later run on a different machine is not comparing like with like
+        // unless the manifest matches.
         func synthetic(seconds: Int) -> [Float] {
             var samples: [Float] = []
             let target = seconds * 16_000
@@ -308,11 +315,15 @@ import WhisperKit
             return Array(samples.prefix(target))
         }
 
+        for clip in clips {
+            print("=== chunking corpus clip=\(clip.name) samples=\(clip.samples.count) seconds=\(Self.format(Double(clip.samples.count) / 16_000))")
+        }
+
         _ = try await kit.transcribe(audioArray: synthetic(seconds: 30), decodeOptions: options(language: "en", chunking: nil, fallbacks: 2))
         for seconds in [30, 60, 120, 300] {
             let input = synthetic(seconds: seconds)
-            // `.vad` only at the ends of the sweep: it was 1.7x SLOWER at 97 s in the first run,
-            // and the question left open is whether that holds as window count grows.
+            // `.vad` only at the ends of the sweep: if it loses at both one window and twelve,
+            // the middle is not where it starts winning. An assumption, not a measurement.
             let strategies: [(String, ChunkingStrategy?)] = seconds == 30 || seconds == 300
                 ? [("sequential", nil), ("vad", .vad)]
                 : [("sequential", nil)]
@@ -323,13 +334,19 @@ import WhisperKit
                     decodeOptions: options(language: "en", chunking: strategy, fallbacks: WhisperKitEngine.decodeFallbackBudget(preview: false))
                 )
                 let wall = Date().timeIntervalSince(start)
-                let timings = results.first?.timings
+                // Summed across every result, not read off the first: `.vad` returns one result
+                // per voice-activity chunk (15 at 300 s) while sequential returns one, so
+                // `results.first?.timings` would report the first chunk's counters as if they
+                // were the whole run and make the arms look comparable when they are not.
+                let loops = results.reduce(0.0) { $0 + $1.timings.totalDecodingLoops }
+                let windows = results.reduce(0.0) { $0 + $1.timings.totalDecodingWindows }
+                let fallbacks = results.reduce(0.0) { $0 + $1.timings.totalDecodingFallbacks }
                 let text = results.map(\.text).joined(separator: " ")
                 print("""
                 === chunking audio=\(seconds)s \(label): wall=\(Self.format(wall))s \
                 realtimeFactor=\(Self.format(wall / Double(seconds))) results=\(results.count) \
-                loops=\(Int(timings?.totalDecodingLoops ?? 0)) windows=\(Int(timings?.totalDecodingWindows ?? 0)) \
-                fallbacks=\(Int(timings?.totalDecodingFallbacks ?? 0)) chars=\(text.count)
+                loops=\(Int(loops)) windows=\(Int(windows)) \
+                fallbacks=\(Int(fallbacks)) chars=\(text.count)
                 """)
             }
         }
@@ -418,18 +435,24 @@ import WhisperKit
     /// anything shorter than a second — shared by the corpus-wide benchmarks.
     private static func corpus() throws -> [(name: String, samples: [Float])] {
         let corpusRoot = NSString(string: "~/Library/Application Support/FreeTalker/failed-dictations").expandingTildeInPath
-        var seen = Set<Data>()
+        var seen = Set<[Float]>()
         var clips: [(name: String, samples: [Float])] = []
+        // Every source goes through the same two filters — dedupe on decoded samples, drop
+        // anything under a second — so "distinct clips over 1 s" is a property of this function
+        // rather than of which directory a clip happened to come from. `last-dictation.wav` is
+        // usually a copy of the newest failure, so without the dedupe it doubles one clip's weight
+        // in the concatenated sweep.
+        func admit(_ name: String, _ samples: [Float]) {
+            guard samples.count >= 16_000, seen.insert(samples).inserted else { return }
+            clips.append((name, samples))
+        }
         for name in try FileManager.default.contentsOfDirectory(atPath: corpusRoot).sorted()
         where name.hasSuffix(".wav") {
             let data = try Data(contentsOf: URL(fileURLWithPath: corpusRoot).appendingPathComponent(name))
-            guard seen.insert(data).inserted else { continue }
-            let samples = try decodeWAV(data)
-            guard samples.count >= 16_000 else { continue }
-            clips.append((name, samples))
+            admit(name, try decodeWAV(data))
         }
         if let latest = try? loadPCM(path: audioPath) {
-            clips.append(("last-dictation.wav", latest))
+            admit("last-dictation.wav", latest)
         }
         return clips
     }

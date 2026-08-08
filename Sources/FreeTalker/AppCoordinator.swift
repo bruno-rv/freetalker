@@ -3081,6 +3081,18 @@ final class AppCoordinator: ObservableObject {
     private var livePreviewGeneration = 0
     private var livePreviewInFlight = false
     private var lastLivePreviewText: String?
+    /// The language an earlier preview tick already resolved for this recording, reused by later
+    /// ticks so they skip WhisperKit's separate detection pass — a whole logmel+encoder pass over
+    /// the window, measured at a constant ~0.31 s here regardless of window length (see
+    /// `docs/perf-decode-latency-2026-08-08.md`, finding 1), paid every
+    /// `livePreviewTickInterval` seconds on the same ANE the final transcription is about to need.
+    ///
+    /// Preview lane only. The final transcription still resolves the language from its own audio,
+    /// so the words the user keeps are never decided by an earlier window. It is not a no-op
+    /// though: preview text now follows the first language of the recording that produced words,
+    /// and only re-detects once that language stops producing them (see `runLivePreviewTick`).
+    /// Reset per recording alongside `lastLivePreviewText`.
+    private var livePreviewResolvedLanguage: String?
 
     nonisolated static func shouldRunLivePreviewTick(isRecording: Bool, isPartialInFlight: Bool, sampleCount: Int, minSamples: Int) -> Bool {
         isRecording && !isPartialInFlight && sampleCount >= minSamples
@@ -3088,6 +3100,34 @@ final class AppCoordinator: ObservableObject {
 
     nonisolated static func shouldAcceptLivePreviewResult(isRecording: Bool, resultGeneration: Int, currentGeneration: Int) -> Bool {
         isRecording && resultGeneration == currentGeneration
+    }
+
+    /// What a preview tick pins its decode to. `nil` means "let the engine resolve it", which is
+    /// what every first tick of a recording gets.
+    ///
+    /// A cached language is only reused while it is still one of the recording's candidates. That
+    /// set is frozen at Recording start, so this cannot disagree with it mid-recording — the check
+    /// guards against reusing a language the engine reported from outside the configured set, not
+    /// against a live settings change.
+    nonisolated static func livePreviewForcedLanguage(cached: String?, candidates: [String]) -> String? {
+        guard let cached, candidates.contains(cached) else { return nil }
+        return cached
+    }
+
+    /// What the recording's pin becomes after a tick this recording accepted.
+    ///
+    /// A tick that produced words pins its language; a tick that came back empty drops the pin so
+    /// the next one re-detects. Both halves matter. Pinning from an empty tick would let detection
+    /// over a near-silent window stick for the whole recording, and *not* dropping on empty would
+    /// leave a pin taken before a mid-recording language switch decoding the rest of the recording
+    /// in the wrong language.
+    ///
+    /// Ceiling: recovery only fires when the stale pin stops yielding words. A wrong pin that
+    /// keeps producing plausible text holds until the recording ends — preview text only; the
+    /// final transcript resolves its own language. Upgrade path if that is ever seen: re-detect
+    /// every N ticks rather than only on an empty one.
+    nonisolated static func livePreviewPin(resultLanguage: String, text: String) -> String? {
+        text.isEmpty ? nil : resultLanguage
     }
 
     nonisolated static func isLivePreviewEnabled(settingEnabled: Bool, sttEngine: STTEngineKind, whisperKitLoaded: Bool) -> Bool {
@@ -3104,6 +3144,7 @@ final class AppCoordinator: ObservableObject {
         let generation = livePreviewGeneration
         livePreviewInFlight = false
         lastLivePreviewText = nil
+        livePreviewResolvedLanguage = nil
 
         guard Self.isLivePreviewEnabled(
             settingEnabled: AppSettings.shared.livePreviewEnabled,
@@ -3379,11 +3420,20 @@ final class AppCoordinator: ObservableObject {
         // display-only and superseded by the next tick — and, while a Recording runs, spent on the
         // same ANE the final transcription is about to need. The words the user keeps come from
         // the final pipeline, which makes its own decision.
-        guard let result = try? await whisperEngine.transcribe(samples: window, forcedLanguage: nil, candidateLanguages: recordingLanguageSnapshot, vocabulary: [], allowEarlyCancel: true) else { return }
+        // `livePreviewResolvedLanguage`: after the first tick of this recording resolves a
+        // language, later ticks are pinned to it and skip the detection pass entirely.
+        let forcedLanguage = Self.livePreviewForcedLanguage(
+            cached: livePreviewResolvedLanguage,
+            candidates: recordingLanguageSnapshot
+        )
+        guard let result = try? await whisperEngine.transcribe(samples: window, forcedLanguage: forcedLanguage, candidateLanguages: recordingLanguageSnapshot, vocabulary: [], allowEarlyCancel: true) else { return }
 
         guard Self.shouldAcceptLivePreviewResult(isRecording: isRecording, resultGeneration: generation, currentGeneration: livePreviewGeneration) else { return }
 
         let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Set only from a tick this recording still accepts (hence below the generation gate).
+        // `livePreviewPin` owns both halves of the rule and documents their ceiling.
+        livePreviewResolvedLanguage = Self.livePreviewPin(resultLanguage: result.language, text: text)
         guard !text.isEmpty, text != lastLivePreviewText else { return }
         lastLivePreviewText = text
         if let destination = recordingDestination {

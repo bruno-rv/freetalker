@@ -268,6 +268,37 @@ struct DictationLanguageTests {
         #expect(settings.appLanguageRules == ["com.example.app": "en"])
     }
 
+    // MARK: - Live-preview language pin
+
+    /// The first tick of a recording has nothing pinned, so it detects; later ticks reuse what it
+    /// resolved instead of paying the detection pass again (~0.31 s of ANE work per tick, on the
+    /// same ANE the final transcription is about to need — see
+    /// `docs/perf-decode-latency-2026-08-08.md`).
+    @Test func aPreviewTickReusesTheLanguageAnEarlierTickResolved() {
+        #expect(AppCoordinator.livePreviewForcedLanguage(cached: nil, candidates: ["en", "pt"]) == nil)
+        #expect(AppCoordinator.livePreviewForcedLanguage(cached: "pt", candidates: ["en", "pt"]) == "pt")
+    }
+
+    /// A language the engine reported from outside the recording's candidate set is not reusable:
+    /// pinning to it would decode later ticks in a language the Dictation Language Set never
+    /// allowed.
+    @Test func aPreviewTickDoesNotReuseALanguageOutsideTheCandidateSet() {
+        #expect(AppCoordinator.livePreviewForcedLanguage(cached: "de", candidates: ["en", "pt"]) == nil)
+        #expect(AppCoordinator.livePreviewForcedLanguage(cached: "pt", candidates: []) == nil)
+    }
+
+    /// A tick that produced words pins its language for the ticks after it.
+    @Test func aPreviewTickThatProducedWordsPinsItsLanguage() {
+        #expect(AppCoordinator.livePreviewPin(resultLanguage: "pt", text: "olá") == "pt")
+    }
+
+    /// And a tick that came back empty drops the pin, so the next one re-detects. Without this,
+    /// a pin taken before a mid-recording language switch would decode the rest of the recording
+    /// in the language the user stopped speaking.
+    @Test func anEmptyPreviewTickDropsThePinSoTheNextOneReDetects() {
+        #expect(AppCoordinator.livePreviewPin(resultLanguage: "en", text: "") == nil)
+    }
+
     // MARK: - Helpers
 
     private func isolatedDefaults() -> UserDefaults {
