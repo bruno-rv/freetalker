@@ -71,9 +71,82 @@ struct LLMProviderDefault: Equatable {
 /// Secrets (API keys) never live here — see Keychain.swift.
 @MainActor
 final class AppSettings: ObservableObject {
-    static let shared = AppSettings()
+    static let shared = AppSettings(defaults: sharedBackingStore())
 
     private let defaults: UserDefaults
+
+    /// Where `shared` persists. The real app's defaults normally — but never from a test process.
+    ///
+    /// Two reasons, one measured and one structural.
+    ///
+    /// Measured: `recoveryRetryUsesOneVocabularySnapshotForTranscriptionAndPostProcessing` failed
+    /// 2 of 8 full-suite runs on `main` with `["Alpha", "Qdrant"]` where it expected `["Alpha"]`.
+    /// "Qdrant" is a real user vocabulary term arriving from the real domain through another
+    /// suite's restore window, since these suites run in parallel against one singleton. An
+    /// isolated domain removes the source of the contamination.
+    ///
+    /// Structural: `RecoveryRetryTests` replaces `vocabularyText` and restores it in a `defer`,
+    /// which does not run when the process dies — and it does die, in a pre-existing
+    /// `EXC_BAD_ACCESS` under `-[NSPasteboard _updateTypeCacheIfNeeded]` reached from
+    /// `Insertion.pasteboardSnapshot` in `PermissionAndCapturePresentationTests`. Every such crash
+    /// was a chance to leave a real 13-term vocabulary set to "Alpha", silently.
+    ///
+    /// Not a fix for tests racing each other: `AppSettings.shared` is still one object, and two
+    /// parallel tests mutating the same property still race. What this removes is the real domain
+    /// as a participant.
+    ///
+    /// Safe under a false positive: `removePersistentDomain` names only `testDomainName`, so the
+    /// worst case if this ever misfires in the shipped app is that it reads an empty isolated
+    /// domain. The user's real values stay on disk, untouched and recoverable.
+    private static func sharedBackingStore() -> UserDefaults {
+        guard isRunningUnderTest(
+            environment: ProcessInfo.processInfo.environment,
+            xcTestLinked: NSClassFromString("XCTestCase") != nil,
+            executablePath: Bundle.main.executablePath,
+            processName: ProcessInfo.processInfo.processName
+        ) else { return .standard }
+
+        // Crashing loudly beats the fallback here: `.standard` in a test process is the exact
+        // outcome this function exists to prevent. Unreachable in practice — `UserDefaults`
+        // rejects only reserved suite names.
+        guard let isolated = UserDefaults(suiteName: testDomainName) else {
+            preconditionFailure("Could not isolate UserDefaults for tests; refusing to fall back to the real domain")
+        }
+        // On first access to `shared`, not at process start — this is a `static let`, so the wipe
+        // happens whenever something first reads it. Anything written directly to this domain
+        // before that point is discarded.
+        isolated.removePersistentDomain(forName: testDomainName)
+        return isolated
+    }
+
+    /// Deliberately not `testSuiteName`: that exact string is already a defaults *key* in several
+    /// suites, meaning something unrelated.
+    private static let testDomainName = "org.freetalker.app.tests"
+
+    /// True inside a test process. Four signals because no single one covers every runner, and
+    /// the two obvious ones cover neither of the runners this package actually uses:
+    ///
+    /// - `XCTestConfigurationFilePath` is exported by XCTest, which `swift test` does not use here.
+    /// - `XCTestCase` is only present when XCTest is linked; a pure swift-testing bundle does not
+    ///   link it, and this package's suites are all swift-testing (measured: the class lookup
+    ///   returns nil under `swift test`).
+    /// - SwiftPM runs swift-testing inside `swiftpm-testing-helper`, which is what actually
+    ///   identifies this package's own runs.
+    /// - An `.xctest` bundle path covers `xctest`/Xcode invocations.
+    ///
+    /// Heuristic by nature, so it is not left to fail silently: if a future toolchain renames the
+    /// helper and every signal misses, `sharedSettingsNeverWriteTheRealDomainFromTests` fails
+    /// rather than the suite quietly resuming writes to the user's real defaults.
+    nonisolated static func isRunningUnderTest(
+        environment: [String: String],
+        xcTestLinked: Bool,
+        executablePath: String?,
+        processName: String
+    ) -> Bool {
+        if environment["XCTestConfigurationFilePath"] != nil || xcTestLinked { return true }
+        if processName == "swiftpm-testing-helper" || processName == "xctest" { return true }
+        return executablePath?.contains(".xctest") ?? false
+    }
 
     /// The push-to-talk hotkey: modifier chord and/or non-modifier key. Persisted as JSON;
     /// legacy single-modifier installs (pre-HotKeySpec `hotKeyDeviceMask`) are migrated in

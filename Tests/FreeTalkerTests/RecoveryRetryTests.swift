@@ -3,6 +3,32 @@ import Testing
 @testable import FreeTalker
 
 @Suite struct RecoveryRetryTests {
+    /// `recoveryRetryUsesOneVocabularySnapshotForTranscriptionAndPostProcessing` below writes
+    /// `AppSettings.shared.vocabularyText` and restores it in a `defer`. That is only safe because
+    /// `AppSettings.sharedBackingStore()` gives a test process its own domain — a `defer` does not
+    /// run when the process is killed, and this suite has been measured aborting mid-run. This
+    /// pins the guarantee: if `shared` ever goes back to the real domain, the write below is
+    /// editing the user's live vocabulary and this fails first.
+    @MainActor @Test func sharedSettingsNeverWriteTheRealDomainFromTests() throws {
+        // `try #require`, not `#expect`: `#expect` records the failure and carries on into the
+        // write below, which would put the sentinel into the user's real domain — the exact
+        // outcome this test exists to catch. That is not hypothetical; the first version of this
+        // test used `#expect` and did precisely that when detection was broken.
+        try #require(AppSettings.isRunningUnderTest(
+            environment: ProcessInfo.processInfo.environment,
+            xcTestLinked: NSClassFromString("XCTestCase") != nil,
+            executablePath: Bundle.main.executablePath,
+            processName: ProcessInfo.processInfo.processName
+        ))
+        let real = UserDefaults.standard.string(forKey: "vocabularyText")
+        let original = AppSettings.shared.vocabularyText
+        defer { AppSettings.shared.vocabularyText = original }
+
+        AppSettings.shared.vocabularyText = "SentinelTermThatMustNotEscape"
+
+        #expect(UserDefaults.standard.string(forKey: "vocabularyText") == real)
+    }
+
     @MainActor @Test func recoveredDictationMustPersistBeforeItsAudioCanBeFinalized() throws {
         // `duration: 3.5` here proves the field carries through `persistRecoveredDictation` to the
         // record boundary (`persisted == dictation` compares it). The upstream computation
