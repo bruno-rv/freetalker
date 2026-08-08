@@ -454,6 +454,12 @@ import WhisperKit
         if let latest = try? loadPCM(path: audioPath) {
             admit("last-dictation.wav", latest)
         }
+        // Every caller either indexes `clips[0]` or concatenates the corpus to a target length —
+        // and that concatenation loops until it reaches the target, so an empty corpus is an
+        // infinite loop rather than a failure. One guard here beats one at each call site, and a
+        // machine without the capture directory (a fresh clone, or after a cleanup) deserves a
+        // sentence explaining what is missing rather than a hang.
+        guard !clips.isEmpty else { throw EmptyCorpusError(root: corpusRoot) }
         return clips
     }
 
@@ -757,6 +763,17 @@ import WhisperKit
 private enum DecodePromptBenchmarkWAVError: Error {
     case invalidContainer
     case unsupportedFormat
+}
+
+private struct EmptyCorpusError: Error, CustomStringConvertible {
+    let root: String
+    var description: String {
+        """
+        No benchmark clips found. These benchmarks read preserved captures from \(root) \
+        (plus last-dictation.wav), keeping distinct clips of at least 1 s. That directory is \
+        machine-local and is not part of the repo, so a fresh clone has nothing to measure.
+        """
+    }
 }
 
 private extension Data {
