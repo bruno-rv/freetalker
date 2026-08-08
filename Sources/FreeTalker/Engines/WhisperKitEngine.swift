@@ -357,6 +357,11 @@ final class WhisperKitEngine: ObservableObject, TranscriptionEngine, WhisperFile
 
     var isLoaded: Bool { modelController.state.isLoaded }
 
+    /// The variant behind the currently loaded kit, or nil when nothing is loaded. `isLoaded` only
+    /// says a model is resident; this says which one, so a caller that asked for an exact variant
+    /// can verify it got that one rather than one left over from an earlier load.
+    var loadedVariant: String? { modelController.state.snapshot().variant }
+
     /// Synchronous, non-loading accessor for the currently loaded tokenizer's exact token-count
     /// function (PLAN.md PR B, item 4's "tokenizer loaded → exact token count" path) — nil when no
     /// model is loaded yet, in which case `VocabularyFitGate`/`EffectiveVocabulary` fall back to
