@@ -3,6 +3,34 @@ import Testing
 @testable import FreeTalker
 
 @Suite struct RecoveryRetryTests {
+    /// A per-call domain, so parallel suites cannot clear each other's and nothing here can reach
+    /// the real one, emptied again on the way out. See the removal closure for what that does and
+    /// does not achieve — the contents go, the file does not.
+    @MainActor private static func isolatedSettings() -> (settings: AppSettings, removeDomain: () -> Void) {
+        let suiteName = "RecoveryRetryTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        return (AppSettings(defaults: defaults), {
+            // This empties the domain. It does NOT stop the file appearing, and nothing in this
+            // process can: cfprefsd is a separate daemon that writes a 42-byte `{}` stub back
+            // after the test process exits. Measured with a 120 s settling window — counts went
+            // 13 → 14 → 17 → 18 across three runs, every new file a stub, several with mtimes
+            // after the run that produced them. An earlier version of this also unlinked the plist
+            // directly and appeared to hold the count flat; that was the count being sampled
+            // before the daemon wrote, and raw-deleting a file while cfprefsd holds the domain is
+            // not worth doing for a benefit that does not exist.
+            //
+            // What is gained is the contents: the file drops from 252 bytes of real settings to an
+            // empty stub, so nothing this suite writes persists. `DictationLanguageTests` shows
+            // the same signature at scale — 2,124 of its 2,126 leaked files are 42-byte stubs.
+            //
+            // The file count itself is a suite-wide problem (69k files, 298 MB, nine suites) and
+            // needs a structural answer — an out-of-band sweep in the test target, or defaults
+            // that never touch disk — not a per-suite patch. Deliberately out of scope here.
+            defaults.removePersistentDomain(forName: suiteName)
+            UserDefaults.standard.removeSuite(named: suiteName)
+        })
+    }
+
     @MainActor @Test func recoveredDictationMustPersistBeforeItsAudioCanBeFinalized() throws {
         // `duration: 3.5` here proves the field carries through `persistRecoveredDictation` to the
         // record boundary (`persisted == dictation` compares it). The upstream computation
@@ -64,12 +92,24 @@ import Testing
     /// which is asserted here rather than assumed, so a future "just pass the vocabulary
     /// through" edit shows up as a failure instead of as a silent latency regression.
     @MainActor @Test func recoveryRetryUsesOneVocabularySnapshotForTranscriptionAndPostProcessing() async throws {
-        let originalVocabularyText = AppSettings.shared.vocabularyText
-        defer { AppSettings.shared.vocabularyText = originalVocabularyText }
-        AppSettings.shared.vocabularyText = "Alpha"
+        // Its own settings instance, not `AppSettings.shared`, for two reasons. Writing the
+        // singleton writes the user's real `UserDefaults`, and the `defer` that used to restore it
+        // does not run when the process dies. And `AppSettings.vocabulary` is the text PLUS
+        // `approvedVocabularyCache`, which `refreshApprovedVocabularyCache` fills asynchronously
+        // from the real `library.db` — so pinning only the text left a real approved term free to
+        // appear in the assertion below, which is what made this fail 2 of 8 full-suite runs. A
+        // fresh instance has an empty cache and an empty domain, so `vocabulary` is exactly what
+        // this test sets.
+        let (settings, removeDomain) = Self.isolatedSettings()
+        defer { removeDomain() }
+        // Load-bearing for the assertion below and for this test's determinism: `vocabulary` is
+        // `vocabularyText` PLUS the approved cache, so "== [\"Alpha\"]" only means what it says
+        // while the cache is empty. Asserted rather than assumed.
+        #expect(settings.approvedVocabularyCache.isEmpty)
+        settings.vocabularyText = "Alpha"
 
         let transcriber = VocabularyMutatingTranscriberProbe {
-            AppSettings.shared.vocabularyText = "Alpha\nBeta"
+            settings.vocabularyText = "Alpha\nBeta"
         }
         let processor = RecoveryPostProcessorSpy(output: "polished text")
 
@@ -79,13 +119,61 @@ import Testing
             captureID: UUID(),
             transcriber: transcriber,
             processor: processor,
-            record: { _ in }
+            record: { _ in },
+            settings: settings
         )
 
         let transcriberVocabulary = await transcriber.receivedVocabulary
         let postProcessorVocabulary = try #require(await processor.lastRequest?.vocabulary)
         #expect(postProcessorVocabulary == ["Alpha"])
         #expect(transcriberVocabulary == AppCoordinator.decoderBiasVocabulary(
+            postProcessorVocabulary,
+            refinementCarriesVocabulary: true,
+            biasCostsDecodeTime: await transcriber.vocabularyBiasCostsDecodeTime
+        ))
+    }
+
+    /// The empty approved cache that makes the test above deterministic also means that test
+    /// cannot see the approved-term half of `vocabulary` at all. That half is the one recovery
+    /// actually depends on: if a change left the approved cache stale or empty, retry would
+    /// silently drop every self-learned term and the test above would stay green, because it only
+    /// ever exercises `vocabularyText`.
+    ///
+    /// So: publish an approved term the way `refreshApprovedVocabularyCache` does — through
+    /// `applyApprovedVocabularyCache`, the one place that writes that cache — and prove it reaches
+    /// both consumers of the snapshot.
+    ///
+    /// Ceiling: this covers settings → transcriber/post-processor. It does not cover
+    /// `VocabStore` → settings, because `refreshApprovedVocabularyCache` writes
+    /// `AppSettings.shared` rather than an injectable owner; making that injectable is an
+    /// ownership change, not a test.
+    @MainActor @Test func recoveryRetryCarriesApprovedVocabularyTermsToBothConsumers() async throws {
+        let (settings, removeDomain) = Self.isolatedSettings()
+        defer { removeDomain() }
+        settings.vocabularyText = "Alpha"
+        settings.applyApprovedVocabularyCache([
+            ApprovedVocabularyTerm(normalizedTerm: "qdrant", surfaceTerm: "Qdrant", decidedAt: Date())
+        ])
+
+        let transcriber = VocabularyMutatingTranscriberProbe {}
+        let processor = RecoveryPostProcessorSpy(output: "polished text")
+
+        _ = try await AppCoordinator.shared.processRecoveredDictation(
+            samples: [0.1],
+            configuration: .init(),
+            captureID: UUID(),
+            transcriber: transcriber,
+            processor: processor,
+            record: { _ in },
+            settings: settings
+        )
+
+        let postProcessorVocabulary = try #require(await processor.lastRequest?.vocabulary)
+        #expect(postProcessorVocabulary == ["Alpha", "Qdrant"])
+        // The transcriber takes the same snapshot through `decoderBiasVocabulary` — retry always
+        // post-processes, so a bias-costing engine gets the empty projection. Asserting the
+        // relationship rather than the literal keeps this honest if that policy changes.
+        #expect(await transcriber.receivedVocabulary == AppCoordinator.decoderBiasVocabulary(
             postProcessorVocabulary,
             refinementCarriesVocabulary: true,
             biasCostsDecodeTime: await transcriber.vocabularyBiasCostsDecodeTime
