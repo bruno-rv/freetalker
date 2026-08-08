@@ -143,7 +143,7 @@ cleanup can't remove the model currently serving dictation. WhisperKit shares mo
 under `~/Documents/huggingface`.
 
 <p align="center">
-  <img src="docs/screenshots/settings-transcription.png" alt="Settings > Transcription showing the mic picker, noise reduction, WhisperKit vs Cloud engine toggle, model list, live preview, and vocabulary" width="700">
+  <img src="docs/screenshots/settings-transcription.png" alt="Settings > Transcription showing microphone and noise controls, the WhisperKit versus Cloud engine toggle, dictation languages, and the speech model list" width="700">
 </p>
 
 ## Permissions walkthrough
@@ -175,7 +175,7 @@ FreeTalker from the relevant Privacy & Security list, add the current app
 bundle again, enable it, and relaunch.
 
 <p align="center">
-  <img src="docs/screenshots/settings-privacy.png" alt="Settings > Privacy showing granted permissions and the local-only text context picker" width="700">
+  <img src="docs/screenshots/settings-privacy.png" alt="Settings > Privacy showing granted permissions, Permission Diagnosis, and the local-only Text context picker" width="700">
 </p>
 
 ## Settings
@@ -254,8 +254,8 @@ explanation; the same explanation is available as a hover tip.
   <img src="docs/screenshots/recording-hud.png" alt="FreeTalker recording HUD during hands-free recording, showing elapsed time, lock, context, cancel/done, Raw, language selectors, and active template" width="600">
 </p>
 
-- Menu bar icon → pick the **Active Template** (Clean Dictation, Refined Message, Refined
-  Prompt, Email — editable in Settings → Templates).
+- Menu bar icon → pick the **Active Template** (including Clean Dictation, Refined Message,
+  Refined Prompt, Email, and the Prompt Engineer variants — editable in Settings → Templates).
 - Hold **Right-⌥**, speak (English or Portuguese, auto-detected), release. A small pill HUD
   shows "Recording…" then "Processing…". Turn on **Live preview while recording** in
   Settings → Transcription and the HUD streams the transcript as you speak,
@@ -308,9 +308,10 @@ be explicitly resolved (English, via the language pin or an App Rule) at the mom
 recording; leaving language on **Auto** never streams, since there's no known language to type in
 yet. Cloud STT, Scratchpad dictation, and secure fields (password inputs) don't stream either —
 all of these fall back silently to today's batch behavior: no partial typing, refined text pasted
-once you stop, unchanged from before this feature existed. Tapping a one-shot **EN**/**PT**
-language override on the Recording Panel mid-recording also falls back to batch for the rest of
-that Recording, rather than trying to restart streaming under the new language.
+once you stop, unchanged from before this feature existed. Choosing a one-shot **English** or
+**Portuguese** language override from the **Speak** menu on the Recording Panel mid-recording
+also falls back to batch for the rest of that Recording, rather than trying to restart
+streaming under the new language.
 
 Safety comes first. Streaming only starts when the focused field has an empty, collapsed cursor —
 never over a selection, since typing over one would silently destroy it with no way to restore it
@@ -368,16 +369,18 @@ instead of replacing newer edits.
 
 ## Templates
 
-Four built-ins ship with the app: **Clean Dictation** (default), **Refined Message**,
-**Refined Prompt**, and **Email**. Every Template strips disfluencies ("um", "uh", "hmm") and
-collapses self-corrections — "I'll do A… actually, I'll do B" becomes "I'll do B" — even when
-the correction spans multiple sentences.
+Eight built-ins ship with the app: **Clean Dictation** (default), **Refined Message**,
+**Refined Prompt**, **Email**, **Prompt Engineer**, **Prompt Engineer (Fable 5)**,
+**Prompt Engineer (Opus 5)**, and **Prompt Engineer (Sonnet 5)**. The four general-purpose
+dictation templates strip disfluencies ("um", "uh", "hmm") and collapse self-corrections —
+"I'll do A… actually, I'll do B" becomes "I'll do B" — even when the correction spans multiple
+sentences.
 
 A built-in Template you've never edited quietly picks up improved prompts as the app evolves;
 once you edit one yourself, it's yours and is never touched automatically.
 
 <p align="center">
-  <img src="docs/screenshots/settings-templates.png" alt="Settings > Templates showing the template list and the Refined Message prompt editor" width="700">
+  <img src="docs/screenshots/settings-templates.png" alt="Settings > Templates showing the Voice commands toggle, Import, Export, New Template, and Delete Template controls, plus eight built-in templates" width="700">
 </p>
 
 ### Spoken Commands
@@ -427,7 +430,7 @@ post-processing requests; when cloud post-processing is configured, FreeTalker o
 ### Voice Edit and snippets
 
 <p align="center">
-  <img src="docs/screenshots/settings-recording.png" alt="Settings > Recording showing the push-to-talk hold key, Insert Last Dictation key, Voice Edit key, and hands-free auto-stop cap" width="700">
+  <img src="docs/screenshots/settings-recording.png" alt="Settings > Recording showing the push-to-talk, Insert Last Dictation, Voice Edit, Dictation History, and Correct Last Dictation keys, correction watcher, and hands-free auto-stop cap" width="700">
 </p>
 
 Assign a **Voice Edit key** in Settings → Recording, select editable text, and
@@ -529,9 +532,9 @@ Limitations, plainly:
 The menu bar has an **Auto / English / Portuguese** pin below the Template list,
 forcing the transcript language instead of auto-detecting it. Settings →
 Processing → **App Rules** can override the pin per app, alongside
-its Template rule. The Recording Panel's EN/PT buttons (below) add a one-shot
-override on top of both, good for a single dictation without changing any
-standing setting. Precedence, most to least specific: **one-shot > app rule >
+its Template rule. The Recording Panel's **Speak** menu (below) adds a one-shot
+language override on top of both, good for a single dictation without changing
+any standing setting. Precedence, most to least specific: **one-shot > app rule >
 pin > auto**.
 
 ## Recording Panel
@@ -544,8 +547,8 @@ of a plain pill:
 - **Raw** stops and pastes the transcript verbatim, skipping post-processing entirely; the
   Library entry is filed under the reserved Template name "Raw Transcript" rather than whatever
   Template was active.
-- **EN** / **PT** set a one-shot language override for this recording only (tap the active one
-  again to clear it) — see "Language" above for how it fits with the pin and App Rules.
+- The **Speak** menu sets a one-shot language override for this recording only (choose **Auto**
+  to clear it) — see "Language" above for how it fits with the pin and App Rules.
 - The Template name button cycles the Active Template without leaving the recording.
 - **Lock** (only shown while not already locked) switches a held push-to-talk key into
   hands-free recording without releasing it — the elapsed/cap readout replaces the Lock button
