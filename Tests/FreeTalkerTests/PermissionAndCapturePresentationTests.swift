@@ -417,7 +417,13 @@ import Testing
         #expect(reason == .targetDrift)
     }
 
-    @Test func insertWithStrictAndNoTargetLeavesTextOnThePasteboardInsteadOfPasting() {
+    /// `@MainActor` is required, not decorative: `Insertion.insert` mutates `NSPasteboard.general`
+    /// and reads back `NSPasteboardItem`s, which any other `clearContents()` invalidates. These two
+    /// were bare `@Test`, so swift-testing ran them in parallel on arbitrary threads and each freed
+    /// the items the other was iterating — `EXC_BAD_ACCESS` in `objc_msgSend` under
+    /// `-[NSPasteboard _updateTypeCacheIfNeeded]`, the crash that aborted full-suite runs. The
+    /// annotation on `Insertion.insert` is what makes this a compile error rather than a segfault.
+    @MainActor @Test func insertWithStrictAndNoTargetLeavesTextOnThePasteboardInsteadOfPasting() {
         // Exercises the real `Insertion.insert` end to end: the History panel's call shape (no
         // target, `strict: true`) must report `.targetDrift`/`posted == false` — the manual-
         // paste flow — never an unverified synthetic paste, regardless of this process's own
@@ -427,7 +433,7 @@ import Testing
         #expect(!outcome.isPermissionClassFailure)
     }
 
-    @Test func insertReportsTargetDriftForAMismatchedBundleIDRegardlessOfEnvironment() {
+    @MainActor @Test func insertReportsTargetDriftForAMismatchedBundleIDRegardlessOfEnvironment() {
         // Exercises the real `Insertion.insert` end to end: a target snapshotted against a
         // bundle ID that cannot possibly be the live frontmost app is a deterministic drift
         // case independent of this process's own Accessibility/AX-trust state, unlike the

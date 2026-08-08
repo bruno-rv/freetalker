@@ -166,6 +166,15 @@ enum Insertion {
     /// phase 2 would otherwise snapshot phase 1's raw transcript and "restore" *that* over the
     /// user's clipboard. Those callers snapshot once, before phase 1, and restore once, after
     /// phase 2.
+    /// `@MainActor` because this mutates `NSPasteboard.general` and then reads back
+    /// `NSPasteboardItem`s, which are invalidated the instant anything else clears the pasteboard.
+    /// Two callers running concurrently free each other's items mid-iteration, which surfaced as
+    /// `EXC_BAD_ACCESS` in `objc_msgSend` under `-[NSPasteboard _updateTypeCacheIfNeeded]`,
+    /// reached from `pasteboardSnapshot`. Every production caller is already inside the
+    /// `@MainActor` `AppCoordinator`, so this costs production nothing and makes the concurrent
+    /// case unrepresentable rather than unlikely. It also covers `schedulePasteboardRestore`'s
+    /// 1-second deferred write, which `.serialized` on a test suite would not.
+    @MainActor
     @discardableResult
     static func insert(
         _ text: String, target: InsertionTarget? = nil, strict: Bool = false,
