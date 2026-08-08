@@ -275,16 +275,35 @@ struct DictationLanguageTests {
     /// same ANE the final transcription is about to need — see
     /// `docs/perf-decode-latency-2026-08-08.md`).
     @Test func aPreviewTickReusesTheLanguageAnEarlierTickResolved() {
-        #expect(AppCoordinator.livePreviewForcedLanguage(cached: nil, candidates: ["en", "pt"]) == nil)
-        #expect(AppCoordinator.livePreviewForcedLanguage(cached: "pt", candidates: ["en", "pt"]) == "pt")
+        #expect(AppCoordinator.livePreviewForcedLanguage(
+            cached: nil, candidates: ["en", "pt"], ticksSincePin: 0, reDetectEvery: 10
+        ) == nil)
+        #expect(AppCoordinator.livePreviewForcedLanguage(
+            cached: "pt", candidates: ["en", "pt"], ticksSincePin: 9, reDetectEvery: 10
+        ) == "pt")
+    }
+
+    /// The pin expires on schedule, so a pin taken before a mid-recording language switch cannot
+    /// outlive its window even while it keeps producing plausible-looking text.
+    @Test func aPinExpiresAfterTheReDetectionInterval() {
+        #expect(AppCoordinator.livePreviewForcedLanguage(
+            cached: "pt", candidates: ["en", "pt"], ticksSincePin: 10, reDetectEvery: 10
+        ) == nil)
+        #expect(AppCoordinator.livePreviewForcedLanguage(
+            cached: "pt", candidates: ["en", "pt"], ticksSincePin: 11, reDetectEvery: 10
+        ) == nil)
     }
 
     /// A language the engine reported from outside the recording's candidate set is not reusable:
     /// pinning to it would decode later ticks in a language the Dictation Language Set never
     /// allowed.
     @Test func aPreviewTickDoesNotReuseALanguageOutsideTheCandidateSet() {
-        #expect(AppCoordinator.livePreviewForcedLanguage(cached: "de", candidates: ["en", "pt"]) == nil)
-        #expect(AppCoordinator.livePreviewForcedLanguage(cached: "pt", candidates: []) == nil)
+        #expect(AppCoordinator.livePreviewForcedLanguage(
+            cached: "de", candidates: ["en", "pt"], ticksSincePin: 0, reDetectEvery: 10
+        ) == nil)
+        #expect(AppCoordinator.livePreviewForcedLanguage(
+            cached: "pt", candidates: [], ticksSincePin: 0, reDetectEvery: 10
+        ) == nil)
     }
 
     /// A tick that produced words pins its language for the ticks after it.

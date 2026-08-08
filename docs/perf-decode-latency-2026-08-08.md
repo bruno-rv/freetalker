@@ -55,7 +55,11 @@ own `TranscribeTask` instead detects the language *from the encoder output it al
 | 1.786 s | 0.309 s | 8.505 s | 8.814 s | 7.802 s | en / **es** | no |
 
 0.309–0.314 s across a 10× spread of audio length: constant, as the padded-30 s-window reasoning
-predicts. That is **~20 % of a 3 s dictation, ~15 % of an 18 s one, and ~0.3 % of a 90 s one**.
+predicts. As a share of the two-pass wall time in the table — the time the user actually waits —
+that is **19.7 % on the 3 s clip, 15.7 % and 14.8 % on the two mid clips, and 3.5 % on the
+near-silence clip** (small there only because its decode ran away to 8.5 s; see finding 3).
+Every figure is 0.31 s over that clip's own two-pass total, no other denominator mixed in, and no
+length is extrapolated past the 18.2 s the corpus reaches.
 
 **The cheap version of this fix is dead, by measurement.** Letting WhisperKit detect internally
 (one encoder pass instead of two) is worth 0.31 s but picked a *different language on 3 of the 4
@@ -75,10 +79,19 @@ lane calls `whisperEngine.transcribe(… forcedLanguage: nil, candidateLanguages
 (`livePreviewTickInterval`), so *every tick pays the same 0.31 s detect* — whenever the Dictation
 Language Set has more than one entry. A single-language user never pays it at all:
 `predeterminedLanguage` short-circuits a one-element set. Bruno's is en+pt, so he pays it on every
-tick of every recording. Pinning later ticks to the
-language an earlier one resolved removes ~0.31 s of ANE work per tick — on a 60 s recording, about
-forty ticks' worth of duplicated detection, on the same ANE the final transcription is about to
-need. The final decode is untouched. It is not behaviour-neutral though, and the ranking section
+tick of every recording.
+
+Ticks now reuse the language an earlier tick resolved, and every eleventh tick detects anyway
+(`livePreviewReDetectEvery` = 10 pinned ticks, then one that detects), so a pin cannot go unchecked
+for longer than that cycle. One detect per eleven ticks instead of one per tick: over 44 ticks,
+44 detects drop to 4 — ~13.6 s of duplicated ANE work down to ~1.2 s, on the same ANE the final
+transcription is about to need.
+
+**The bound is in ticks, not seconds.** Eleven ticks is roughly 16 s at `livePreviewTickInterval`,
+but only while ticks are actually firing at that interval: `shouldRunLivePreviewTick` skips a tick
+whose predecessor is still decoding, and a preview decode measured 1.2–1.8 s on these clips — the
+same order as the interval itself. The 11-tick cycle is exact; the seconds are an estimate, and it
+degrades in exactly the regime where recordings are longest. The final decode is untouched. It is not behaviour-neutral though, and the ranking section
 below states exactly how preview text can now differ.
 
 Two caveats on the 0.31 s as a *per-tick* figure. It was measured with the final path's decoding
@@ -87,7 +100,7 @@ detect call itself is identical in both, but the fraction of a tick it represent
 bench omits `promptTokens`, which ticks also omit — so on that axis the bench is tick-shaped.
 
 **1b — also hand that cached language to the final decode.** Worth the full 0.31 s off stop→text,
-which is ~20 % of a 3 s dictation. But it decides the dictation's language from earlier audio
+which was 19.7 % of the wall time on the 3 s clip. But it decides the dictation's language from earlier audio
 rather than from the full recording, so it needs sign-off before it ships.
 
 ### 2. VAD chunking is 1.6× slower where it actually chunks — do not enable it
@@ -346,12 +359,12 @@ defaulting to "no variable latency", not as another `processor is X` clause in t
 
 | # | change | regime it helps | measured effect | verdict |
 |---|---|---|---|---|
-| 1a | pin the preview lane to the language an earlier tick resolved | during every recording | ~0.31 s of ANE work per tick, ticks every 1.5 s | **shipped on this branch** (`livePreviewResolvedLanguage`) — see the behaviour note below |
+| 1a | pin the preview lane to the language an earlier tick resolved, re-detecting every 10th tick | every recording with a multi-entry Dictation Language Set | ~0.31 s of ANE work saved on 10 of every 11 ticks; ~13.6 s → ~1.2 s over 44 ticks | **shipped** (`livePreviewResolvedLanguage`, `livePreviewReDetectEvery`) — see the behaviour note below |
 | 4 | decode completed windows during recording | long dictations (72.6 % of seconds) | best case ~24 s of 29.9 s at 120 s; ~49 s of 54.2 s at 300 s | project, high risk — Bruno's call |
 | 1b | also hand the cached language to the final decode | short dictations (73/106 by count) | 0.31 s off stop→text | needs sign-off: language decided from earlier audio |
 | 8 | prewarm the Apple FM session | on-device refinement only | unmeasured | **not this user's provider** (`llmProvider = ollama`) |
 | 3 | anything touching the silence path | silent/near-silent captures | one clip, three runs: 0.3 s to 9.4 s at the same settings; clearing the threshold is inert on speech and 0.12 s on silence | document only — the delta is inside this clip's own spread and it worsens the silence output |
-| 2 | `chunkingStrategy = .vad` | — | **1.61× slower at 300 s**, the only length where it actually chunked | rejected |
+| 2 | `chunkingStrategy = .vad` | — | **1.61× slower at 300 s**, the only length where it actually chunked | rejected for this workload: one synthetic 300 s input, one run, this machine |
 | 5 | pre-warm the cloud connection | — | ~50 ms handshake | rejected |
 
 No row claims a number that no benchmark produced. Row 1a is the only one this branch implements;
@@ -362,12 +375,13 @@ tick re-detected, so preview text followed a mid-recording language switch withi
 it, ticks are pinned to the first language of the recording that produced words, and re-detect only
 once that pin stops producing them (`livePreviewPin`). A wrong pin that keeps yielding
 plausible-looking text — English decoding of Portuguese speech, say — holds for the rest of the
-recording. The final transcript is unaffected: it resolves the language from its own audio, always
-has, and still does. If the mid-switch case is ever seen in practice, the upgrade paths are
-re-detecting every N ticks, or pinning only under an explicit confidence policy (a language
-detection has to win by some margin, or agree across two consecutive ticks, before it pins) —
-strictly better than "empty drops the pin", at the cost of exposing the detect probabilities the
-engine currently keeps to itself.
+recording, but no longer than the 11-tick cycle — `livePreviewReDetectEvery` forces a detect
+regardless, capping the stale window at roughly 16 s when ticks are not being skipped. The final transcript is unaffected: it resolves the
+language from its own audio, always has, and still does. The remaining upgrade path, if ~15 s ever
+proves too long, is pinning only under an explicit confidence policy (a detection has to win by a
+margin, or agree across two consecutive ticks, before it pins) — at the cost of exposing detect
+probabilities the engine currently keeps to itself, and of a detect on every tick until agreement,
+which spends most of the saving to protect a preview.
 
 **The ranking is conditional on one unmeasured quantity.** Bruno's configured refinement is
 `llmProvider = ollama`, `cloudLLMModel = gemma4:31b-cloud` over `https://ollama.com/v1` — a 31 B
@@ -396,8 +410,10 @@ All env-gated and excluded from the suite, in `Tests/FreeTalkerTests/DecodePromp
 ```
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer FREETALKER_LANGDETECT_BENCH=1 \
   swift test -c release --filter measureLanguageDetectionCost
-DEVELOPER_DIR=… FREETALKER_CHUNKING_BENCH=1   swift test -c release --filter measureChunkingAndFallbackCost
-DEVELOPER_DIR=… FREETALKER_FIRSTTOKEN_BENCH=1 swift test -c release --filter measureFirstTokenThresholdCost
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer FREETALKER_CHUNKING_BENCH=1 \
+  swift test -c release --filter measureChunkingAndFallbackCost
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer FREETALKER_FIRSTTOKEN_BENCH=1 \
+  swift test -c release --filter measureFirstTokenThresholdCost
 ```
 
 The length sweep's input is the corpus in `corpus()`'s order (filenames sorted, duplicates dropped

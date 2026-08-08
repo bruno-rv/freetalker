@@ -3089,10 +3089,13 @@ final class AppCoordinator: ObservableObject {
     ///
     /// Preview lane only. The final transcription still resolves the language from its own audio,
     /// so the words the user keeps are never decided by an earlier window. It is not a no-op
-    /// though: preview text now follows the first language of the recording that produced words,
-    /// and only re-detects once that language stops producing them (see `runLivePreviewTick`).
+    /// though: preview text follows the pinned language until either the pin stops producing words
+    /// or `livePreviewReDetectEvery` ticks pass, whichever comes first (see `runLivePreviewTick`).
     /// Reset per recording alongside `lastLivePreviewText`.
     private var livePreviewResolvedLanguage: String?
+    /// Pinned ticks run since the last one that actually detected. Drives
+    /// `livePreviewReDetectEvery`; reset per recording and whenever a tick re-detects.
+    private var livePreviewTicksSincePin = 0
 
     nonisolated static func shouldRunLivePreviewTick(isRecording: Bool, isPartialInFlight: Bool, sampleCount: Int, minSamples: Int) -> Bool {
         isRecording && !isPartialInFlight && sampleCount >= minSamples
@@ -3102,15 +3105,27 @@ final class AppCoordinator: ObservableObject {
         isRecording && resultGeneration == currentGeneration
     }
 
+    /// How many pinned ticks may run before one re-detects anyway. At `livePreviewTickInterval`
+    /// this bounds how long a wrong pin can survive to ~15 s of recording, while still paying the
+    /// detection pass once per 15 s instead of once per 1.5 s — most of the saving, with a hard
+    /// recovery bound rather than one that depends on a tick happening to come back empty.
+    private static let livePreviewReDetectEvery = 10
+
     /// What a preview tick pins its decode to. `nil` means "let the engine resolve it", which is
-    /// what every first tick of a recording gets.
+    /// what every first tick of a recording gets, and what every `reDetectEvery`-th tick after a
+    /// pin gets so a pin taken before a mid-recording language switch cannot outlive its window.
     ///
     /// A cached language is only reused while it is still one of the recording's candidates. That
     /// set is frozen at Recording start, so this cannot disagree with it mid-recording — the check
     /// guards against reusing a language the engine reported from outside the configured set, not
     /// against a live settings change.
-    nonisolated static func livePreviewForcedLanguage(cached: String?, candidates: [String]) -> String? {
-        guard let cached, candidates.contains(cached) else { return nil }
+    nonisolated static func livePreviewForcedLanguage(
+        cached: String?,
+        candidates: [String],
+        ticksSincePin: Int,
+        reDetectEvery: Int
+    ) -> String? {
+        guard let cached, candidates.contains(cached), ticksSincePin < reDetectEvery else { return nil }
         return cached
     }
 
@@ -3122,10 +3137,9 @@ final class AppCoordinator: ObservableObject {
     /// leave a pin taken before a mid-recording language switch decoding the rest of the recording
     /// in the wrong language.
     ///
-    /// Ceiling: recovery only fires when the stale pin stops yielding words. A wrong pin that
-    /// keeps producing plausible text holds until the recording ends — preview text only; the
-    /// final transcript resolves its own language. Upgrade path if that is ever seen: re-detect
-    /// every N ticks rather than only on an empty one.
+    /// This half only reacts to a pin failing outright. The time bound is the other half:
+    /// `livePreviewReDetectEvery` forces a detect regardless, so a wrong pin that keeps producing
+    /// plausible text is capped at ~15 s rather than lasting the recording.
     nonisolated static func livePreviewPin(resultLanguage: String, text: String) -> String? {
         text.isEmpty ? nil : resultLanguage
     }
@@ -3145,6 +3159,7 @@ final class AppCoordinator: ObservableObject {
         livePreviewInFlight = false
         lastLivePreviewText = nil
         livePreviewResolvedLanguage = nil
+        livePreviewTicksSincePin = 0
 
         guard Self.isLivePreviewEnabled(
             settingEnabled: AppSettings.shared.livePreviewEnabled,
@@ -3424,8 +3439,14 @@ final class AppCoordinator: ObservableObject {
         // language, later ticks are pinned to it and skip the detection pass entirely.
         let forcedLanguage = Self.livePreviewForcedLanguage(
             cached: livePreviewResolvedLanguage,
-            candidates: recordingLanguageSnapshot
+            candidates: recordingLanguageSnapshot,
+            ticksSincePin: livePreviewTicksSincePin,
+            reDetectEvery: Self.livePreviewReDetectEvery
         )
+        // Counted before the await, so a tick that is later discarded still counts against the
+        // window — the point is to bound how long a pin goes unchecked, and a discarded tick
+        // checked nothing.
+        if forcedLanguage != nil { livePreviewTicksSincePin += 1 }
         guard let result = try? await whisperEngine.transcribe(samples: window, forcedLanguage: forcedLanguage, candidateLanguages: recordingLanguageSnapshot, vocabulary: [], allowEarlyCancel: true) else { return }
 
         guard Self.shouldAcceptLivePreviewResult(isRecording: isRecording, resultGeneration: generation, currentGeneration: livePreviewGeneration) else { return }
@@ -3434,6 +3455,10 @@ final class AppCoordinator: ObservableObject {
         // Set only from a tick this recording still accepts (hence below the generation gate).
         // `livePreviewPin` owns both halves of the rule and documents their ceiling.
         livePreviewResolvedLanguage = Self.livePreviewPin(resultLanguage: result.language, text: text)
+        // Only a tick that actually detected restarts the window. Resetting on every accepted tick
+        // would let a pin that keeps producing text renew itself forever, which is the staleness
+        // this bound exists to cut.
+        if forcedLanguage == nil { livePreviewTicksSincePin = 0 }
         guard !text.isEmpty, text != lastLivePreviewText else { return }
         lastLivePreviewText = text
         if let destination = recordingDestination {
