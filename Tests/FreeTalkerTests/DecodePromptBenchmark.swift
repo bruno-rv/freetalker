@@ -165,6 +165,275 @@ import WhisperKit
         """)
     }
 
+    /// `WhisperKitEngine.performTranscribe` calls `kit.detectLangauge(audioArray:)` and then
+    /// `kit.transcribe(...)`. Both compute a log-mel spectrogram and run the audio encoder over the
+    /// first 30 s window, so the encoder runs twice per dictation — WhisperKit's own
+    /// `TranscribeTask` instead detects the language *from the encoder output it already has*
+    /// (`TranscribeTask.swift`, `decodeWithFallback`). This measures what the separate pass costs
+    /// on this machine's real captures, and whether the one-pass alternative picks the same
+    /// language (it cannot be constrained to the configured Dictation Language Set, which is why
+    /// the separate call exists — see `performTranscribe`).
+    ///
+    ///     DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+    ///       FREETALKER_LANGDETECT_BENCH=1 \
+    ///       swift test -c release --filter measureLanguageDetectionCost
+    @Test func measureLanguageDetectionCost() async throws {
+        guard ProcessInfo.processInfo.environment["FREETALKER_LANGDETECT_BENCH"] != nil else { return }
+
+        let clips = try Self.corpus()
+        print("=== langdetect: \(clips.count) distinct clips")
+
+        let kit = try await WhisperKit(WhisperKitConfig(
+            modelFolder: Self.modelFolder, verbose: false, logLevel: .none, load: true, download: false
+        ))
+
+        func pinnedOptions(_ language: String?) -> DecodingOptions {
+            var options = DecodingOptions()
+            options.language = language
+            options.usePrefillPrompt = true
+            options.detectLanguage = language == nil
+            options.temperatureFallbackCount = WhisperKitEngine.decodeFallbackBudget(preview: false)
+            return options
+        }
+
+        // Warm the CoreML compute plan on both shapes before anything is timed.
+        _ = try await kit.detectLangauge(audioArray: clips[0].samples)
+        _ = try await kit.transcribe(audioArray: clips[0].samples, decodeOptions: pinnedOptions("en"))
+        _ = try await kit.transcribe(audioArray: clips[0].samples, decodeOptions: pinnedOptions(nil))
+
+        var totals = (detect: 0.0, twoPass: 0.0, onePass: 0.0, audio: 0.0)
+        var languageDisagreements = 0
+        var textDisagreements = 0
+        for clip in clips {
+            let audioSeconds = Double(clip.samples.count) / 16_000
+
+            let detectStart = Date()
+            let (_, langProbs) = try await kit.detectLangauge(audioArray: clip.samples)
+            let detectSpan = Date().timeIntervalSince(detectStart)
+            let constrained = WhisperKitEngine.constrainedLanguage(langProbs: langProbs, candidates: ["en", "pt"])
+            let pinnedStart = Date()
+            let pinned = try await kit.transcribe(audioArray: clip.samples, decodeOptions: pinnedOptions(constrained))
+            let pinnedSpan = Date().timeIntervalSince(pinnedStart)
+
+            let onePassStart = Date()
+            let onePass = try await kit.transcribe(audioArray: clip.samples, decodeOptions: pinnedOptions(nil))
+            let onePassSpan = Date().timeIntervalSince(onePassStart)
+
+            let pinnedText = pinned.map(\.text).joined(separator: " ")
+            let onePassText = onePass.map(\.text).joined(separator: " ")
+            let onePassLanguage = onePass.first?.language ?? "?"
+            if onePassLanguage != constrained { languageDisagreements += 1 }
+            if pinnedText != onePassText { textDisagreements += 1 }
+
+            totals.detect += detectSpan
+            totals.twoPass += detectSpan + pinnedSpan
+            totals.onePass += onePassSpan
+            totals.audio += audioSeconds
+
+            print("""
+            === langdetect clip=\(clip.name) audio=\(Self.format(audioSeconds))s \
+            detect=\(Self.format(detectSpan))s pinnedDecode=\(Self.format(pinnedSpan))s \
+            twoPass=\(Self.format(detectSpan + pinnedSpan))s onePass=\(Self.format(onePassSpan))s \
+            encodeTwoPass=\(Self.format(pinned.first?.timings.encoding ?? 0))s \
+            encodeOnePass=\(Self.format(onePass.first?.timings.encoding ?? 0))s \
+            language=\(constrained)/\(onePassLanguage) textMatch=\(pinnedText == onePassText)
+            """)
+            if pinnedText != onePassText {
+                print("""
+                ===   two-pass: \(pinnedText)
+                ===   one-pass: \(onePassText)
+                """)
+            }
+        }
+
+        let saved = totals.twoPass - totals.onePass
+        print("""
+        === langdetect totals over \(Self.format(totals.audio))s of audio in \(clips.count) clips: \
+        detectOnly=\(Self.format(totals.detect))s twoPass=\(Self.format(totals.twoPass))s \
+        onePass=\(Self.format(totals.onePass))s saved=\(Self.format(saved))s \
+        perClip=\(Self.format(saved / Double(clips.count)))s \
+        languageDisagreements=\(languageDisagreements)/\(clips.count) \
+        textDisagreements=\(textDisagreements)/\(clips.count)
+        """)
+    }
+
+    /// Two questions the corpus above cannot answer, because every preserved capture on this
+    /// machine is under 30 s:
+    ///
+    /// 1. Audio longer than one 30 s window is decoded window-by-window in a single
+    ///    `TranscribeTask`. WhisperKit's `.vad` chunking instead splits at voice-activity
+    ///    boundaries and decodes the chunks *concurrently* (`WhisperKit.transcribe`, the
+    ///    `(true, .vad)` case, batched into `concurrentWorkerCount` = 16 on macOS). The app sets
+    ///    no strategy, so it always takes the sequential path.
+    /// 2. A near-silent capture in the corpus cost 8.5 s to decode 1.8 s of audio — the
+    ///    temperature-fallback budget spent in full on audio the quality heuristics keep
+    ///    rejecting. This measures what that budget costs on exactly that clip.
+    ///
+    /// The long-audio input is the corpus concatenated to ~90 s: synthetic, so its transcript is
+    /// nonsense, but both variants decode the identical samples so the wall-clock comparison is
+    /// honest. Text is printed for both so a chunking-induced difference is visible.
+    ///
+    ///     DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+    ///       FREETALKER_CHUNKING_BENCH=1 \
+    ///       swift test -c release --filter measureChunkingAndFallbackCost
+    @Test func measureChunkingAndFallbackCost() async throws {
+        guard ProcessInfo.processInfo.environment["FREETALKER_CHUNKING_BENCH"] != nil else { return }
+
+        let clips = try Self.corpus()
+        let kit = try await WhisperKit(WhisperKitConfig(
+            modelFolder: Self.modelFolder, verbose: false, logLevel: .none, load: true, download: false
+        ))
+
+        func options(language: String, chunking: ChunkingStrategy?, fallbacks: Int) -> DecodingOptions {
+            var options = DecodingOptions()
+            options.language = language
+            options.usePrefillPrompt = true
+            options.detectLanguage = false
+            options.temperatureFallbackCount = fallbacks
+            options.chunkingStrategy = chunking
+            return options
+        }
+
+        // MARK: long audio, sequential windows vs concurrent VAD chunks
+
+        // Bruno's own history (library.db `dictations.duration_secs`, 106 rows) puts 72.6% of all
+        // transcribed audio seconds in dictations of 30 s or more, mean 30.6 s, max 299.9 s — so
+        // the interesting regime is several windows, not one. Sweep it.
+        func synthetic(seconds: Int) -> [Float] {
+            var samples: [Float] = []
+            let target = seconds * 16_000
+            while samples.count < target {
+                for clip in clips where samples.count < target { samples.append(contentsOf: clip.samples) }
+            }
+            return Array(samples.prefix(target))
+        }
+
+        _ = try await kit.transcribe(audioArray: synthetic(seconds: 30), decodeOptions: options(language: "en", chunking: nil, fallbacks: 2))
+        for seconds in [30, 60, 120, 300] {
+            let input = synthetic(seconds: seconds)
+            // `.vad` only at the ends of the sweep: it was 1.7x SLOWER at 97 s in the first run,
+            // and the question left open is whether that holds as window count grows.
+            let strategies: [(String, ChunkingStrategy?)] = seconds == 30 || seconds == 300
+                ? [("sequential", nil), ("vad", .vad)]
+                : [("sequential", nil)]
+            for (label, strategy) in strategies {
+                let start = Date()
+                let results = try await kit.transcribe(
+                    audioArray: input,
+                    decodeOptions: options(language: "en", chunking: strategy, fallbacks: WhisperKitEngine.decodeFallbackBudget(preview: false))
+                )
+                let wall = Date().timeIntervalSince(start)
+                let timings = results.first?.timings
+                let text = results.map(\.text).joined(separator: " ")
+                print("""
+                === chunking audio=\(seconds)s \(label): wall=\(Self.format(wall))s \
+                realtimeFactor=\(Self.format(wall / Double(seconds))) results=\(results.count) \
+                loops=\(Int(timings?.totalDecodingLoops ?? 0)) windows=\(Int(timings?.totalDecodingWindows ?? 0)) \
+                fallbacks=\(Int(timings?.totalDecodingFallbacks ?? 0)) chars=\(text.count)
+                """)
+            }
+        }
+
+        // MARK: the fallback budget on audio the quality heuristics reject
+
+        guard let shortest = clips.min(by: { $0.samples.count < $1.samples.count }) else { return }
+        print("=== fallback: clip=\(shortest.name) audio=\(Self.format(Double(shortest.samples.count) / 16_000))s")
+        for budget in [0, 1, 2] {
+            let start = Date()
+            let results = try await kit.transcribe(
+                audioArray: shortest.samples,
+                decodeOptions: options(language: "en", chunking: nil, fallbacks: budget)
+            )
+            let wall = Date().timeIntervalSince(start)
+            let timings = results.first?.timings
+            print("""
+            === fallback budget=\(budget): wall=\(Self.format(wall))s \
+            loops=\(Int(timings?.totalDecodingLoops ?? 0)) fallbacks=\(Int(timings?.totalDecodingFallbacks ?? 0)) \
+            text=\(results.map(\.text).joined(separator: " "))
+            """)
+        }
+    }
+
+    /// `DecodingFallback.init` (WhisperKit `Models.swift`, "NOTE: order matters here") checks
+    /// `isFirstTokenLogProbTooLow` BEFORE the `noSpeechProb > noSpeechThreshold` silence verdict,
+    /// so on near-silence the improbable first token wins the race and the decoder retries at a
+    /// higher temperature instead of stopping — WhisperKit's own "this is silence" path is
+    /// unreachable with the default `firstTokenLogProbThreshold` of -1.5. This measures what
+    /// clearing that threshold does to (a) the near-silent clip's decode and (b) the transcripts
+    /// of clips that decode fine today, which must not change.
+    ///
+    ///     DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+    ///       FREETALKER_FIRSTTOKEN_BENCH=1 \
+    ///       swift test -c release --filter measureFirstTokenThresholdCost
+    @Test func measureFirstTokenThresholdCost() async throws {
+        guard ProcessInfo.processInfo.environment["FREETALKER_FIRSTTOKEN_BENCH"] != nil else { return }
+
+        let clips = try Self.corpus()
+        let kit = try await WhisperKit(WhisperKitConfig(
+            modelFolder: Self.modelFolder, verbose: false, logLevel: .none, load: true, download: false
+        ))
+
+        func options(language: String, firstTokenThreshold: Float?) -> DecodingOptions {
+            var options = DecodingOptions()
+            options.language = language
+            options.usePrefillPrompt = true
+            options.detectLanguage = false
+            options.temperatureFallbackCount = WhisperKitEngine.decodeFallbackBudget(preview: false)
+            options.firstTokenLogProbThreshold = firstTokenThreshold
+            return options
+        }
+
+        _ = try await kit.transcribe(audioArray: clips[0].samples, decodeOptions: options(language: "en", firstTokenThreshold: -1.5))
+
+        var identical = 0
+        for clip in clips {
+            let (_, langProbs) = try await kit.detectLangauge(audioArray: clip.samples)
+            let language = WhisperKitEngine.constrainedLanguage(langProbs: langProbs, candidates: ["en", "pt"])
+            var texts: [String] = []
+            for (label, threshold) in [("default(-1.5)", Float(-1.5)), ("nil", nil as Float?)] {
+                let start = Date()
+                let results = try await kit.transcribe(
+                    audioArray: clip.samples,
+                    decodeOptions: options(language: language, firstTokenThreshold: threshold)
+                )
+                let wall = Date().timeIntervalSince(start)
+                let timings = results.first?.timings
+                let text = results.map(\.text).joined(separator: " ")
+                texts.append(text)
+                print("""
+                === firsttoken clip=\(clip.name) audio=\(Self.format(Double(clip.samples.count) / 16_000))s \
+                threshold=\(label) wall=\(Self.format(wall))s \
+                loops=\(Int(timings?.totalDecodingLoops ?? 0)) fallbacks=\(Int(timings?.totalDecodingFallbacks ?? 0)) \
+                chars=\(text.count)
+                ===   text: \(text)
+                """)
+            }
+            if texts[0] == texts[1] { identical += 1 }
+            else { print("=== firsttoken DIVERGENCE clip=\(clip.name)") }
+        }
+        print("=== firsttoken totals: identical=\(identical)/\(clips.count)")
+    }
+
+    /// Every distinct preserved capture on this machine, deduplicated by content and skipping
+    /// anything shorter than a second — shared by the corpus-wide benchmarks.
+    private static func corpus() throws -> [(name: String, samples: [Float])] {
+        let corpusRoot = NSString(string: "~/Library/Application Support/FreeTalker/failed-dictations").expandingTildeInPath
+        var seen = Set<Data>()
+        var clips: [(name: String, samples: [Float])] = []
+        for name in try FileManager.default.contentsOfDirectory(atPath: corpusRoot).sorted()
+        where name.hasSuffix(".wav") {
+            let data = try Data(contentsOf: URL(fileURLWithPath: corpusRoot).appendingPathComponent(name))
+            guard seen.insert(data).inserted else { continue }
+            let samples = try decodeWAV(data)
+            guard samples.count >= 16_000 else { continue }
+            clips.append((name, samples))
+        }
+        if let latest = try? loadPCM(path: audioPath) {
+            clips.append(("last-dictation.wav", latest))
+        }
+        return clips
+    }
+
     /// Measures the stop-time latency the user actually experiences when a live-preview decode is
     /// cancelled immediately before the final request reaches `WhisperKitEngine`'s shared serial
     /// gate, mirroring `AppCoordinator.stopLivePreview()` followed by the final pipeline. This is
