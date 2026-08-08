@@ -152,9 +152,9 @@ consulted. WhisperKit already has a "this is silence, stop" verdict; the app nev
 because `firstTokenLogProbThreshold` defaults to -1.5 (`Configurations.swift:211`) and nothing
 overrides it.
 
-The tempting one-line fix — clear `firstTokenLogProbThreshold` so the silence branch becomes
-reachable — **does not work**, and the reason is worth recording. That flag is not only a fallback
-trigger; it is also a decode-loop early exit (`TextDecoder.swift:852-869`):
+The tempting one-line fix is to clear `firstTokenLogProbThreshold` so the silence branch becomes
+reachable. Reading the source, that flag is not only a fallback trigger; it is also a decode-loop
+early exit (`TextDecoder.swift:852-869`):
 
 ```swift
 let isSegmentCompleted =
@@ -163,8 +163,25 @@ if isSegmentCompleted { … break }
 ```
 
 That early exit is precisely why the budget=0 arm costs 0.318 s at `loops=1`: pass 1 bails after one
-token. Clearing the threshold removes the bail, so pass 1 would run the full decode before reaching
-the silence verdict — slower, not faster. `measureFirstTokenThresholdCost` records the arms.
+token. From that alone the prediction was that clearing the threshold removes the bail and is
+*slower*. `measureFirstTokenThresholdCost` measured both arms at the app's real budget (2) over all
+four clips and **that prediction did not hold**:
+
+| clip | audio | `-1.5` (default) | `nil` |
+|---|---|---|---|
+| 12E6C560 (en) | 18.2 s | 1.780 s, 37 loops, 0 fallbacks | 1.780 s, 37 loops, 0 fallbacks |
+| 2F97652E (pt) | 16.4 s | 1.638 s, 33 loops, 0 fallbacks | 1.615 s, 33 loops, 0 fallbacks |
+| 409FC354 (pt) | 3.0 s | 1.259 s, 24 loops, 0 fallbacks | 1.244 s, 24 loops, 0 fallbacks |
+| CBDDCA9C (near-silence) | 1.8 s | 0.592 s, 8 loops, **2 fallbacks**, `- -` | 0.472 s, 5 loops, **0 fallbacks**, `Thank you.` |
+
+Text identical on 3/4. On real speech the flag never fires, so clearing it is inert — that is the
+safety evidence, not a win. On the silence clip it does what the source predicted structurally
+(`fallbacks=0`, i.e. the silence verdict is now reached) and was 0.12 s *faster*, not slower.
+
+It still ships nothing, for three reasons. The 0.12 s is inside this clip's own noise — the same
+clip at the same budget measured 0.593 s in one run and 5.021 s in another. It changes the silence
+output from `- -` to a hallucinated `Thank you.`, which is worse: `- -` is more likely to be caught
+as junk. And n=1 near-silence clip cannot establish how often either path fires.
 
 The remaining options, none of them shipped here:
 
@@ -271,17 +288,16 @@ defaulting to "no variable latency", not as another `processor is X` clause in t
 
 | # | change | regime it helps | measured effect | verdict |
 |---|---|---|---|---|
-| 1a | cache the resolved language for the recording, reuse it for later preview ticks | during every recording | ~0.31 s of ANE work per tick, ticks every 1.5 s | **ship** — no user-visible behaviour change |
+| 1a | cache the resolved language for the recording, reuse it for later preview ticks | during every recording | ~0.31 s of ANE work per tick, ticks every 1.5 s | **recommended, not implemented** — no user-visible behaviour change, but it edits the live-preview lane and wants its own review |
 | 4 | decode completed windows during recording | long dictations (72.6 % of seconds) | ~11 s of 14.6 s on a 97 s dictation; ~44 s of 59 s on a 300 s one | project, high risk — Bruno's call |
 | 1b | also hand the cached language to the final decode | short dictations (73/106 by count) | 0.31 s off stop→text | needs sign-off: language decided from earlier audio |
 | 8 | prewarm the Apple FM session | on-device refinement only | unmeasured | **not this user's provider** (`llmProvider = ollama`) |
-| 3 | anything touching the silence path | silent/near-silent captures | budget 0/1/2 measured at 0.320 / 0.357 / 5.021 s, non-deterministic | document only — needs a real-speech distribution first |
+| 3 | anything touching the silence path | silent/near-silent captures | budget 0/1/2 at 0.320 / 0.357 / 5.021 s; clearing the threshold: 0.592 s → 0.472 s on one clip, inert on the other three | document only — the delta is inside this clip's own noise and it worsens the silence output |
 | 2 | `chunkingStrategy = .vad` | — | **1.6–3.5× slower at every length** | rejected |
 | 5 | pre-warm the cloud connection | — | ~50 ms handshake | rejected |
 
-No row claims a number that no benchmark produced: the 0.320 s in row 3 is the *budget=0* arm, a
-different intervention from clearing `firstTokenLogProbThreshold`, which was not measured to be
-faster and by the mechanism above should not be.
+No row claims a number that no benchmark produced, and row 1a is a recommendation rather than a
+delivered change: this branch contains the doc and the benchmarks only, no `Sources/` edit.
 
 **The ranking is conditional on one unmeasured quantity.** Bruno's configured refinement is
 `llmProvider = ollama`, `cloudLLMModel = gemma4:31b-cloud` over `https://ollama.com/v1` — a 31 B
@@ -325,4 +341,6 @@ DEVELOPER_DIR=… FREETALKER_FIRSTTOKEN_BENCH=1 swift test -c release --filter m
   bias when refinement will carry the vocabulary anyway.
 - Arms run in fixed order within a clip, so a small delta between arms is not distinguishable from
   ordering noise. Findings here rest on directly timed quantities (finding 1) or on deltas large
-  enough that ordering cannot explain them (findings 2 and 3).
+  enough that ordering cannot explain them (finding 2, and the budget sweep in finding 3). The
+  0.12 s threshold delta in finding 3 is explicitly *not* one of those, which is why it ships
+  nothing.
