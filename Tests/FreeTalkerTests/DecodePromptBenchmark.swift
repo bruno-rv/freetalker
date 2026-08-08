@@ -11,7 +11,11 @@ import WhisperKit
 ///       swift test --filter DecodePromptBenchmark
 @Suite struct DecodePromptBenchmark {
     private static let previewContentionEnvironmentKey = "FREETALKER_PREVIEW_CONTENTION_BENCH"
-    private static let modelFolder = NSString(string: "~/Documents/huggingface/models/argmaxinc/whisperkit-coreml/openai_whisper-large-v3_turbo_954MB").expandingTildeInPath
+    /// The model these benchmarks run against, named once here rather than inherited from
+    /// `AppSettings.shared.whisperModel`: the direct-`WhisperKit` benchmarks always load
+    /// `modelFolder`, and the engine benchmark pins the same id through `reload(to:)`.
+    private static let modelID = "openai_whisper-large-v3_turbo_954MB"
+    private static let modelFolder = NSString(string: "~/Documents/huggingface/models/argmaxinc/whisperkit-coreml/\(modelID)").expandingTildeInPath
     private static let audioPath = NSString(string: "~/Library/Application Support/FreeTalker/last-dictation.wav").expandingTildeInPath
     private static let vocabulary = [
         "Anh", "Claude", "Conrad", "Joyn", "Data Vault Builder", "DVB", "DBT",
@@ -488,11 +492,6 @@ import WhisperKit
             fileManager.fileExists(atPath: Self.audioPath),
             "Real-audio fixture is required at \(Self.audioPath)"
         )
-        let selectedModel = await AppSettings.shared.whisperModel
-        _ = try #require(
-            selectedModel == SpeechModelCatalog.defaultID,
-            "Benchmark requires selected model \(SpeechModelCatalog.defaultID), found \(selectedModel)"
-        )
 
         let setupStart = Date()
         let allSamples = try Self.loadPCM(path: Self.audioPath)
@@ -500,8 +499,21 @@ import WhisperKit
         let audioAttributes = try fileManager.attributesOfItem(atPath: Self.audioPath)
         let audioBytes = audioAttributes[.size] as? NSNumber
         let engine = WhisperKitEngine()
-        await engine.preload()
-        _ = try #require(engine.isLoaded, "Pinned Whisper model did not load")
+        // `reload(to:)` rather than `preload()`: preload resolves the variant from
+        // `AppSettings.shared.whisperModel`, so the benchmark decoded whatever model the user had
+        // selected, and a guard on that setting could only reject the run, never correct it. This
+        // names the model instead. It cannot perturb the numbers: the load sits inside `setupSpan`,
+        // outside the contention window this test exists to measure. `reload` swallows failures
+        // into the engine status, so `isLoaded` is the failure check and the status is the cause.
+        await engine.reload(to: Self.modelID)
+        let loadStatus = await engine.statusText
+        _ = try #require(engine.isLoaded, "Pinned Whisper model \(Self.modelID) did not load: \(loadStatus)")
+        // The variant, not just "something loaded" — a resident kit from an earlier load would
+        // otherwise satisfy `isLoaded` while the benchmark reported the wrong model.
+        _ = try #require(
+            engine.loadedVariant == Self.modelID,
+            "Benchmark loaded \(engine.loadedVariant ?? "nothing"), expected \(Self.modelID)"
+        )
         let setupSpan = Date().timeIntervalSince(setupStart)
 
         let process = ProcessInfo.processInfo
@@ -513,7 +525,7 @@ import WhisperKit
         print("""
         === preview-contention metadata: host=\(process.hostName) os=\(process.operatingSystemVersionString) \
         arch=\(architecture) processors=\(process.processorCount) activeProcessors=\(process.activeProcessorCount)
-        === preview-contention model: id=\(selectedModel) folder=\(Self.modelFolder)
+        === preview-contention model: id=\(Self.modelID) folder=\(Self.modelFolder)
         === preview-contention audio: path=\(Self.audioPath) bytes=\(audioBytes?.intValue ?? 0) \
         format=WAV/mono/16000Hz samples=\(allSamples.count) finalSeconds=\(Self.seconds(allSamples)) \
         previewSuffixLimit=12.00s previewSeconds=\(Self.seconds(previewSamples))
