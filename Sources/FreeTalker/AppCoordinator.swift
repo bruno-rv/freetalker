@@ -4954,22 +4954,39 @@ final class AppCoordinator: ObservableObject {
         // pipeline wires this to its `CancellationToken.checkCancellation`, which is the only
         // thing a heartbeat lease-renewal failure actually cancels — see P2 finding: recovery
         // could still persist after its runner token was cancelled.
-        checkCancellation: () throws -> Void = { try Task.checkCancellation() }
+        checkCancellation: () throws -> Void = { try Task.checkCancellation() },
+        // Every settings read in this function goes through here rather than `AppSettings.shared`,
+        // so a test can supply its own instance instead of mutating the user's live settings —
+        // `AppSettings.shared` writes through to `UserDefaults.standard`, and a test that restores
+        // in `defer` loses that restore whenever the process dies.
+        //
+        // It also makes `vocabularySnapshot` below deterministic. `AppSettings.vocabulary` is the
+        // user's text PLUS `approvedVocabularyCache`, which `refreshApprovedVocabularyCache`
+        // populates asynchronously from the real `library.db` — so a test that pins only the text
+        // still saw whatever approved terms happened to have loaded. That is what made
+        // `recoveryRetryUsesOneVocabularySnapshotForTranscriptionAndPostProcessing` fail 2 of 8
+        // full-suite runs with a stray real term. A fresh instance has an empty cache.
+        //
+        // Ceiling: this call path only. `AppSettings.shared` appears ~80 more times in this file,
+        // including `refreshApprovedVocabularyCache`'s own write, so `settings` is not authoritative
+        // coordinator-wide and a test injecting it does not isolate the coordinator. Per-call
+        // injection until something else needs the same treatment.
+        settings: AppSettings = .shared
     ) async throws -> RecoveryDictation {
         let template = TemplateStore.shared.templates.first {
             $0.id == configuration.template || $0.name == configuration.template
-        } ?? TemplateStore.shared.template(id: AppSettings.shared.activeTemplateID) ?? Template.builtIns[0]
+        } ?? TemplateStore.shared.template(id: settings.activeTemplateID) ?? Template.builtIns[0]
         // ONE read of the effective vocabulary for this whole retry — both the transcriber and the
         // post-processing request below must observe the exact same snapshot. Two independent live
         // `AppSettings.shared.vocabulary` reads (as this used to be) could disagree if the approved-
         // terms cache republishes (a concurrent decision, or `refreshApprovedVocabularyCache`)
         // between them, mid-retry. See Codex finding (AppCoordinator.swift:3769/3797).
-        let vocabularySnapshot = AppSettings.shared.vocabulary
+        let vocabularySnapshot = settings.vocabulary
         let localTranscriber = transcriber ?? whisperEngine
         let transcription = try await RecoveryLocalProcessor(transcriber: localTranscriber).process(
             samples: samples,
             configuration: configuration,
-            candidateLanguages: AppSettings.shared.dictationLanguages,
+            candidateLanguages: settings.dictationLanguages,
             // Retry always runs the post-processing pass below, which carries the same terms — so
             // for an engine that pays decode time for the prompt, this is the redundant copy. See
             // `decoderBiasVocabulary`.
@@ -4978,7 +4995,7 @@ final class AppCoordinator: ObservableObject {
                 refinementCarriesVocabulary: true,
                 biasCostsDecodeTime: localTranscriber.vocabularyBiasCostsDecodeTime
             ),
-            defaultModel: AppSettings.shared.whisperModel
+            defaultModel: settings.whisperModel
         )
         // Retry must apply the same post-processing (active processor + template) the live path
         // does — transcription-only retries came back raw, silently skipping the configured
@@ -4992,9 +5009,9 @@ final class AppCoordinator: ObservableObject {
         // job row at attempt-begin time — see `TranscriptionJobStore.beginAttempt`/
         // `queueRecoveryRetry`) when present, else falls back to current settings — the second
         // half of the two-level nullable fallback (job snapshot itself absent = legacy job).
-        let voiceCommandsEnabled = configuration.voiceCommandsEnabled ?? AppSettings.shared.voiceCommandsEnabled
+        let voiceCommandsEnabled = configuration.voiceCommandsEnabled ?? settings.voiceCommandsEnabled
         let voiceCommandPolicy: VoiceCommandPolicy = voiceCommandsEnabled
-            ? .enabled(keywords: configuration.commandKeywords ?? AppSettings.shared.commandKeywords)
+            ? .enabled(keywords: configuration.commandKeywords ?? settings.commandKeywords)
             : .disabled
         let request = PostProcessingRequest(
             transcript: transcription.text,

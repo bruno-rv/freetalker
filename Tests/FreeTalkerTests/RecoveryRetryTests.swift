@@ -3,6 +3,12 @@ import Testing
 @testable import FreeTalker
 
 @Suite struct RecoveryRetryTests {
+    /// Same pattern as `DictationLanguageTests.isolatedDefaults()`: a per-call domain, so parallel
+    /// suites cannot clear each other's and nothing here can reach the real one.
+    private func isolatedDefaults() -> UserDefaults {
+        UserDefaults(suiteName: "RecoveryRetryTests.\(UUID().uuidString)")!
+    }
+
     @MainActor @Test func recoveredDictationMustPersistBeforeItsAudioCanBeFinalized() throws {
         // `duration: 3.5` here proves the field carries through `persistRecoveredDictation` to the
         // record boundary (`persisted == dictation` compares it). The upstream computation
@@ -64,12 +70,19 @@ import Testing
     /// which is asserted here rather than assumed, so a future "just pass the vocabulary
     /// through" edit shows up as a failure instead of as a silent latency regression.
     @MainActor @Test func recoveryRetryUsesOneVocabularySnapshotForTranscriptionAndPostProcessing() async throws {
-        let originalVocabularyText = AppSettings.shared.vocabularyText
-        defer { AppSettings.shared.vocabularyText = originalVocabularyText }
-        AppSettings.shared.vocabularyText = "Alpha"
+        // Its own settings instance, not `AppSettings.shared`, for two reasons. Writing the
+        // singleton writes the user's real `UserDefaults`, and the `defer` that used to restore it
+        // does not run when the process dies. And `AppSettings.vocabulary` is the text PLUS
+        // `approvedVocabularyCache`, which `refreshApprovedVocabularyCache` fills asynchronously
+        // from the real `library.db` — so pinning only the text left a real approved term free to
+        // appear in the assertion below, which is what made this fail 2 of 8 full-suite runs. A
+        // fresh instance has an empty cache and an empty domain, so `vocabulary` is exactly what
+        // this test sets.
+        let settings = AppSettings(defaults: isolatedDefaults())
+        settings.vocabularyText = "Alpha"
 
         let transcriber = VocabularyMutatingTranscriberProbe {
-            AppSettings.shared.vocabularyText = "Alpha\nBeta"
+            settings.vocabularyText = "Alpha\nBeta"
         }
         let processor = RecoveryPostProcessorSpy(output: "polished text")
 
@@ -79,7 +92,8 @@ import Testing
             captureID: UUID(),
             transcriber: transcriber,
             processor: processor,
-            record: { _ in }
+            record: { _ in },
+            settings: settings
         )
 
         let transcriberVocabulary = await transcriber.receivedVocabulary
