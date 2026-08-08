@@ -1,3 +1,4 @@
+import AppKit
 import Testing
 @testable import FreeTalker
 
@@ -8,6 +9,13 @@ import Testing
 /// under test is a `nonisolated static` value computation, mirroring the existing
 /// `Insertion.classifyPreflightFailure`/`shouldSynthesizePaste` split of decision from effect.
 @Suite struct StreamingASRSafetyTests {
+
+    /// A pasteboard of this suite's own: `finalize`'s `.clipboardOnly` outcome writes the text and
+    /// nothing on that path ever restores it, so against `NSPasteboard.general` these tests
+    /// overwrote whatever the user had copied — verified with `pbpaste`, which returned "refined".
+    private static func privatePasteboard() -> NSPasteboard {
+        NSPasteboard(name: NSPasteboard.Name("FreeTalkerTests.StreamingASR.\(UUID().uuidString)"))
+    }
     // MARK: - Finding 1: collapsed-selection start gate
 
     @Test func shouldStreamLiveRequiresCollapsedSelection() {
@@ -163,7 +171,8 @@ import Testing
                 return 0
             },
             readBaselineValue: { _ in "" },
-            verifyBeforeDelete: { _, _, _, _ in false }
+            verifyBeforeDelete: { _, _, _, _ in false },
+            pasteboard: Self.privatePasteboard()
         )
         let outcome = session.finalize(action: .done, refinedText: "refined", rawText: "refined")
         #expect(writeSnapshotCaretCalls == [nil])
@@ -183,7 +192,8 @@ import Testing
             generation: 1,
             writeSnapshotCaret: { _, _ in nil },
             readBaselineValue: { _ in "" },
-            verifyBeforeDelete: { _, _, _, _ in false }
+            verifyBeforeDelete: { _, _, _, _ in false },
+            pasteboard: Self.privatePasteboard()
         )
         let outcome = session.finalize(action: .done, refinedText: "refined", rawText: "refined")
         #expect(outcome == .clipboardOnly("refined"))
@@ -203,7 +213,8 @@ import Testing
                 return nil
             },
             readBaselineValue: { _ in "" },
-            verifyBeforeDelete: { _, _, _, _ in false }
+            verifyBeforeDelete: { _, _, _, _ in false },
+            pasteboard: Self.privatePasteboard()
         )
         let outcome = session.finalize(action: .cancel, refinedText: "", rawText: "")
         #expect(!writeSnapshotCaretCalled)
@@ -289,7 +300,8 @@ import Testing
             target: target,
             generation: 1,
             writeSnapshotCaret: { _, _ in nil },
-            verifyBeforeDelete: { _, _, _, _ in false }
+            verifyBeforeDelete: { _, _, _, _ in false },
+            pasteboard: Self.privatePasteboard()
         )
         session.receivePartial("hello")
         #expect(session.ledger.isEmpty)
@@ -312,7 +324,8 @@ import Testing
                 observedExpectedCaret = expectedCaret
                 return nil // still unsafe/unreadable in this test — no real CGEvent posted
             },
-            verifyBeforeDelete: { _, _, _, _ in false }
+            verifyBeforeDelete: { _, _, _, _ in false },
+            pasteboard: Self.privatePasteboard()
         )
         session.receivePartial("hi")
         #expect(wasCalled)

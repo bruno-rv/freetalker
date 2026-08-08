@@ -68,6 +68,10 @@ final class LiveInsertionSession {
     /// the session closed (frozen) since no later delete could ever be proven safe without it.
     private let readBaselineValue: (InsertionTarget) -> String?
     private let verifyBeforeDelete: (InsertionTarget, String, Int, String) -> Bool
+    /// Where `.clipboardOnly` puts the text. The system pasteboard in the app — but a test that
+    /// reaches this path against `NSPasteboard.general` overwrites whatever the user had copied,
+    /// with no restore anywhere on this path. `StreamingASRSafetyTests` did exactly that.
+    private let pasteboard: NSPasteboard
 
     init(
         target: InsertionTarget,
@@ -81,8 +85,10 @@ final class LiveInsertionSession {
         verifyBeforeDelete: @escaping (InsertionTarget, String, Int, String) -> Bool = { target, ledgerText, expectedCaret, baseline in
             guard let element = Insertion.streamingSafeElement(target: target) else { return false }
             return Insertion.readbackMatches(element: element, expectedTrailingText: ledgerText, expectedCaret: expectedCaret, baseline: baseline)
-        }
+        },
+        pasteboard: NSPasteboard = .general
     ) {
+        self.pasteboard = pasteboard
         self.target = target
         self.generation = generation
         self.writeSnapshotCaret = writeSnapshotCaret
@@ -188,7 +194,7 @@ final class LiveInsertionSession {
         )
         if shouldFreeze { isFrozen = true }
         if shouldBackspace { backspaceLedger() }
-        if case .clipboardOnly(let text) = outcome { Self.putOnClipboard(text) }
+        if case .clipboardOnly(let text) = outcome { putOnClipboard(text) }
         return outcome
     }
 
@@ -262,8 +268,7 @@ final class LiveInsertionSession {
         ledger.removeAll()
     }
 
-    private static func putOnClipboard(_ text: String) {
-        let pasteboard = NSPasteboard.general
+    private func putOnClipboard(_ text: String) {
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
     }
